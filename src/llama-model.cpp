@@ -513,6 +513,29 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         return hparams.is_recr(std::stoul(tensor_name.substr(4, length_prefix)));
     };
 
+    // A layer with a single kv head has nothing to distribute: a per-head split hands the whole
+    //   row to one device and nothing to the others, and attn_k_norm then has to normalize over a
+    //   row its device may not hold. Detect those layers so the kv path can be mirrored instead.
+    auto in_mqa_layer = [&]() -> bool {
+        uint32_t il = 0;
+        if (tensor_name.compare(0, 4, "blk.") == 0) {
+            const size_t length_prefix = tensor_name.find('.', 4);
+            if (length_prefix == std::string::npos) {
+                return false;
+            }
+            il = std::stoul(tensor_name.substr(4, length_prefix));
+        } else if (tensor_name.compare(0, 6, "cache_") == 0) {
+            const size_t layer_index_start = tensor_name.find("_l", 6);
+            if (layer_index_start == std::string::npos) {
+                return false;
+            }
+            il = std::stoul(tensor_name.substr(layer_index_start + 2));
+        } else {
+            return false;
+        }
+        return hparams.n_head_kv(il) == 1;
+    };
+
     auto get_tensor_config = [&]() -> tensor_config {
         // The MiniMax-01 lightning attention layers are split by head up to their output, which is then
         //   all-gathered because attn_norm_2 normalizes across all of them. Everything from the norm onwards
@@ -542,6 +565,17 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             if (std::regex_match(tensor_name, pattern_k_b_weight) || std::regex_match(tensor_name, pattern_v_b_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output.weight");
+            }
+        }
+
+        // Multi-query attention: k and v hold one head shared by every q head, so replicate them on
+        //   all devices and keep only the q heads and attn_output split. Same shape as the MLA latent
+        //   above. Fused attn_qkv is left alone - its q part still has to be split.
+        if (in_mqa_layer()) {
+            if (std::regex_match(tensor_name, pattern_kv_weight) ||
+                    std::regex_match(tensor_name, pattern_kv_bias) ||
+                    std::regex_match(tensor_name, pattern_kv_cache)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
         }
 
