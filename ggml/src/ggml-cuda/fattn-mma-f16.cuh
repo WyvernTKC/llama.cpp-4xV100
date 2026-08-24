@@ -110,6 +110,15 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 }
 
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_volta(const int DKQ, const int DV, const int ncols) {
+    // Volta's MMA tile is 32 columns wide instead of 16, so the combine buffer is twice the size of Ampere's.
+    // A smaller nbatch_combine keeps it within the 96 kiB of shared memory and at 2 blocks per SM.
+    // For 256/256 the freed space also pays for a larger nbatch_fa, which halves the K/V loop trip count.
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  64, 128, 128,  64, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2,  64, 128, 128,  64, 2, true);
+
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 128, 2,  32, 128, 128,  64, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 256, 1,  32, 128, 128,  64, 1, false);
+
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512,  8,  64, 4,  32, 256, 256,  64, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16,  64, 4,  32, 256, 256,  64, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 128, 2,  32, 128, 128,  64, 1, false);
@@ -1935,6 +1944,19 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     using fattn_kernel_ptr_t = fattn_kernel_t;
 #endif // defined(GGML_USE_HIP)
     fattn_kernel_t fattn_kernel;
+
+    // TEMPORARY DEBUG - remove before committing
+    static bool cfg_printed = false;
+    if (!cfg_printed) {
+        cfg_printed = true;
+        fprintf(stderr,
+                "FA cfg DKQ=%d DV=%d ncols1=%d ncols2=%d ncols=%d nthreads=%d nwarps=%d cpw=%d nbatch_fa=%d ncomb=%d nstages=%d Q_in_reg=%d"
+                " | Q=%zu KV=%zu mask=%zu combine=%zu -> total=%zu (smpbo=%zu)\n",
+                DKQ, DV, ncols1, ncols2, ncols, nthreads, nwarps, cols_per_warp, nbatch_fa, nbatch_combine, nstages, (int) Q_in_reg,
+                nbytes_shared_Q, nbytes_shared_KV, nbytes_shared_mask, nbytes_shared_combine, nbytes_shared_total,
+                ggml_cuda_info().devices[id].smpbo);
+    }
+
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
         fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view>;

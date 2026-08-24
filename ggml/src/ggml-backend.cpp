@@ -331,7 +331,11 @@ void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, siz
     }
 
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
-    GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
+    if (offset + size > ggml_nbytes(tensor)) {
+        GGML_ABORT("tensor write out of bounds: %s, offset = %zu, size = %zu, nbytes = %zu, ne = [%lld, %lld, %lld, %lld]",
+            tensor->name, offset, size, ggml_nbytes(tensor),
+            (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3]);
+    }
 
     buf->iface.set_tensor(buf, tensor, data, offset, size);
 }

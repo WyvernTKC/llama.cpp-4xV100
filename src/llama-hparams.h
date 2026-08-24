@@ -377,6 +377,10 @@ struct llama_hparams {
     // dimension of the recurrent state embeddings
     uint32_t n_embd_s() const;
 
+    // head dimension of the recurrent/linear attention layers,
+    //   the recurrent state and the qkv projections are laid out in units of this size
+    uint32_t n_embd_head_recr() const;
+
     uint32_t n_pos_per_embd() const;
 
     // note: currently only support if either all or none of the layers are MLA

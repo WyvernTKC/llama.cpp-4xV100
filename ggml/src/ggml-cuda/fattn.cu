@@ -17,8 +17,11 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
         }
     }
 
+    // Volta has no device code for fewer than 32 columns in total, see the VOLTA_MMA_AVAILABLE guard in
+    //   flash_attn_ext_f16 - it has to skip this tier and use the next one up instead. This is reachable
+    //   whenever few query columns meet a small gqa ratio, e.g. token generation with MLA split by head.
     if constexpr (ncols2 <= 16) {
-        if (Q->ne[1] <= 16/ncols2) {
+        if (Q->ne[1] <= 16/ncols2 && !volta_mma_available(cc)) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
             return;
         }

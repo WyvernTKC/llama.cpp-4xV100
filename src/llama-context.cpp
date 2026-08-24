@@ -244,7 +244,17 @@ llama_context::llama_context(
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
-    cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+    // an explicitly requested physical batch size is honored as-is - it is not clamped to n_batch,
+    //   instead the logical batch grows to fit it: a logical batch is never smaller than the
+    //   physical batches it is split into, so a larger n_ubatch would otherwise never be filled
+    cparams.n_ubatch = params.n_ubatch == 0 ? cparams.n_batch : params.n_ubatch;
+
+    if (cparams.n_ubatch > cparams.n_batch) {
+        LLAMA_LOG_WARN("%s: n_ubatch (%u) > n_batch (%u) - increasing n_batch to %u\n",
+                __func__, cparams.n_ubatch, cparams.n_batch, cparams.n_ubatch);
+
+        cparams.n_batch = cparams.n_ubatch;
+    }
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
@@ -1212,19 +1222,6 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     }
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
-
-    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        static bool warned = false;
-        if (!warned) {
-            LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
-            warned = true;
-        }
-        if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
-        }
-        sampling.samplers.erase(seq_id);
-        return false;
-    }
 
     const bool can_offload =
         sampler &&
@@ -2503,10 +2500,24 @@ ggml_status llama_context::graph_compute(
 
 llm_graph_cb llama_context::graph_get_cb() const {
     return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
-        if (il >= 0) {
-            ggml_format_name(cur, "%s-%d", name, il);
-        } else {
-            ggml_set_name(cur, name);
+        // Only name tensors that belong to the graph: those are either not allocated yet or live in a
+        //   compute buffer. Anything else outlives the graph - a weight, or a memory module tensor handed
+        //   out by get_r_l()/get_s_l() - and renaming it corrupts state that the rest of llama.cpp looks
+        //   up by name, in particular the tensor parallelism split configuration.
+        //   A view of such a tensor keeps its provenance in its name ("blk.0.ssm_a (reshaped)"), which is
+        //   how that lookup still recognizes it, so follow the view chain to the tensor that owns the data.
+        const ggml_tensor * root = cur;
+        while (root->view_src != nullptr) {
+            root = root->view_src;
+        }
+        const bool owned_by_graph = root->buffer == nullptr ||
+            ggml_backend_buffer_get_usage(root->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE;
+        if (owned_by_graph) {
+            if (il >= 0) {
+                ggml_format_name(cur, "%s-%d", name, il);
+            } else {
+                ggml_set_name(cur, name);
+            }
         }
 
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends

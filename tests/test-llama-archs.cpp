@@ -109,7 +109,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             || arch == LLM_ARCH_KIMI_K3
             || arch == LLM_ARCH_MISTRAL4) {
         n_embd = 128;
-        n_head = 1;
+        // more than one head so that the per-head split of tensor parallelism is actually exercised;
+        //   with a single head the strides of the q views are ambiguous and nothing gets distributed
+        n_head = 8;
         n_ff   = 192;
     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         n_layer = 3;
@@ -118,6 +120,17 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     } else if (arch == LLM_ARCH_QWEN3TTS) {
         n_vocab = 4096; // must be >= the hard-coded codec head size (3072)
     }
+
+    // these architectures compress k and v into a single latent vector shared by all heads, so like the
+    //   real models they have exactly one kv head regardless of how many query heads there are
+    const bool is_mla = arch == LLM_ARCH_DEEPSEEK2
+            || arch == LLM_ARCH_DEEPSEEK32
+            || arch == LLM_ARCH_GLM_DSA
+            || arch == LLM_ARCH_KIMI_LINEAR
+            || arch == LLM_ARCH_BAILINGMOE3
+            || arch == LLM_ARCH_KIMI_K3
+            || arch == LLM_ARCH_MISTRAL4;
+    const uint32_t n_head_kv = is_mla ? 1 : n_head;
 
     const uint32_t n_embd_head = n_embd / n_head;
 
@@ -151,15 +164,18 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_KIMI_K3) {
         GGML_ASSERT(n_layer >= 2);
         std::vector<uint32_t> n_head_per_layer;
+        std::vector<uint32_t> n_head_kv_per_layer;
         n_head_per_layer.reserve(n_layer);
+        n_head_kv_per_layer.reserve(n_layer);
         for (uint32_t il = 0; il < n_layer; il++) {
             n_head_per_layer.push_back(il == 1 ? 0 : n_head);
+            n_head_kv_per_layer.push_back(il == 1 ? 0 : n_head_kv);
         }
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head_per_layer);
-        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_per_layer);
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_kv_per_layer);
     } else {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
-        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head);
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_kv);
     }
 
     ms.add_kv(LLM_KV_ATTENTION_MAX_ALIBI_BIAS, 8.0f);
@@ -243,9 +259,13 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_XIELU_EPS,                 1.0e-7f);
     ms.add_kv(LLM_KV_SSM_INNER_SIZE,            arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ? 256 : 2*n_embd);
     ms.add_kv(LLM_KV_SSM_CONV_KERNEL,           uint32_t(4));
-    ms.add_kv(LLM_KV_SSM_STATE_SIZE,            uint32_t(128));
+    // Mamba-1 has a decay per state and the backends implement that variant only for the shape the real
+    //   models use (d_state 16, a single group), so give those architectures a realistic configuration
+    //   instead of one that silently falls back to the CPU
+    const bool ssm_mamba1 = arch == LLM_ARCH_MAMBA || arch == LLM_ARCH_JAMBA;
+    ms.add_kv(LLM_KV_SSM_STATE_SIZE,            uint32_t(ssm_mamba1 ? 16 : 128));
     ms.add_kv(LLM_KV_SSM_TIME_STEP_RANK,        n_head);
-    ms.add_kv(LLM_KV_SSM_GROUP_COUNT,           arch == LLM_ARCH_PLAMO2 ? 0 : uint32_t(2));
+    ms.add_kv(LLM_KV_SSM_GROUP_COUNT,           arch == LLM_ARCH_PLAMO2 ? 0 : uint32_t(ssm_mamba1 ? 1 : 2));
     ms.add_kv(LLM_KV_KDA_HEAD_DIM,              uint32_t(128));
     ms.add_kv(LLM_KV_KDA_SAFE_GATE,              true);
     ms.add_kv(LLM_KV_KDA_GATE_LOWER_BOUND,       -5.0f);
@@ -331,6 +351,10 @@ static std::vector<float> get_logits(
             throw std::runtime_error("failed to encode batch");
         }
     }
+    // decode all but the last token as a batch, then the last one on its own - architectures with recurrent or
+    //   linear attention take a different code path for single-token ubatches, this covers both of them
+    const uint32_t n_prompt = n_tokens > 1 ? n_tokens - 1 : n_tokens;
+    batch.n_tokens = n_prompt;
     if (llama_decode(lctx, batch)) {
         llama_batch_free(batch);
         throw std::runtime_error("failed to decode batch");
@@ -338,12 +362,26 @@ static std::vector<float> get_logits(
 
     std::vector<float> ret;
     ret.reserve(n_tokens*n_vocab);
-    for (uint32_t i = 0; i < n_tokens; i++) {
+    for (uint32_t i = 0; i < n_prompt; i++) {
         const float * logits_ith = llama_get_logits_ith(lctx, i);
         for (uint32_t j = 0; j < n_vocab; j++) {
             ret.push_back(logits_ith[j]);
         }
     }
+
+    if (n_prompt < n_tokens) {
+        common_batch_clear(batch);
+        common_batch_add(batch, tokens[n_prompt], n_prompt, {0}, true);
+        if (llama_decode(lctx, batch)) {
+            llama_batch_free(batch);
+            throw std::runtime_error("failed to decode single token");
+        }
+        const float * logits_ith = llama_get_logits_ith(lctx, 0);
+        for (uint32_t j = 0; j < n_vocab; j++) {
+            ret.push_back(logits_ith[j]);
+        }
+    }
+
     llama_batch_free(batch);
     return ret;
 }

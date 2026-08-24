@@ -228,6 +228,23 @@ uint32_t llama_hparams::n_embd_s() const {
     return ssm_d_state * ssm_d_inner;
 }
 
+uint32_t llama_hparams::n_embd_head_recr() const {
+    // keep this in sync with the branches of n_embd_s()
+
+    if (n_embd_head_kda != 0) {
+        // Kimi KDA layers
+        return n_embd_head_kda;
+    }
+
+    if (n_embd_head_la != 0) {
+        // MiniMax-Text-01 linear attention layers
+        return n_embd_head_la;
+    }
+
+    // Mamba and the gated delta net models use the state size as the head dimension
+    return ssm_d_state;
+}
+
 bool llama_hparams::is_recr(uint32_t il) const {
     if (il < n_layer_all) {
         return is_recr_impl[il];

@@ -1,8 +1,12 @@
+#ifdef GGML_USE_NCCL
+#include <nccl.h>
+#endif // GGML_USE_NCCL
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/allreduce.cuh"
+#include "ggml-cuda/allreduce-p2p.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -977,6 +981,10 @@ struct ggml_backend_cuda_comm_context {
 
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
 
+    // Latency path for small messages, tried ahead of try_allreduce. Null when peer access is
+    // unavailable or the user disabled it, in which case try_allreduce handles every call.
+    ggml_cuda_p2p_ar *          p2p_ar = nullptr;
+
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
 #endif // GGML_USE_NCCL
@@ -988,12 +996,54 @@ struct ggml_backend_cuda_comm_context {
         }
 #endif // GGML_USE_NCCL
         ggml_cuda_ar_pipeline_free(ar_pipeline);
+        ggml_cuda_p2p_ar_free(p2p_ar);
     }
 };
 
 #ifdef GGML_USE_NCCL
 // AllReduce via NCCL. Reduces as FP32 for small tensors and BF16 for large
 // tensors (bandwidth-bound), then converts back to FP32.
+// Compress the payload to a 16-bit type for the reduction. Which one is faster is hardware dependent:
+//   BF16 keeps the full FP32 exponent range, but before Ampere neither its conversion nor its addition
+//   has native instructions, so both are emulated. FP16 is native as far back as Volta and carries three
+//   more mantissa bits, but saturates at 65504 - a partial sum above that would turn into an infinity.
+template <typename T>
+static void ggml_backend_cuda_comm_allreduce_nccl_16bit(
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors, const int64_t ne,
+        to_t_cuda_t<T> to_16, to_fp32_cuda_t to_fp32, ncclDataType_t nccl_type) {
+    const size_t n_backends = comm_ctx->backends.size();
+
+    ggml_cuda_pool_alloc<T> tmp[GGML_CUDA_MAX_DEVICES];
+    for (size_t i = 0; i < n_backends; ++i) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+        tmp[i].pool = &cuda_ctx->pool();
+        tmp[i].alloc(ne);
+
+        ggml_cuda_set_device(cuda_ctx->device);
+        if (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) {
+            to_16(tensors[i]->data, tmp[i].get(), ne, cuda_ctx->stream());
+        } else {
+            CUDA_CHECK(cudaMemsetAsync(tmp[i].get(), 0, ne * sizeof(T), cuda_ctx->stream()));
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    NCCL_CHECK(ncclGroupStart());
+    for (size_t i = 0; i < n_backends; ++i) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+        NCCL_CHECK(ncclAllReduce(tmp[i].get(), tmp[i].get(), ne, nccl_type, ncclSum, comm_ctx->comms[i], cuda_ctx->stream()));
+    }
+    NCCL_CHECK(ncclGroupEnd());
+
+    for (size_t i = 0; i < n_backends; ++i) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+
+        ggml_cuda_set_device(cuda_ctx->device);
+        to_fp32(tmp[i].get(), (float *) tensors[i]->data, ne, cuda_ctx->stream());
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
 static bool ggml_backend_cuda_comm_allreduce_nccl(
         ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
     const int64_t ne = ggml_nelements(tensors[0]);
@@ -1011,9 +1061,20 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
         GGML_ASSERT(ggml_is_contiguously_allocated(tensors[i]));
     }
 
+    // Type used to reduce large tensors. GGML_CUDA_AR_DTYPE selects it: bf16 (default), f16 or f32.
+    enum ar_dtype { AR_BF16, AR_F16, AR_F32 };
+    static const ar_dtype ar_dt = [] {
+        const char * env = getenv("GGML_CUDA_AR_DTYPE");
+        if (env == nullptr)          return AR_BF16;
+        if (strcmp(env, "f32") == 0) return AR_F32;
+        if (strcmp(env, "f16") == 0) return AR_F16;
+        return AR_BF16;
+    }();
+
     // For small tensors, simply reduce them as FP32.
     // The following heuristic for how "small" a tensor should be is based on RTX 4090s connected via 16x PCIe 4.0.
-    if ((n_backends <= 2 && ne < 32768) || (n_backends == 3 && ne < 131072) || (n_backends >= 4 && ne < 262144)) {
+    if (ar_dt == AR_F32 ||
+            (n_backends <= 2 && ne < 32768) || (n_backends == 3 && ne < 131072) || (n_backends >= 4 && ne < 262144)) {
         for (size_t i = 0; i < n_backends; ++i) {
             if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                 ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
@@ -1030,39 +1091,85 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
         return true;
     }
 
-    // For large tensors it's faster to compress them to BF16 for the reduction:
-    to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
-    to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+    // For large tensors it's faster to compress them to 16 bit for the reduction:
+    if (ar_dt == AR_F16) {
+        ggml_backend_cuda_comm_allreduce_nccl_16bit<half>(comm_ctx, tensors, ne,
+            ggml_get_to_fp16_cuda(GGML_TYPE_F32), ggml_get_to_fp32_cuda(GGML_TYPE_F16), ncclFloat16);
+    } else {
+        ggml_backend_cuda_comm_allreduce_nccl_16bit<nv_bfloat16>(comm_ctx, tensors, ne,
+            ggml_get_to_bf16_cuda(GGML_TYPE_F32), ggml_get_to_fp32_cuda(GGML_TYPE_BF16), ncclBfloat16);
+    }
 
-    ggml_cuda_pool_alloc<nv_bfloat16> tmp[GGML_CUDA_MAX_DEVICES];
+    return true;
+}
+
+// AllGather via NCCL. srcs[i] holds device i's slice along dim 0, dsts[i] receives all slices concatenated.
+// NCCL has no allgatherv, so uneven slices are handled with one broadcast per source inside a group.
+static bool ggml_backend_cuda_comm_allgather_nccl(
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** srcs, struct ggml_tensor ** dsts) {
+    const size_t n_backends = comm_ctx->backends.size();
+
+    const ggml_type type = dsts[0]->type;
+    if (type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const int64_t ne0    = dsts[0]->ne[0];
+    const int64_t n_rows = ggml_nrows(dsts[0]);
+    if (ne0 == 0 || n_rows == 0) {
+        return true;
+    }
+
+    int64_t offset[GGML_CUDA_MAX_DEVICES + 1] = {0};
+    bool    slices_equal = true;
     for (size_t i = 0; i < n_backends; ++i) {
-        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
-        tmp[i].pool = &cuda_ctx->pool();
-        tmp[i].alloc(ne);
-
-        ggml_cuda_set_device(cuda_ctx->device);
-        if (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) {
-            to_bf16(tensors[i]->data, tmp[i].get(), ne, cuda_ctx->stream());
-        } else {
-            CUDA_CHECK(cudaMemsetAsync(tmp[i].get(), 0, ne * sizeof(nv_bfloat16), cuda_ctx->stream()));
+        if (srcs[i] == nullptr || dsts[i] == nullptr) {
+            return false;
         }
-        CUDA_CHECK(cudaGetLastError());
+        if (srcs[i]->type != type || dsts[i]->type != type) {
+            return false;
+        }
+        if (!ggml_is_contiguously_allocated(srcs[i]) || !ggml_is_contiguously_allocated(dsts[i])) {
+            return false;
+        }
+        if (dsts[i]->ne[0] != ne0 || ggml_nrows(dsts[i]) != n_rows || ggml_nrows(srcs[i]) != n_rows) {
+            return false;
+        }
+        offset[i + 1] = offset[i] + srcs[i]->ne[0];
+        slices_equal &= srcs[i]->ne[0] == srcs[0]->ne[0];
+    }
+    if (offset[n_backends] != ne0) {
+        return false;
+    }
+
+    // a single row is laid out exactly as an allgather wants it, no per-source offsets needed
+    if (slices_equal && n_rows == 1) {
+        NCCL_CHECK(ncclGroupStart());
+        for (size_t i = 0; i < n_backends; ++i) {
+            ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+            NCCL_CHECK(ncclAllGather(srcs[i]->data, dsts[i]->data, srcs[i]->ne[0], ncclFloat,
+                comm_ctx->comms[i], cuda_ctx->stream()));
+        }
+        NCCL_CHECK(ncclGroupEnd());
+        return true;
     }
 
     NCCL_CHECK(ncclGroupStart());
-    for (size_t i = 0; i < n_backends; ++i) {
-        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
-        NCCL_CHECK(ncclAllReduce(tmp[i].get(), tmp[i].get(), ne, ncclBfloat16, ncclSum, comm_ctx->comms[i], cuda_ctx->stream()));
+    for (size_t s = 0; s < n_backends; ++s) {
+        if (srcs[s]->ne[0] == 0) {
+            continue;
+        }
+        for (int64_t r = 0; r < n_rows; ++r) {
+            for (size_t i = 0; i < n_backends; ++i) {
+                ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+                const void * sendbuf = (const char *) srcs[i]->data + r*srcs[i]->nb[1];
+                void       * recvbuf =       (char *) dsts[i]->data + r*dsts[i]->nb[1] + offset[s]*dsts[i]->nb[0];
+                NCCL_CHECK(ncclBroadcast(sendbuf, recvbuf, srcs[s]->ne[0], ncclFloat, s,
+                    comm_ctx->comms[i], cuda_ctx->stream()));
+            }
+        }
     }
     NCCL_CHECK(ncclGroupEnd());
-
-    for (size_t i = 0; i < n_backends; ++i) {
-        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
-
-        ggml_cuda_set_device(cuda_ctx->device);
-        to_fp32(tmp[i].get(), (float *) tensors[i]->data, ne, cuda_ctx->stream());
-        CUDA_CHECK(cudaGetLastError());
-    }
 
     return true;
 }
@@ -1241,6 +1348,10 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
         }
     }
 
+    // Independent of the mode above: small messages are latency-bound, where a ring loses badly
+    // to a single round of direct peer writes. Declines fall through to the selected mode.
+    ret->p2p_ar = ggml_cuda_p2p_ar_init(ret->dev_ids.data(), ret->dev_ids.size());
+
     return ret;
 }
 
@@ -1251,7 +1362,31 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
         return false;
     }
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    // The one-shot P2P path only claims small, contiguous F32 messages; anything it declines
+    // falls through to the mode chosen by the init chain.
+    if (comm_ctx->p2p_ar != nullptr &&
+            ggml_cuda_p2p_ar_allreduce(comm_ctx->p2p_ar, comm_ctx->backends.data(), tensors)) {
+        return true;
+    }
+
     return comm_ctx->try_allreduce(comm_ctx, tensors);
+}
+
+static bool ggml_backend_cuda_comm_allgather_tensor(void * comm_ctx_v, struct ggml_tensor ** srcs, struct ggml_tensor ** dsts) {
+    if (comm_ctx_v == nullptr) {
+        return false;
+    }
+#ifdef GGML_USE_NCCL
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (comm_ctx->backends.size() > GGML_CUDA_MAX_DEVICES) {
+        return false;
+    }
+    return ggml_backend_cuda_comm_allgather_nccl(comm_ctx, srcs, dsts);
+#else
+    GGML_UNUSED(srcs);
+    GGML_UNUSED(dsts);
+    return false;
+#endif // GGML_USE_NCCL
 }
 
 // host buffer type
@@ -2790,6 +2925,179 @@ static int ggml_cuda_try_gdn_cache_fusion(
     return skip;
 }
 
+struct ggml_cuda_rwkv7_output_fusion {
+    const ggml_tensor * norm        = nullptr;
+    const ggml_tensor * norm_weight = nullptr;
+    const ggml_tensor * norm_bias   = nullptr;
+    const ggml_tensor * k           = nullptr;
+    const ggml_tensor * r           = nullptr;
+    const ggml_tensor * r_k         = nullptr;
+    const ggml_tensor * v           = nullptr;
+    const ggml_tensor * gate        = nullptr;
+    ggml_tensor *       dst         = nullptr;
+};
+
+static const ggml_tensor * ggml_cuda_other_src(const ggml_tensor * node, const ggml_tensor * src) {
+    if (node->src[0] == src) {
+        return node->src[1];
+    }
+    if (node->src[1] == src) {
+        return node->src[0];
+    }
+    return nullptr;
+}
+
+static int ggml_cuda_try_rwkv7_output_fusion(
+        const ggml_cgraph * cgraph, int node_idx, ggml_cuda_rwkv7_output_fusion & fusion) {
+    static const ggml_op ops[] = {
+        GGML_OP_NORM,
+        GGML_OP_RESHAPE,
+        GGML_OP_MUL,
+        GGML_OP_ADD,
+        GGML_OP_MUL,
+        GGML_OP_RESHAPE,
+        GGML_OP_MUL,
+        GGML_OP_SUM_ROWS,
+        GGML_OP_MUL,
+        GGML_OP_RESHAPE,
+        GGML_OP_ADD,
+    };
+
+    constexpr int node_count = sizeof(ops) / sizeof(ops[0]);
+    if (node_idx + node_count > cgraph->n_nodes) {
+        return 0;
+    }
+
+    bool has_gate = false;
+    if (node_idx + node_count < cgraph->n_nodes) {
+        const ggml_tensor * maybe_gate = cgraph->nodes[node_idx + node_count];
+        has_gate = maybe_gate->op == GGML_OP_MUL &&
+                   (maybe_gate->src[0] == cgraph->nodes[node_idx + node_count - 1] ||
+                    maybe_gate->src[1] == cgraph->nodes[node_idx + node_count - 1]);
+    }
+
+    std::array<ggml_op, node_count + 1> matched_ops;
+    std::copy(std::begin(ops), std::end(ops), matched_ops.begin());
+    if (has_gate) {
+        matched_ops[node_count] = GGML_OP_MUL;
+    }
+
+    const int matched_count = node_count + (has_gate ? 1 : 0);
+    const int out_idx       = node_idx + matched_count - 1;
+
+    // op / compute-flag / output-flag / use-count checks, plus the view_src
+    // containment check that keeps an elided reshape from aliasing a tensor
+    // produced outside the fused range
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, matched_count, matched_ops.data(), &out_idx, 1)) {
+        return 0;
+    }
+
+    const ggml_tensor * norm         = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * reshape_norm = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * mul_norm     = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * add_norm     = cgraph->nodes[node_idx + 3];
+    const ggml_tensor * mul_kr       = cgraph->nodes[node_idx + 4];
+    const ggml_tensor * reshape_r_k  = cgraph->nodes[node_idx + 5];
+    const ggml_tensor * mul_krrk     = cgraph->nodes[node_idx + 6];
+    const ggml_tensor * sum_rk       = cgraph->nodes[node_idx + 7];
+    const ggml_tensor * mul_v        = cgraph->nodes[node_idx + 8];
+    const ggml_tensor * reshape_v    = cgraph->nodes[node_idx + 9];
+    const ggml_tensor * add_out      = cgraph->nodes[node_idx + 10];
+    const ggml_tensor * gate_out     = has_gate ? cgraph->nodes[node_idx + 11] : nullptr;
+
+    if (reshape_norm->src[0] != norm || add_norm->src[0] != mul_norm || reshape_r_k->src[0] == nullptr ||
+        sum_rk->src[0] != mul_krrk || reshape_v->src[0] != mul_v) {
+        return 0;
+    }
+
+    const ggml_tensor * norm_weight = ggml_cuda_other_src(mul_norm, reshape_norm);
+    const ggml_tensor * norm_bias   = ggml_cuda_other_src(add_norm, mul_norm);
+    const ggml_tensor * r_k_view    = ggml_cuda_other_src(mul_krrk, mul_kr);
+    const ggml_tensor * v           = ggml_cuda_other_src(mul_v, sum_rk);
+    if (norm_weight == nullptr || norm_bias == nullptr || r_k_view != reshape_r_k || v == nullptr ||
+        ggml_cuda_other_src(add_out, add_norm) != reshape_v) {
+        return 0;
+    }
+
+    const ggml_tensor * gate = nullptr;
+    ggml_tensor *       dst  = const_cast<ggml_tensor *>(add_out);
+    if (has_gate) {
+        gate = ggml_cuda_other_src(gate_out, add_out);
+        if (gate == nullptr) {
+            return 0;
+        }
+        dst = const_cast<ggml_tensor *>(gate_out);
+    }
+
+    const ggml_tensor * x   = norm->src[0];
+    const ggml_tensor * k   = mul_kr->src[0];
+    const ggml_tensor * r   = mul_kr->src[1];
+    const ggml_tensor * r_k = reshape_r_k->src[0];
+
+    // Every value read by the fused kernel must already exist before this
+    // range is executed. In particular, do not reinterpret an elided compute
+    // node as a weight or activation input merely because the op sequence and
+    // element counts happen to match.
+    auto is_elided_node = [&](const ggml_tensor * tensor) {
+        for (int i = 0; i < matched_count - 1; ++i) {
+            if (tensor == cgraph->nodes[node_idx + i]) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (is_elided_node(x) || is_elided_node(norm_weight) || is_elided_node(norm_bias) || is_elided_node(k) ||
+        is_elided_node(r) || is_elided_node(r_k) || is_elided_node(v) || (gate != nullptr && is_elided_node(gate))) {
+        return 0;
+    }
+
+    if (x == nullptr || k == nullptr || r == nullptr || x->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 ||
+        norm_weight->type != GGML_TYPE_F32 || norm_bias->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F32 ||
+        r->type != GGML_TYPE_F32 || r_k->type != GGML_TYPE_F32 || v->type != GGML_TYPE_F32 ||
+        (gate != nullptr && gate->type != GGML_TYPE_F32) || dst->type != GGML_TYPE_F32) {
+        return 0;
+    }
+
+    const int64_t head_size = x->ne[0];
+    const int64_t H         = x->ne[1];
+    const int64_t C         = head_size * H;
+    const int64_t n_tokens  = ggml_nelements(x) / C;
+
+    auto has_shape = [](const ggml_tensor * tensor, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3) {
+        return tensor->ne[0] == ne0 && tensor->ne[1] == ne1 && tensor->ne[2] == ne2 && tensor->ne[3] == ne3;
+    };
+
+    if ((head_size != 64 && head_size != 128) || !ggml_are_same_shape(x, norm) || !ggml_are_same_shape(x, mul_kr) ||
+        !ggml_are_same_shape(x, k) || !ggml_are_same_shape(x, r) || !ggml_are_same_shape(x, v) ||
+        !has_shape(x, head_size, H, n_tokens, 1) || !has_shape(reshape_norm, C, n_tokens, 1, 1) ||
+        !has_shape(mul_norm, C, n_tokens, 1, 1) || !has_shape(add_norm, C, n_tokens, 1, 1) ||
+        !has_shape(norm_weight, C, 1, 1, 1) || !has_shape(norm_bias, C, 1, 1, 1) ||
+        !has_shape(reshape_r_k, head_size, H, 1, 1) || !has_shape(r_k, C, 1, 1, 1) ||
+        !has_shape(mul_krrk, head_size, H, n_tokens, 1) || !has_shape(sum_rk, 1, H, n_tokens, 1) ||
+        !has_shape(mul_v, head_size, H, n_tokens, 1) || !has_shape(reshape_v, C, n_tokens, 1, 1) ||
+        !has_shape(add_out, C, n_tokens, 1, 1) || !has_shape(dst, C, n_tokens, 1, 1) ||
+        (gate != nullptr && !has_shape(gate, C, n_tokens, 1, 1))) {
+        return 0;
+    }
+
+    if (!ggml_is_contiguous(x) || !ggml_is_contiguous(norm_weight) || !ggml_is_contiguous(norm_bias) ||
+        !ggml_is_contiguous(k) || !ggml_is_contiguous(r) || !ggml_is_contiguous(r_k) || !ggml_is_contiguous(v) ||
+        (gate != nullptr && !ggml_is_contiguous(gate)) || !ggml_is_contiguous(dst)) {
+        return 0;
+    }
+
+    fusion.norm        = norm;
+    fusion.norm_weight = norm_weight;
+    fusion.norm_bias   = norm_bias;
+    fusion.k           = k;
+    fusion.r           = r;
+    fusion.r_k         = r_k;
+    fusion.v           = v;
+    fusion.gate        = gate;
+    fusion.dst         = dst;
+    return matched_count - 1;
+}
+
 static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int node_idx, ggml_cuda_topk_moe_args & args) {
     args.sigmoid         = false;
     args.sqrt_softplus   = false;
@@ -3269,6 +3577,31 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_NORM) {
+        ggml_cuda_rwkv7_output_fusion fusion;
+        const int nodes_to_skip = ggml_cuda_try_rwkv7_output_fusion(cgraph, i, fusion);
+        const int out_nodes[]   = { i + nodes_to_skip };
+        if (nodes_to_skip > 0 &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, i, nodes_to_skip + 1, out_nodes, 1)) {
+#ifdef GGML_CUDA_DEBUG
+            GGML_LOG_INFO("%s: fused RWKV7 output preparation for %s (skipped %d nodes)\n",
+                          __func__, node->name, nodes_to_skip);
+#endif
+            ggml_cuda_op_rwkv7_output_fused(
+                *cuda_ctx,
+                fusion.norm,
+                fusion.norm_weight,
+                fusion.norm_bias,
+                fusion.k,
+                fusion.r,
+                fusion.r_k,
+                fusion.v,
+                fusion.gate,
+                fusion.dst);
+            return nodes_to_skip;
+        }
+    }
 
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
@@ -5468,6 +5801,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_allgather_tensor") == 0) {
+        return (void *)ggml_backend_cuda_comm_allgather_tensor;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;

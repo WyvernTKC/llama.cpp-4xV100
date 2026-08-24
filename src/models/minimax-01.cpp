@@ -434,6 +434,15 @@ llama_model_minimax_01::graph::graph(const llama_model & model, const llm_graph_
 
             qkv = ggml_reshape_4d(ctx0, qkv, qkv->ne[0]*qkv->ne[1], qkv->ne[2], 1, qkv->ne[3]);
 
+            if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+                // attn_norm_2 normalizes across all heads, but with tensor parallelism each device only holds
+                //   the output of its own heads - mark the copy as mirrored, the multi-device backend then
+                //   fills it with an all-gather. Everything from here on is replicated.
+                qkv = ggml_cont(ctx0, qkv);
+                qkv->flags |= GGML_TENSOR_FLAG_MIRRORED;
+                cb(qkv, "qkv_gathered", il);
+            }
+
             // norm
             ggml_tensor * qkv_norm = build_norm(qkv,
                     model.layers[il].attn_norm_2, NULL,

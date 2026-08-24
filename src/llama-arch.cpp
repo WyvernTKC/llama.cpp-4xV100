@@ -1035,37 +1035,48 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
     }
 }
 
+bool llm_arch_ssm_scan_family(const llm_arch & arch) {
+    switch (arch) {
+        case LLM_ARCH_MAMBA:
+        case LLM_ARCH_MAMBA2:
+        case LLM_ARCH_JAMBA:
+        case LLM_ARCH_PLAMO2:
+        case LLM_ARCH_FALCON_H1:
+        case LLM_ARCH_NEMOTRON_H:
+        case LLM_ARCH_NEMOTRON_H_MOE:
+        case LLM_ARCH_GRANITE_HYBRID:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_GROK:
         case LLM_ARCH_MPT:
-        case LLM_ARCH_PLAMO2:
+        // MLA without the absorption optimization: uses the unsplit attn_kv_b instead of attn_k_b/attn_v_b
         case LLM_ARCH_MINICPM3:
         case LLM_ARCH_GEMMA3N:
-        case LLM_ARCH_MAMBA:
+        // Mamba-2 fuses z, x, B, C and dt into one in projection. B and C are shared by a group of heads,
+        //   so splitting that tensor by head would split them too - it needs a per-segment split plus
+        //   n_group large enough to distribute, which ggml_ssm_scan does not accept yet.
         case LLM_ARCH_MAMBA2:
-        case LLM_ARCH_JAMBA:
         case LLM_ARCH_FALCON_H1:
-        case LLM_ARCH_OLMO2:
-        case LLM_ARCH_OLMOE:
-        case LLM_ARCH_DEEPSEEK2:
-        case LLM_ARCH_DEEPSEEK32:
-        case LLM_ARCH_DEEPSEEK4:
-        case LLM_ARCH_GLM_DSA:
-        case LLM_ARCH_BITNET:
-        case LLM_ARCH_T5:
         case LLM_ARCH_NEMOTRON_H:
         case LLM_ARCH_NEMOTRON_H_MOE:
         case LLM_ARCH_GRANITE_HYBRID:
+        case LLM_ARCH_OLMO2:
+        case LLM_ARCH_OLMOE:
+        case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_BITNET:
+        case LLM_ARCH_T5:
         case LLM_ARCH_LFM2:
         case LLM_ARCH_LFM2MOE:
-        case LLM_ARCH_MINIMAX_01:
         case LLM_ARCH_MINIMAX_M2:
         case LLM_ARCH_MINIMAX_M3:
-        case LLM_ARCH_MISTRAL4:
-        case LLM_ARCH_KIMI_LINEAR:
-        case LLM_ARCH_BAILINGMOE3:
-        case LLM_ARCH_KIMI_K3:
+        // KDA and MLA both work for these, but the recurrent state copies of KIMI_LINEAR and the input
+        //   embedding reshape of KIMI_K3 still end up outside the multi-device backend
         case LLM_ARCH_QWEN3TTS:
             return false;
         default:

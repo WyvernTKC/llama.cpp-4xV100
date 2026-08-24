@@ -359,7 +359,25 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
-    const std::string tensor_name = tensor->name;
+
+    // ggml_backend_sched mangles the names of the input copies it creates as "<backend>#<name>#<copy>",
+    //   and a copy of a reshaped weight additionally carries the " (reshaped)" that ggml_reshape appends.
+    //   Strip both so that these copies are configured like the tensor they are a copy of; the rules below
+    //   check the shape they are given, so a name that resolves to the wrong tensor cannot pass silently.
+    const std::string tensor_name = [&]() -> std::string {
+        std::string name = tensor->name;
+        const size_t first = name.find('#');
+        const size_t last  = name.rfind('#');
+        if (first != std::string::npos && first != last) {
+            name = name.substr(first + 1, last - first - 1);
+        }
+        static const std::string suffix_reshaped = " (reshaped)";
+        while (name.size() > suffix_reshaped.size() &&
+                name.compare(name.size() - suffix_reshaped.size(), suffix_reshaped.size(), suffix_reshaped) == 0) {
+            name.resize(name.size() - suffix_reshaped.size());
+        }
+        return name;
+    }();
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
@@ -373,6 +391,19 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
     static const std::regex pattern_attn_out_bias   ("blk\\.\\d*\\.attn_output.bias");
     static const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
+    static const std::regex pattern_attn_norm_2     ("blk\\.\\d*\\.attn_norm_2\\.weight");
+
+    // multi-head latent attention
+    static const std::regex pattern_q_a_weight      ("blk\\.\\d*\\.attn_q_a\\.weight");
+    static const std::regex pattern_q_b_weight      ("blk\\.\\d*\\.attn_q_b\\.weight");
+    static const std::regex pattern_kv_a_mqa_weight ("blk\\.\\d*\\.attn_kv_a_mqa\\.weight");
+    static const std::regex pattern_k_b_weight      ("blk\\.\\d*\\.attn_k_b\\.weight");
+    static const std::regex pattern_v_b_weight      ("blk\\.\\d*\\.attn_v_b\\.weight");
+
+    // per-head graph inputs of the MiniMax-01 lightning attention layers
+    static const std::regex pattern_la_slopes    ("slopes");
+    static const std::regex pattern_la_decay     ("(q|k)_decay_exp");
+    static const std::regex pattern_la_diag_decay("diag_decay_exp");
 
     static const std::regex pattern_ssm_dt          ("blk\\.\\d*\\.ssm_dt.bias");
     static const std::regex pattern_ssm_a           ("blk\\.\\d*\\.ssm_a");
@@ -382,6 +413,19 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_r_cache         ("cache_r_l\\d*");
     static const std::regex pattern_s_cache         ("cache_s_l\\d*");
     static const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
+
+    // mamba
+    static const std::regex pattern_ssm_in          ("blk\\.\\d*\\.ssm_in\\.weight");
+    static const std::regex pattern_ssm_conv1d_bias ("blk\\.\\d*\\.ssm_conv1d\\.bias");
+    static const std::regex pattern_ssm_x           ("blk\\.\\d*\\.ssm_x\\.weight");
+    static const std::regex pattern_ssm_dt_weight   ("blk\\.\\d*\\.ssm_dt\\.weight");
+    static const std::regex pattern_ssm_d           ("blk\\.\\d*\\.ssm_d");
+
+    // Kimi delta attention
+    static const std::regex pattern_ssm_conv1d_qkv  ("blk\\.\\d*\\.ssm_conv1d_(q|k|v)\\.weight");
+    static const std::regex pattern_ssm_fg_a        ("blk\\.\\d*\\.ssm_(f|g)_a\\.weight");
+    static const std::regex pattern_ssm_fg_b        ("blk\\.\\d*\\.ssm_(f|g)_b\\.weight");
+    static const std::regex pattern_ssm_g           ("blk\\.\\d*\\.ssm_g\\.weight");
     static const std::regex pattern_ssm_out_weight  ("blk\\.\\d*\\.ssm_out.weight");
 
     static const std::regex pattern_ffn_up_weight     ("blk\\.\\d*\\.ffn_up(_exps)?.weight");
@@ -438,6 +482,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             il = 0;
             rotation = hparams.n_layer() % ud->n_devices;
         }
+        if (ud->model->arch == LLM_ARCH_MINIMAX_01) {
+            // the lightning attention decay rates and slopes are graph inputs shared by all layers,
+            //   so every layer has to split its heads in the same way for them to line up
+            rotation = 0;
+        }
         const ggml_tensor * tensor_axis_0 = suffix.empty() ? tensor : ud->model->get_tensor((prefix + suffix).c_str());
         if (tensor_axis_0 == nullptr) {
             GGML_ASSERT(!suffix_fallback.empty());
@@ -447,7 +496,50 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         return {axis, tensor_axis_0, il, rotation};
     };
 
+    // whether the tensor belongs to a recurrent/linear attention layer
+    auto in_recr_layer = [&]() -> bool {
+        if (tensor_name.compare(0, 4, "blk.") != 0) {
+            return false;
+        }
+        const size_t length_prefix = tensor_name.find('.', 4);
+        if (length_prefix == std::string::npos) {
+            return false;
+        }
+        return hparams.is_recr(std::stoul(tensor_name.substr(4, length_prefix)));
+    };
+
     auto get_tensor_config = [&]() -> tensor_config {
+        // The MiniMax-01 lightning attention layers are split by head up to their output, which is then
+        //   all-gathered because attn_norm_2 normalizes across all of them. Everything from the norm onwards
+        //   therefore works on the full head dim and is replicated on every device.
+        if (ud->model->arch == LLM_ARCH_MINIMAX_01 && in_recr_layer() &&
+                (std::regex_match(tensor_name, pattern_attn_norm_2) ||
+                 std::regex_match(tensor_name, pattern_attn_gate_weight) ||
+                 std::regex_match(tensor_name, pattern_attn_out_weight))) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+
+        // Multi-head latent attention compresses k and v into a single latent vector that all heads share,
+        //   which after the absorption optimization turns the attention itself into MQA. Everything that
+        //   produces or holds that latent is therefore replicated on every device:
+        //     - attn_q_a / attn_kv_a_mqa and their norms, which reduce over n_embd into the lora ranks
+        //     - the kv cache, which stores the latent instead of per-head k and v
+        //   Only the per-head parts are split: the q projection (attn_q / attn_q_b), the k and v
+        //   decompression (attn_k_b / attn_v_b, whose head index is dim 2) and attn_output.
+        if (hparams.is_mla()) {
+            if (std::regex_match(tensor_name, pattern_q_a_weight) ||
+                    std::regex_match(tensor_name, pattern_kv_a_mqa_weight) ||
+                    std::regex_match(tensor_name, pattern_kv_cache)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+            if (std::regex_match(tensor_name, pattern_q_b_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_k_b_weight) || std::regex_match(tensor_name, pattern_v_b_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output.weight");
+            }
+        }
+
         // standard attention
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
@@ -477,18 +569,78 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         if (std::regex_match(tensor_name, pattern_attn_gate_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
         }
-        if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a)) {
+        // MiniMax-01 lightning attention inputs, one value per head:
+        if (ud->model->arch == LLM_ARCH_MINIMAX_01) {
+            if (std::regex_match(tensor_name, pattern_la_slopes)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);  // [n_head]
+            }
+            if (std::regex_match(tensor_name, pattern_la_decay)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);  // [1, n_head, n_seq_tokens, n_seqs]
+            }
+            if (std::regex_match(tensor_name, pattern_la_diag_decay)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);  // [n_seq_tokens, n_seq_tokens, n_head, n_seqs]
+            }
+        }
+        // Mamba selective state space. The heads of the inner dim are independent and get split; the
+        //   projection that derives B, C and dt from them reduces over that dim, so it is split along
+        //   dim 0 and all-reduced, which leaves B and C replicated the way ssm_scan needs them.
+        if (std::regex_match(tensor_name, pattern_ssm_in) || std::regex_match(tensor_name, pattern_ssm_dt_weight)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
+        }
+        if (std::regex_match(tensor_name, pattern_ssm_x)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+        }
+        if (std::regex_match(tensor_name, pattern_ssm_d) || std::regex_match(tensor_name, pattern_ssm_conv1d_bias)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight");
+        }
+
+        // Kimi delta attention. Like the other linear attention variants it is split by head, but its
+        //   convolutions keep the channels in dim 2, its decay rates are indexed by head along dim 1, and
+        //   some architectures project the gates through a bottleneck of one head dim that all heads share.
+        if (hparams.n_embd_head_kda != 0) {
+            if (std::regex_match(tensor_name, pattern_ssm_conv1d_qkv)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_ssm_fg_a)) {
+                // ssm_f_a/ssm_g_a either project straight to the full head dim, or into a bottleneck that
+                //   ssm_f_b/ssm_g_b then expands per head - a bottleneck is shared, so it stays replicated
+                const size_t length_prefix = tensor_name.find('.', 4);
+                GGML_ASSERT(length_prefix != std::string::npos);
+                const std::string name_b = tensor_name.substr(0, length_prefix + 1) +
+                    "ssm_" + tensor_name.substr(length_prefix + 5, 1) + "_b.weight";
+                if (ud->model->get_tensor(name_b.c_str()) != nullptr) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                }
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_ssm_fg_b) || std::regex_match(tensor_name, pattern_ssm_g)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_ssm_a)) {
+                // one decay rate per head, laid out as [1, n_head]
+                GGML_ASSERT(tensor->ne[0] == 1 && tensor->ne[1] == hparams.n_head());
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+            }
+        }
+
+        if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a)) {
+            // ssm_a holds one row per head, so the heads are on dim 1 whenever it is a matrix: Mamba-1 has
+            //   a decay per state ([d_state, n_head]), Mamba-2 a single one ([1, n_head]), and the models
+            //   that store it as a vector can still hand us a copy of a reshape of it
+            const ggml_backend_meta_split_axis axis = ggml_n_dims(tensor) >= 2 ?
+                GGML_BACKEND_SPLIT_AXIS_1 : GGML_BACKEND_SPLIT_AXIS_0;
+            return get_tensor_config_impl(axis, "ssm_out.weight", "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_ssm_alpha) || std::regex_match(tensor_name, pattern_ssm_beta) ||
                 std::regex_match(tensor_name, pattern_ssm_beta_alpha)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight", "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_r_cache) || std::regex_match(tensor_name, pattern_s_cache)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight");
+            // lightning attention layers project the head dim with attn_output instead of ssm_out
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight", "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_ssm_conv1d)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight", "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_ssm_out_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
@@ -519,8 +671,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
         }
         if (std::regex_match(tensor_name, pattern_output_bias)) {
-            const ggml_tensor * output_weight = ud->model->get_tensor("output.weight");
-            GGML_ASSERT(output_weight != nullptr);
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
         }
 
@@ -575,7 +725,35 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return {{tensor->ne[axis], 1}};
         }
 
-        if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias)) {
+        // Mamba-1 stores the in projection as two blocks, x followed by z, that are each split by head
+        if ((ud->model->arch == LLM_ARCH_MAMBA || ud->model->arch == LLM_ARCH_JAMBA) &&
+                std::regex_match(tensor_name, pattern_ssm_in)) {
+            const int64_t d_inner = hparams.ssm_d_inner;
+            GGML_ASSERT(tensor->ne[axis] == 2*d_inner);
+            return {{d_inner, 2}};
+        }
+
+        if (hparams.n_embd_head_kda != 0 && hparams.is_recr(il)) {
+            // recurrent layers are marked by having no kv heads, so their head count is the model-wide one
+            const int64_t d_inner = hparams.n_head() * hparams.n_embd_head_kda;
+            // q, k and v are convolved separately, so their conv states are three independent blocks
+            //   that each have to be split by head
+            if (std::regex_match(tensor_name, pattern_r_cache)) {
+                const int64_t conv_state_size = (hparams.ssm_d_conv - 1) * d_inner;
+                GGML_ASSERT(tensor->ne[axis] == 3*conv_state_size);
+                return {{conv_state_size, 3}};
+            }
+            // a fused qkv tensor holds three equally sized blocks rather than the q/kv split of GQA
+            if (std::regex_match(tensor_name, pattern_qkv_weight)) {
+                GGML_ASSERT(tensor->ne[axis] == 3*d_inner);
+                return {{d_inner, 3}};
+            }
+        }
+
+        // note: recurrent layers can have a fused qkv tensor with a layout that differs from regular attention,
+        //   those are handled by the per-arch code above or fall through to a single segment
+        if (!hparams.is_recr(il) &&
+                (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias))) {
             const int64_t n_embd      = hparams.n_embd;
             const int64_t n_embd_gqa  = hparams.n_embd_v_gqa(il);
             GGML_ASSERT(hparams.n_embd_k_gqa() == n_embd_gqa);
@@ -600,11 +778,79 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
     auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments) -> std::vector<int64_t> {
         // for better performance it may make sense to round up blck_size to a higher power of 2 so that more efficient kernels can be used
+        {
+            // per-head graph inputs are shared by all layers, they need the head granularity of the recurrent layers
+            //   regardless of which layer index they nominally belong to
+            const int64_t head_dim = hparams.n_embd_head_recr();
+            if (ud->model->arch == LLM_ARCH_MINIMAX_01 && head_dim > 0 &&
+                    (std::regex_match(tensor_name, pattern_la_slopes) ||
+                     std::regex_match(tensor_name, pattern_la_decay) ||
+                     std::regex_match(tensor_name, pattern_la_diag_decay))) {
+                GGML_ASSERT(segments.size() == 1);
+                return {std::lcm(std::lcm(blck_size, (int64_t) 128), head_dim) / head_dim};
+            }
+        }
         if (hparams.is_recr(il)) {
             // linear attention
-            const int64_t head_dim        = hparams.ssm_d_state;
+            const int64_t head_dim        = hparams.n_embd_head_recr();
             const int64_t blck_size_perf  = std::lcm(blck_size, 128);
             const int64_t granularity_qkv = std::lcm(blck_size_perf, head_dim);
+            if (ud->model->arch == LLM_ARCH_MINIMAX_01) {
+                // the lightning attention layers interleave q, k and v per head instead of concatenating them
+                //   in blocks, so the fused qkv tensor has to be split in units of three heads
+                if (std::regex_match(tensor_name, pattern_qkv_weight)) {
+                    GGML_ASSERT(segments.size() == 1);
+                    return {3 * granularity_qkv};
+                }
+            }
+            // Mamba splits the inner dim by head. Its head dim is n_ff_inner/n_head rather than the state
+            //   size, and the two states are sized per head in different units, so it needs its own rules.
+            if (llm_arch_ssm_scan_family(ud->model->arch)) {
+                // Mamba-1 treats every channel of the inner dim as its own head
+                const bool    mamba1     = ud->model->arch == LLM_ARCH_MAMBA || ud->model->arch == LLM_ARCH_JAMBA;
+                const int64_t n_head_ssm = mamba1 ? hparams.ssm_d_inner : hparams.ssm_dt_rank;
+                const int64_t head_dim_m = hparams.ssm_d_inner / n_head_ssm;
+                const int64_t g_feat     = std::lcm(std::lcm(blck_size, (int64_t) 128), head_dim_m);
+                const int64_t g_heads    = g_feat / head_dim_m;
+
+                if (std::regex_match(tensor_name, pattern_ssm_in)) {
+                    // Mamba-1 stores x and z as two blocks, PLaMo-2 interleaves them per head
+                    return std::vector<int64_t>(segments.size(), mamba1 ? g_feat : 2 * g_feat);
+                }
+                GGML_ASSERT(segments.size() == 1);
+                if (std::regex_match(tensor_name, pattern_ssm_conv1d) || std::regex_match(tensor_name, pattern_ssm_x) ||
+                        std::regex_match(tensor_name, pattern_ssm_conv1d_bias) ||
+                        std::regex_match(tensor_name, pattern_ssm_out_weight)) {
+                    return {g_feat};
+                }
+                // one value per head
+                if (std::regex_match(tensor_name, pattern_ssm_dt_weight) || std::regex_match(tensor_name, pattern_ssm_dt) ||
+                        std::regex_match(tensor_name, pattern_ssm_a) || std::regex_match(tensor_name, pattern_ssm_d)) {
+                    return {g_heads};
+                }
+                if (std::regex_match(tensor_name, pattern_r_cache)) {
+                    return {(hparams.ssm_d_conv - 1) * g_feat};
+                }
+                if (std::regex_match(tensor_name, pattern_s_cache)) {
+                    return {hparams.ssm_d_state * g_feat};
+                }
+            }
+
+            // Kimi delta attention keeps everything in units of the head dim, except for the decay rates
+            //   and the conv/recurrent states, which are indexed by head and by state size respectively
+            if (hparams.n_embd_head_kda != 0) {
+                if (std::regex_match(tensor_name, pattern_ssm_a) || std::regex_match(tensor_name, pattern_ssm_beta)) {
+                    return std::vector<int64_t>(segments.size(), granularity_qkv / head_dim);
+                }
+                if (std::regex_match(tensor_name, pattern_r_cache)) {
+                    return std::vector<int64_t>(segments.size(), granularity_qkv * (hparams.ssm_d_conv - 1));
+                }
+                if (std::regex_match(tensor_name, pattern_s_cache)) {
+                    return std::vector<int64_t>(segments.size(), granularity_qkv * head_dim);
+                }
+                // ssm_dt is a bias over the full head dim here, not one value per head
+                return std::vector<int64_t>(segments.size(), granularity_qkv);
+            }
             if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_attn_gate_weight) ||
                     std::regex_match(tensor_name, pattern_ssm_conv1d) || std::regex_match(tensor_name, pattern_ssm_out_weight)) {
                 return std::vector<int64_t>(segments.size(), granularity_qkv);
@@ -621,6 +867,40 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             if (std::regex_match(tensor_name, pattern_s_cache)) {
                 return std::vector<int64_t>(segments.size(), granularity_qkv * head_dim);
+            }
+        } else if (hparams.is_mla()) {
+            // Multi-head latent attention is split in units of whole heads. The q/k head dim differs from
+            //   the v head dim and attn_k_b/attn_v_b are indexed by head directly, so rather than a single
+            //   granularity in features every tensor gets the head count converted to its own units.
+            const int64_t head_k = hparams.n_embd_head_k_mla();
+            const int64_t head_v = hparams.n_embd_head_v_mla();
+
+            // attn_output is split along dim 0, so its slices have to be a whole number of quantization
+            //   blocks - that is what decides how many heads a single granule has to hold
+            const int64_t blck_size_perf = std::lcm(blck_size, (int64_t) 128);
+            // after the absorption optimization MLA is MQA with a single kv head, and the flash attention
+            //   kernels for these head sizes need more than one query head per kv head to be usable at all,
+            //   so a device must never end up with just one head
+            const int64_t g_heads = std::max<int64_t>(std::lcm(head_v, blck_size_perf) / head_v, 4);
+
+            if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_q_b_weight)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {g_heads * head_k};
+            }
+            // attn_k_b/attn_v_b are split along their head dim, so one slice per head
+            if (std::regex_match(tensor_name, pattern_k_b_weight) || std::regex_match(tensor_name, pattern_v_b_weight)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {g_heads};
+            }
+            // the output gate is per head in some architectures (BailingMoE3) and per feature of the
+            //   attention output in others (Kimi-K3), tell them apart by the size being gated
+            if (std::regex_match(tensor_name, pattern_attn_gate_weight)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {segments[0].first == hparams.n_head(il) ? g_heads : g_heads * head_v};
+            }
+            if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {g_heads * head_v};
             }
         } else {
             // regular attention
@@ -648,6 +928,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 return {granularity_q};
             }
             if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {granularity_q};
+            }
+            // per-head output gate (e.g. muse-glimmer): must split on head boundaries
+            //   like q/attn_output so it lines up with the attention output it multiplies
+            if (std::regex_match(tensor_name, pattern_attn_gate_weight)) {
                 GGML_ASSERT(segments.size() == 1);
                 return {granularity_q};
             }

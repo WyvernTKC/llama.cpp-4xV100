@@ -3657,7 +3657,8 @@ void llm_graph_context::build_pooling(
 }
 
 void llm_graph_context::build_sampling() const {
-    if (samplers.empty() || !res->t_logits) {
+    // no output token in this ubatch, there is nothing to sample
+    if (samplers.empty() || !res->t_logits || ggml_nelements(res->t_logits) == 0) {
         return;
     }
 
@@ -3683,9 +3684,15 @@ void llm_graph_context::build_sampling() const {
     // res->t_logits will contain logits for all tokens that want the logits calculated (logits=1 or output=1)
     GGML_ASSERT(res->t_logits != nullptr && "missing t_logits tensor");
 
+    // with tensor parallelism the logits are split over the vocab dim, but every sampler op reduces over it.
+    // mark the copy as mirrored, the multi-device backend then fills it with an all-gather.
+    ggml_tensor * logits_full = ggml_cont(ctx0, res->t_logits);
+    logits_full->flags |= GGML_TENSOR_FLAG_MIRRORED;
+    ggml_format_name(logits_full, "logits_mirrored");
+
     // add a dummy row to keep the single-output graph static regardless of active samplers
     // multi-output graphs can still vary with the number of output rows
-    ggml_tensor * logits_t = ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
+    ggml_tensor * logits_t = ggml_pad(ctx0, logits_full, 0, 1, 0, 0);
 
     for (const auto & entry : samplers) {
         if (entry.second->iface->backend_reset) {

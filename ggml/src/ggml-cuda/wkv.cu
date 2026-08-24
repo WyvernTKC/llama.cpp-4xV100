@@ -1,6 +1,8 @@
 #include "common.cuh"
 #include "wkv.cuh"
 
+#include <type_traits>
+
 template <int block_size>
 static __global__ void rwkv_wkv_f32(const int B, const int T, const int C, const int H, const float * k, const float * v, const float * r, const float * tf, const float * td, const float * s, float * dst) {
     const int tid = threadIdx.x;
@@ -192,6 +194,66 @@ rwkv_wkv7_f32_t1_warp_row(const int T, const int C, const int H, const float * r
     }
 }
 
+template <int head_size, bool has_gate>
+static __global__ void __launch_bounds__(head_size)
+rwkv7_output_f32(
+        const int H,
+        const float eps,
+        const float * x,
+        const float * norm_weight,
+        const float * norm_bias,
+        const float * k,
+        const float * r,
+        const float * r_k,
+        const float * v,
+        const float * gate,
+        float * dst) {
+    const int tid      = threadIdx.x;
+    const int token    = blockIdx.x / H;
+    const int head     = blockIdx.x % H;
+    const int C        = H * head_size;
+    const int head_off = head * head_size;
+    const int base     = token * C + head_off;
+
+    __shared__ float stats[2];
+    __shared__ float corr_reduce[32];
+
+    // Match the standalone norm kernel's 32-thread reduction order. One warp
+    // handles all values in the head while the remaining warps prepare the
+    // correction reduction below.
+    if (tid < WARP_SIZE) {
+        float2 mean_var = make_float2(0.0f, 0.0f);
+        #pragma unroll
+        for (int col = tid; col < head_size; col += WARP_SIZE) {
+            const float xi = x[base + col];
+            mean_var.x += xi;
+            mean_var.y += xi * xi;
+        }
+        mean_var = warp_reduce_sum(mean_var);
+        if (tid == 0) {
+            const float mean = mean_var.x / head_size;
+            const float var  = mean_var.y / head_size - mean * mean;
+            stats[0] = mean;
+            stats[1] = rsqrtf(var + eps);
+        }
+    }
+    __syncthreads();
+
+    // block_reduce broadcasts the result to every thread, so no shared staging
+    float corr = k[base + tid] * r[base + tid];
+    corr *= r_k[head_off + tid];
+    corr = block_reduce<block_reduce_method::SUM, head_size>(corr, corr_reduce);
+
+    float out = (x[base + tid] - stats[0]) * stats[1];
+    out *= norm_weight[head_off + tid];
+    out += norm_bias[head_off + tid];
+    out += v[base + tid] * corr;
+    if constexpr (has_gate) {
+        out *= gate[base + tid];
+    }
+    dst[base + tid] = out;
+}
+
 void ggml_cuda_op_rwkv_wkv6(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const float * k_d  = (const float *)dst->src[0]->data;
     const float * v_d  = (const float *)dst->src[1]->data;
@@ -249,5 +311,74 @@ void ggml_cuda_op_rwkv_wkv7(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         rwkv_wkv7_f32<CUDA_WKV_BLOCK_SIZE><<<B * H, C / H, 0, stream>>>(B, T, C, H, r_d, w_d, k_d, v_d, a_d, b_d, s_d, dst_d);
     } else {
         rwkv_wkv7_f32<CUDA_WKV_BLOCK_SIZE * 2><<<B * H, C / H, 0, stream>>>(B, T, C, H, r_d, w_d, k_d, v_d, a_d, b_d, s_d, dst_d);
+    }
+}
+
+void ggml_cuda_op_rwkv7_output_fused(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * norm,
+        const ggml_tensor * norm_weight,
+        const ggml_tensor * norm_bias,
+        const ggml_tensor * k,
+        const ggml_tensor * r,
+        const ggml_tensor * r_k,
+        const ggml_tensor * v,
+        const ggml_tensor * gate,
+        ggml_tensor * dst) {
+    const ggml_tensor * x = norm->src[0];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(norm->type == GGML_TYPE_F32);
+    GGML_ASSERT(norm_weight->type == GGML_TYPE_F32);
+    GGML_ASSERT(norm_bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(r->type == GGML_TYPE_F32);
+    GGML_ASSERT(r_k->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->type == GGML_TYPE_F32);
+    GGML_ASSERT(gate == nullptr || gate->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int head_size = x->ne[0];
+    const int H         = x->ne[1];
+    const int n_tokens  = ggml_nelements(x) / (head_size * H);
+
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const dim3 blocks(H * n_tokens, 1, 1);
+    cudaStream_t stream = ctx.stream();
+
+    auto launch = [&](auto head_size_tag, auto has_gate_tag) {
+        constexpr int  hs = decltype(head_size_tag)::value;
+        constexpr bool hg = decltype(has_gate_tag)::value;
+        rwkv7_output_f32<hs, hg><<<blocks, hs, 0, stream>>>(
+            H, eps,
+            (const float *) x->data,
+            (const float *) norm_weight->data,
+            (const float *) norm_bias->data,
+            (const float *) k->data,
+            (const float *) r->data,
+            (const float *) r_k->data,
+            (const float *) v->data,
+            hg ? (const float *) gate->data : nullptr,
+            (float *) dst->data);
+    };
+
+    const bool has_gate = gate != nullptr;
+
+    if (head_size == 64) {
+        if (has_gate) {
+            launch(std::integral_constant<int, 64>{}, std::true_type{});
+        } else {
+            launch(std::integral_constant<int, 64>{}, std::false_type{});
+        }
+    } else {
+        GGML_ASSERT(head_size == 128);
+        if (has_gate) {
+            launch(std::integral_constant<int, 128>{}, std::true_type{});
+        } else {
+            launch(std::integral_constant<int, 128>{}, std::false_type{});
+        }
     }
 }
