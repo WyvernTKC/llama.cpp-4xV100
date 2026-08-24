@@ -72,8 +72,9 @@ static constexpr size_t GGML_CUDA_AR_ARRIVAL_STRIDE = 64;
 
 // Number of blocks the chunked kernel launches with.  Each block stripes a
 // disjoint slice of the data and synchronizes through its own arrival-token
-// slot so multiple SMs can pump PCIe stores in parallel.
-static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS = 8;
+// slot so multiple SMs can pump PCIe stores in parallel.  Override via
+// GGML_CUDA_AR_KERNEL_BLOCKS.
+static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS_DEFAULT = 8;
 
 // ---------------------------------------------------------------------------
 // Chunked kernel AllReduce -- 2 GPUs, supports float, half, and bfloat16.
@@ -304,6 +305,7 @@ struct ggml_cuda_ar_pipeline {
     size_t   copy_threshold;
     size_t   copy_chunk_bytes;
     size_t   bf16_threshold; // tensors >= this size (bytes) are reduced via FP32->BF16 round-trip; 0 disables
+    int      kernel_blocks;  // grid size of the chunked kernel
     uint64_t call_count;
 
     // Per-device resources.
@@ -337,7 +339,7 @@ struct ggml_cuda_ar_pipeline {
 // blockIdx.x * (ARRIVAL_STRIDE/sizeof(int)) internally to land on its own slot.
 static int * ggml_cuda_ar_arrival_ptr(const ggml_cuda_ar_pipeline * p, int slot, int rank) {
     const size_t offset = ((size_t)slot * p->n_devices + rank) *
-                          GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+                          p->kernel_blocks * GGML_CUDA_AR_ARRIVAL_STRIDE;
     return reinterpret_cast<int *>(p->arrival.dev + offset);
 }
 
@@ -428,6 +430,19 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
     // byte threshold to opt out for small tensors.
     p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
+    // Every block spins on its peer's matching arrival slot, so all blocks must
+    // be resident at the same time -- more blocks than SMs deadlocks.  One
+    // block per SM is the safe ceiling for a 256-thread block.
+    int max_blocks = ggml_cuda_info().devices[devices[0]].nsm;
+    for (size_t i = 1; i < n_devices; ++i) {
+        max_blocks = std::min(max_blocks, ggml_cuda_info().devices[devices[i]].nsm);
+    }
+    p->kernel_blocks    = (int) ggml_cuda_ar_env_u64("GGML_CUDA_AR_KERNEL_BLOCKS", GGML_CUDA_AR_KERNEL_BLOCKS_DEFAULT);
+    if (p->kernel_blocks < 1 || p->kernel_blocks > max_blocks) {
+        GGML_LOG_WARN("%s: GGML_CUDA_AR_KERNEL_BLOCKS=%d outside [1, %d]; clamping\n",
+                      __func__, p->kernel_blocks, max_blocks);
+        p->kernel_blocks = std::min(std::max(p->kernel_blocks, 1), max_blocks);
+    }
     for (size_t i = 0; i < n_devices; ++i) {
         p->devices[i] = devices[i];
     }
@@ -478,7 +493,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     // Arrival ring: cache-line padded so each GPU's int is on its own line.
     const size_t arrival_bytes =
         (size_t)GGML_CUDA_AR_POOL_SIZE * n_devices *
-        GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+        p->kernel_blocks * GGML_CUDA_AR_ARRIVAL_STRIDE;
     if (p->arrival.alloc(arrival_bytes) != cudaSuccess) {
         GGML_LOG_ERROR("%s: alloc for arrival ring failed (%zu bytes)\n",
                        __func__, arrival_bytes);
@@ -528,8 +543,9 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     }
 
     GGML_LOG_INFO("%s: initialized AllReduce pipeline: %zu GPUs, "
-                  "%zu KB chunked kernel staging + %zu MB copy-engine staging per GPU\n",
-                  __func__, n_devices, p->buf_bytes >> 10, p->copy_bytes >> 20);
+                  "%zu KB chunked kernel staging + %zu MB copy-engine staging per GPU, "
+                  "%d kernel blocks\n",
+                  __func__, n_devices, p->buf_bytes >> 10, p->copy_bytes >> 20, p->kernel_blocks);
 
     return p;
 }
@@ -917,7 +933,7 @@ bool ggml_cuda_ar_allreduce(
                 }
 
 #define LAUNCH_AR_KERNEL(T_dst, T_wire) \
-                ggml_cuda_ar_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>( \
+                ggml_cuda_ar_kernel<T_dst, T_wire><<<dim3(p->kernel_blocks), dim3(256), 0, stream>>>( \
                     reinterpret_cast<const T_dst *>(data), \
                     reinterpret_cast<T_dst *>(data), \
                     reinterpret_cast<T_wire *>(p->host_buf[i].dev + (size_t) slot * p->buf_bytes), \

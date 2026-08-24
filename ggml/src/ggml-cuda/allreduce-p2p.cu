@@ -4,8 +4,9 @@
 
 // One block index is the unit of cross-device synchronisation: block b on every rank exchanges
 // the same slice, so a per-block-index barrier is enough and no grid-wide sync is needed.
-#define GGML_CUDA_P2P_AR_NBLOCKS  16
-#define GGML_CUDA_P2P_AR_NTHREADS 256
+// Override the block count with GGML_CUDA_P2P_AR_NBLOCKS.
+#define GGML_CUDA_P2P_AR_NBLOCKS_DEFAULT 16
+#define GGML_CUDA_P2P_AR_NTHREADS        256
 
 // Two staging slots, alternating per call. A rank can run at most one call ahead of its peers
 // (it cannot finish call k until every peer published its flag for k, and a peer only publishes
@@ -24,6 +25,7 @@ struct ggml_cuda_p2p_ar {
 
     size_t             max_bytes    = 0; // per-rank payload cap, above which the caller uses NCCL
     int64_t            stage_stride = 0; // float4 elements per (slot, rank) region
+    int                nblocks      = 0; // grid size, also the flag array's last dimension
     unsigned long long seq          = 0; // monotonic, identical across ranks for a given call
 };
 
@@ -139,6 +141,25 @@ ggml_cuda_p2p_ar * ggml_cuda_p2p_ar_init(const int * devices, size_t n_devices) 
     }
     max_bytes = GGML_PAD(max_bytes, sizeof(float4));
 
+    int nblocks = GGML_CUDA_P2P_AR_NBLOCKS_DEFAULT;
+    if (const char * env = getenv("GGML_CUDA_P2P_AR_NBLOCKS")) {
+        nblocks = atoi(env);
+    }
+    // Block b waits on block b of every other rank, so all blocks must be resident at the same
+    // time -- more blocks than SMs deadlocks. One block per SM is the safe ceiling.
+    int max_nblocks = ggml_cuda_info().devices[devices[0]].nsm;
+    for (size_t i = 1; i < n_devices; ++i) {
+        const int nsm = ggml_cuda_info().devices[devices[i]].nsm;
+        if (nsm < max_nblocks) {
+            max_nblocks = nsm;
+        }
+    }
+    if (nblocks < 1 || nblocks > max_nblocks) {
+        GGML_LOG_WARN("%s: GGML_CUDA_P2P_AR_NBLOCKS=%d outside [1, %d], clamping\n",
+            __func__, nblocks, max_nblocks);
+        nblocks = nblocks < 1 ? 1 : max_nblocks;
+    }
+
     // Every pair has to be reachable, a partial mesh would leave some ranks unable to push.
     for (size_t i = 0; i < n_devices; ++i) {
         for (size_t j = 0; j < n_devices; ++j) {
@@ -159,10 +180,11 @@ ggml_cuda_p2p_ar * ggml_cuda_p2p_ar_init(const int * devices, size_t n_devices) 
     ar->n_devices    = n_devices;
     ar->max_bytes    = max_bytes;
     ar->stage_stride = (int64_t) (max_bytes / sizeof(float4));
+    ar->nblocks      = nblocks;
 
     const size_t stage_bytes = (size_t) GGML_CUDA_P2P_AR_NSLOTS * n_devices * max_bytes;
     const size_t flag_bytes  = (size_t) GGML_CUDA_P2P_AR_NSLOTS * n_devices *
-                               GGML_CUDA_P2P_AR_NBLOCKS * sizeof(unsigned long long);
+                               ar->nblocks * sizeof(unsigned long long);
 
     for (size_t i = 0; i < n_devices; ++i) {
         ar->devices[i] = devices[i];
@@ -199,8 +221,8 @@ ggml_cuda_p2p_ar * ggml_cuda_p2p_ar_init(const int * devices, size_t n_devices) 
     }
 
     GGML_LOG_INFO("%s: one-shot P2P AllReduce enabled for %zu devices, up to %zu KiB per rank "
-                  "(%zu MiB staging per device)\n",
-        __func__, n_devices, max_bytes >> 10, (stage_bytes + flag_bytes) >> 20);
+                  "(%zu MiB staging per device), %d blocks\n",
+        __func__, n_devices, max_bytes >> 10, (stage_bytes + flag_bytes) >> 20, ar->nblocks);
 
     return ar;
 }
@@ -265,7 +287,7 @@ bool ggml_cuda_p2p_ar_allreduce(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends
 
         ggml_cuda_set_device(cuda_ctx->device);
 
-        ggml_cuda_p2p_ar_kernel<<<GGML_CUDA_P2P_AR_NBLOCKS, GGML_CUDA_P2P_AR_NTHREADS, 0, cuda_ctx->stream()>>>(args);
+        ggml_cuda_p2p_ar_kernel<<<ar->nblocks, GGML_CUDA_P2P_AR_NTHREADS, 0, cuda_ctx->stream()>>>(args);
         CUDA_CHECK(cudaGetLastError());
     }
 
