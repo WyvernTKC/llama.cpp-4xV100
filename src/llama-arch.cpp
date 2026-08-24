@@ -1084,8 +1084,6 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_GRANITE_HYBRID:
         case LLM_ARCH_MINIMAX_M2:
         case LLM_ARCH_MINIMAX_M3:
-        // KDA and MLA both work for these, but the recurrent state copies of KIMI_LINEAR and the input
-        //   embedding reshape of KIMI_K3 still end up outside the multi-device backend
         case LLM_ARCH_QWEN3TTS:
             return false;
         default:
