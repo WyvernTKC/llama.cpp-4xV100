@@ -112,9 +112,11 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_volta(const int DKQ, const int DV, const int ncols) {
     // Volta's MMA tile is 32 columns wide instead of 16, so the combine buffer is twice the size of Ampere's.
     // A smaller nbatch_combine keeps it within the 96 kiB of shared memory and at 2 blocks per SM.
-    // For 256/256 the freed space also pays for a larger nbatch_fa, which halves the K/V loop trip count.
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  64, 128, 128,  64, 2, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2,  64, 128, 128,  64, 2, true);
+    // For DV=256 the VKQ accumulator alone takes 128 registers, so Q in registers spills ~3 kiB per thread.
+    // Q from SRAM needs a second tile, so keep nbatch_fa and nbatch_K2 small enough for 2 blocks per SM.
+    // Two blocks beat one wider block: one block can do math while the other waits on __syncthreads.
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  32,  64,  64,  64, 2, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2,  32,  64,  64,  64, 2, false);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 128, 2,  32, 128, 128,  64, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 256, 1,  32, 128, 128,  64, 1, false);
