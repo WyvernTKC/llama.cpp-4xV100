@@ -187,6 +187,114 @@ struct common_speculative_impl {
     static constexpr float acc_ema_probe  = 1.0f;  // additive growth on a clean draft
     static constexpr float acc_ema_init   = 2.0f;
 
+    // EXPERIMENTAL, OFF BY DEFAULT -- shape bucketing.
+    //
+    // Enabled only by setting LLAMA_SPEC_ADAPTIVE_BUCKETS. With the variable unset
+    // this whole mechanism is bypassed and adaptive drafting behaves exactly as
+    // upstream, so nothing below can affect a default build.
+    //
+    // Motivation: the EMA wants an arbitrary integer draft length, but the draft
+    // length sets the batch shape, and some backends key graph reuse on the shape.
+    // The meta backend under -sm tensor rebuilds the split state of every node for
+    // every device whenever the graph uid changes (ggml_backend_meta_graph_compute).
+    // Measured on 4xV100 + MTP, a draft that changes length every step costs ~2.5x
+    // the throughput of a fixed-length one: an adaptive draft averaging 5.15 tokens
+    // paid 125 ms/step where a fixed 6.77-token draft paid 56. One shape change is
+    // worth about 69 ms, i.e. more than a whole decode step.
+    //
+    // Snapping the length to a short ladder of fixed rungs, with a deadband so a rung
+    // has to be wanted repeatedly before it is adopted, recovers most of that: rungs
+    // {2,7} with deadband 8 measured 59.4 prose / 84.6 json against raw adaptive's
+    // 24.3 / 35.1.
+    //
+    // It is off by default because it still does not beat simply choosing n_max:
+    // fixed n=2 gets 63.3 on prose and fixed n=7 gets 94.9 on json, and the bucketed
+    // two-class mean (72.0) merely lands between those of the two fixed settings
+    // (71.4 and 73.1). Adaptation speed and shape stability trade directly against
+    // each other -- deadband 32 held the shape but sat ~36 drafts on the wrong rung,
+    // deadband 8 adapted but thrashed enough to widen prose spread to 13%. Kept in
+    // tree because it isolates the cost cleanly and is the starting point if the
+    // backend ever makes a shape change cheap.
+    std::vector<int32_t> n_buckets;         // ascending ladder of allowed draft lengths
+    std::vector<int32_t> bucket_cur;        // per-seq committed rung (-1 = none yet)
+    std::vector<int32_t> bucket_want;       // per-seq rung currently being argued for
+    std::vector<int32_t> bucket_want_n;     // per-seq consecutive drafts wanting it
+
+    // Deadband, in drafts. The EMA is inherently oscillatory (+1 on every clean
+    // accept, averaged back down on a rejection), so it recrosses rung boundaries
+    // constantly; the deadband is what turns that into a rare shape change rather
+    // than a frequent one. Tunable with LLAMA_SPEC_ADAPTIVE_DEADBAND.
+    int32_t bucket_switch_after = [] {
+        const char * env = std::getenv("LLAMA_SPEC_ADAPTIVE_DEADBAND");
+        const int32_t v = env ? atoi(env) : 0;
+        return v > 0 ? v : 8;
+    }();
+
+    // Opt-in only: LLAMA_SPEC_ADAPTIVE_BUCKETS=2,7 for an explicit ladder, or
+    // LLAMA_SPEC_ADAPTIVE_BUCKETS=auto for powers of two below the ceiling plus the
+    // ceiling itself (n_max=7 -> 1,2,4,7). Unset leaves bucketing disabled.
+    bool bucket_init = false;
+
+    void init_buckets(int32_t n_cfg) {
+        if (bucket_init) {
+            return;
+        }
+        bucket_init = true;
+
+        const char * env = std::getenv("LLAMA_SPEC_ADAPTIVE_BUCKETS");
+        if (!env || !*env) {
+            return; // disabled: n_buckets stays empty
+        }
+
+        if (std::strcmp(env, "auto") == 0) {
+            for (int32_t v = 1; v < n_cfg; v *= 2) {
+                n_buckets.push_back(v);
+            }
+            n_buckets.push_back(n_cfg);
+        } else {
+            std::stringstream ss(env);
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                const int32_t v = atoi(tok.c_str());
+                if (v > 0 && v <= n_cfg) {
+                    n_buckets.push_back(v);
+                }
+            }
+            std::sort(n_buckets.begin(), n_buckets.end());
+            n_buckets.erase(std::unique(n_buckets.begin(), n_buckets.end()), n_buckets.end());
+        }
+
+        if (n_buckets.empty()) {
+            SPC_WRN("LLAMA_SPEC_ADAPTIVE_BUCKETS='%s' yielded no usable rung for n_max=%d - "
+                    "bucketing stays disabled\n", env, n_cfg);
+            return;
+        }
+
+        std::string s;
+        for (size_t i = 0; i < n_buckets.size(); ++i) {
+            s += (i ? "," : "") + std::to_string(n_buckets[i]);
+        }
+        SPC_INF("EXPERIMENTAL adaptive draft bucketing enabled: rungs [%s], deadband %d drafts\n",
+                s.c_str(), bucket_switch_after);
+    }
+
+    // nearest rung to n_want, clamped into [n_lo, n_cfg]
+    int32_t snap_to_bucket(int32_t n_want, int32_t n_lo, int32_t n_cfg) const {
+        const auto dist = [n_want](int32_t v) { return v > n_want ? v - n_want : n_want - v; };
+
+        int32_t best = -1;
+        for (const int32_t b : n_buckets) {
+            if (b < n_lo || b > n_cfg) {
+                continue;
+            }
+            if (best < 0 || dist(b) < dist(best)) {
+                best = b;
+            }
+        }
+        // no rung survives the clamp (e.g. n_min above every rung): fall back to the clamp
+        return best < 0 ? std::max(n_lo, std::min(n_cfg, n_want)) : best;
+    }
+
     void update_acc_ema(llama_seq_id seq_id, uint16_t n_accepted) {
         if (seq_id < 0 || (size_t) seq_id >= acc_ema.size()) {
             return;
@@ -204,8 +312,11 @@ struct common_speculative_impl {
     // tracking content drift within a response is the point of the EMA
     void reset_acc_ema(llama_seq_id seq_id) {
         if (seq_id >= 0 && (size_t) seq_id < acc_ema.size()) {
-            acc_ema[seq_id]      = acc_ema_init;
-            n_last_draft[seq_id] = 0;
+            acc_ema[seq_id]       = acc_ema_init;
+            n_last_draft[seq_id]  = 0;
+            bucket_cur[seq_id]    = -1;
+            bucket_want[seq_id]   = -1;
+            bucket_want_n[seq_id] = 0;
         }
     }
 
@@ -214,9 +325,39 @@ struct common_speculative_impl {
         if (!adaptive_n || seq_id < 0 || (size_t) seq_id >= acc_ema.size()) {
             return n_cfg;
         }
+        init_buckets(n_cfg);
+
         const int32_t n_want = (int32_t) std::lround(acc_ema[seq_id]);
-        const int32_t n      = std::max(std::max(1, n_min), std::min(n_cfg, n_want));
         acc_ema[seq_id]      = std::min(acc_ema[seq_id], (float) n_cfg); // do not let the probe run away
+
+        if (n_buckets.empty()) {
+            // bucketing disabled (the default): behave exactly as upstream
+            const int32_t n = std::max(std::max(1, n_min), std::min(n_cfg, n_want));
+            n_last_draft[seq_id] = n;
+            return n;
+        }
+
+        const int32_t want = snap_to_bucket(n_want, std::max(1, n_min), n_cfg);
+
+        // deadband: adopt a new rung only once it has been wanted repeatedly
+        if (bucket_cur[seq_id] < 0) {
+            bucket_cur[seq_id] = want;   // first draft of the sequence, nothing to debounce
+        } else if (want != bucket_cur[seq_id]) {
+            if (want == bucket_want[seq_id]) {
+                bucket_want_n[seq_id]++;
+            } else {
+                bucket_want  [seq_id] = want;
+                bucket_want_n[seq_id] = 1;
+            }
+            if (bucket_want_n[seq_id] >= bucket_switch_after) {
+                bucket_cur   [seq_id] = want;
+                bucket_want_n[seq_id] = 0;
+            }
+        } else {
+            bucket_want_n[seq_id] = 0;   // already there, drop any pending argument
+        }
+
+        const int32_t n = bucket_cur[seq_id];
         n_last_draft[seq_id] = n;
         return n;
     }
@@ -225,6 +366,9 @@ struct common_speculative_impl {
         // start optimistic so a predictable prefix is not throttled from step one
         acc_ema.assign(n_seq, acc_ema_init);
         n_last_draft.assign(n_seq, 0);
+        bucket_cur.assign(n_seq, -1);
+        bucket_want.assign(n_seq, -1);
+        bucket_want_n.assign(n_seq, 0);
     }
 
     virtual ~common_speculative_impl() = default;
