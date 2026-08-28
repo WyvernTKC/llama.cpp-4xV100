@@ -1368,6 +1368,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     return ret;
 }
 
+// Host-resident tensors reach this graph without per-device counterparts (views of CPU data, and the
+// offloaded weights that ggml_backend_sched streams in). They have no meta buffer context, so asking
+// for their split state reads a context that is not there.
+static bool ggml_backend_meta_has_split_state(const struct ggml_tensor * tensor) {
+    return tensor != nullptr && ggml_backend_buffer_is_meta(tensor->buffer);
+}
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     return ggml_backend_meta_get_split_state(buf_ctx->get_simple_tensor_container(tensor), tensor, assume_sync);
@@ -2406,7 +2413,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 auto skip_unrelated = [&]() {
                     while (id + 1 < cgraph->n_nodes) {
                         ggml_tensor * next = cgraph->nodes[id+1];
-                        if (ggml_backend_meta_get_split_state(next, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                        if (!ggml_backend_meta_has_split_state(next) ||
+                                ggml_backend_meta_get_split_state(next, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                             break;
                         }
                         bool safe = true;
@@ -2418,7 +2426,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                                 safe = false;
                                 break;
                             }
-                            if (ggml_backend_meta_get_split_state(next->src[s], false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                            if (!ggml_backend_meta_has_split_state(next->src[s]) ||
+                                    ggml_backend_meta_get_split_state(next->src[s], false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                                 safe = false;
                                 break;
                             }
@@ -2437,6 +2446,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 {
                     ggml_tensor * next = cgraph->nodes[id+1];
                     if (next->op == GGML_OP_ADD_ID && next->src[0] == node &&
+                            ggml_backend_meta_has_split_state(next->src[1]) && ggml_backend_meta_has_split_state(next->src[2]) &&
                             ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL &&
                             ggml_backend_meta_get_split_state(next->src[2], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                         node = next;
@@ -2453,6 +2463,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                     ggml_tensor * next = cgraph->nodes[id+1];
                     if (next->op == GGML_OP_MUL && next->src[0] == node &&
+                            ggml_backend_meta_has_split_state(next->src[1]) &&
                             ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                         node = next;
                         id++;
@@ -2518,7 +2529,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     if (next->view_src != nullptr && next->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(next->view_src->buffer)) {
                         continue;
                     }
-                    if (ggml_backend_meta_get_split_state(next, false).axis != GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+                    if (!ggml_backend_meta_has_split_state(next) ||
+                            ggml_backend_meta_get_split_state(next, false).axis != GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                         continue;
                     }
 
