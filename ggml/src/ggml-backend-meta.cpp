@@ -2432,6 +2432,17 @@ static bool ggml_backend_meta_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
         return false;
     }
+    // the async fan-out only knows the plain axis splits and mirroring; anything else (a PARTIAL tensor
+    // needs its value divided over the devices) has to go through the synchronous buffer path
+    switch (split_state.axis) {
+        case GGML_BACKEND_SPLIT_AXIS_0:
+        case GGML_BACKEND_SPLIT_AXIS_1:
+        case GGML_BACKEND_SPLIT_AXIS_2:
+        case GGML_BACKEND_SPLIT_AXIS_MIRRORED:
+            break;
+        default:
+            return false;
+    }
     if (!ggml_backend_meta_stage_weight(backend_dst, dst, src->data, ggml_nbytes(src))) {
         ggml_backend_meta_set_tensor_async(backend_dst, dst, src->data, 0, ggml_nbytes(src));
     }
