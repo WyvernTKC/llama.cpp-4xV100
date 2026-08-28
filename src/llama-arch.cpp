@@ -1061,6 +1061,20 @@ bool llm_arch_ssm_scan_family(const llm_arch & arch) {
     }
 }
 
+// Whether offloaded expert weights may be streamed to the devices under SPLIT_MODE_TENSOR.
+// Gemma 4 fuses gate and up into one expert tensor, which the meta backend splits as a repeated
+// segment; the whole-layer copy of that layout does not reproduce the reference result. These
+// models are small enough to keep resident, so the streaming path is simply not used for them.
+bool llm_arch_supports_sm_tensor_expert_offload(const llm_arch & arch) {
+    switch (arch) {
+        case LLM_ARCH_GEMMA4:
+        case LLM_ARCH_GEMMA4_ASSISTANT:
+            return false;
+        default:
+            return true;
+    }
+}
+
 bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_GROK:

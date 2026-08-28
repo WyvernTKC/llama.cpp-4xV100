@@ -742,6 +742,7 @@ bool llm_arch_is_recurrent      (const llm_arch & arch);
 bool llm_arch_is_hybrid         (const llm_arch & arch);
 bool llm_arch_is_diffusion      (const llm_arch & arch);
 bool llm_arch_supports_sm_tensor(const llm_arch & arch);
+bool llm_arch_supports_sm_tensor_expert_offload(const llm_arch & arch);
 
 // architectures whose recurrent layers are a Mamba-style selective state space driven by ggml_ssm_scan
 bool llm_arch_ssm_scan_family(const llm_arch & arch);

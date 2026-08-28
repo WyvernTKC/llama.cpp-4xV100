@@ -280,6 +280,12 @@ llama_context::llama_context(
     }
 
     cparams.op_offload = params.op_offload;
+    if (cparams.op_offload && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
+            !llm_arch_supports_sm_tensor_expert_offload(model.arch)) {
+        LLAMA_LOG_INFO("%s: disabling op_offload, %s keeps its expert weights resident under SPLIT_MODE_TENSOR\n",
+            __func__, llm_arch_name(model.arch));
+        cparams.op_offload = false;
+    }
     cparams.kv_unified = params.kv_unified;
 
     // initialized later
