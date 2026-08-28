@@ -1637,14 +1637,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
-                // The meta backend stages offloaded weights in its own rotating buffers and orders them with
-                // events, so it does not need the drain below. Draining stops the host queueing ahead, which
-                // is exactly what lets the staged copy overlap with compute. Other backends still drain: the
-                // CUDA peer copy runs on the source stream and is not ordered against the destination's work.
-                if (ggml_backend_is_meta(split_backend) && split_backend->iface.cpy_tensor_async &&
-                        split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-                    continue;
-                }
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
