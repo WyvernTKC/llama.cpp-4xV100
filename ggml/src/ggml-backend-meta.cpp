@@ -160,6 +160,13 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
         [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_supports_op(simple_dev, op); });
 }
 
+static bool ggml_backend_meta_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+    return std::all_of(meta_dev_ctx->simple_devs.begin(), meta_dev_ctx->simple_devs.end(),
+        [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_offload_op(simple_dev, op); });
+}
+
 static bool ggml_backend_meta_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
     ggml_backend_dev_t dev_buft = ggml_backend_buft_get_device(buft);
@@ -191,7 +198,7 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .buffer_from_host_ptr = */ nullptr,
     /* .supports_op          = */ ggml_backend_meta_device_supports_op,
     /* .supports_buft        = */ ggml_backend_meta_device_supports_buft,
-    /* .offload_op           = */ nullptr,
+    /* .offload_op           = */ ggml_backend_meta_device_offload_op,
     /* .event_new            = */ nullptr,
     /* .event_free           = */ nullptr,
     /* .event_synchronize    = */ nullptr,
@@ -496,6 +503,65 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
 }
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
+
+static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+    ggml_backend_meta_simple_tensor_container & stc, const struct ggml_tensor * tensor, bool assume_sync);
+
+// Whether the split state of a tensor comes from its srcs. Empty, mirrored, weight and graph input tensors
+// read it off the tensor itself and stop the walk. calculate_split_state below tests the same thing, so the
+// walk and the derivation always agree on which nodes recurse.
+static bool ggml_backend_meta_split_state_from_srcs(const struct ggml_tensor * tensor) {
+    if (ggml_nelements(tensor) == 0 || (tensor->flags & GGML_TENSOR_FLAG_MIRRORED)) {
+        return false;
+    }
+    if (tensor->view_src != nullptr) {
+        return true;
+    }
+    const bool is_graph_input = tensor->op == GGML_OP_NONE;
+    return ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE && !is_graph_input;
+}
+
+static bool ggml_backend_meta_split_state_cached(const struct ggml_tensor * tensor, bool assume_sync) {
+    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
+    const auto it = buf_ctx->split_state_cache.find(std::make_pair(tensor, assume_sync));
+    return it != buf_ctx->split_state_cache.end() &&
+        memcmp(it->second.second, (const char *) tensor, sizeof(it->second.second)) == 0;
+}
+
+// Cache the split state of every transitive src, deepest first.
+// One frame of the derivation below is ~16 kiB, so deriving a deep node against a cold cache walks the
+// whole graph and runs out of stack. After this the derivation finds its srcs cached and stays one level deep.
+static void ggml_backend_meta_warm_split_state_srcs(
+        ggml_backend_meta_simple_tensor_container & stc, const struct ggml_tensor * tensor) {
+    std::vector<std::pair<const ggml_tensor *, bool>> stack; // tensor, srcs already pushed
+    std::set<const ggml_tensor *> pushed;
+
+    stack.emplace_back(tensor, false);
+    while (!stack.empty()) {
+        const ggml_tensor * t = stack.back().first;
+        if (stack.back().second) {
+            stack.pop_back();
+            if (t != tensor) {
+                ggml_backend_meta_get_split_state(stc, t, /*assume_sync =*/ true);
+            }
+            continue;
+        }
+        stack.back().second = true;
+        if (!ggml_backend_meta_split_state_from_srcs(t)) {
+            continue;
+        }
+        for (size_t i = 0; i < GGML_MAX_SRC; i++) {
+            const ggml_tensor * src = t->src[i];
+            if (src == nullptr || src == t || !ggml_backend_buffer_is_meta(src->buffer)) {
+                continue;
+            }
+            if (ggml_backend_meta_split_state_cached(src, /*assume_sync =*/ true) || !pushed.insert(src).second) {
+                continue;
+            }
+            stack.emplace_back(src, false);
+        }
+    }
+}
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         ggml_backend_meta_simple_tensor_container & stc, const struct ggml_tensor * tensor, bool assume_sync) {
@@ -938,9 +1004,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         //   everything else falls through to the mirrored default of the callback.
         //   A leaf in a compute buffer is always an input; note that GGML_TENSOR_FLAG_INPUT cannot be used to
         //   detect them because ggml_backend_sched strips the flag from the input copies it creates.
-        const bool is_graph_input = tensor->op == GGML_OP_NONE && tensor->view_src == nullptr;
-        if ((ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE || is_graph_input)
-                && tensor->view_src == nullptr) {
+        if (!ggml_backend_meta_split_state_from_srcs(tensor)) {
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
             const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
             ggml_backend_meta_split_state ret = dev_ctx->get_split_state(tensor, dev_ctx->get_split_state_ud);
@@ -1249,6 +1313,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     }
 
     if (it == buf_ctx->split_state_cache.end()) {
+        ggml_backend_meta_warm_split_state_srcs(stc, tensor);
         buf_ctx->split_state_cache[key].first = calculate_split_state();
         memcpy(buf_ctx->split_state_cache[key].second, tensor, sizeof(buf_ctx->split_state_cache[key].second));
         if (buf_ctx->debug > 0) {
@@ -2200,6 +2265,26 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
     }
 }
 
+static bool ggml_backend_meta_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst,
+        const ggml_tensor * src, ggml_tensor * dst) {
+    GGML_UNUSED(backend_src);
+    // Only host -> meta, which is how ggml_backend_sched moves offloaded weights into the split.
+    // The point is the fan-out below: it leaves one async copy per device in flight, so every link runs at
+    // the same time. The buffer set_tensor path syncs after each device instead, which uses one link at a time.
+    if (!ggml_backend_buffer_is_host(src->buffer) || !ggml_backend_buffer_is_meta(dst->buffer)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst) || ggml_nbytes(src) != ggml_nbytes(dst)) {
+        return false;
+    }
+    const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(dst, /*assume_sync =*/ false);
+    if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
+        return false;
+    }
+    ggml_backend_meta_set_tensor_async(backend_dst, dst, src->data, 0, ggml_nbytes(src));
+    return true;
+}
+
 static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     const int64_t t_start_us = ggml_backend_meta_stats::enabled() ? ggml_time_us() : 0;
@@ -2874,7 +2959,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .get_tensor_async        = */ ggml_backend_meta_get_tensor_async,
     /* .set_tensor_2d_async     = */ nullptr,
     /* .get_tensor_2d_async     = */ nullptr,
-    /* .cpy_tensor_async        = */ nullptr,
+    /* .cpy_tensor_async        = */ ggml_backend_meta_cpy_tensor_async,
     /* .synchronize             = */ ggml_backend_meta_synchronize,
     /* .graph_plan_create       = */ nullptr,
     /* .graph_plan_free         = */ nullptr,
