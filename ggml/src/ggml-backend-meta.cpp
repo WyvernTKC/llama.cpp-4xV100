@@ -2361,6 +2361,12 @@ static bool ggml_backend_meta_stage_ensure(ggml_backend_t backend, size_t need) 
     }
 
     if (need > ctx->stage_slot_size) {
+        // Kernels queued earlier may still be reading the slots that are about to be freed, and the
+        // release events only cover slots that have been handed out, not the buffers themselves.
+        for (size_t j = 0; j < n_dev; j++) {
+            ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, j));
+            ggml_backend_synchronize(ctx->stage_backends[j]);
+        }
         for (auto & slot : ctx->stage_slots) {
             for (size_t j = 0; j < n_dev; j++) {
                 slot.bufs[j].reset(); // free first, the old slot is not needed and the new one is larger
@@ -2434,6 +2440,11 @@ static bool ggml_backend_meta_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     // The point is the fan-out below: it leaves one async copy per device in flight, so every link runs at
     // the same time. The buffer set_tensor path syncs after each device instead, which uses one link at a time.
     if (!ggml_backend_buffer_is_host(src->buffer) || !ggml_backend_buffer_is_meta(dst->buffer)) {
+        return false;
+    }
+    // Only weights. Everything else copied into a split lives for a different span than the staging
+    // slots assume, and a graph input handed a rotating slot is read after the slot moves on.
+    if (ggml_backend_buffer_get_usage(src->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
         return false;
     }
     if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst) || ggml_nbytes(src) != ggml_nbytes(dst)) {
