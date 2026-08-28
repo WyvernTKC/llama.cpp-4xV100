@@ -2372,6 +2372,7 @@ static bool ggml_backend_meta_stage_ensure(ggml_backend_t backend, size_t need) 
                     ctx->stage_failed = true;
                     return false;
                 }
+                ggml_backend_buffer_clear(buf, 0); // the row padding is read by MMQ, it must not hold NaNs
                 slot.bufs[j].reset(buf);
             }
         }
@@ -2386,9 +2387,12 @@ static bool ggml_backend_meta_stage_weight(ggml_backend_t backend, ggml_tensor *
     ggml_backend_meta_context * ctx = (ggml_backend_meta_context *) backend->context;
     const size_t n_dev = ggml_backend_meta_n_backends(backend);
 
+    // the buffer type decides the real size: CUDA pads quantized rows and MMQ reads into that padding
     size_t need = 0;
     for (size_t j = 0; j < n_dev; j++) {
-        need = std::max(need, ggml_nbytes(ggml_backend_meta_buffer_simple_tensor(dst, j)));
+        ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+        need = std::max(need, ggml_backend_buft_get_alloc_size(ggml_backend_get_default_buffer_type(simple_backend),
+            ggml_backend_meta_buffer_simple_tensor(dst, j)));
     }
     if (need == 0 || !ggml_backend_meta_stage_ensure(backend, need)) {
         return false;
