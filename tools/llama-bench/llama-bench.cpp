@@ -937,6 +937,13 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                         if (buft) {
                             buft_list[ggml_backend_buft_name(buft)] = buft;
                         }
+                        // also expose the device's pinned host buffer type, so weights kept
+                        // in host memory can be made DMA-able (much faster H2D when the op
+                        // is offloaded to the GPU for large batches)
+                        auto * hbuft = ggml_backend_dev_host_buffer_type(dev);
+                        if (hbuft) {
+                            buft_list[ggml_backend_buft_name(hbuft)] = hbuft;
+                        }
                     }
                 }
                 auto override_group_span_len = std::strcspn(value, ",");
