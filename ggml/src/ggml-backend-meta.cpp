@@ -2093,6 +2093,21 @@ struct ggml_backend_meta_context {
         SUBGRAPH_COMM_ALLGATHER,
     };
 
+    // Staging for offloaded weights. The copies run on a second backend instance per device, which owns a
+    // separate stream, so they overlap with work already queued for compute. Slots rotate so a copy never
+    // lands on weights a running kernel still reads; the ready/release events order the two streams.
+    struct stage_slot {
+        std::vector<ggml_backend_buffer_ptr> bufs;
+        std::vector<ggml_backend_event_t>    ready;   // the copy into this slot has finished
+        std::vector<ggml_backend_event_t>    release; // the compute that read this slot has finished
+    };
+    std::vector<ggml_backend_t> stage_backends;
+    std::vector<stage_slot>     stage_slots;
+    std::vector<int>            stage_pending; // slots whose compute is queued but not yet marked released
+    size_t                      stage_slot_size = 0;
+    int                         stage_next      = 0;
+    bool                        stage_failed    = false;
+
     std::string                 name;
     std::vector<backend_config> backend_configs;
     ggml_context_ptr            ctx;
@@ -2150,6 +2165,18 @@ struct ggml_backend_meta_context {
     }
 
     ~ggml_backend_meta_context() {
+        for (auto & slot : stage_slots) {
+            for (ggml_backend_event_t ev : slot.ready) {
+                ggml_backend_event_free(ev);
+            }
+            for (ggml_backend_event_t ev : slot.release) {
+                ggml_backend_event_free(ev);
+            }
+        }
+        stage_slots.clear();
+        for (ggml_backend_t b : stage_backends) {
+            ggml_backend_free(b);
+        }
         if (comm_ctx != nullptr) {
             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
@@ -2175,8 +2202,12 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
     delete backend;
 }
 
-static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml_tensor * tensor, const void * data,
+        size_t offset, size_t size, const std::vector<ggml_backend_t> * backends_override) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    auto backend_j = [&](size_t j) {
+        return backends_override ? (*backends_override)[j] : ggml_backend_meta_simple_backend(backend, j);
+    };
     GGML_ASSERT(offset == 0);
     GGML_ASSERT(ggml_is_contiguous(tensor));
 
@@ -2196,7 +2227,7 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
             const int64_t i_stop  = (offset + size)/chunk_size_full;
             size_t offset_j = 0;
             for (size_t j = 0; j < n_backends; j++){
-                ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+                ggml_backend_t simple_backend = backend_j(j);
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                 const size_t chunk_size_j = simple_tensor->nb[split_state.axis + 1];
                 if (chunk_size_j == 0) {
@@ -2210,14 +2241,17 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
             for (size_t j = 0; j < n_backends; j++) {
-                ggml_backend_tensor_set_async(
-                    ggml_backend_meta_simple_backend(backend, j), ggml_backend_meta_buffer_simple_tensor(tensor, j), data, offset, size);
+                ggml_backend_tensor_set_async(backend_j(j), ggml_backend_meta_buffer_simple_tensor(tensor, j), data, offset, size);
             }
         } break;
         default: {
             GGML_ABORT("fatal error");
         }
     }
+}
+
+static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_backend_meta_set_tensor_async_impl(backend, tensor, data, offset, size, /*backends_override =*/ nullptr);
 }
 
 static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -2265,6 +2299,123 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
     }
 }
 
+// More slots let the host queue more copies ahead, at one expert tensor of VRAM each. On 4x V100 with
+// DeepSeek V4 Flash, 4 slots reach 94% of the compute-bound ceiling and 12 reach 99%; below 2 the
+// staging is pointless and is turned off.
+static int ggml_backend_meta_stage_n_slots() {
+    static const int n = []{
+        const char * env = getenv("GGML_META_STAGE_SLOTS");
+        return env ? atoi(env) : 4;
+    }();
+    return n;
+}
+
+// Build the staging backends and slots on first use. Returns false when the devices cannot support it,
+// and the caller then copies on the compute stream as before.
+static bool ggml_backend_meta_stage_ensure(ggml_backend_t backend, size_t need) {
+    ggml_backend_meta_context * ctx = (ggml_backend_meta_context *) backend->context;
+    if (ctx->stage_failed) {
+        return false;
+    }
+    const int    n_slots = ggml_backend_meta_stage_n_slots();
+    const size_t n_dev   = ggml_backend_meta_n_backends(backend);
+    if (n_slots < 2) {
+        ctx->stage_failed = true;
+        return false;
+    }
+
+    if (ctx->stage_backends.empty()) {
+        for (size_t j = 0; j < n_dev; j++) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_meta_simple_backend(backend, j));
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev, &props);
+            ggml_backend_t stage_backend = props.caps.events ? ggml_backend_dev_init(dev, nullptr) : nullptr;
+            if (stage_backend == nullptr) {
+                GGML_LOG_INFO("%s: no staging stream for %s, offloaded weights stay on the compute stream\n",
+                    __func__, ggml_backend_dev_name(dev));
+                ctx->stage_failed = true;
+                return false;
+            }
+            ctx->stage_backends.push_back(stage_backend);
+        }
+        ctx->stage_slots.resize(n_slots);
+        for (auto & slot : ctx->stage_slots) {
+            slot.bufs.resize(n_dev);
+            for (size_t j = 0; j < n_dev; j++) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_meta_simple_backend(backend, j));
+                slot.ready.push_back(ggml_backend_event_new(dev));
+                slot.release.push_back(ggml_backend_event_new(dev));
+                if (slot.ready.back() == nullptr || slot.release.back() == nullptr) {
+                    ctx->stage_failed = true;
+                    return false;
+                }
+            }
+        }
+    }
+
+    if (need > ctx->stage_slot_size) {
+        for (auto & slot : ctx->stage_slots) {
+            for (size_t j = 0; j < n_dev; j++) {
+                slot.bufs[j].reset(); // free first, the old slot is not needed and the new one is larger
+                ggml_backend_buffer_t buf =
+                    ggml_backend_alloc_buffer(ggml_backend_meta_simple_backend(backend, j), need);
+                if (buf == nullptr) {
+                    GGML_LOG_INFO("%s: could not allocate %.0f MiB of staging memory, offloaded weights stay on the compute stream\n",
+                        __func__, need/1024.0/1024.0);
+                    ctx->stage_failed = true;
+                    return false;
+                }
+                slot.bufs[j].reset(buf);
+            }
+        }
+        ctx->stage_slot_size = need;
+    }
+    return true;
+}
+
+// Move an offloaded weight into a rotating staging slot on the staging stream, so that the transfer runs
+// while the compute stream works through what is already queued.
+static bool ggml_backend_meta_stage_weight(ggml_backend_t backend, ggml_tensor * dst, const void * data, size_t size) {
+    ggml_backend_meta_context * ctx = (ggml_backend_meta_context *) backend->context;
+    const size_t n_dev = ggml_backend_meta_n_backends(backend);
+
+    size_t need = 0;
+    for (size_t j = 0; j < n_dev; j++) {
+        need = std::max(need, ggml_nbytes(ggml_backend_meta_buffer_simple_tensor(dst, j)));
+    }
+    if (need == 0 || !ggml_backend_meta_stage_ensure(backend, need)) {
+        return false;
+    }
+
+    const int n_slots = (int) ctx->stage_slots.size();
+    int slot_id = -1;
+    for (int i = 0; i < n_slots && slot_id < 0; i++) {
+        const int cand = (ctx->stage_next + i) % n_slots;
+        if (std::find(ctx->stage_pending.begin(), ctx->stage_pending.end(), cand) == ctx->stage_pending.end()) {
+            slot_id = cand;
+        }
+    }
+    if (slot_id < 0) {
+        return false; // every slot feeds compute that is still queued, copy on the compute stream instead
+    }
+    ctx->stage_next = (slot_id + 1) % n_slots;
+
+    auto & slot = ctx->stage_slots[slot_id];
+    for (size_t j = 0; j < n_dev; j++) {
+        ggml_backend_event_wait(ctx->stage_backends[j], slot.release[j]);
+        ggml_backend_meta_buffer_simple_tensor(dst, j)->data = ggml_backend_buffer_get_base(slot.bufs[j].get());
+    }
+
+    ggml_backend_meta_set_tensor_async_impl(backend, dst, data, 0, size, &ctx->stage_backends);
+
+    for (size_t j = 0; j < n_dev; j++) {
+        ggml_backend_event_record(slot.ready[j], ctx->stage_backends[j]);
+        ggml_backend_event_wait(ggml_backend_meta_simple_backend(backend, j), slot.ready[j]);
+    }
+    ctx->stage_pending.push_back(slot_id);
+    return true;
+}
+
 static bool ggml_backend_meta_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst,
         const ggml_tensor * src, ggml_tensor * dst) {
     GGML_UNUSED(backend_src);
@@ -2281,7 +2432,9 @@ static bool ggml_backend_meta_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
         return false;
     }
-    ggml_backend_meta_set_tensor_async(backend_dst, dst, src->data, 0, ggml_nbytes(src));
+    if (!ggml_backend_meta_stage_weight(backend_dst, dst, src->data, ggml_nbytes(src))) {
+        ggml_backend_meta_set_tensor_async(backend_dst, dst, src->data, 0, ggml_nbytes(src));
+    }
     return true;
 }
 
@@ -2949,6 +3102,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
     }
+
+    // the kernels that read the staged weights are queued now, so those slots can take a new copy
+    for (int slot_id : backend_ctx->stage_pending) {
+        for (size_t j = 0; j < n_backends; j++) {
+            ggml_backend_event_record(
+                backend_ctx->stage_slots[slot_id].release[j], ggml_backend_meta_simple_backend(backend, j));
+        }
+    }
+    backend_ctx->stage_pending.clear();
+
     return GGML_STATUS_SUCCESS;
 }
 
