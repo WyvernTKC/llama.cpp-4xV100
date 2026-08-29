@@ -1637,11 +1637,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
+                // Opt-in with GGML_META_PARTIAL_COPY=1: let the meta backend take the used-experts-only
+                // path below instead of staging a whole layer. At decode only 6 of 256 experts are live,
+                // so this moves ~1/40 of the bytes. Off by default until the staging path also uses it.
+                static const bool meta_partial = getenv("GGML_META_PARTIAL_COPY") != nullptr;
+                const bool meta_try_partial = meta_partial && ggml_backend_is_meta(split_backend) &&
+                    split->graph.n_nodes > 0 && split->graph.nodes[0]->op == GGML_OP_MUL_MAT_ID &&
+                    split->graph.nodes[0]->src[0] == input_cpy &&
+                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                    ggml_backend_buffer_is_host(input->buffer);
+
                 // The meta backend stages offloaded weights in its own rotating buffers and orders them with
                 // events, so it does not need the drain below. Draining stops the host queueing ahead, which
                 // is exactly what lets the staged copy overlap with compute. Other backends still drain: the
                 // CUDA peer copy runs on the source stream and is not ordered against the destination's work.
-                if (ggml_backend_is_meta(split_backend) && split_backend->iface.cpy_tensor_async &&
+                if (!meta_try_partial && ggml_backend_is_meta(split_backend) && split_backend->iface.cpy_tensor_async &&
                         split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
                     continue;
                 }
@@ -1653,9 +1663,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
-                // the meta backend has no partial-copy path, it always moves a full layer
+                // the meta backend joins this path only under GGML_META_PARTIAL_COPY; otherwise it moves a full layer
                 ggml_tensor * node = split->graph.nodes[0];
-                if (split->graph.n_nodes > 0 && !ggml_backend_is_meta(split_backend) &&
+                if (split->graph.n_nodes > 0 && (!ggml_backend_is_meta(split_backend) || meta_try_partial) &&
                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                     ggml_backend_buffer_is_host(input->buffer) && (
                     (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
@@ -1700,12 +1710,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prev_ids_tensor = ids_tensor;
                     }
 
+                    // Meta splices the copy by chunk, so the 512 B MMQ pad below would break alignment.
+                    // Zero the destination once instead: untouched regions then read as zeros, not stale data.
+                    if (meta_try_partial) {
+                        static std::vector<ggml_backend_buffer_t> cleared;
+                        if (std::find(cleared.begin(), cleared.end(), input_cpy->buffer) == cleared.end()) {
+                            ggml_backend_synchronize(split_backend);
+                            ggml_backend_buffer_clear(input_cpy->buffer, 0);
+                            cleared.push_back(input_cpy->buffer);
+                        }
+                    }
+
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
-                        const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+                        // meta keeps size a multiple of the chunk stride; its padding is zeroed above instead
+                        const size_t padding_end = meta_try_partial ? 0 : (last_id < n_expert - 1 ? padding : 0);
 
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,

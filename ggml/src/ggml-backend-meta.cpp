@@ -2215,7 +2215,7 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
     auto backend_j = [&](size_t j) {
         return backends_override ? (*backends_override)[j] : ggml_backend_meta_simple_backend(backend, j);
     };
-    GGML_ASSERT(offset == 0);
+    // partial copies are allowed; offset and size must land on chunk boundaries, asserted below
     GGML_ASSERT(ggml_is_contiguous(tensor));
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
@@ -2240,7 +2240,8 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
                 if (chunk_size_j == 0) {
                     continue;
                 }
-                ggml_backend_tensor_set_2d_async(simple_backend, simple_tensor, (const char *) data + offset_j, offset, chunk_size_j,
+                ggml_backend_tensor_set_2d_async(simple_backend, simple_tensor, (const char *) data + offset_j,
+                    i_start*chunk_size_j, chunk_size_j,
                     i_stop - i_start, chunk_size_j, chunk_size_full);
                 offset_j += chunk_size_j;
             }
@@ -2263,12 +2264,17 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
 
 static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
-    GGML_ASSERT(offset == 0);
-    GGML_ASSERT(ggml_is_contiguous(tensor));
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(split_state.n_segments == 1);
     GGML_ASSERT(split_state.nr[0]      == 1);
+
+    // Only the chunk-splicing paths below need contiguity and offset 0; a mirrored read is forwarded
+    // to one device as-is, so a view of the ids tensor is fine there.
+    if (split_state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        GGML_ASSERT(offset == 0);
+        GGML_ASSERT(ggml_is_contiguous(tensor));
+    }
 
     switch (split_state.axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
