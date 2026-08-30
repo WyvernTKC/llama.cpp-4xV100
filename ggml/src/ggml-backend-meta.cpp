@@ -160,8 +160,23 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
         [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_supports_op(simple_dev, op); });
 }
 
+// MoE weights are split over the devices AND copied per used expert, so one token moves about
+// k/n_expert of the tensor divided by the device count - cheap enough to offload at any batch size.
+// This lives here rather than in the CUDA device because it depends on the split: under SPLIT_MODE_LAYER
+// a layer's experts land on one device, and offloading them at batch 1 measures slower than computing
+// on the CPU. A dense matmul has no expert selection at all and keeps the plain batch threshold.
+static bool ggml_backend_meta_moe_offload_always(const ggml_tensor * op) {
+    static const int64_t min_experts = getenv("GGML_META_MOE_OFFLOAD_MIN_EXPERTS")
+        ? atoll(getenv("GGML_META_MOE_OFFLOAD_MIN_EXPERTS")) : 64;
+    return min_experts > 0 && op->op == GGML_OP_MUL_MAT_ID &&
+        op->src[0] != nullptr && op->src[0]->ne[2] >= min_experts;
+}
+
 static bool ggml_backend_meta_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    if (ggml_backend_meta_moe_offload_always(op)) {
+        return true;
+    }
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
     return std::all_of(meta_dev_ctx->simple_devs.begin(), meta_dev_ctx->simple_devs.end(),
         [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_offload_op(simple_dev, op); });
