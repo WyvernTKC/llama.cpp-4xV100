@@ -1641,9 +1641,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // path below instead of staging a whole layer. At decode only 6 of 256 experts are live,
                 // so this moves ~1/40 of the bytes. Off by default until the staging path also uses it.
                 static const bool meta_partial = getenv("GGML_META_PARTIAL_COPY") != nullptr;
+                // Only worth it while few experts are live. Routing tokens top-k of n_expert, a batch of
+                // B touches ~n_expert*(1-(1-k/n_expert)^B) of them, so the saving vanishes as B grows
+                // while the cost - a drain plus one ids readback per layer - does not. Gate on the batch,
+                // which is free to read; the used-expert count would need the readback to find out.
+                static const int64_t meta_partial_max_batch = getenv("GGML_META_PARTIAL_COPY_MAX_BATCH")
+                    ? atoll(getenv("GGML_META_PARTIAL_COPY_MAX_BATCH")) : 32;
                 const bool meta_try_partial = meta_partial && ggml_backend_is_meta(split_backend) &&
                     split->graph.n_nodes > 0 && split->graph.nodes[0]->op == GGML_OP_MUL_MAT_ID &&
                     split->graph.nodes[0]->src[0] == input_cpy &&
+                    split->graph.nodes[0]->ne[2] <= meta_partial_max_batch &&
                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                     ggml_backend_buffer_is_host(input->buffer);
 
