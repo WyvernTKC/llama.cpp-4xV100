@@ -104,6 +104,12 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
     int id = -1; // in case cudaGetDevice fails
     (void)cudaGetDevice(&id);
 
+    // the log callback is async and GGML_ABORT kills the process before it flushes, so the message
+    // is otherwise lost; write it synchronously first
+    fprintf(stderr, "%s error: %s\n  current device: %d, in function %s at %s:%d\n  %s\n",
+        GGML_CUDA_NAME, msg, id, func, file, line, stmt);
+    fflush(stderr);
+
     GGML_LOG_ERROR(GGML_CUDA_NAME " error: %s\n", msg);
     GGML_LOG_ERROR("  current device: %d, in function %s at %s:%d\n", id, func, file, line);
     GGML_LOG_ERROR("  %s\n", stmt);
