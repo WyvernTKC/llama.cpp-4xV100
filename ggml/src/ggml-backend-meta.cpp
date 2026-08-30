@@ -2393,6 +2393,60 @@ static bool ggml_backend_meta_stage_ensure(ggml_backend_t backend, size_t need) 
     return true;
 }
 
+// Same as ggml_backend_meta_stage_weight, but moves only the given byte ranges of dst - the experts this
+// ubatch actually uses. The slot holds the whole tensor, so ranges land at their real offsets and the
+// rest is simply not read. Going through a slot also gives MMQ the padded, zeroed destination it needs;
+// copying into dst's own buffer instead reads out of bounds.
+bool ggml_backend_meta_stage_weight_ranges(ggml_backend_t backend, ggml_tensor * dst, const void * base,
+        const size_t * offsets, const size_t * sizes, size_t n_ranges) {
+    ggml_backend_meta_context * ctx = (ggml_backend_meta_context *) backend->context;
+    const size_t n_dev = ggml_backend_meta_n_backends(backend);
+    if (n_ranges == 0) {
+        return false;
+    }
+
+    size_t need = 0;
+    for (size_t j = 0; j < n_dev; j++) {
+        ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+        need = std::max(need, ggml_backend_buft_get_alloc_size(ggml_backend_get_default_buffer_type(simple_backend),
+            ggml_backend_meta_buffer_simple_tensor(dst, j)));
+    }
+    if (need == 0 || !ggml_backend_meta_stage_ensure(backend, need)) {
+        return false;
+    }
+
+    const int n_slots = (int) ctx->stage_slots.size();
+    int slot_id = -1;
+    for (int i = 0; i < n_slots && slot_id < 0; i++) {
+        const int cand = (ctx->stage_next + i) % n_slots;
+        if (std::find(ctx->stage_pending.begin(), ctx->stage_pending.end(), cand) == ctx->stage_pending.end()) {
+            slot_id = cand;
+        }
+    }
+    if (slot_id < 0) {
+        return false;
+    }
+    ctx->stage_next = (slot_id + 1) % n_slots;
+
+    auto & slot = ctx->stage_slots[slot_id];
+    for (size_t j = 0; j < n_dev; j++) {
+        ggml_backend_event_wait(ctx->stage_backends[j], slot.release[j]);
+        ggml_backend_meta_buffer_simple_tensor(dst, j)->data = ggml_backend_buffer_get_base(slot.bufs[j].get());
+    }
+
+    for (size_t r = 0; r < n_ranges; r++) {
+        ggml_backend_meta_set_tensor_async_impl(backend, dst, (const char *) base + offsets[r],
+            offsets[r], sizes[r], &ctx->stage_backends);
+    }
+
+    for (size_t j = 0; j < n_dev; j++) {
+        ggml_backend_event_record(slot.ready[j], ctx->stage_backends[j]);
+        ggml_backend_event_wait(ggml_backend_meta_simple_backend(backend, j), slot.ready[j]);
+    }
+    ctx->stage_pending.push_back(slot_id);
+    return true;
+}
+
 // Move an offloaded weight into a rotating staging slot on the staging stream, so that the transfer runs
 // while the compute stream works through what is already queued.
 static bool ggml_backend_meta_stage_weight(ggml_backend_t backend, ggml_tensor * dst, const void * data, size_t size) {

@@ -1710,24 +1710,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prev_ids_tensor = ids_tensor;
                     }
 
-                    // Meta splices the copy by chunk, so the 512 B MMQ pad below would break alignment.
-                    // Zero the destination once instead: untouched regions then read as zeros, not stale data.
-                    if (meta_try_partial) {
-                        static std::vector<ggml_backend_buffer_t> cleared;
-                        if (std::find(cleared.begin(), cleared.end(), input_cpy->buffer) == cleared.end()) {
-                            ggml_backend_synchronize(split_backend);
-                            ggml_backend_buffer_clear(input_cpy->buffer, 0);
-                            cleared.push_back(input_cpy->buffer);
-                        }
-                    }
-
                     // group consecutive experts and copy them together
+                    std::vector<size_t> range_off;
+                    std::vector<size_t> range_len;
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         // meta keeps size a multiple of the chunk stride; its padding is zeroed above instead
                         const size_t padding_end = meta_try_partial ? 0 : (last_id < n_expert - 1 ? padding : 0);
+
+                        if (meta_try_partial) {
+                            // defer: these go through a staging slot, which is padded and zeroed the way
+                            // MMQ needs. Copying into input_cpy directly reads out of bounds.
+                            range_off.push_back(expert_offset);
+                            range_len.push_back(expert_size_copy);
+                            return;
+                        }
 
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
@@ -1760,6 +1759,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         last_id = id;
                     }
                     copy_experts(first_id, last_id);
+
+                    if (meta_try_partial &&
+                            !ggml_backend_meta_stage_weight_ranges(split_backend, input_cpy, input->data,
+                                range_off.data(), range_len.data(), range_off.size())) {
+                        // no staging slot available: fall back to the whole-layer copy, which is what
+                        // this path does without the gate. A direct partial copy into input_cpy is not
+                        // safe - MMQ reads past the end of the unpadded destination.
+                        ggml_backend_tensor_copy(input, input_cpy);
+                    }
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface

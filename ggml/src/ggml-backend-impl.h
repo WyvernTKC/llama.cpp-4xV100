@@ -90,6 +90,8 @@ extern "C" {
     //
 
     GGML_API bool ggml_backend_is_meta       (ggml_backend_t backend);
+    GGML_API bool ggml_backend_meta_stage_weight_ranges(ggml_backend_t backend, struct ggml_tensor * dst, const void * base,
+                                                        const size_t * offsets, const size_t * sizes, size_t n_ranges);
     GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
     GGML_API bool ggml_backend_buft_is_meta  (ggml_backend_buffer_type_t buft);
 
