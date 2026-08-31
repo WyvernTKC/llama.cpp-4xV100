@@ -2122,6 +2122,12 @@ struct ggml_backend_meta_context {
         std::vector<ggml_backend_buffer_ptr> bufs;
         std::vector<ggml_backend_event_t>    ready;   // the copy into this slot has finished
         std::vector<ggml_backend_event_t>    release; // the compute that read this slot has finished
+        // Which tensor's bytes this slot currently holds. A partial (per-expert) copy only writes the
+        // experts one ubatch routes to, and MMQ's mul_mat_id reads outside them, so the rest of the
+        // slot has to be valid data for *this* tensor. That holds while a slot keeps being handed to
+        // the same tensor - it accumulates that tensor's experts - and breaks the moment a different
+        // one lands in it, because the leftovers are then another tensor's quantized rows, whose F16
+        // block scales can decode to inf. So a partial copy is only safe into a slot we already own.
     };
     std::vector<ggml_backend_t> stage_backends;
     std::vector<stage_slot>     stage_slots;
@@ -2408,6 +2414,61 @@ static bool ggml_backend_meta_stage_ensure(ggml_backend_t backend, size_t need) 
     return true;
 }
 
+// Put a staged tensor's per-device data pointers back in its own buffers. Staging rebinds them to a
+// rotating slot and nothing else ever restores them, so every path that gives up on staging must call
+// this first: the caller's fallback writes through dst->data, and without this it would write a whole
+// layer into whichever slot this tensor last used - a slot another tensor now owns, on the compute
+// stream, with no wait on that slot's release event. Silent weight corruption, not a crash.
+// The pointer is recomputed the way ggml_backend_meta_buffer_init_tensor_impl derives it, so nothing
+// has to be remembered.
+static void ggml_backend_meta_stage_restore(ggml_backend_t backend, ggml_tensor * dst) {
+    if (!ggml_backend_buffer_is_meta(dst->buffer)) {
+        return;
+    }
+    const size_t n_dev  = ggml_backend_meta_n_backends(backend);
+    const size_t offset = size_t(dst->data) - size_t(ggml_backend_buffer_get_base(dst->buffer));
+    for (size_t j = 0; j < n_dev; j++) {
+        ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(dst, j);
+        // views take their data from view_src and are never staged, so leave them alone
+        if (simple_tensor == nullptr || simple_tensor->view_src != nullptr || simple_tensor->buffer == nullptr) {
+            continue;
+        }
+        simple_tensor->data = (char *) ggml_backend_buffer_get_base(simple_tensor->buffer) + offset;
+    }
+}
+
+// A slot cannot be recycled inside one scheduler split. ggml_backend_sched copies every input of a
+// split before submitting that split's graph, and stage_pending is only cleared once the graph has
+// been submitted (end of ggml_backend_meta_graph_compute). So while the inputs are being copied, the
+// slots already handed out belong to a graph that does not exist yet: no amount of synchronising
+// frees them, because the work that will read them has not been queued.
+//
+// The pool therefore needs at least as many slots as the split has host-resident weight inputs -
+// three for a MoE layer (ffn_gate_exps, ffn_up_exps, ffn_down_exps). That is a hard requirement, not
+// a tuning knob. Running short is reported once and the tensor is copied unstaged, which costs the
+// overlap for that one tensor and is correct.
+// GGML_META_STAGE_TRACE=N logs the first N staging events: which tensor took which slot, and where
+// each split ends and releases. Reveals how many slots one split consumes and how soon a slot is reused.
+static int ggml_backend_meta_stage_trace_budget() {
+    static int n = []{
+        const char * env = getenv("GGML_META_STAGE_TRACE");
+        return env ? atoi(env) : 0;
+    }();
+    return n > 0 ? n-- : 0;
+}
+
+static void ggml_backend_meta_stage_report_starved(int n_slots) {
+    static bool reported = false;
+    if (reported) {
+        return;
+    }
+    reported = true;
+    GGML_LOG_INFO("%s: all %d staging slots are held by the split being assembled; copying this weight "
+        "on the compute stream instead. Raise GGML_META_STAGE_SLOTS to at least the number of "
+        "host-resident weight tensors in one split (3 for MoE) to keep the overlap.\n",
+        __func__, n_slots);
+}
+
 // Same as ggml_backend_meta_stage_weight, but moves only the given byte ranges of dst - the experts this
 // ubatch actually uses. The slot holds the whole tensor, so ranges land at their real offsets and the
 // rest is simply not read. Going through a slot also gives MMQ the padded, zeroed destination it needs;
@@ -2417,8 +2478,16 @@ bool ggml_backend_meta_stage_weight_ranges(ggml_backend_t backend, ggml_tensor *
     ggml_backend_meta_context * ctx = (ggml_backend_meta_context *) backend->context;
     const size_t n_dev = ggml_backend_meta_n_backends(backend);
     if (n_ranges == 0) {
+        ggml_backend_meta_stage_restore(backend, dst);
         return false;
     }
+    const ggml_backend_meta_split_state ss_ranges =
+        ggml_backend_meta_get_split_state(dst, /*assume_sync =*/ false);
+    if (ss_ranges.axis < 0 || ss_ranges.axis >= GGML_MAX_DIMS) {
+        ggml_backend_meta_stage_restore(backend, dst);
+        return false;
+    }
+    const int split_axis_for_ranges = ss_ranges.axis;
 
     size_t need = 0;
     for (size_t j = 0; j < n_dev; j++) {
@@ -2427,6 +2496,7 @@ bool ggml_backend_meta_stage_weight_ranges(ggml_backend_t backend, ggml_tensor *
             ggml_backend_meta_buffer_simple_tensor(dst, j)));
     }
     if (need == 0 || !ggml_backend_meta_stage_ensure(backend, need)) {
+        ggml_backend_meta_stage_restore(backend, dst);
         return false;
     }
 
@@ -2439,9 +2509,15 @@ bool ggml_backend_meta_stage_weight_ranges(ggml_backend_t backend, ggml_tensor *
         }
     }
     if (slot_id < 0) {
+        ggml_backend_meta_stage_report_starved(n_slots);
+        ggml_backend_meta_stage_restore(backend, dst);
         return false;
     }
     ctx->stage_next = (slot_id + 1) % n_slots;
+    if (ggml_backend_meta_stage_trace_budget()) {
+        GGML_LOG_INFO("stage: RANGES %-30s slot %d  n_ranges %zu  pending %zu\n",
+            dst->name, slot_id, n_ranges, ctx->stage_pending.size());
+    }
 
     auto & slot = ctx->stage_slots[slot_id];
     for (size_t j = 0; j < n_dev; j++) {
@@ -2449,9 +2525,43 @@ bool ggml_backend_meta_stage_weight_ranges(ggml_backend_t backend, ggml_tensor *
         ggml_backend_meta_buffer_simple_tensor(dst, j)->data = ggml_backend_buffer_get_base(slot.bufs[j].get());
     }
 
+    // MMQ's mul_mat_id reads a little past the rows it is handed. It multiplies those bytes by
+    // zero-padded activations, so finite garbage there is harmless - but a stale F16 block scale that
+    // decodes to inf is not, and inf*0 is NaN. Slots rotate between tensors of different types
+    // (Q6_K gate/up vs Q8_0 down here), so the bytes after a range are the previous occupant's rows
+    // read as the wrong quantization, which is exactly where those inf scales come from.
+    //
+    // So extend each range far enough to cover the over-read with this tensor's own data. Only a
+    // tensor whose per-device row length is not a multiple of MATRIX_ROW_PADDING has an over-read at
+    // all - that is precisely when the CUDA buffer type adds row padding - and the extension has to
+    // stay a whole number of chunks to keep the strided copy's alignment.
+    //
+    // The over-read past the very last row lands in that allocation padding, above ggml_nbytes.
+    // Nothing writes there: the only tensor with padding is also the largest staged tensor, so its
+    // padding sits above every other tensor's data and keeps the zeros from ggml_backend_buffer_clear.
+    const size_t chunk_full = dst->nb[split_axis_for_ranges + 1];
+    size_t pad_max = 0;
+    for (size_t j = 0; j < n_dev; j++) {
+        ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(dst, j);
+        if (simple_tensor == nullptr || ggml_nbytes(simple_tensor) == 0) {
+            continue;
+        }
+        ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+        const size_t alloc_j = ggml_backend_buft_get_alloc_size(
+            ggml_backend_get_default_buffer_type(simple_backend), simple_tensor);
+        pad_max = std::max(pad_max, alloc_j - std::min(alloc_j, ggml_nbytes(simple_tensor)));
+    }
+    const size_t extra = (pad_max == 0 || chunk_full == 0) ? 0 :
+        ((pad_max + chunk_full - 1)/chunk_full)*chunk_full;
+    const size_t span = ggml_nbytes(dst);
+
     for (size_t r = 0; r < n_ranges; r++) {
+        size_t size_r = sizes[r];
+        if (extra > 0) {
+            size_r = std::min(size_r + extra, span - std::min(span, offsets[r]));
+        }
         ggml_backend_meta_set_tensor_async_impl(backend, dst, (const char *) base + offsets[r],
-            offsets[r], sizes[r], &ctx->stage_backends);
+            offsets[r], size_r, &ctx->stage_backends);
     }
 
     for (size_t j = 0; j < n_dev; j++) {
@@ -2476,6 +2586,7 @@ static bool ggml_backend_meta_stage_weight(ggml_backend_t backend, ggml_tensor *
             ggml_backend_meta_buffer_simple_tensor(dst, j)));
     }
     if (need == 0 || !ggml_backend_meta_stage_ensure(backend, need)) {
+        ggml_backend_meta_stage_restore(backend, dst);
         return false;
     }
 
@@ -2488,9 +2599,17 @@ static bool ggml_backend_meta_stage_weight(ggml_backend_t backend, ggml_tensor *
         }
     }
     if (slot_id < 0) {
-        return false; // every slot feeds compute that is still queued, copy on the compute stream instead
+        // no slot free: restore dst's own pointers first, or the caller's unstaged copy below writes
+        // into whichever slot this tensor last used
+        ggml_backend_meta_stage_report_starved(n_slots);
+        ggml_backend_meta_stage_restore(backend, dst);
+        return false;
     }
     ctx->stage_next = (slot_id + 1) % n_slots;
+    if (ggml_backend_meta_stage_trace_budget()) {
+        GGML_LOG_INFO("stage: WHOLE  %-30s slot %d  pending %zu\n",
+            dst->name, slot_id, ctx->stage_pending.size());
+    }
 
     auto & slot = ctx->stage_slots[slot_id];
     for (size_t j = 0; j < n_dev; j++) {
@@ -3217,6 +3336,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     }
 
     // the kernels that read the staged weights are queued now, so those slots can take a new copy
+    if (!backend_ctx->stage_pending.empty() && ggml_backend_meta_stage_trace_budget()) {
+        std::string ids;
+        for (int s : backend_ctx->stage_pending) { ids += " " + std::to_string(s); }
+        GGML_LOG_INFO("stage: -- split end, releasing%s\n", ids.c_str());
+    }
     for (int slot_id : backend_ctx->stage_pending) {
         for (size_t j = 0; j < n_backends; j++) {
             ggml_backend_event_record(

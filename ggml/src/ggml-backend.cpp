@@ -1827,9 +1827,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (meta_try_partial &&
                             !ggml_backend_meta_stage_weight_ranges(split_backend, input_cpy, input->data,
                                 range_off.data(), range_len.data(), range_off.size())) {
-                        // no staging slot available: fall back to the whole-layer copy, which is what
-                        // this path does without the gate. A direct partial copy into input_cpy is not
-                        // safe - MMQ reads past the end of the unpadded destination.
+                        // staging is unavailable here: no event support on the device, or the slots would
+                        // not allocate. Fall back to the whole-layer copy, which is what this path does
+                        // without the gate. A direct partial copy into input_cpy is not safe - MMQ reads
+                        // past the end of the unpadded destination.
+                        // Slot exhaustion alone no longer reaches here: the meta backend drains and reuses
+                        // instead. It must not reach here uncorrected either - input_cpy's per-device
+                        // pointers are rebound to a staging slot by every staged copy, so this write only
+                        // lands in input_cpy's own buffer because stage_weight_ranges restores them before
+                        // returning false.
                         ggml_backend_tensor_copy(input, input_cpy);
                     }
                 } else {
