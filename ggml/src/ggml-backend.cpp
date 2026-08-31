@@ -2168,6 +2168,8 @@ bool ggml_backend_op_alloc_size_may_expand(enum ggml_op op) {
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
+        // CUDA pads the rows of a quantized dst, so a quantized concat expands too
+        case GGML_OP_CONCAT:
             return true;
         default:
             return false;
