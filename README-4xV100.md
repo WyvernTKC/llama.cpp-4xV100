@@ -393,6 +393,34 @@ notice the 50.66 GiB per-layer embedding table lives in host RAM regardless — 
 to fit. It only works at small context: an earlier sweep at `-c 16384` bottomed out at `-ncmoe 2`, and
 at `-c 262144` the floor is 12. **The floor is a function of context, not of the model.**
 
+### Offload sweep on the server — `-c 16384`, 1000-token generation
+
+`llama-server`, `-sm tensor`, partial copy on, 4 slots, `-ub 4096 -b 4096`, one 1000-token request:
+
+| `-ncmoe` | deepseek4 256×6 Q2_K | | | qwen4exp 512×10 Q6_K | | |
+|---|---|---|---|---|---|---|
+| | tg t/s | ms/tok | VRAM/GPU | tg t/s | ms/tok | VRAM/GPU |
+| **2** | 31.28 | 31.97 | 27.5 GB | **41.85** | 23.89 | 31.3 GB |
+| **8** | 22.51 | 44.43 | 24.9 GB | 27.42 | 36.47 | 28.5 GB |
+| **16** | 16.39 | 61.01 | 21.5 GB | 17.98 | 55.62 | 23.8 GB |
+| **99** (all) | 7.90 | 126.65 | 8.3 GB | 7.83 | 127.70 | 6.5 GB |
+
+Per-layer cost from the ms/tok deltas — deepseek4 **2.08 / 2.07 / 2.43**, qwen4exp
+**2.10 / 2.39 / 2.25** — so **~2.1 ms/token per offloaded layer** holds here too. That is now three
+independent confirmations across two architectures, two harnesses and two context sizes.
+
+Both models converge on **~7.9 t/s** with everything streaming. That is the PCIe floor of this box, not
+a property of either model.
+
+**Prefill is not measurable from this run.** The prompts are 40 and 89 tokens, so `prompt eval` is one
+forward pass amortised over a handful of tokens — 47.99 down to 7.38 t/s for deepseek4, 67.00 down to
+8.06 for qwen4exp. Those numbers are the per-pass cost of offloading (74–223 ms per offloaded layer,
+30–100× the decode cost, which is why the partial copy is gated off above batch 32), **not** prefill
+throughput. For that see the `pp512` figures in the all-GPU table above.
+
+VRAM is the real constraint on the low end: qwen4exp at `-ncmoe 2` sits at 31.3 GB of 32.0, which is why
+2 is the floor at this context even though `-ncmoe 0` fits at a tiny one.
+
 ### `-ncmoe` at `-c 16384` — the dominant lever
 
 
@@ -821,6 +849,14 @@ decode look host-bound when it was not — a 2.7× difference in host enqueue ti
 - The `mirror_gen` guard in the decomposition cache has **never been observed firing**. It protects
   against a graph rebuilt into a reset `ggml_context` coming back identical — uid stable, per-device
   mirrors replaced. Reasoned about, not provoked.
+- **Fixed since:** `qwen4exp` at `-ncmoe 99` used to abort on a contiguity assert in
+  `ggml_backend_meta_get_tensor_async`. The tensor was an **empty** ids tensor (`ne=[10,0,1,1]`,
+  `nbytes=0`) and the read was for zero bytes; an empty tensor has no usable split state and a
+  zero-element view reports non-contiguous, so the checks rejected it on the way to doing nothing.
+  The abort was hiding an **unbounded out-of-bounds read** in `ggml_backend_sched_compute_splits`,
+  whose used-experts scan assumed at least one bit was set in the bitset. Both fixed in `56cbbb32e`.
+  The second one is not specific to `-ncmoe 99` or to the meta backend — any graph routing zero
+  tokens to an MoE layer reaches it, so it is worth reporting upstream.
 - `test-dflash.gguf` fails to load on this branch *and* on the previous commit, so the `dflash`
   architecture is untested rather than passing.
 - `-sm layer` at `-ncmoe 18 -c 262144` runs out of memory on device 2. It doesn't split weights by
