@@ -2765,9 +2765,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     }
     const bool needs_rebuild = D == nullptr;
     if (needs_rebuild) {
+        // The pool has to cover the whole working set or LRU misses every time: ggml_backend_sched
+        // hands the splits round-robin, so a pool smaller than the split count thrashes and gives up
+        // the entire benefit silently. There are roughly 3 splits per offloaded MoE layer - 7 at
+        // -ncmoe 2, ~37 at -ncmoe 12, ~130 at -ncmoe 43 - so size for the largest, not the common
+        // case. Entries are created on demand and sized to their own graph, so a high ceiling costs
+        // nothing when it is not reached.
         static const size_t n_max = [] {
             const char * env = getenv("GGML_META_DEC_CACHE");
-            return (size_t) (env ? std::max(1, atoi(env)) : 16);
+            return (size_t) (env ? std::max(1, atoi(env)) : 256);
         }();
         for (auto & d : backend_ctx->decs) {
             if (d->uid == 0) { D = d.get(); break; }
@@ -2781,6 +2787,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 [](const std::unique_ptr<ggml_backend_meta_context::decomposition> & a,
                    const std::unique_ptr<ggml_backend_meta_context::decomposition> & b) { return a->used < b->used; });
             D = it->get();
+            static bool evict_reported = false;
+            if (!evict_reported) {
+                evict_reported = true;
+                GGML_LOG_INFO("%s: decomposition cache is full at %zu entries and evicting; a graph "
+                    "with more splits than that will miss every time - raise GGML_META_DEC_CACHE.\n",
+                    __func__, n_max);
+            }
         }
         D->uid = 0; // invalid until the rebuild below completes
     }
