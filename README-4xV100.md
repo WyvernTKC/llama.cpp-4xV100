@@ -10,10 +10,37 @@ and streaming them per token.
 If you only read one thing: for a 156 GiB model on 128 GiB of VRAM, decode went from **15.7 to
 39.7 tokens/s** over the past week. Roughly half of that was configuration and half was code.
 
+> **Power note:** the four V100s are capped at **150 W each, against a 300 W default TDP** — halved
+> deliberately to save power. Every number in this file is measured at half power, so treat them as a
+> floor rather than as representative V100 performance.
+
+---
+
+## The machine
+
+| | |
+|---|---|
+| GPUs | 4× Tesla V100-SXM2-32GB — sm_70, 32 768 MiB each, **128 GiB total** |
+| GPU power | **150 W limit each (default and max are 300 W)** — deliberately lowered |
+| PCIe | Gen 3. GPU 0/1/3 at **x16**, **GPU 2 at x8** — it runs at roughly half the bandwidth of the others, which shapes a lot of what follows |
+| CPU | 2× Intel Xeon Gold 6230 @ 2.10 GHz — 20 cores per socket, **40 cores total**, no HT |
+| System RAM | **382.6 GiB** |
+| OS | Windows Server 2022 Standard (10.0.20348) |
+| CUDA | 12.8, driver 573.96 |
+| Also present | 1× Tesla T4 (60 W limit) — **cannot share a process with the V100s**; `cudaSetDevice` on it fails whenever a V100 is visible, so `--mmproj-device CUDA4` can never work |
+
+Two consequences worth knowing before reading any benchmark here:
+
+- **GPU 2's x8 link** measures 5.3 GB/s against 8.6–9.8 GB/s for the others. When weights stream from
+  host RAM per token, it sets the critical path.
+- **`-t 18`, not 40.** Two sockets means NUMA, and thread count is not monotonic: 20 and 40 threads
+  measure the same, while 28 was 14 % *worse*.
+
 ---
 
 ## Table of contents
 
+- [The machine](#the-machine)
 - [Quick start](#quick-start)
 - [How the split works](#how-the-split-works)
 - [How a dense model runs](#how-a-dense-model-runs)
@@ -22,6 +49,7 @@ If you only read one thing: for a 156 GiB model on 128 GiB of VRAM, decode went 
 - [Benchmarks](#benchmarks)
 - [Flags that matter](#flags-that-matter)
 - [Estimating `-ncmoe`](#estimating--ncmoe)
+- [Split-tensor enablement work](#split-tensor-enablement-work)
 - [What changed this week](#what-changed-this-week)
 - [Measuring things on this box](#measuring-things-on-this-box)
 - [Known gaps](#known-gaps)
@@ -287,6 +315,41 @@ residency, or ~38 % of decode speed.
 
 All on the 4× V100 box, from `llama-server` timings unless noted.
 
+### `-sm layer` vs `-sm tensor`, models fully on GPU
+
+This is the core benefit of the split mode, with no expert offload involved — every model here fits
+entirely in the 128 GiB of VRAM. `llama-bench -p 512 -n 128 -r 2 -fa on -lm none -lzm off -ub 2048`,
+build `1b202c10f`, **at the 150 W power cap**.
+
+| model | arch | | size | pp `layer` | pp `tensor` | | tg `layer` | tg `tensor` | |
+|---|---|---|---|---|---|---|---|---|---|
+| glm4 9B Q8_0 | glm4 | dense | 9.3 GiB | 1181.7 | **2908.6** | +146 % | 68.5 | **123.5** | +80 % |
+| qwen35 27B Q8_K_P | qwen35 | dense | 29.3 | 647.4 | **1700.5** | +163 % | 22.2 | **51.1** | +130 % |
+| gemma4 31B Q8_0 | gemma4 | dense | 30.4 | 686.0 | **1862.2** | +171 % | 20.6 | **46.8** | +127 % |
+| muse-glimmer 30B F16 | muse-glimmer | dense | 51.9 | 1044.2 | **2383.8** | +128 % | 15.1 | **40.4** | +168 % |
+| llama 70B Q8_0 | llama | dense | 69.8 | 302.1 | **949.1** | +214 % | 9.8 | **28.7** | +193 % |
+| qwen35moe 35B-A3B Q8_0 | qwen35moe | MoE 256×8 | 34.4 | 1593.0 | **3150.2** | +98 % | 92.3 | **111.9** | +21 % |
+| qwen3next 80B-A3B Q4_K_M | qwen3next | MoE 512×10 | 45.9 | 887.1 | **1643.9** | +85 % | 76.3 | **85.3** | +12 % |
+| deepseek4 284B Q2_K | deepseek4 | MoE 256×6 | 90.9 | 188.6 | **614.3** | +226 % | 26.4 | **36.7** | +39 % |
+| nemotron_h_moe 31B-A3.5B Q8_0 | nemotron_h_moe | MoE 128×6 | 32.6 | 1513.9 | *unsupported* | — | 115.7 | *unsupported* | — |
+
+**Prefill gains everywhere — +85 % to +226 %.** Prompt processing is compute-bound, and four GPUs
+working the same layer bring four times the FLOPs. The largest gain is on the largest model, where
+`-sm layer` leaves three cards idle for most of each token.
+
+**Decode splits sharply by model type.** Dense models gain **+80 % to +193 %**; MoE models only
+**+12 % to +39 %**. Dense decode is bandwidth-bound on the *whole* weight set, so splitting it four
+ways multiplies the bandwidth available. An MoE model at batch 1 only reads its active experts — 3 B
+of 80 B for qwen3next — so each device was already reading little, and the all-reduce overhead is a
+larger share of a smaller total. If you are choosing hardware for MoE decode specifically, that is the
+number to look at.
+
+`nemotron_h_moe` is on the deny-list in `llm_arch_supports_sm_tensor()`, with the other Mamba-2-style
+hybrids: their in-projection fuses `z, x, B, C` and `dt` into one tensor, and `B`/`C` are shared by a
+group of heads, so splitting by head would split them too. That needs a per-segment split plus enough
+groups to distribute, which `ggml_ssm_scan` does not accept. `gemma4` works but is excluded from
+*expert offload* specifically (`llm_arch_supports_sm_tensor_expert_offload`).
+
 ### `-ncmoe` is the dominant lever
 
 `qwen4exp`, `-sm tensor`, even split, 4 slots, `-c 16384`:
@@ -412,6 +475,59 @@ Two caveats worth knowing:
 
 Treat the result as a starting point and confirm against the `model buffer size` / `KV buffer size` /
 `compute buffer size` lines llama.cpp prints at load.
+
+---
+
+## Split-tensor enablement work
+
+`-sm tensor` is the fork's reason for existing, and most of the work is not the split arithmetic
+itself — it is making every architecture, collective and sampler survive being cut four ways. The
+branch is **34 commits and ~2 850 inserted lines** ahead of upstream across 25 files, mostly in
+`ggml/src/ggml-backend-meta.cpp` and `src/llama-model.cpp`.
+
+### Making architectures work under the split
+
+Each tensor needs a rule for *how* it splits, and getting one wrong is usually silent. The split-state
+table in `src/llama-model.cpp` now handles:
+
+| case | rule | why |
+|---|---|---|
+| standard attention | Q and KV split on the head axis, `attn_output` on the row axis | heads cannot be cut in half, so the granularity is the head size |
+| **MLA** (`cb693151b`) | the latent KV, `q_a`, `kv_a_mqa` and their norms **mirrored**; only `q_b`, `k_b`, `v_b` and `attn_output` split | after absorption MLA is effectively MQA — every head shares one latent, so the latent cannot be split |
+| **MQA / 1 KV head** (`1c707cf1b`) | mirror K, V and the KV cache; split only the Q heads | one KV head cannot be divided across four devices; mirroring costs N× KV cache but is the only correct option |
+| MoE experts | split on the expert-inner axis, with the granularity taken from `ffn_down`'s quantization block so `gate`/`up`/`down` agree | mismatched boundaries would have each device's down-projection consume a slice it did not produce |
+| gemma4 experts (`7b121bc7f`) | kept resident under `SPLIT_MODE_TENSOR` | — |
+| `lm_head` | **mirrored** | logits then come out replicated and every sampler reduction (argmax, top-k, softmax) works unchanged |
+| PLE / indexer caches | mirrored | the conv runs on every device, so each needs the whole history |
+| host-resident nodes (`c441eeee5`) | no split state queried at all | previously an access violation |
+
+### Collectives
+
+| commit | change |
+|---|---|
+| `cb693151b` | a **one-shot P2P all-reduce** for small messages, alongside NCCL |
+| `6406802e4` | make the all-reduce kernel block counts env-tunable (`GGML_CUDA_P2P_AR_NBLOCKS`) |
+
+At 4 GPUs `GGML_CUDA_ALLREDUCE=nccl` is required — the internal all-reduce is 2-device only, and the
+Windows default otherwise falls back to a slower meta butterfly. The P2P path handles small messages,
+capped by `GGML_CUDA_P2P_AR_MAX_BYTES`.
+
+### Attention kernels on Volta
+
+`-sm tensor` shifts attention onto shapes upstream does not tune for on sm_70 — see the retune table
+in [Benchmarks](#benchmarks). `028c1a96b` removed a ~3 kiB/thread register spill at head size 256,
+`ba3088a16` split DV accumulation at head size 512, and `eca0bd8b9` fixed a divergent `__syncthreads`
+in the MMA combine that `compute-sanitizer --tool synccheck` flagged as undefined behaviour.
+
+### Test coverage added
+
+`24d173dfb` vocab-scale `ARGMAX` cases · `51204c319` deepseek4-scale `FLASH_ATTN_EXT` cases ·
+`15793de79` MLA-shaped `FLASH_ATTN_EXT` cases · `37d44070a` drive the MLA fixture off a single
+`is_mla` predicate.
+
+Worth knowing what this coverage does *not* prove: the synthetic architecture sweep is **F16-only**, so
+a green sweep says nothing about MMQ, quantized padding or expert geometry. Both of this week's
+corruption bugs were in quantized MoE paths that no test reaches.
 
 ---
 
