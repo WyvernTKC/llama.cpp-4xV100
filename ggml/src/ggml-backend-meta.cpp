@@ -2300,6 +2300,9 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
 
 static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml_tensor * tensor, const void * data,
         size_t offset, size_t size, const std::vector<ggml_backend_t> * backends_override) {
+    if (size == 0) {
+        return; // nothing to splice; see the note in get_tensor_async
+    }
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     auto backend_j = [&](size_t j) {
         return backends_override ? (*backends_override)[j] : ggml_backend_meta_simple_backend(backend, j);
@@ -2352,6 +2355,13 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
 }
 
 static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    // A zero-byte read has nothing to splice. Bail before the checks below: an empty tensor has
+    // no usable split state - calculate_split_state maps zero elements to UNKNOWN - and a
+    // zero-element view reports as non-contiguous, so they would reject it on the way to doing
+    // nothing. Reached with an empty ids tensor, e.g. a layer with no tokens routed at -ncmoe 99.
+    if (size == 0) {
+        return;
+    }
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
@@ -2361,8 +2371,15 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
     // Only the chunk-splicing paths below need contiguity and offset 0; a mirrored read is forwarded
     // to one device as-is, so a view of the ids tensor is fine there.
     if (split_state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
-        GGML_ASSERT(offset == 0);
-        GGML_ASSERT(ggml_is_contiguous(tensor));
+        if (offset != 0 || !ggml_is_contiguous(tensor)) {
+            GGML_ABORT("%s: cannot splice a read of %s (op %s): axis=%d offset=%zu size=%zu "
+                "ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                "nb=[%zu,%zu,%zu,%zu] contiguous=%d nbytes=%zu",
+                __func__, tensor->name, ggml_op_name(tensor->op), (int) split_state.axis, offset, size,
+                tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+                tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3],
+                (int) ggml_is_contiguous(tensor), ggml_nbytes(tensor));
+        }
     }
 
     switch (split_state.axis) {

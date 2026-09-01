@@ -1871,8 +1871,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     };
 
                     int id = 0;
-                    while (!ggml_bitset_get(used_ids.data(), id)) {
+                    while (id < n_expert && !ggml_bitset_get(used_ids.data(), id)) {
                         id++;
+                    }
+                    if (id == n_expert) {
+                        // No expert is used at all - the ids tensor is empty, i.e. no tokens were
+                        // routed to this layer. The scan below assumed at least one bit was set and
+                        // walked off the end of the bitset. Nothing to copy per expert, so fall back
+                        // to the plain copy. Go through the zero-range call first when staging: it
+                        // restores the destination's own per-device pointers, which are otherwise
+                        // still bound to a staging slot and would take the copy below.
+                        if (!meta_try_partial || !ggml_backend_meta_stage_weight_ranges(
+                                split_backend, input_cpy, input->data, nullptr, nullptr, 0)) {
+                            ggml_backend_tensor_copy(input, input_cpy);
+                        }
+                        continue;
                     }
                     int32_t first_id = id;
                     int32_t last_id = first_id;
