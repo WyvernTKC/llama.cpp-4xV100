@@ -1,0 +1,116 @@
+================================================================================
+UPSTREAM BUG REPORT (draft) - not yet filed
+ggml_backend_sched_compute_splits: unbounded out-of-bounds read when an MoE
+layer's expert-ids tensor is empty
+================================================================================
+
+Status      : found 2026-09-02, fixed locally, NOT yet reported upstream
+Affects     : ggml/src/ggml-backend.cpp, current master (present at tag b10731)
+Introduced  : 5682a3745 "sched : copy only the used experts when offloading
+              prompt processing (#15346)"
+Severity    : out-of-bounds read of unbounded length; in practice a crash or
+              silently wrong expert selection
+Not specific to any backend, model or split mode.
+
+--------------------------------------------------------------------------------
+THE CODE
+--------------------------------------------------------------------------------
+
+ggml/src/ggml-backend.cpp, in ggml_backend_sched_compute_splits(), inside the
+"copy only the experts that are used" block (line 1763 at b10731):
+
+    // find the used experts
+    used_ids.clear();
+    used_ids.resize(ggml_bitset_size(n_expert));
+    for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
+        for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
+            int32_t id = ids[...];
+            GGML_ASSERT(id >= 0 && id < n_expert);
+            ggml_bitset_set(used_ids.data(), id);
+        }
+    }
+    ...
+    int id = 0;
+    while (!ggml_bitset_get(used_ids.data(), id)) {   // <-- unbounded
+        id++;
+    }
+    int32_t first_id = id;
+
+--------------------------------------------------------------------------------
+THE PROBLEM
+--------------------------------------------------------------------------------
+
+The while loop has no upper bound. It assumes at least one bit is set in
+used_ids, i.e. that the ubatch routes to at least one expert.
+
+That assumption fails when the ids tensor is EMPTY. If ids_tensor->ne[1] == 0
+(no tokens routed to this layer) the two nested loops above execute zero
+iterations, so no bit is ever set, and the scan walks off the end of the bitset
+allocation. There is no termination condition other than finding a set bit
+somewhere in unrelated heap memory.
+
+Consequences, in order of luck:
+  - reads past the end of the used_ids allocation until it happens to find a
+    non-zero bit; first_id is then a garbage expert index
+  - the following loop and copy_experts() then copy a wrong, possibly huge,
+    byte range
+  - or it runs far enough to fault
+
+--------------------------------------------------------------------------------
+HOW WE HIT IT
+--------------------------------------------------------------------------------
+
+Observed on llama.cpp at b10731 with an MoE model where one block ends up with
+no tokens routed to it. The empty tensor was ffn_moe_topk-47 with
+ne = [10, 0, 1, 1], nbytes = 0.
+
+It surfaced only once enough MoE layers were offloaded to host memory for that
+particular layer's expert weights to enter this code path (-n-cpu-moe 99, i.e.
+all MoE layers offloaded). With fewer offloaded layers the affected layer never
+reaches the used-experts scan and the bug stays hidden.
+
+In our case it aborted earlier, in a backend read that rejected the zero-byte
+request, which masked the OOB. Without that earlier check the scan runs.
+
+Reproducing upstream needs any graph where a MUL_MAT_ID node has an ids tensor
+with zero rows while its weights are host-resident and op-offload is active. We
+have not tried to build a minimal upstream-only reproducer.
+
+--------------------------------------------------------------------------------
+SUGGESTED FIX
+--------------------------------------------------------------------------------
+
+Bound the scan and handle "no experts used" explicitly. Ours:
+
+    int id = 0;
+    while (id < n_expert && !ggml_bitset_get(used_ids.data(), id)) {
+        id++;
+    }
+    if (id == n_expert) {
+        // no expert used at all - the ids tensor is empty, no tokens routed to
+        // this layer. Nothing to copy per expert; fall back to the plain copy.
+        ggml_backend_tensor_copy(input, input_cpy);
+        continue;
+    }
+    int32_t first_id = id;
+
+Note for anyone adapting this: if the destination backend rebinds the copy
+tensor's data pointer (as ours does when staging offloaded weights), the
+fallback must restore that pointer before copying, or the copy lands in the
+wrong buffer.
+
+An arguably better fix is to skip the whole used-experts block when
+ids_tensor->ne[1] == 0, since there is no work to do for that node at all.
+
+--------------------------------------------------------------------------------
+RELATED
+--------------------------------------------------------------------------------
+
+Adjacent, backend-side, and probably worth its own note: a zero-byte
+get_tensor/set_tensor on an empty tensor is a reasonable thing for the scheduler
+to issue, and backends that inspect tensor layout should treat size == 0 as a
+no-op rather than validating a tensor that has no meaningful layout. An empty
+tensor has no usable split/stride information and a zero-element view reports as
+non-contiguous.
+
+Local fix: 56cbbb32e on WyvernTKC/llama.cpp-4xV100, branch sm-tensor-4xv100.
