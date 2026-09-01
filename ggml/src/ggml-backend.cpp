@@ -841,6 +841,19 @@ struct ggml_backend_sched {
     int debug_realloc;
     int debug_graph_size;
     int debug_prev_graph_size;
+
+    // Graph identity across evals, so consumers can cache what they derive from a graph.
+    // ggml_graph_next_uid() is a global counter, so stamping the graph and every split on each eval
+    // - which is what this used to do - guarantees a miss in every downstream cache: the meta backend
+    // rebuilt its per-device subgraphs on 100% of calls (30% of decode time on a 4x V100
+    // expert-offload run), and ggml-cuda's uid fast path in ggml_cuda_graph_update_required never hit,
+    // so it re-validated every node's properties every time.
+    uint64_t   prev_graph_uid;
+    uint64_t * prev_node_sig;      // [prev_n_node_sig] per-node signature of the last graph seen
+    int        prev_n_node_sig;
+    uint64_t * prev_split_uids;    // [prev_n_split_uids]
+    int        prev_n_split_uids;
+    int      * prev_split_sig;     // [3*prev_n_split_uids] n_nodes, n_inputs, backend_id
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1066,6 +1079,22 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
+// A node's identity for caching: where it is, what it does, what shape it has. Pointers alone are not
+// enough - llama.cpp rebuilds into a reset ggml_context so addresses recur, and prefill and decode
+// reuse the same addresses with the same node count but different ne[]. Reusing a graph decomposition
+// across that would be silently wrong.
+static uint64_t ggml_backend_sched_node_sig(const struct ggml_tensor * node) {
+    uint64_t h = 1469598103934665603ULL; // FNV-1a
+    const uint64_t vals[6] = {
+        (uint64_t) (uintptr_t) node, (uint64_t) node->op,
+        (uint64_t) node->ne[0], (uint64_t) node->ne[1], (uint64_t) node->ne[2], (uint64_t) node->ne[3],
+    };
+    for (int i = 0; i < 6; i++) {
+        h = (h ^ vals[i]) * 1099511628211ULL;
+    }
+    return h;
+}
+
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
     sched->n_splits = 0;
@@ -1085,7 +1114,25 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         GGML_ABORT("%s: failed to initialize context\n", __func__);
     }
 
-    graph->uid = ggml_graph_next_uid();
+    {
+        bool graph_same = sched->prev_n_node_sig == graph->n_nodes && graph->n_nodes > 0;
+        for (int i = 0; graph_same && i < graph->n_nodes; i++) {
+            graph_same = sched->prev_node_sig[i] == ggml_backend_sched_node_sig(graph->nodes[i]);
+        }
+        if (!graph_same) {
+            if (sched->prev_n_node_sig < graph->n_nodes) {
+                sched->prev_node_sig = (uint64_t *) realloc(sched->prev_node_sig, graph->n_nodes*sizeof(uint64_t));
+                GGML_ASSERT(sched->prev_node_sig);
+            }
+            for (int i = 0; i < graph->n_nodes; i++) {
+                sched->prev_node_sig[i] = ggml_backend_sched_node_sig(graph->nodes[i]);
+            }
+            sched->prev_n_node_sig   = graph->n_nodes;
+            sched->prev_graph_uid    = ggml_graph_next_uid();
+            sched->prev_n_split_uids = 0; // force the splits below to be restamped too
+        }
+        graph->uid = sched->prev_graph_uid;
+    }
 
     // pass 1: assign backends to ops with pre-allocated inputs
     for (int i = 0; i < graph->n_leafs; i++) {
@@ -1596,9 +1643,31 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         graph_copy->leafs[graph_copy->n_leafs++] = leaf;
     }
 
-    // set ids for all splits
-    for (int i = 0; i < sched->n_splits; ++i) {
-        sched->splits[i].graph.uid = ggml_graph_next_uid();
+    // set ids for all splits - same rule as the graph above, only restamp what actually changed
+    {
+        bool splits_same = sched->prev_n_split_uids == sched->n_splits;
+        for (int i = 0; splits_same && i < sched->n_splits; i++) {
+            splits_same = sched->prev_split_sig[3*i + 0] == sched->splits[i].graph.n_nodes &&
+                          sched->prev_split_sig[3*i + 1] == sched->splits[i].n_inputs &&
+                          sched->prev_split_sig[3*i + 2] == sched->splits[i].backend_id;
+        }
+        if (!splits_same) {
+            if (sched->prev_n_split_uids < sched->n_splits) {
+                sched->prev_split_uids = (uint64_t *) realloc(sched->prev_split_uids, sched->n_splits*sizeof(uint64_t));
+                sched->prev_split_sig  = (int *)      realloc(sched->prev_split_sig,  3*sched->n_splits*sizeof(int));
+                GGML_ASSERT(sched->prev_split_uids && sched->prev_split_sig);
+            }
+            for (int i = 0; i < sched->n_splits; i++) {
+                sched->prev_split_uids[i]    = ggml_graph_next_uid();
+                sched->prev_split_sig[3*i+0] = sched->splits[i].graph.n_nodes;
+                sched->prev_split_sig[3*i+1] = sched->splits[i].n_inputs;
+                sched->prev_split_sig[3*i+2] = sched->splits[i].backend_id;
+            }
+            sched->prev_n_split_uids = sched->n_splits;
+        }
+        for (int i = 0; i < sched->n_splits; ++i) {
+            sched->splits[i].graph.uid = sched->prev_split_uids[i];
+        }
     }
 }
 
@@ -1993,6 +2062,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     }
     free(sched->splits);
     free(sched->graph_inputs);
+    free(sched->prev_node_sig);
+    free(sched->prev_split_uids);
+    free(sched->prev_split_sig);
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_copies);
     free(sched->node_backend_ids);
