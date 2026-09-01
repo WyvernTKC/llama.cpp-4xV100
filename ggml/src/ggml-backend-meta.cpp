@@ -6,6 +6,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cinttypes>
 #include <cmath>
@@ -17,6 +18,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -2078,7 +2080,9 @@ struct ggml_backend_meta_stats {
         const double inv    = 1e-3 / n_compute;                              // us total -> ms per call
         const double inv_sg = n_subgraphs ? 1.0/(n_compute*n_subgraphs) : 0.0; // us total -> us per subgraph
 
-        GGML_LOG_INFO("%s: %s: %" PRId64 " calls, %" PRId64 " rebuilds (%.1f%%), per call: "
+        // WARN, not INFO: llama.cpp's logger filters ggml INFO out of the server log, and this only
+        // prints at all when GGML_META_STATS asked for it
+        GGML_LOG_WARN("%s: %s: %" PRId64 " calls, %" PRId64 " rebuilds (%.1f%%), per call: "
                 "enqueue %.2f ms (launch %.2f, comm %.2f, other %.2f, rebuild %.2f), sync %.2f ms | "
                 "%d nodes, %zu subgraphs, per subgraph: launch %.1f us, comm %.1f us\n",
             "ggml_backend_meta", name, n_compute, n_rebuild, 100.0*n_rebuild/n_compute,
@@ -2114,6 +2118,38 @@ struct ggml_backend_meta_context {
         SUBGRAPH_COMM_ALLREDUCE,
         SUBGRAPH_COMM_ALLGATHER,
     };
+
+    // Parallel per-device subgraph launch.
+    //
+    // The launches within one subgraph are independent - each only touches its own device's backend,
+    // and ggml_backend_cuda_graph_compute sets the CUDA device itself, which is per-thread state. But
+    // they were issued serially from the one thread that drives graph_compute, and with expert
+    // offload that thread is the bottleneck: measured 529 cudaGraphLaunch per token at ~32 us each
+    // (17.9 ms) with the GPUs only 35-41% busy.
+    //
+    // Workers take devices 1..n-1 and the calling thread keeps device 0, so a 1-device meta backend
+    // spawns nothing. The rendezvous spins and then yields rather than using a condition variable:
+    // a subgraph launch is ~130 us apart, and a CV wakeup (10-30 us) against ~130 subgraphs per token
+    // would give back a third of what this saves.
+    struct launch_pool {
+        std::vector<std::thread> threads;
+        std::atomic<uint64_t>    epoch{0};
+        std::atomic<int>         done{0};
+        std::atomic<bool>        stop{false};
+        size_t                   i_subgraph = 0;
+        ggml_status              status[GGML_BACKEND_META_MAX_DEVICES];
+
+        ~launch_pool() {
+            stop.store(true, std::memory_order_release);
+            epoch.fetch_add(1, std::memory_order_release);
+            for (std::thread & t : threads) {
+                if (t.joinable()) {
+                    t.join();
+                }
+            }
+        }
+    };
+    std::unique_ptr<launch_pool> lpool;
 
     // Staging for offloaded weights. The copies run on a second backend instance per device, which owns a
     // separate stream, so they overlap with work already queued for compute. Slots rotate so a copy never
@@ -3267,14 +3303,66 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
     const bool stats_enabled = ggml_backend_meta_stats::enabled();
 
+    // start the launch workers on first use; GGML_META_SERIAL_LAUNCH=1 keeps the old serial path
+    if (n_backends > 1 && !backend_ctx->lpool) {
+        static const bool serial_launch = getenv("GGML_META_SERIAL_LAUNCH") != nullptr;
+        if (!serial_launch) {
+            backend_ctx->lpool.reset(new ggml_backend_meta_context::launch_pool());
+            ggml_backend_meta_context::launch_pool * lpp = backend_ctx->lpool.get();
+            for (size_t j = 1; j < n_backends; j++) {
+                lpp->threads.emplace_back([backend_ctx, lpp, j]() {
+                    uint64_t seen = 0;
+                    while (true) {
+                        for (int spin = 0; lpp->epoch.load(std::memory_order_acquire) == seen; ++spin) {
+                            if (spin > 512) {
+                                std::this_thread::yield();
+                            }
+                        }
+                        seen = lpp->epoch.load(std::memory_order_acquire);
+                        if (lpp->stop.load(std::memory_order_acquire)) {
+                            return;
+                        }
+                        auto & bcj = backend_ctx->backend_configs[j];
+                        lpp->status[j] = ggml_backend_graph_compute_async(
+                            bcj.backend, bcj.cgraphs[lpp->i_subgraph].cgraph_main);
+                        lpp->done.fetch_add(1, std::memory_order_release);
+                    }
+                });
+            }
+        }
+    }
+
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         const int64_t t_launch_start_us = stats_enabled ? ggml_time_us() : 0;
 
-        for (size_t j = 0; j < n_backends; j++) {
-            auto & bcj = backend_ctx->backend_configs[j];
-            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
-            if (status != GGML_STATUS_SUCCESS) {
-                return status;
+        if (backend_ctx->lpool) {
+            ggml_backend_meta_context::launch_pool & lp = *backend_ctx->lpool;
+            lp.i_subgraph = i;
+            lp.done.store(0, std::memory_order_relaxed);
+            lp.epoch.fetch_add(1, std::memory_order_release);
+
+            // device 0 on this thread, so one device costs no rendezvous at all
+            auto & bc0 = backend_ctx->backend_configs[0];
+            lp.status[0] = ggml_backend_graph_compute_async(bc0.backend, bc0.cgraphs[i].cgraph_main);
+
+            const int n_workers = (int) n_backends - 1;
+            for (int spin = 0; lp.done.load(std::memory_order_acquire) != n_workers; ++spin) {
+                if (spin > 512) {
+                    std::this_thread::yield();
+                }
+            }
+            for (size_t j = 0; j < n_backends; j++) {
+                if (lp.status[j] != GGML_STATUS_SUCCESS) {
+                    return lp.status[j];
+                }
+            }
+        } else {
+            for (size_t j = 0; j < n_backends; j++) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
             }
         }
 
