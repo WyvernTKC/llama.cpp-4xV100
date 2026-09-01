@@ -8,7 +8,7 @@ machinery to run **MoE models that are larger than VRAM** by keeping some expert
 and streaming them per token.
 
 If you only read one thing: for a 156 GiB model on 128 GiB of VRAM, decode went from **15.7 to
-39.7 tokens/s** over the past week. Roughly half of that was configuration and half was code.
+42.2 tokens/s** over the past week. Roughly half of that was configuration and half was code.
 
 > **Power note:** the four V100s are capped at **150 W each, against a 300 W default TDP** — halved
 > deliberately to save power. Every number in this file is measured at half power, so treat them as a
@@ -75,7 +75,7 @@ llama-server -m Qwen3.8-Flash-Next-Uncensored-Q6_K-00001-of-00005.gguf ^
   --flash-attn on --fit off -t 18
 ```
 
-That gives about **39.7 t/s**. Note there is deliberately **no `-ts`** — see
+That gives about **42.2 t/s**. Note there is deliberately **no `-ts`** — see
 [Flags that matter](#flags-that-matter).
 
 **Same model at full 256 k context:** use `--ctx-size 262144 -ncmoe 12` and expect ~21.8 t/s. The KV
@@ -649,7 +649,37 @@ every legal config lands there and tuning is purely about tile shape.
 `--spec-draft-adaptive`, off by default (variable draft length breaks CUDA graph reuse under
 `-sm tensor`, costing ~2.5×).
 
-Upstream merges: `78d65dc2d` master · `403e98723` b10679 · `d4052c0a8` b10705.
+Upstream merges: `78d65dc2d` master · `403e98723` b10679 · `d4052c0a8` b10705 · `d8464c440` **b10731**.
+
+### b10731 merge (2026-09-01)
+
+26 upstream commits, 8 touching files we own. Two conflicts, both resolved as unions:
+
+- **`fattn-mma-f16.cuh`**, one hunk inside the `#else // Volta` branch. Upstream's XOR swizzle
+  (#25635) routes `load_ldmatrix` through `ggml_cuda_fattn_smem_swizzle::`; ours is the
+  `VKQ_C[(i_VKQ_0 - dvp*DV_acc)/i0_stride]` index from `ba3088a16`. Orthogonal, so upstream's call
+  form plus our index. Safe on sm_70 because the wrapper's `if constexpr (swz)` **else-branch is
+  literally the original call**. Taking upstream's side wholesale would have silently dropped the DV
+  split and regressed deepseek4-scale FA.
+- **`test-backend-ops.cpp`**, one hunk in the FLASH_ATTN_EXT perf list. Took upstream's wider loop
+  (kv ≤ 65536, hs ≤ 576, nr ≤ 8, nb ∈ {1, 4096}) and kept all five of our explicit cases: upstream's
+  `hs` list has no 512, and its 576 cases use `nh=8 / nr≤8` where ours are `nh=1 / nr=16` — a
+  different GQA ratio, so not the subsumption it first looks like.
+
+The meta backend, `llama-model.cpp` and `llama-arch.cpp` all auto-merged.
+
+**Verified:** `test-backend-ops test -o FLASH_ATTN_EXT` passes; the `-ncmoe 2` hammer is
+byte-identical to the pre-merge run with the decomposition cache still at 0.0 % rebuilds; and FA perf
+at `hsk=256 kv=20000 nb=512 f16` is 14 902 µs against a 14 770 µs baseline — no regression, so the
+swizzle plumbing costs nothing on sm_70 as expected (it needs cp.async/ldmatrix, neither of which
+exists there).
+
+**The merge is also a speedup: tg 39.7 → 42.2 t/s (+6.3 %).** Most likely `41ef91f7c`, which lifts the
+1-token restriction on the MoE glu and topk-router fusion, and/or the qwen4exp indexer slice change
+in `09412af38`. Not attributed further. Two upstream commits in this range land directly on our
+production arch — `0eadefebd` qwen4exp recurrent state rollback and `09412af38` indexer slices — and
+`6d1479c14` fixes the `ggml_backend_buft_get_alloc_size()` guard that our MMQ over-read padding reads,
+which is why the hammer was the load-bearing check rather than a nicety.
 
 ---
 
