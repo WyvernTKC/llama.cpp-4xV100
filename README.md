@@ -8,7 +8,7 @@ machinery to run **MoE models that are larger than VRAM** by keeping some expert
 and streaming them per token.
 
 If you only read one thing: for a 156 GiB model on 128 GiB of VRAM, decode went from **15.7 to
-42.2 tokens/s** over the past week. Roughly half of that was configuration and half was code.
+42.2 tokens/s**.
 
 > **Power note:** the four V100s are capped at **150 W each, against a 300 W default TDP** — halved
 > deliberately to save power. Every number in this file is measured at half power, so treat them as a
@@ -22,12 +22,11 @@ If you only read one thing: for a 156 GiB model on 128 GiB of VRAM, decode went 
 |---|---|
 | GPUs | 4× Tesla V100-SXM2-32GB — sm_70, 32 768 MiB each, **128 GiB total** |
 | GPU power | **150 W limit each (default and max are 300 W)** — deliberately lowered |
-| PCIe | Gen 3. GPU 0/1/3 at **x16**, **GPU 2 at x8** — it runs at roughly half the bandwidth of the others, which shapes a lot of what follows |
+| PCIe | Gen 3. GPU 0/1/3 at **x16**, **GPU 2 at x8** — it runs at roughly half the bandwidth of the others, its a dodgy PCIE cable |
 | CPU | 2× Intel Xeon Gold 6230 @ 2.10 GHz — 20 cores per socket, **40 cores total**, no HT |
 | System RAM | **382.6 GiB** |
 | OS | Windows Server 2022 Standard (10.0.20348) |
 | CUDA | 12.8, driver 573.96 |
-| Also present | 1× Tesla T4 (60 W limit) — **cannot share a process with the V100s**; `cudaSetDevice` on it fails whenever a V100 is visible, so `--mmproj-device CUDA4` can never work |
 
 Two consequences worth knowing before reading any benchmark here:
 
@@ -465,7 +464,7 @@ Recorded so nobody rebuilds them:
 |---|---|
 | `-sm tensor` | the split mode this branch adds; requires `--flash-attn on` |
 | `-ncmoe N` | keep the first `N` MoE layers' experts in host RAM. **The single biggest lever.** Push it as low as VRAM allows |
-| `-lzm off` | **mandatory.** Otherwise the 50.66 GiB embedding table is mmap-read on demand — 12.7× slower prefill off a network share |
+| `-lzm off` | **mandatory.** Otherwise the 50.66 GiB embedding table is mmap-read on demand — 12.7× slower prefill off a network share 10Gbe |
 | `--load-mode none` | mmap costs ~2.8× prefill even on local storage |
 | `--fit off` | you are choosing `-ncmoe` yourself; auto-fit will fight you |
 | `-ub 4096 -b 4096` | keeps prefill above the partial-copy batch gate, so prefill uses the cheaper full-layer staged copy |
