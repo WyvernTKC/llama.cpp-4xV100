@@ -320,19 +320,21 @@ All on the 4× V100 box, from `llama-server` timings unless noted.
 
 This is the core benefit of the split mode, with no expert offload involved — every model here fits
 entirely in the 128 GiB of VRAM. `llama-bench -p 512 -n 128 -r 2 -fa on -lm none -lzm off -ub 2048`,
-build `1b202c10f`, **at the 150 W power cap**.
+build `d8464c440` (upstream b10731), **at the 150 W power cap**. Re-measured after the merge: every
+cell is within noise of the pre-merge run, so the merge's +6.3 % showed up in the offload path, not in
+fully-resident models.
 
 | model | arch | | size | pp `layer` | pp `tensor` | | tg `layer` | tg `tensor` | |
 |---|---|---|---|---|---|---|---|---|---|
-| glm4 9B Q8_0 | glm4 | dense | 9.3 GiB | 1181.7 | **2908.6** | +146 % | 68.5 | **123.5** | +80 % |
-| qwen35 27B Q8_K_P | qwen35 | dense | 29.3 | 647.4 | **1700.5** | +163 % | 22.2 | **51.1** | +130 % |
-| gemma4 31B Q8_0 | gemma4 | dense | 30.4 | 686.0 | **1862.2** | +171 % | 20.6 | **46.8** | +127 % |
-| muse-glimmer 30B F16 | muse-glimmer | dense | 51.9 | 1044.2 | **2383.8** | +128 % | 15.1 | **40.4** | +168 % |
-| llama 70B Q8_0 | llama | dense | 69.8 | 302.1 | **949.1** | +214 % | 9.8 | **28.7** | +193 % |
-| qwen35moe 35B-A3B Q8_0 | qwen35moe | MoE 256×8 | 34.4 | 1593.0 | **3150.2** | +98 % | 92.3 | **111.9** | +21 % |
-| qwen3next 80B-A3B Q4_K_M | qwen3next | MoE 512×10 | 45.9 | 887.1 | **1643.9** | +85 % | 76.3 | **85.3** | +12 % |
-| deepseek4 284B Q2_K | deepseek4 | MoE 256×6 | 90.9 | 188.6 | **614.3** | +226 % | 26.4 | **36.7** | +39 % |
-| nemotron_h_moe 31B-A3.5B Q8_0 | nemotron_h_moe | MoE 128×6 | 32.6 | 1513.9 | *unsupported* | — | 115.7 | *unsupported* | — |
+| glm4 9B Q8_0 | glm4 | dense | 9.3 GiB | 1187.9 | **2924.3** | +146 % | 67.6 | **123.0** | +82 % |
+| qwen35 27B Q8_K_P | qwen35 | dense | 29.3 | 640.4 | **1717.6** | +168 % | 22.2 | **52.4** | +137 % |
+| gemma4 31B Q8_0 | gemma4 | dense | 30.4 | 679.8 | **1621.2 ±322** | *noisy* | 20.6 | **46.7** | +127 % |
+| muse-glimmer 30B F16 | muse-glimmer | dense | 51.9 | 1048.4 | **2395.6** | +128 % | 15.1 | **40.4** | +168 % |
+| llama 70B Q8_0 | llama | dense | 69.8 | 302.5 | **950.5** | +214 % | 9.8 | **28.6** | +192 % |
+| qwen35moe 35B-A3B Q8_0 | qwen35moe | MoE 256×8 | 34.4 | 1602.6 | **3143.7** | +96 % | 93.6 | **113.7** | +21 % |
+| qwen3next 80B-A3B Q4_K_M | qwen3next | MoE 512×10 | 45.9 | 889.8 | **1647.0** | +85 % | 76.6 | **86.8** | +13 % |
+| deepseek4 284B Q2_K | deepseek4 | MoE 256×6 | 90.9 | 188.8 | **616.1** | +226 % | 27.3 | **37.7** | +38 % |
+| nemotron_h_moe 31B-A3.5B Q8_0 | nemotron_h_moe | MoE 128×6 | 32.6 | 1513.9 | *deny-listed* | — | 115.7 | *deny-listed* | — |
 
 **Prefill gains everywhere — +85 % to +226 %.** Prompt processing is compute-bound, and four GPUs
 working the same layer bring four times the FLOPs. The largest gain is on the largest model, where
@@ -351,7 +353,49 @@ group of heads, so splitting by head would split them too. That needs a per-segm
 groups to distribute, which `ggml_ssm_scan` does not accept. `gemma4` works but is excluded from
 *expert offload* specifically (`llm_arch_supports_sm_tensor_expert_offload`).
 
-### `-ncmoe` is the dominant lever
+### Expert offload sweep — `-ncmoe 0 / 2 / 8 / 99`
+
+`-sm tensor`, partial copy on, 4 slots, `llama-bench -p 512 -n 128 -r 2` (so a tiny context — KV is
+negligible here, which is why `-ncmoe 0` fits at all). Two architectures with quite different expert
+geometry:
+
+| `-ncmoe` | deepseek4 256×6 Q2_K, 90.9 GiB | | qwen4exp 512×10 Q6_K, 156 GiB | |
+|---|---|---|---|---|
+| | pp512 | tg128 | pp512 | tg128 |
+| **0** | 612.9 | **37.9** | 1153.2 | **50.8** |
+| 2 | 539.2 | 32.6 | 874.3 | 42.5 |
+| 8 | 395.1 | 23.1 | 471.9 | 27.9 |
+| **99** (all layers) | 132.4 | **7.93** | 109.6 | **7.86** |
+
+**The cost per offloaded layer is ~2.1 ms/token, and it barely depends on the architecture.** Converting
+each step to ms/token per layer:
+
+| step | deepseek4 | qwen4exp |
+|---|---|---|
+| 0 → 2 | 2.16 | 1.91 |
+| 2 → 8 | 2.10 | 2.05 |
+| 8 → 99 | 2.37 | 2.29 |
+
+That holds across 256 experts top-6 at 2.06 bpw and 512 experts top-10 at Q6_K, and the slope only
+creeps up at the extreme, where there is less resident compute left to hide the transfers behind. The
+practical reading: **decide how many layers you can keep resident, and the decode cost follows
+mechanically.**
+
+**Both models converge to ~7.9 t/s with everything streaming** (7.93 and 7.86) — that is the floor set
+by PCIe, not by the model.
+
+**Prefill degrades far harder in relative terms:** qwen4exp `pp512` falls 10.5× from `-ncmoe 0` to 99,
+deepseek4 4.6×. Prompt processing wants every expert at once, so there is nothing for the partial copy
+to skip — it is gated off above batch 32 for exactly that reason.
+
+**`-ncmoe 0` is reachable for a 156 GiB model on 128 GiB of VRAM**, which looks impossible until you
+notice the 50.66 GiB per-layer embedding table lives in host RAM regardless — so only ~105 GiB needs
+to fit. It only works at small context: an earlier sweep at `-c 16384` bottomed out at `-ncmoe 2`, and
+at `-c 262144` the floor is 12. **The floor is a function of context, not of the model.**
+
+### `-ncmoe` at `-c 16384` — the dominant lever
+
+
 
 `qwen4exp`, `-sm tensor`, even split, 4 slots, `-c 16384`:
 
