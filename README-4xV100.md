@@ -681,29 +681,38 @@ A larger effect turned up alongside it, unrelated to the PR: **gemma4 perplexity
 is plain F16 rounding, not overflow. If you ever chase a gemma4 numerics gap, sweep the compute type
 before suspecting the split.
 
-### `pr-26812` — ARGMAX tile rewrite (wjinxu)
+### `pr-26812` — ARGMAX split over multiple blocks (wjinxu)
 
-An `argmax.cu` rewrite using tiles instead of chunks. **Not evaluated end to end**, but it targets a
-gap we did measure and fix coverage for.
+**Already merged upstream and present in this branch** — it arrived via one of our upstream merges, as
+`10939eedd` / `4bd613406` / `4cb4de7af` / `a1a7bc405`. Easy to miss, because the `origin/master` ref in
+this repo is 236 commits stale, so diffing against it makes the change look absent.
 
-Upstream's ARGMAX perf list stopped at 32 000 columns, so the single-row vocab-wide shape that backend
-sampling actually uses was never measured. `24d173dfb` added cases for it, and they show the shape is
-far off roofline:
+It replaces one-block-per-row with a tiled kernel plus a combine pass, which is exactly the right fix
+for a single long row. Measured here by reverting `argmax.cu` to the pre-PR version (`58062860a`) and
+rebuilding `test-backend-ops`:
 
-| shape | µs/run | effective bandwidth |
-|---|---|---|
-| `[32000, 512]` — upstream's largest | 84.75 | **720 GB/s** — near roofline |
-| `[151936, 1]` — **vocab-wide, batch 1** | 6.99 | **81 GB/s** — 9× off |
-| `[151936, 8]` | 7.87 | 575 GB/s |
-| `[129023, 3]` | 6.66 | 217 GB/s |
+| shape | before | after | |
+|---|---|---|---|
+| `[32, 10]` | 2.04 µs | 2.05 µs | launch floor, unchanged |
+| `[1024, 10]` | 2.39 µs | 2.40 µs | unchanged |
+| `[32000, 512]` | 96.84 µs / 630 GB/s | 84.75 µs / **720 GB/s** | **1.14×** |
+| `[129023, 3]` | 26.93 µs / 54 GB/s | 6.66 µs / **217 GB/s** | **4.04×** |
+| `[151936, 8]` | 31.44 µs / 144 GB/s | 7.87 µs / **575 GB/s** | **3.99×** |
+| **`[151936, 1]`** — vocab-wide, batch 1 | 31.38 µs / 18 GB/s | 6.99 µs / **81 GB/s** | **4.49×** |
 
-One row over a full vocabulary gets a ninth of the bandwidth the many-row case does, which is what a
-one-work-group-per-row kernel would predict.
+**Verdict: it helps, substantially, on exactly the shape backend sampling uses** — 4.0–4.5× on
+vocab-scale rows, and it does not regress the small shapes. `test-backend-ops test -o ARGMAX` passes.
+Nothing to do; we already have it.
 
-**In absolute terms it does not matter to us:** 6.99 µs once per token against a ~25 ms token is about
-0.03 %. That is presumably why it was never followed up. Recorded because the measurement is cheap to
-repeat and the coverage now exists — if backend sampling ever moves onto a hot path, or a much larger
-vocabulary shows up, this is the shape to watch and that PR is the thing to try.
+The 81 GB/s that remains on `[151936, 1]` is *not* headroom worth chasing. That row is 594 kB, and
+6.99 µs is close to the launch floor visible in the `[32, 10]` row — there is simply not enough data in
+one row to saturate the bus. The many-row cases reaching 575–720 GB/s show the kernel itself is fine.
+
+Our contribution here was coverage, not the kernel: upstream's ARGMAX perf list stopped at 32 000
+columns, so the single-row vocab-wide shape was never measured. `24d173dfb` added it.
+
+In absolute terms this is still tiny for us — 6.99 µs once per token against a ~25 ms token is 0.03 %,
+and it was 31 µs before, or 0.13 %. Worth knowing it is fixed rather than pending.
 
 ---
 
