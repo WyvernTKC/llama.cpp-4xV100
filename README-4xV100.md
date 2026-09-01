@@ -51,6 +51,7 @@ Two consequences worth knowing before reading any benchmark here:
 - [Estimating `-ncmoe`](#estimating--ncmoe)
 - [Split-tensor enablement work](#split-tensor-enablement-work)
 - [What changed this week](#what-changed-this-week)
+- [Upstream PRs evaluated](#upstream-prs-evaluated)
 - [Measuring things on this box](#measuring-things-on-this-box)
 - [Known gaps](#known-gaps)
 
@@ -649,6 +650,60 @@ every legal config lands there and tuning is purely about tile shape.
 `-sm tensor`, costing ~2.5×).
 
 Upstream merges: `78d65dc2d` master · `403e98723` b10679 · `d4052c0a8` b10705.
+
+---
+
+## Upstream PRs evaluated
+
+Branches in this repo named `pr-*` are **fetched upstream pull requests by other authors**, kept for
+review and testing. They are not part of this fork's work and are not merged into
+`sm-tensor-4xv100`. Two are worth recording because we measured them on this hardware.
+
+### `pr-27016` — F16 activation scaling (kungfudaibi)
+
+**A real bug on our exact hardware, but inert for every model we run.** `ggml_cuda_mul_mat_cublas_impl`
+casts F32 `src1` to F16 with a plain convert, so values above the F16 max (65 504) become `inf` and
+poison the GEMM. Reproduced precisely with `test-backend-ops test -o MUL_MAT -b CUDA0`:
+
+| case | without the PR | with it |
+|---|---|---|
+| q8_0, n=**63**, b_max 1e5 | OK | OK |
+| q8_0, n=**64**, b_max 1e5 | **FAIL** — `NaN at index 0` | OK |
+
+The 63/64 boundary is where cuBLAS takes over from MMQ. But perplexity is **bit-identical** with and
+without it for every model here — the scale resolves to 1.0 because our activations never approach
+32 768. Exposure needs a model whose F32 activations exceed the F16 range at batch ≥ 64.
+
+**Verdict: tracked, not carried.** It adds two kernels per F16 cuBLAS matmul for no benefit to us.
+
+A larger effect turned up alongside it, unrelated to the PR: **gemma4 perplexity moves 3.4 % on
+`GGML_CUDA_CUBLAS_COMPUTE_TYPE` alone** (1.7549 forced `f32` vs 1.8139 default under `-sm layer`). That
+is plain F16 rounding, not overflow. If you ever chase a gemma4 numerics gap, sweep the compute type
+before suspecting the split.
+
+### `pr-26812` — ARGMAX tile rewrite (wjinxu)
+
+An `argmax.cu` rewrite using tiles instead of chunks. **Not evaluated end to end**, but it targets a
+gap we did measure and fix coverage for.
+
+Upstream's ARGMAX perf list stopped at 32 000 columns, so the single-row vocab-wide shape that backend
+sampling actually uses was never measured. `24d173dfb` added cases for it, and they show the shape is
+far off roofline:
+
+| shape | µs/run | effective bandwidth |
+|---|---|---|
+| `[32000, 512]` — upstream's largest | 84.75 | **720 GB/s** — near roofline |
+| `[151936, 1]` — **vocab-wide, batch 1** | 6.99 | **81 GB/s** — 9× off |
+| `[151936, 8]` | 7.87 | 575 GB/s |
+| `[129023, 3]` | 6.66 | 217 GB/s |
+
+One row over a full vocabulary gets a ninth of the bandwidth the many-row case does, which is what a
+one-work-group-per-row kernel would predict.
+
+**In absolute terms it does not matter to us:** 6.99 µs once per token against a ~25 ms token is about
+0.03 %. That is presumably why it was never followed up. Recorded because the measurement is cheap to
+repeat and the coverage now exists — if backend sampling ever moves onto a hot path, or a much larger
+vocabulary shows up, this is the shape to watch and that PR is the thing to try.
 
 ---
 
