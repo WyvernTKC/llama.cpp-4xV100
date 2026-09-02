@@ -707,9 +707,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
             }
             if (std::regex_match(tensor_name, pattern_ssm_a)) {
-                // one decay rate per head, laid out as [1, n_head]
-                GGML_ASSERT(tensor->ne[0] == 1 && tensor->ne[1] == hparams.n_head());
-                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+                // one decay rate per head, laid out as [1, n_head] - kimi-k3 stores a plain [n_head]
+                if (ggml_n_dims(tensor) >= 2) {
+                    GGML_ASSERT(tensor->ne[0] == 1 && tensor->ne[1] == hparams.n_head());
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+                }
+                GGML_ASSERT(tensor->ne[0] == hparams.n_head());
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
             }
         }
 
