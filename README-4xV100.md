@@ -416,10 +416,73 @@ a property of either model.
 forward pass amortised over a handful of tokens — 47.99 down to 7.38 t/s for deepseek4, 67.00 down to
 8.06 for qwen4exp. Those numbers are the per-pass cost of offloading (74–223 ms per offloaded layer,
 30–100× the decode cost, which is why the partial copy is gated off above batch 32), **not** prefill
-throughput. For that see the `pp512` figures in the all-GPU table above.
+throughput. For that see the `pp512` figures in the all-GPU table above, or the 2000-token sweep
+below, which was run specifically to close this gap.
 
 VRAM is the real constraint on the low end: qwen4exp at `-ncmoe 2` sits at 31.3 GB of 32.0, which is why
 2 is the floor at this context even though `-ncmoe 0` fits at a tiny one.
+
+### Offload sweep with a real prompt — 2000-token prompt, 1000-token generation
+
+The sweep above cannot report prefill: its prompts are 40 and 89 tokens, so `prompt eval` is one
+forward pass amortised over a handful of tokens. This one sends an **exact 2000-token prompt** as raw
+token ids, so PP is a genuine throughput figure, and it adds **TTFT** measured client-side — wall clock
+from issuing the HTTP request to the first streamed content chunk.
+
+Note this is the **Q4_K** build of deepseek4 (153 GiB), not the Q2_K used above. At Q4_K the model no
+longer fits at any low `-ncmoe`, so its sweep starts at its floor.
+
+`llama-server` build 10784 (`11f3772f1`), `-sm tensor -ngl 999`, `--load-mode none`,
+`GGML_META_PARTIAL_COPY=1`, `GGML_META_STAGE_SLOTS=4`, `-ub 4096 -b 4096`, `--flash-attn on`,
+`--fit off`, `-np 1`, `-c 16384`, even tensor split, greedy sampling, `cache_prompt: false`.
+
+**deepseek4 Q4_K** — 43 MoE layers, 3.38 GiB of experts per layer:
+
+| `-ncmoe` | PP ms/tok | PP tok/s | TG ms/tok | TG tok/s | TTFT | VRAM/GPU | RAM offloaded |
+|---|---|---|---|---|---|---|---|
+| **16** | 2.43 | 410.7 | 88.19 | 11.33 | 4.90 s | 30.9 GiB | 54.1 GiB |
+| **20** | 2.44 | 410.2 | 102.41 | 9.76 | 4.90 s | 27.5 GiB | 67.6 GiB |
+| **26** | 2.77 | 360.9 | 124.93 | 8.00 | 5.57 s | 22.5 GiB | 87.9 GiB |
+| **99** (all 43) | 3.73 | 268.1 | 187.95 | 5.32 | 7.47 s | 8.2 GiB | 145.3 GiB |
+
+**qwen4exp Q6_K** — 48 MoE layers, 2.11 GiB of experts per layer, plus 50.7 GiB of per-layer token
+embeddings that are always host-resident:
+
+| `-ncmoe` | PP ms/tok | PP tok/s | TG ms/tok | TG tok/s | TTFT | VRAM/GPU | RAM offloaded |
+|---|---|---|---|---|---|---|---|
+| **2** | 1.01 | 993.0 | 23.99 | 41.64 | 2.03 s | 30.6 GiB | 54.9 GiB |
+| **8** | 1.29 | 775.3 | 36.58 | 27.31 | 2.59 s | 27.9 GiB | 67.5 GiB |
+| **16** | 1.65 | 607.7 | 55.81 | 17.90 | 3.30 s | 23.2 GiB | 84.4 GiB |
+| **99** (all 48) | 3.05 | 328.3 | 127.02 | 7.86 | 6.11 s | 6.5 GiB | 151.9 GiB |
+
+**Decode cost per offloaded layer is set by bytes, not by architecture.** deepseek4 costs
+**3.56 ms/token per layer** (88.19 → 187.95 across 27 layers), qwen4exp **2.24** (23.99 → 127.02 across
+46). The ratio of those costs is 1.59; the ratio of their expert bytes per layer, 3.38 / 2.11 GiB, is
+1.60. Decode under offload is purely transfer-bound — only the bytes crossing PCIe matter. This is a
+sharper statement of the ~2.1 ms/layer figure above, which was measured on two models that happened to
+have similar per-layer expert sizes.
+
+**Prefill degrades far more gently than decode.** Over its full range deepseek4 loses 2.1× on decode
+but only 1.5× on prefill; qwen4exp 5.3× against 3.0×. Offloading spends decode first, which is the
+right trade for prompt-heavy work.
+
+**deepseek4's first four layers past the floor are nearly free on prefill.** `-ncmoe` 16 → 20 moves
+prefill 410.7 → 410.2 tok/s, inside noise, while decode drops 14 %. If you need 3.4 GiB/device back and
+your workload is prompt-heavy, 20 costs almost nothing.
+
+**The floor for deepseek4 Q4_K is `-ncmoe 16`**, and it is a hard one. `-ncmoe 8` aborts after 19 s on
+a `cudaMalloc` failure; `-ncmoe 2` is arithmetically impossible — 146.6 GiB of resident weights against
+127.4 GiB usable. At 16 the devices sit at 31.6 of 32.8 GiB.
+
+Two caveats when reading the last column. For qwen4exp it is dominated by the always-host per-layer
+embeddings, so at `-ncmoe 2` only 4.2 GiB of the 54.9 is actually experts — the two models' RAM columns
+are not measuring the same thing. And TTFT is end-to-end client wall clock including HTTP, so it tracks
+`PP total + one decode step` closely rather than exactly.
+
+These runs use an **even** tensor split. `server-qwen38-flash.bat` ships `-ts 1.15,1.15,0.7,1.15`, which
+OOMs at `-ncmoe` 2 and 8: it drives devices 1 and 3 to 27.3 GiB while device 2 idles at 16.5. That is
+the same conclusion as the skew experiment in [Things that were measured and
+rejected](#things-that-were-measured-and-rejected) — the binding device is what sets the floor.
 
 ### `-ncmoe` at `-c 16384` — the dominant lever
 
