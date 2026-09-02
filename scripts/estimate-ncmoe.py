@@ -14,9 +14,10 @@ not attempt to model multi-GPU tensor-split imbalance (see docs/moe-offload.md
 on why -ncmoe's "first N layers" isn't necessarily a balanced split).
 
 Also prints a ready-to-run llama-server/llama-cli command line with the
-suggested -ncmoe value plugged in, plus --load-mode none and (for -sm tensor)
-GGML_META_STAGE_SLOTS / GGML_META_PARTIAL_COPY, per the recipe in
-docs/moe-offload.md.
+suggested -ncmoe value plugged in, plus --load-mode none, (for -sm tensor)
+GGML_META_STAGE_SLOTS / GGML_META_PARTIAL_COPY, and (for multi-GPU)
+GGML_CUDA_ALLREDUCE / GGML_CUDA_P2P / GGML_CUDA_P2P_AR_MAX_BYTES, per the
+recipe in docs/moe-offload.md.
 
 Usage:
     python scripts/estimate-ncmoe.py model.gguf --vram-gib 32
@@ -24,6 +25,8 @@ Usage:
         --compute-buffer-gib 2.5 --headroom-gib 1.0
     python scripts/estimate-ncmoe.py model.gguf --vram-gib 32 --gpus 4 \
         --binary llama-server --sm tensor --stage-slots 8 --partial-copy
+    python scripts/estimate-ncmoe.py model.gguf --vram-gib 32 --gpus 4 \
+        --partial-copy --allreduce internal --p2p --p2p-ar-max-bytes 1048576
 """
 
 import argparse
@@ -126,6 +129,19 @@ def print_command(args, ncmoe, offloading_experts, cmoe_all=False):
         print("(note: --stage-slots / --partial-copy only apply under -sm tensor with offloaded "
               "experts; omitted from the command below)")
 
+    # How the devices talk to each other, so these apply to any multi-GPU run, with or without
+    # offloaded experts.
+    if args.gpus > 1:
+        if args.allreduce is not None:
+            env["GGML_CUDA_ALLREDUCE"] = args.allreduce
+        if args.p2p:
+            env["GGML_CUDA_P2P"] = "1"
+        if args.p2p_ar_max_bytes is not None:
+            env["GGML_CUDA_P2P_AR_MAX_BYTES"] = str(args.p2p_ar_max_bytes)
+    elif args.allreduce is not None or args.p2p or args.p2p_ar_max_bytes is not None:
+        print("(note: --allreduce / --p2p / --p2p-ar-max-bytes need more than one GPU; omitted "
+              "from the command below)")
+
     argv = [args.binary, "-m", str(args.gguf_path)]
     if split_mode:
         argv += ["-sm", split_mode]
@@ -180,15 +196,25 @@ def main():
                           "--gpus > 1, otherwise omitted)")
     ap.add_argument("--ctx", type=int, default=262144, help="-c/--ctx-size value to include in the printed command")
     ap.add_argument("--ubatch", type=int, default=4096,
-                     help="-ub/--ubatch-size value to include in the printed command (default 1024, "
+                     help="-ub/--ubatch-size value to include in the printed command (default 4096, "
                           "see docs/moe-offload.md -- larger ubatch generally helps prefill throughput "
                           "with CPU-resident experts)")
-    ap.add_argument("--stage-slots", type=int, default=2,
-                     help="GGML_META_STAGE_SLOTS to include (only meaningful with -sm tensor; "
-                          "default 4 if -sm tensor is selected and experts are offloaded, omitted otherwise)")
+    ap.add_argument("--stage-slots", type=int, default=4,
+                     help="GGML_META_STAGE_SLOTS to include (only meaningful with -sm tensor and "
+                          "offloaded experts; default 4, omitted otherwise)")
     ap.add_argument("--partial-copy", action="store_true",
                      help="include GGML_META_PARTIAL_COPY=1 in the printed command "
                           "(only worth it for decode-heavy/low-batch workloads, see docs/moe-offload.md)")
+    ap.add_argument("--allreduce", choices=("nccl", "internal", "none"), default=None,
+                     help="GGML_CUDA_ALLREDUCE to include (needs more than one GPU). Omit to leave "
+                          "the platform default: nccl on Linux, internal elsewhere")
+    ap.add_argument("--p2p", action="store_true",
+                     help="include GGML_CUDA_P2P=1 (needs more than one GPU) to enable peer access; "
+                          "NCCL builds already enable it implicitly")
+    ap.add_argument("--p2p-ar-max-bytes", type=int, default=None,
+                     help="GGML_CUDA_P2P_AR_MAX_BYTES to include (needs more than one GPU): size "
+                          "ceiling for the one-shot P2P allreduce, which beats a ring on small "
+                          "latency-bound messages. In-tree default is 1048576; 0 disables it")
     ap.add_argument("--host", default=None, help="--host value to include for llama-server")
     ap.add_argument("--port", type=int, default=None, help="--port value to include for llama-server")
     args = ap.parse_args()
