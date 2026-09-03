@@ -1152,19 +1152,11 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         // MLA without the absorption optimization: uses the unsplit attn_kv_b instead of attn_k_b/attn_v_b
         case LLM_ARCH_MINICPM3:
         case LLM_ARCH_GEMMA3N:
-        // Mamba-2 fuses z, x, B, C and dt into one in projection. B and C are shared by a group of heads,
-        //   so splitting that tensor by head would split them too - it needs a per-segment split plus
-        //   n_group large enough to distribute, which ggml_ssm_scan does not accept yet.
-        case LLM_ARCH_MAMBA2:
-        case LLM_ARCH_FALCON_H1:
         case LLM_ARCH_OLMO2:
         case LLM_ARCH_OLMOE:
         case LLM_ARCH_DOTS3NOTE:
         case LLM_ARCH_BITNET:
         case LLM_ARCH_T5:
-        case LLM_ARCH_NEMOTRON_H:
-        case LLM_ARCH_NEMOTRON_H_MOE:
-        case LLM_ARCH_GRANITE_HYBRID:
         case LLM_ARCH_MINIMAX_M2:
         case LLM_ARCH_MINIMAX_M3:
         case LLM_ARCH_QWEN3TTS:

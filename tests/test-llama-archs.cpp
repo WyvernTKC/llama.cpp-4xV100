@@ -184,9 +184,13 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         std::vector<uint32_t> n_head_kv_per_layer;
         n_head_per_layer.reserve(n_layer);
         n_head_kv_per_layer.reserve(n_layer);
+        // Nemotron-H has three kinds of layer: recurrent, attention and FFN only. Its FFN layers
+        //   declare no kv heads, which the other hybrids here do not do.
+        const bool ffn_layers_have_no_attn = arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE;
         for (uint32_t il = 0; il < n_layer; il++) {
+            const bool no_attn = il == 1 || (ffn_layers_have_no_attn && il >= 2);
             n_head_per_layer.push_back(il == 1 ? 0 : n_head);
-            n_head_kv_per_layer.push_back(il == 1 ? 0 : n_head_kv);
+            n_head_kv_per_layer.push_back(no_attn ? 0 : n_head_kv);
         }
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head_per_layer);
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_kv_per_layer);
@@ -328,6 +332,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         arch == LLM_ARCH_DEEPSEEK4 ? uint32_t(4) : uint32_t(2)); // sqrtsoftplus : sigmoid
         ms.add_kv(LLM_KV_EXPERT_GROUP_SCALE,         1.0f);
         ms.add_kv(LLM_KV_EXPERTS_PER_GROUP,          uint32_t(1));
+        if (arch == LLM_ARCH_NEMOTRON_H_MOE) {
+            ms.add_kv(LLM_KV_MOE_LATENT_SIZE,        n_embd / 2); // experts run in a latent space smaller than n_embd
+        }
     }
 
     ms.add_kv(LLM_KV_POSNET_EMBEDDING_LENGTH,   n_embd);
@@ -345,8 +352,13 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     //   instead of one that silently falls back to the CPU
     const bool ssm_mamba1 = arch == LLM_ARCH_MAMBA || arch == LLM_ARCH_JAMBA;
     ms.add_kv(LLM_KV_SSM_STATE_SIZE,            uint32_t(ssm_mamba1 ? 16 : 128));
-    ms.add_kv(LLM_KV_SSM_TIME_STEP_RANK,        n_head);
-    ms.add_kv(LLM_KV_SSM_GROUP_COUNT,           arch == LLM_ARCH_PLAMO2 ? 0 : uint32_t(ssm_mamba1 ? 1 : 2));
+    // The grouped Mamba-2 archs split their mixer in whole groups, so give them enough groups to
+    //   distribute over the devices and a head count that is a multiple of them
+    const bool ssm_grouped = arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE ||
+        arch == LLM_ARCH_MAMBA2 || arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_GRANITE_HYBRID;
+    ms.add_kv(LLM_KV_SSM_TIME_STEP_RANK,        ssm_grouped ? uint32_t(8) : n_head);
+    ms.add_kv(LLM_KV_SSM_GROUP_COUNT,           arch == LLM_ARCH_PLAMO2 ? 0 :
+                                                    uint32_t(ssm_mamba1 ? 1 : (ssm_grouped ? 4 : 2)));
     ms.add_kv(LLM_KV_KDA_HEAD_DIM,              uint32_t(128));
     ms.add_kv(LLM_KV_KDA_SAFE_GATE,              true);
     ms.add_kv(LLM_KV_KDA_GATE_LOWER_BOUND,       -5.0f);
@@ -501,6 +513,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_HY_V3:
         case LLM_ARCH_OPENAI_MOE:
         case LLM_ARCH_LFM2MOE:
+        case LLM_ARCH_NEMOTRON_H_MOE:
         case LLM_ARCH_SMALLTHINKER:
         case LLM_ARCH_LLADA_MOE:
         case LLM_ARCH_GROVEMOE:
@@ -532,6 +545,7 @@ static bool moe_implemented(const llm_arch arch) {
         case LLM_ARCH_MINICPM:
         case LLM_ARCH_GRANITE:
         case LLM_ARCH_GRANITE_MOE:
+        case LLM_ARCH_GRANITE_HYBRID:
         case LLM_ARCH_MISTRAL3:
         case LLM_ARCH_LLAMA_EMBED:
             return true;

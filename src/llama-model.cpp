@@ -433,6 +433,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
     // mamba
     static const std::regex pattern_ssm_in          ("blk\\.\\d*\\.ssm_in\\.weight");
+    static const std::regex pattern_ssm_norm        ("blk\\.\\d*\\.ssm_norm\\.weight");
+    static const std::regex pattern_ssm_scale       ("blk\\.\\d*\\.ssm_\\w+\\.(input_)?scale");
     static const std::regex pattern_ssm_conv1d_bias ("blk\\.\\d*\\.ssm_conv1d\\.bias");
     static const std::regex pattern_ssm_x           ("blk\\.\\d*\\.ssm_x\\.weight");
     static const std::regex pattern_ssm_dt_weight   ("blk\\.\\d*\\.ssm_dt\\.weight");
@@ -514,6 +516,51 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
         GGML_ASSERT(tensor_axis_0 != nullptr);
         return {axis, tensor_axis_0, il, rotation};
+    };
+
+    // Mamba-2 keeps z, x, B, C and dt in one fused in projection, and x, B, C in one fused conv.
+    //   B and C are shared by a group of heads instead of being per head.
+    auto is_mamba2_grouped = [&]() -> bool {
+        switch (ud->model->arch) {
+            case LLM_ARCH_MAMBA2:
+            case LLM_ARCH_FALCON_H1:
+            case LLM_ARCH_NEMOTRON_H:
+            case LLM_ARCH_NEMOTRON_H_MOE:
+            case LLM_ARCH_GRANITE_HYBRID:
+                return true;
+            default:
+                return false;
+        }
+    };
+
+    // Those fused tensors can only be split if every device gets whole groups: ssm_scan takes the group
+    //   from the head as h/(n_head/n_group), so the heads and the groups have to be split the same way.
+    //   ssm_out is split along its row dim, so one group of features also has to be a whole quant block.
+    auto ssm_group_split_ok = [&](ggml_type type_ssm_out) -> bool {
+        const int64_t n_group = hparams.ssm_n_group;
+        const int64_t n_head  = hparams.ssm_dt_rank;
+        const int64_t d_inner = hparams.ssm_d_inner;
+        if (n_group <= 0 || n_head <= 0 || d_inner <= 0) {
+            return false;
+        }
+        if (n_group % ud->n_devices != 0 || n_head % n_group != 0 || d_inner % n_group != 0) {
+            return false;
+        }
+        return (d_inner/n_group) % ggml_blck_size(type_ssm_out) == 0;
+    };
+
+    // Falcon-H1 runs softmax attention beside the Mamba mixer in every layer, so all of its layers are
+    //   marked recurrent even though they also carry ordinary attention tensors. Those follow the
+    //   regular attention rules, not the mixer's, so they have to be told apart by name.
+    auto in_parallel_attn = [&]() -> bool {
+        if (ud->model->arch != LLM_ARCH_FALCON_H1) {
+            return false;
+        }
+        return std::regex_match(tensor_name, pattern_q_weight)   || std::regex_match(tensor_name, pattern_q_bias) ||
+               std::regex_match(tensor_name, pattern_kv_weight)  || std::regex_match(tensor_name, pattern_kv_bias) ||
+               std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias) ||
+               std::regex_match(tensor_name, pattern_qk_norm)    || std::regex_match(tensor_name, pattern_kv_cache) ||
+               std::regex_match(tensor_name, pattern_attn_out_weight);
     };
 
     // whether the tensor belongs to a recurrent/linear attention layer
@@ -671,6 +718,31 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);  // [n_seq_tokens, n_seq_tokens, n_head, n_seqs]
             }
         }
+        // A Mamba-2 mixer that cannot hand every device whole groups runs replicated instead, the same
+        //   way the LFM2 shortconv block does. Layers do not share any of these tensors, so the choice is
+        //   made per layer, and it covers the mixer only - a layer can also hold attention and an FFN.
+        if (is_mamba2_grouped() &&
+                (tensor_name.find(".ssm_") != std::string::npos ||
+                 std::regex_match(tensor_name, pattern_r_cache) ||
+                 std::regex_match(tensor_name, pattern_s_cache)) &&
+                !ssm_group_split_ok(get_tensor_config_impl(
+                    GGML_BACKEND_SPLIT_AXIS_MIRRORED, "ssm_out.weight").tensor_axis_0->type)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+        // The grouped RMS norm is [d_inner/n_group, n_group] and normalizes inside a group, so the
+        //   group index on dim 1 is what gets split. A single group leaves it 1-D with nothing to split.
+        if (is_mamba2_grouped() && std::regex_match(tensor_name, pattern_ssm_norm) && ggml_n_dims(tensor) >= 2) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
+        }
+        // A mixer weight's ".scale"/".input_scale" companion is a per-tensor scalar that multiplies the
+        //   whole result, so it stays replicated even when the weight itself is split. One value per
+        //   output channel would instead have to repeat that weight's segmented split, so check the
+        //   shape rather than assume it.
+        if (std::regex_match(tensor_name, pattern_ssm_scale)) {
+            GGML_ASSERT(ggml_nelements(tensor) == 1);
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+
         // Mamba selective state space. The heads of the inner dim are independent and get split; the
         //   projection that derives B, C and dt from them reduces over that dim, so it is split along
         //   dim 0 and all-reduced, which leaves B and C replicated the way ssm_scan needs them.
@@ -681,7 +753,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
         }
         if (std::regex_match(tensor_name, pattern_ssm_d) || std::regex_match(tensor_name, pattern_ssm_conv1d_bias)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight");
+            // Mamba-1 has one value per channel of the inner dim, Mamba-2 one per head as [1, n_head]
+            const ggml_backend_meta_split_axis axis = std::regex_match(tensor_name, pattern_ssm_d) &&
+                ggml_n_dims(tensor) >= 2 ? GGML_BACKEND_SPLIT_AXIS_1 : GGML_BACKEND_SPLIT_AXIS_0;
+            return get_tensor_config_impl(axis, "ssm_out.weight");
         }
 
         // Kimi delta attention. Like the other linear attention variants it is split by head, but its
@@ -838,6 +913,29 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return {{d_inner, 2}};
         }
 
+        // Mamba-2 fuses z, x, B, C and dt into the in projection and x, B, C into the conv. z, x and dt
+        //   are per head, B and C per group, so each block is its own segment. Every segment holds the
+        //   same number of groups, which is what keeps their per-device boundaries lined up.
+        if (is_mamba2_grouped() && hparams.is_recr(il)) {
+            const int64_t d_inner = hparams.ssm_d_inner;
+            const int64_t d_bc    = hparams.ssm_n_group * hparams.ssm_d_state;
+            const int64_t n_head  = hparams.ssm_dt_rank;
+            if (std::regex_match(tensor_name, pattern_ssm_in)) {
+                GGML_ASSERT(tensor->ne[axis] == 2*d_inner + 2*d_bc + n_head);
+                return {{d_inner, 2}, {d_bc, 2}, {n_head, 1}};
+            }
+            if (std::regex_match(tensor_name, pattern_ssm_conv1d) ||
+                    std::regex_match(tensor_name, pattern_ssm_conv1d_bias)) {
+                GGML_ASSERT(tensor->ne[axis] == d_inner + 2*d_bc);
+                return {{d_inner, 1}, {d_bc, 2}};
+            }
+            if (std::regex_match(tensor_name, pattern_r_cache)) {
+                const int64_t d_conv1 = hparams.ssm_d_conv - 1;
+                GGML_ASSERT(tensor->ne[axis] == d_conv1*(d_inner + 2*d_bc));
+                return {{d_conv1*d_inner, 1}, {d_conv1*d_bc, 2}};
+            }
+        }
+
         if (hparams.n_embd_head_kda != 0 && hparams.is_recr(il)) {
             // recurrent layers are marked by having no kv heads, so their head count is the model-wide one
             const int64_t d_inner = hparams.n_head() * hparams.n_embd_head_kda;
@@ -857,7 +955,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         // note: recurrent layers can have a fused qkv tensor with a layout that differs from regular attention,
         //   those are handled by the per-arch code above or fall through to a single segment
-        if (!hparams.is_recr(il) &&
+        if ((!hparams.is_recr(il) || in_parallel_attn()) &&
                 (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias))) {
             const int64_t n_embd      = hparams.n_embd;
             const int64_t n_embd_gqa  = hparams.n_embd_v_gqa(il);
@@ -895,7 +993,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 return {std::lcm(std::lcm(blck_size, (int64_t) 128), head_dim) / head_dim};
             }
         }
-        if (hparams.is_recr(il)) {
+        if (hparams.is_recr(il) && !in_parallel_attn()) {
             // linear attention
             const int64_t head_dim        = hparams.n_embd_head_recr();
             const int64_t blck_size_perf  = std::lcm(blck_size, 128);
@@ -917,6 +1015,42 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 const int64_t head_dim_m = hparams.ssm_d_inner / n_head_ssm;
                 const int64_t g_feat     = std::lcm(std::lcm(blck_size, (int64_t) 128), head_dim_m);
                 const int64_t g_heads    = g_feat / head_dim_m;
+
+                // A grouped Mamba-2 splits in whole groups rather than whole heads, so every tensor
+                //   gets one group converted into its own units. That gives each of them the same unit
+                //   count - n_group - so the proportional split puts their boundaries in the same place.
+                if (is_mamba2_grouped()) {
+                    const int64_t n_group = hparams.ssm_n_group;
+                    const int64_t d_state = hparams.ssm_d_state;
+                    const int64_t gg_feat = hparams.ssm_d_inner / n_group;
+                    const int64_t gg_head = n_head_ssm / n_group;
+
+                    if (std::regex_match(tensor_name, pattern_ssm_in)) {
+                        return {gg_feat, d_state, gg_head};
+                    }
+                    if (std::regex_match(tensor_name, pattern_ssm_conv1d) ||
+                            std::regex_match(tensor_name, pattern_ssm_conv1d_bias)) {
+                        return {gg_feat, d_state};
+                    }
+                    if (std::regex_match(tensor_name, pattern_r_cache)) {
+                        const int64_t d_conv1 = hparams.ssm_d_conv - 1;
+                        return {d_conv1*gg_feat, d_conv1*d_state};
+                    }
+                    GGML_ASSERT(segments.size() == 1);
+                    if (std::regex_match(tensor_name, pattern_ssm_out_weight)) {
+                        return {gg_feat};
+                    }
+                    if (std::regex_match(tensor_name, pattern_ssm_norm)) {
+                        return {1}; // already indexed by group
+                    }
+                    if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a) ||
+                            std::regex_match(tensor_name, pattern_ssm_d)) {
+                        return {gg_head};
+                    }
+                    if (std::regex_match(tensor_name, pattern_s_cache)) {
+                        return {d_state*gg_feat};
+                    }
+                }
 
                 if (std::regex_match(tensor_name, pattern_ssm_in)) {
                     // Mamba-1 stores x and z as two blocks, PLaMo-2 interleaves them per head
@@ -1007,8 +1141,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 GGML_ASSERT(segments.size() == 1);
                 return {g_heads * head_v};
             }
-        } else {
-            // regular attention
+        } else if (hparams.n_head_kv(il) != 0) {
+            // regular attention - a layer without kv heads has no attention tensors, and its n_gqa is 0
             const uint32_t n_gqa    = hparams.n_gqa(il);
             const uint32_t n_embd_q = n_gqa * hparams.n_embd_head_k(il);
 

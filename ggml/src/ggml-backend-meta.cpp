@@ -963,8 +963,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         //   dt [n_head, n_seq_tokens, n_seqs]     A [1 or d_state, n_head]
         //   B, C [d_state, n_group, n_seq_tokens, n_seqs]   ids [n_seqs]
         // The heads are independent, so they are what gets split. B and C are shared by all heads of a
-        //   group; splitting them would need n_group to be divisible by the device count, so for now they
-        //   have to be replicated.
+        //   group, so they are either replicated, or split along their group dim when the head split
+        //   gives every device whole groups - the op takes the group as h/(n_head/n_group), which that
+        //   split leaves unchanged.
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
                 src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
@@ -979,6 +980,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             GGML_BACKEND_SPLIT_AXIS_MIRRORED, // ids
         };
         for (int i = 0; i < 7; i++) {
+            if ((i == 4 || i == 5) && src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_1) {
+                continue; // B/C split by group
+            }
             if (src_ss[i].axis != axis_want[i]) {
                 static const char * src_name[7] = {"s", "x", "dt", "A", "B", "C", "ids"};
                 GGML_ABORT("ssm_scan src[%d] (%s = %s) is split along axis %d, expected %d",
