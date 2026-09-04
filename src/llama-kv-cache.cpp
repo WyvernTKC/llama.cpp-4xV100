@@ -1591,6 +1591,10 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
             const auto & cells = v_cells.at(seq_to_stream[seq_id]);
 
+            // the seq check in the cell loop below reads a 32 byte bitset per cell, which dominates
+            // the loop at large n_kv - skip it when is_empty() already gives the same answer
+            const bool seq_all = cells.seq_has_all(seq_id);
+
                   llama_pos p0 = -1;
             const llama_pos p1 = ubatch->pos[i];
 
@@ -1646,7 +1650,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 }
 
                 // mask the token if not the same sequence
-                if (!cells.seq_has(j, seq_id)) {
+                if (!seq_all && !cells.seq_has(j, seq_id)) {
                     goto skip;
                 }
 

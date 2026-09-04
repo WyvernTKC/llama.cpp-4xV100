@@ -1,4 +1,4 @@
-# MoE expert offload: `-ncmoe`, `GGML_META_PARTIAL_COPY`, `GGML_META_STAGE_SLOTS`
+# MoE expert offload: `-ncmoe`, `GGML_META_PARTIAL_COPY`, `GGML_META_STAGE_SLOTS`, `GGML_META_MOE_OFFLOAD_MIN_EXPERTS`
 
 These three knobs control where a MoE model's expert weights live and how they get
 streamed to the GPU(s) when they don't fit in VRAM. They matter most for large MoE
@@ -117,19 +117,50 @@ tensor's size, times however many devices stage concurrently) — don't raise it
 past the point of measurable benefit, and watch for OOM if you're already close
 to the VRAM ceiling from `-ncmoe` residency choices.
 
+## `GGML_META_MOE_OFFLOAD_MIN_EXPERTS` (env var)
+
+```
+GGML_META_MOE_OFFLOAD_MIN_EXPERTS=N   # default 64, set 0 to disable
+```
+
+`-sm tensor`-only. The meta backend normally offloads an op only above the CUDA
+backend's batch threshold (~32 tokens), but for `mul_mat_id` it also offloads
+unconditionally once the tensor has at least N experts. The reasoning is that one
+token touches only `n_expert_used/n_expert` of the tensor, divided again by the
+device count, so the transfer is small enough to be worth it at any batch size.
+
+**That gate mispredicts for models with many large experts.** It keys on the
+expert *count* as a proxy for bytes per token, which breaks down when the
+per-layer expert tensors are big. Measured on 4x V100, `-ncmoe` decode (tg128):
+
+| model | experts | `-sm layer` | `-sm tensor` | `-sm tensor`, `MIN_EXPERTS=0` |
+| --- | --- | --- | --- | --- |
+| granitehybrid 32B | 72 | 14.16 | 1.58 | 14.28 |
+| nemotron_h_moe 33B | 128 | 36.5 | 1.3 | 31.1 |
+
+Setting it to 0 costs nothing on prefill - at prefill batch sizes the plain
+threshold already streams the experts, so the "always" gate only ever changes
+small-batch behaviour, i.e. exactly decode. Output is byte-identical either way.
+
+**Tuning:** set `0` for any model with >= 64 experts unless you have measured
+otherwise; leave it alone for the 256-expert models it was tuned on (qwen35moe,
+deepseek4), whose experts are individually much smaller. If it is ever retuned in
+tree it should key on staged bytes per token rather than `ne[2]`.
+
 ## Quick recipe
 
 For a MoE model too large for VRAM under `-sm tensor`:
 
 ```bash
-GGML_META_STAGE_SLOTS=8 ./llama-server \
+GGML_META_STAGE_SLOTS=8 GGML_META_MOE_OFFLOAD_MIN_EXPERTS=0 ./llama-server \
   -m model.gguf \
   -sm tensor \
   -ncmoe <N>       \
   -lm none         \
   -ub 1024
+# MIN_EXPERTS=0 matters for >= 64 experts; drop it for the 256-expert models
 # add GGML_META_PARTIAL_COPY=1 only if your workload is decode/low-batch heavy
 ```
 
 Use [scripts/estimate-ncmoe.py](../scripts/estimate-ncmoe.py) to get a starting
-value for `<N>` from your GGUF file and GPU VRAM.
+value for `<N>` from your GGUF file and GPU VRAM. It sizes the KV cache from the model's own per-layer head counts and your `-c`, and prints the env vars above with it.

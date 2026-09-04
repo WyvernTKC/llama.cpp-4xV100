@@ -318,6 +318,16 @@ public:
         return seq[i].test(seq_id);
     }
 
+    // check if every used cell contains seq_id
+    // when true, seq_has(i, seq_id) gives the same answer as !is_empty(i)
+    // seq_pos[seq_id] holds one entry per cell with seq_id and such cells are always used
+    bool seq_has_all(llama_seq_id seq_id) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        return seq_pos[seq_id].size() == used.size();
+    }
+
     // the token of the cell of sequence seq_id at the largest position <= p
     // when several cells share that position, the one with the highest index wins
     // return LLAMA_TOKEN_NULL if the sequence has no cell at or before p

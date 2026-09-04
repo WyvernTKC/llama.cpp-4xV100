@@ -7,6 +7,12 @@ figures out how many of the largest-to-fit layers' worth of experts have to stay
 on the CPU for the rest of the model + KV cache + compute buffer to fit in the
 VRAM you give it.
 
+The KV cache size is computed from the model's own per-layer head counts and
+your --ctx, mirroring what llama_kv_cache allocates: n_embd_k_gqa/n_embd_v_gqa
+per attention layer, K-only for MLA models, and per-sequence recurrent state for
+the mamba layers of a hybrid. --kv-gib overrides it if you already have the exact
+figure from a load log.
+
 This is a starting point, not a substitute for reading the actual `model buffer
 size` / `KV buffer size` / `compute buffer size` lines llama.cpp prints at load
 time -- always confirm against those and adjust. In particular this script does
@@ -15,9 +21,15 @@ on why -ncmoe's "first N layers" isn't necessarily a balanced split).
 
 Also prints a ready-to-run llama-server/llama-cli command line with the
 suggested -ncmoe value plugged in, plus --load-mode none, (for -sm tensor)
-GGML_META_STAGE_SLOTS / GGML_META_PARTIAL_COPY, and (for multi-GPU)
-GGML_CUDA_ALLREDUCE / GGML_CUDA_P2P / GGML_CUDA_P2P_AR_MAX_BYTES, per the
-recipe in docs/moe-offload.md.
+GGML_META_STAGE_SLOTS / GGML_META_PARTIAL_COPY /
+GGML_META_MOE_OFFLOAD_MIN_EXPERTS, and (for multi-GPU) GGML_CUDA_ALLREDUCE /
+GGML_CUDA_P2P / GGML_CUDA_P2P_AR_MAX_BYTES, per the recipe in
+docs/moe-offload.md.
+
+GGML_META_MOE_OFFLOAD_MIN_EXPERTS is pinned to 0 for models with >= 64 experts:
+the in-tree default of 64 makes the meta backend stream offloaded experts at
+batch 1 as well, which measured 9-24x slower decode on nemotron_h_moe and
+granitehybrid while leaving prefill unchanged.
 
 Usage:
     python scripts/estimate-ncmoe.py model.gguf --vram-gib 32
@@ -48,6 +60,31 @@ def get_field_int(reader, suffix):
     for key, field in reader.fields.items():
         if key.endswith(suffix) and field.parts:
             return int(field.parts[field.data[0]][0])
+    return None
+
+
+def get_field_int_list(reader, suffix, n):
+    """Per-layer ints for a key that llama.cpp allows to be a scalar or a per-layer array."""
+    for key, field in reader.fields.items():
+        if key.endswith(suffix) and field.parts:
+            vals = [int(field.parts[i][0]) for i in field.data]
+            if len(vals) == 1:
+                return [vals[0]] * n
+            if len(vals) >= n:
+                return vals[:n]
+            return vals + [vals[-1]] * (n - len(vals))
+    return [0] * n
+
+
+def get_field_bool_list(reader, suffix, n):
+    """Per-layer bools for a key stored as an array (e.g. attention.sliding_window_pattern)."""
+    for key, field in reader.fields.items():
+        if key.endswith(suffix) and field.parts:
+            vals = [bool(field.parts[i][0]) for i in field.data]
+            if len(vals) >= n:
+                return vals[:n]
+            if vals:
+                return vals + [vals[-1]] * (n - len(vals))
     return None
 
 
@@ -116,7 +153,137 @@ def layer_index(name: str):
         return None
 
 
-def print_command(args, ncmoe, offloading_experts, cmoe_all=False):
+# f16 is the default kv cache type; the quantized ones are close enough to their
+# bytes-per-weight for a VRAM estimate.
+KV_TYPE_BYTES = {"f16": 2.0, "bf16": 2.0, "f32": 4.0, "q8_0": 34.0/32, "q5_1": 24.0/32, "q4_0": 18.0/32}
+
+
+# These use their own cache class (llama_kv_cache_dsv4) with fixed-size windows plus a separate
+# compressed CSA cache, so the size does not follow from the generic head counts and does not scale
+# with -c at all. Measured: 768- and 512-cell caches, unchanged between ctx 2048 and 16384.
+ARCH_OPAQUE_KV = {"deepseek4", "dflash"}
+
+
+def estimate_kv_bytes(reader, n_layers, n_ctx, n_seq, type_k, type_v, n_ubatch):
+    """Per-layer KV cache size, mirroring llama_kv_cache's allocation.
+
+    llama-kv-cache.cpp allocates n_embd_k_gqa(il) x kv_size for K and n_embd_v_gqa(il) x kv_size
+    for V per layer, with has_v = !is_mla, and hparams.n_embd_k_gqa = n_embd_head_k * n_head_kv.
+    Layers with no kv heads are recurrent instead: they hold n_embd_r + n_embd_s per *sequence*,
+    not per token.
+
+    Returns (bytes, n_attn_layers, n_recr_layers, notes), or (None, None, None, notes) for an
+    architecture whose cache cannot be derived from the generic metadata. Validated against the
+    llama_kv_cache / llama_memory_recurrent lines of real load logs -- exact on nemotron_h_moe
+    (hybrid + MTP), qwen35moe and qwen3next (linear-attention stride), gemma4 (ISWA) and the
+    120B nemotron_h_moe.
+    """
+    arch_field = reader.get_field("general.architecture")
+    arch = arch_field.contents() if arch_field is not None else None
+    if arch in ARCH_OPAQUE_KV:
+        return None, None, None, [
+            f"{arch} uses its own KV cache (fixed windows + a compressed CSA cache) that does not "
+            "follow from the generic head counts, and does not scale with -c. Pass --kv-gib with "
+            "the figure from a load log; treating it as 0 here."]
+
+    n_head    = get_field_int(reader, "attention.head_count") or 0
+    n_embd    = get_field_int(reader, "embedding_length") or 0
+    head_k    = get_field_int(reader, "attention.key_length")
+    head_v    = get_field_int(reader, "attention.value_length")
+    if head_k is None:
+        head_k = (n_embd // n_head) if n_head else 0
+    if head_v is None:
+        head_v = head_k
+
+    kv_lora   = get_field_int(reader, "attention.kv_lora_rank")
+    n_rot     = get_field_int(reader, "rope.dimension_count") or 0
+    is_mla    = kv_lora is not None and kv_lora > 0
+
+    # Interleaved sliding-window attention (Gemma-style): the SWA layers get their own, much
+    # shorter cache, and may also use different head dims. Measured on test-gemma4moe: 5 full
+    # layers at 4096 cells plus 25 SWA layers at swa+n_ubatch = 1536 cells, not 30 x 4096.
+    swa_window = get_field_int(reader, "attention.sliding_window") or 0
+    swa_pattern = get_field_bool_list(reader, "attention.sliding_window_pattern", n_layers)
+    head_k_swa = get_field_int(reader, "attention.key_length_swa") or head_k
+    head_v_swa = get_field_int(reader, "attention.value_length_swa") or head_v
+    n_ctx_swa = min(n_ctx, swa_window + n_ubatch) if swa_window else n_ctx
+
+    # Linear-attention hybrids (Qwen 3 Next / 3.5) mark the recurrent layers with a stride instead
+    # of n_head_kv == 0: hparams::set_recr_pattern makes layer il recurrent when
+    # il % interval < interval - 1. Measured on test-ornith: interval 4 over 40 layers = 10 attn.
+    attn_interval = get_field_int(reader, "full_attention_interval") or 0
+
+    # A hybrid marks its mamba layers with n_head_kv == 0, but so are its FFN-only layers: the
+    # is_recr rule these models use is (n_head_kv == 0 && n_ff == 0), so both arrays are needed or
+    # the recurrent state gets counted twice over (measured: 46 layers guessed vs 23 allocated).
+    head_kv_per_layer = get_field_int_list(reader, "attention.head_count_kv", n_layers)
+    n_ff_per_layer    = get_field_int_list(reader, "feed_forward_length", n_layers)
+
+    # Trailing NextN/MTP blocks are not part of the trunk: llama.cpp reports their weights as
+    # "unused tensor blk.N.*" and the kv cache filters them out.
+    n_mtp = get_field_int(reader, "nextn_predict_layers") or 0
+    n_trunk = max(0, n_layers - n_mtp)
+
+    bytes_k = KV_TYPE_BYTES.get(type_k, 2.0)
+    bytes_v = KV_TYPE_BYTES.get(type_v, 2.0)
+
+    # recurrent state, for the hybrid layers that have no kv heads
+    d_conv  = get_field_int(reader, "ssm.conv_kernel") or 0
+    d_inner = get_field_int(reader, "ssm.inner_size") or 0
+    d_state = get_field_int(reader, "ssm.state_size") or 0
+    n_group = get_field_int(reader, "ssm.group_count") or 0
+    n_embd_r = (d_conv - 1) * (d_inner + 2 * n_group * d_state) if d_conv > 0 else 0
+    n_embd_s = d_state * d_inner
+
+    total = 0.0
+    n_attn = n_recr = n_swa = 0
+    for il in range(n_trunk):
+        n_head_kv = head_kv_per_layer[il]
+        if n_head_kv == 0:
+            if n_ff_per_layer[il] == 0:
+                # recurrent layer: state is per sequence and f32, not per token
+                total += (n_embd_r + n_embd_s) * n_seq * 4.0
+                n_recr += 1
+            # else: an FFN-only layer, which holds no cache of either kind
+            continue
+        if attn_interval and (il % attn_interval) < (attn_interval - 1):
+            # linear attention layer: recurrent state, no per-token KV
+            total += (n_embd_r + n_embd_s) * n_seq * 4.0
+            n_recr += 1
+            continue
+        n_attn += 1
+        if is_mla:
+            # only the latent is cached, and V is absorbed (has_v = !is_mla)
+            total += (kv_lora + n_rot) * n_ctx * bytes_k
+        elif swa_pattern is not None and swa_pattern[il]:
+            n_swa += 1
+            total += head_k_swa * n_head_kv * n_ctx_swa * bytes_k
+            total += head_v_swa * n_head_kv * n_ctx_swa * bytes_v
+        else:
+            total += head_k * n_head_kv * n_ctx * bytes_k
+            total += head_v * n_head_kv * n_ctx * bytes_v
+
+    notes = []
+    if n_mtp:
+        notes.append(f"skipping {n_mtp} trailing NextN/MTP block(s), which hold no cache")
+    if is_mla:
+        notes.append(f"MLA: caching a {kv_lora}+{n_rot} latent per token, no separate V")
+    if n_recr:
+        notes.append(f"{n_recr} recurrent layer(s) hold per-sequence state, not per-token KV")
+    if swa_window:
+        if swa_pattern is not None:
+            notes.append(f"{n_swa} of {n_attn} attn layer(s) are sliding-window, sized at "
+                         f"{n_ctx_swa} cells (window {swa_window} + ubatch {n_ubatch})")
+        else:
+            notes.append(f"model has sliding_window={swa_window} but no per-layer pattern in the "
+                         "metadata; assuming full ctx everywhere, so the real figure is LOWER")
+    if attn_interval:
+        notes.append(f"full_attention_interval={attn_interval}: the other layers are linear "
+                     "attention and hold per-sequence state")
+    return total, n_attn, n_recr, notes
+
+
+def print_command(args, ncmoe, offloading_experts, cmoe_all=False, n_expert=None):
     """Print a ready-to-run command line, per the recipe in docs/moe-offload.md."""
     split_mode = args.split_mode or ("tensor" if args.gpus > 1 else None)
 
@@ -125,6 +292,21 @@ def print_command(args, ncmoe, offloading_experts, cmoe_all=False):
         env["GGML_META_STAGE_SLOTS"] = str(args.stage_slots if args.stage_slots is not None else 4)
         if args.partial_copy:
             env["GGML_META_PARTIAL_COPY"] = "1"
+
+        # ggml_backend_meta_moe_offload_always() streams the offloaded expert matmul at *every*
+        # batch size once n_expert >= GGML_META_MOE_OFFLOAD_MIN_EXPERTS (default 64). That gate is
+        # a proxy for "bytes per token are small", and it mispredicts badly for models with many
+        # large experts: measured on 4x V100, decode went 14.16 -> 1.58 t/s on granitehybrid
+        # (72 experts) and 36.5 -> 1.3 t/s on nemotron_h_moe (128 experts). Setting it to 0 recovers
+        # decode fully and costs nothing on prefill, because at prefill batch sizes the plain CUDA
+        # offload threshold (~32 tokens) already streams them anyway.
+        if args.moe_offload_min_experts is not None:
+            env["GGML_META_MOE_OFFLOAD_MIN_EXPERTS"] = str(args.moe_offload_min_experts)
+        elif n_expert is not None and n_expert >= 64:
+            env["GGML_META_MOE_OFFLOAD_MIN_EXPERTS"] = "0"
+            print(f"(note: n_expert={n_expert} >= 64 would make the meta backend stream offloaded "
+                  "experts at batch 1 too, which costs ~9-24x decode; pinning "
+                  "GGML_META_MOE_OFFLOAD_MIN_EXPERTS=0 below. Prefill is unaffected.)")
     elif args.stage_slots is not None or args.partial_copy:
         print("(note: --stage-slots / --partial-copy only apply under -sm tensor with offloaded "
               "experts; omitted from the command below)")
@@ -178,11 +360,18 @@ def main():
                      help="usable VRAM per GPU, in GiB (before your own headroom margin)")
     ap.add_argument("--gpus", type=int, default=4,
                      help="number of GPUs the model+KV+compute buffer is split across (default 1)")
-    ap.add_argument("--kv-gib", type=float, default=2.0,
-                     help="expected total KV cache size in GiB, if known "
-                          "(e.g. from a prior load log). Omit to skip accounting for it "
-                          "-- do this for MLA/GQA-with-small-KV models where it barely matters, "
-                          "and always double check against the load log for MHA models.")
+    ap.add_argument("--kv-gib", type=float, default=None,
+                     help="override the computed KV cache size, in GiB (e.g. the exact figure from "
+                          "a prior load log). By default the KV size is computed from the model's "
+                          "own head counts and --ctx, so you should not normally need this.")
+    ap.add_argument("--cache-type-k", choices=tuple(KV_TYPE_BYTES), default="f16",
+                     help="-ctk value, used to size the K cache (default f16)")
+    ap.add_argument("--cache-type-v", choices=tuple(KV_TYPE_BYTES), default="f16",
+                     help="-ctv value, used to size the V cache (default f16)")
+    ap.add_argument("--parallel", type=int, default=1,
+                     help="-np/--parallel value: number of sequences. Scales the recurrent state of "
+                          "hybrid models, and is what llama-server multiplies its KV cache by "
+                          "(default 1)")
     ap.add_argument("--compute-buffer-gib", type=float, default=2.0,
                      help="expected compute buffer size in GiB, total across GPUs (default 2.0; "
                           "read the actual value from a load log once you have one)")
@@ -202,6 +391,12 @@ def main():
     ap.add_argument("--stage-slots", type=int, default=4,
                      help="GGML_META_STAGE_SLOTS to include (only meaningful with -sm tensor and "
                           "offloaded experts; default 4, omitted otherwise)")
+    ap.add_argument("--moe-offload-min-experts", type=int, default=None,
+                     help="GGML_META_MOE_OFFLOAD_MIN_EXPERTS to include (only meaningful with "
+                          "-sm tensor and offloaded experts). Omit to let the script decide: it "
+                          "pins 0 when the model has >= 64 experts, which is where the in-tree "
+                          "default of 64 starts costing an order of magnitude of decode speed. "
+                          "Pass 64 to keep the in-tree behaviour")
     ap.add_argument("--partial-copy", action="store_true",
                      help="include GGML_META_PARTIAL_COPY=1 in the printed command "
                           "(only worth it for decode-heavy/low-batch workloads, see docs/moe-offload.md)")
@@ -254,15 +449,30 @@ def main():
     print()
 
     vram_total = args.vram_gib * args.gpus * (1024 ** 3)
-    kv_bytes = (args.kv_gib * (1024 ** 3)) if args.kv_gib is not None else 0.0
+
+    if args.kv_gib is not None:
+        kv_bytes = args.kv_gib * (1024 ** 3)
+        kv_note = ["overridden by --kv-gib"]
+        kv_attn = kv_recr = None
+    else:
+        kv_bytes, kv_attn, kv_recr, kv_note = estimate_kv_bytes(
+            reader, n_layers, args.ctx, args.parallel, args.cache_type_k, args.cache_type_v,
+            args.ubatch)
+        if kv_bytes is None:
+            kv_bytes = 0.0
     compute_bytes = args.compute_buffer_gib * (1024 ** 3)
     headroom_bytes = args.headroom_gib * args.gpus * (1024 ** 3)
 
     budget_for_weights = vram_total - kv_bytes - compute_bytes - headroom_bytes
 
     print(f"VRAM budget: {args.gpus} x {args.vram_gib:.2f} GiB = {human(vram_total)}")
-    if args.kv_gib is not None:
+    if kv_attn is not None:
+        print(f"  - KV cache:              {human(kv_bytes)}  "
+              f"(ctx {args.ctx}, {kv_attn} attn layer(s), {args.cache_type_k}/{args.cache_type_v})")
+    else:
         print(f"  - KV cache:              {human(kv_bytes)}")
+    for note in kv_note:
+        print(f"      note: {note}")
     print(f"  - compute buffer:        {human(compute_bytes)}")
     print(f"  - headroom:              {human(headroom_bytes)}")
     print(f"  = budget for weights:    {human(budget_for_weights)}")
@@ -273,7 +483,7 @@ def main():
               "every expert layer (and possibly non-expert weights too) needs to be offloaded. "
               "Consider -cmoe / --cpu-moe, a smaller context, or fewer GPUs' worth of KV replication.")
         print()
-        print_command(args, ncmoe=None, offloading_experts=True, cmoe_all=True)
+        print_command(args, ncmoe=None, offloading_experts=True, cmoe_all=True, n_expert=n_expert)
         sys.exit(0)
 
     if budget_for_weights >= total_model_bytes:
@@ -281,7 +491,7 @@ def main():
               "(Still confirm against the actual load log: this ignores allocator fragmentation "
               "and multi-GPU tensor-split imbalance.)")
         print()
-        print_command(args, ncmoe=None, offloading_experts=False)
+        print_command(args, ncmoe=None, offloading_experts=False, n_expert=n_expert)
         sys.exit(0)
 
     remaining = budget_for_weights - non_expert_bytes
@@ -314,7 +524,7 @@ def main():
     print("script's largest-fit selection or to balance evenly across multiple GPUs under -sm")
     print("tensor/-sm row. Re-check against the real load log and adjust.")
     print()
-    print_command(args, ncmoe=n_offload, offloading_experts=True)
+    print_command(args, ncmoe=n_offload, offloading_experts=True, n_expert=n_expert)
 
 
 if __name__ == "__main__":
