@@ -956,7 +956,7 @@ decode look host-bound when it was not — a 2.7× difference in host enqueue ti
 | [CANN](docs/build.md#cann) | Ascend NPU |
 | [CUDA](docs/build.md#cuda) | Nvidia GPU |
 | [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon [In Progress]](docs/backend/snapdragon/README.md) | Snapdragon |
+| [Hexagon](docs/backend/snapdragon/README.md) | Snapdragon |
 | [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
 | [MUSA](docs/build.md#musa) | Moore Threads GPU |
 | [Metal](docs/build.md#metal-build) | Apple Silicon |
