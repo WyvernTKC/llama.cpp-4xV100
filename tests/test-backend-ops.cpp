@@ -9416,7 +9416,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     for (int64_t d_conv : {3, 4, 9}) {
-        for (int64_t d_inner: {1024, 1536, 2048}) {
+        // 320 is not a multiple of the CUDA block size, as a tensor-split slice can be
+        for (int64_t d_inner: {320, 1024, 1536, 2048}) {
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {2 * d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
@@ -9429,7 +9430,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
     for (int64_t d_conv : {3, 4, 9}) {
-        for (int64_t d_inner : {1024, 1536, 2048}) {
+        for (int64_t d_inner : {320, 1024, 1536, 2048}) {
             for (bool fuse_bias : {false, true}) {
                 // short token path (n_t <= 32)
                 test_cases.emplace_back(new test_ssm_conv_bias_silu(

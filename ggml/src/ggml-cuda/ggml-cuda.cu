@@ -5752,8 +5752,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
         }
         case GGML_OP_SSM_CONV: {
-            // assumes d_inner % threads == 0
-            return op->src[0]->ne[1] % 128 == 0;
+            // the kernel bounds-checks a d_inner that the block size does not divide
+            return true;
         }
         case GGML_OP_CONT:
             return true;
