@@ -10,16 +10,21 @@ std::unique_ptr<llm_graph_context> llama_model_nemotron_h_moe::build_arch_graph(
 // MTP draft head for Nemotron-H MoE
 llama_model_nemotron_h_moe::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
     : llm_graph_context(params) {
-    GGML_ASSERT(hparams.n_layer_nextn == 1 && "NEMOTRON_H_MOE MTP currently supports a single MTP block");
+    // the head shares one trailing block, or takes one block per sub-layer
+    GGML_ASSERT((hparams.n_layer_nextn == 1 || hparams.n_layer_nextn == 2) &&
+        "NEMOTRON_H_MOE MTP supports a one or two block head");
 
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
-    const int il = hparams.n_layer();
-    const auto & layer = model.layers[il];
+    const int il     = hparams.n_layer();
+    const int il_ffn = il + hparams.n_layer_nextn - 1;
+
+    const auto & layer     = model.layers[il];
+    const auto & layer_ffn = model.layers[il_ffn];
 
     GGML_ASSERT(layer.nextn.eh_proj && layer.nextn.enorm && layer.nextn.hnorm);
-    GGML_ASSERT(layer.ffn_gate_inp);
+    GGML_ASSERT(layer_ffn.ffn_gate_inp);
 
     // token embedding weights
     ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
@@ -93,35 +98,46 @@ llama_model_nemotron_h_moe::graph_mtp::graph_mtp(const llama_model & model, cons
 
     // MoE FFN sub-layer (mtp.layers.1)
     ggml_tensor * ffn_residual = cur;
-    cur = build_norm(cur, layer.attn_post_norm, nullptr, LLM_NORM_RMS, il);
+    // a two block head keeps the pre-FFN norm in the MoE block's own attn_norm
+    cur = build_norm(cur, layer_ffn.attn_post_norm ? layer_ffn.attn_post_norm : layer_ffn.attn_norm,
+            nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_post_norm", il);
 
     {
-        ggml_tensor * router_logits = build_lora_mm(layer.ffn_gate_inp, cur);
+        ggml_tensor * inp_latent = cur;
+        if (layer_ffn.ffn_latent_down) {
+            inp_latent = ggml_mul_mat(ctx0, layer_ffn.ffn_latent_down, cur);
+        }
+
+        ggml_tensor * router_logits = build_lora_mm(layer_ffn.ffn_gate_inp, cur);
         cb(router_logits, "mtp_ffn_moe_logits", il);
 
         ggml_tensor * moe_out =
-            build_moe_ffn(cur,
-                layer.ffn_gate_inp,
-                layer.ffn_up_exps,
+            build_moe_ffn(inp_latent,
+                layer_ffn.ffn_gate_inp,
+                layer_ffn.ffn_up_exps,
                 nullptr, // no gate
-                layer.ffn_down_exps,
-                layer.ffn_exp_probs_b,
-                n_expert, n_expert_used,
+                layer_ffn.ffn_down_exps,
+                layer_ffn.ffn_exp_probs_b,
+                n_expert, (int64_t) hparams.n_expert_used(il_ffn),
                 LLM_FFN_RELU_SQR, hparams.expert_weights_norm,
                 hparams.expert_weights_scale,
                 LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID,
-                il,
+                il_ffn, // build_moe_ffn bounds its aggregation with the top-k of this layer
                 router_logits, nullptr,
-                layer.ffn_up_exps_s,
+                layer_ffn.ffn_up_exps_s,
                 nullptr, // no gate
-                layer.ffn_down_exps_s);
+                layer_ffn.ffn_down_exps_s);
         cb(moe_out, "mtp_ffn_moe_out", il);
 
+        if (layer_ffn.ffn_latent_up) {
+            moe_out = ggml_mul_mat(ctx0, layer_ffn.ffn_latent_up, moe_out);
+        }
+
         ggml_tensor * ffn_shexp = build_ffn(cur,
-                layer.ffn_up_shexp,   NULL, layer.ffn_up_shexp_s,
-                NULL,                 NULL, NULL,
-                layer.ffn_down_shexp, NULL, layer.ffn_down_shexp_s,
+                layer_ffn.ffn_up_shexp,   NULL, layer_ffn.ffn_up_shexp_s,
+                NULL,                     NULL, NULL,
+                layer_ffn.ffn_down_shexp, NULL, layer_ffn.ffn_down_shexp_s,
                 NULL,
                 LLM_FFN_RELU_SQR, LLM_FFN_PAR, il);
         cb(ffn_shexp, "mtp_ffn_shexp", il);
@@ -134,8 +150,8 @@ llama_model_nemotron_h_moe::graph_mtp::graph_mtp(const llama_model & model, cons
     cb(cur, "mtp_post_ffn", il);
 
     // final head norm: the MTP head has its own LayerNorm
-    GGML_ASSERT(layer.nextn.shared_head_norm && "NEMOTRON_H_MOE MTP: missing final head norm");
-    cur = build_norm(cur, layer.nextn.shared_head_norm, nullptr, LLM_NORM, -1);
+    GGML_ASSERT(layer_ffn.nextn.shared_head_norm && "NEMOTRON_H_MOE MTP: missing final head norm");
+    cur = build_norm(cur, layer_ffn.nextn.shared_head_norm, nullptr, LLM_NORM, -1);
 
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;

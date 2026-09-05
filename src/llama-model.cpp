@@ -3033,7 +3033,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
 
                     if (mtp_on_hybrid_qwen || mtp_on_hybrid_nemotron) {
-                        filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                        // a two block MTP head holds the attention in its first block only
+                        filter = [&](uint32_t il) { return il >= hparams.n_layer() && hparams.n_head_kv(il) != 0; };
                     }
 
                     if ((arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_HY_V3 || arch == LLM_ARCH_GLM_DSA ||
