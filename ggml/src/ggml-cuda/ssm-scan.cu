@@ -140,7 +140,8 @@ __global__ void __launch_bounds__(splitD, 1)
 #endif // __clang__
 
 // assumes as many threads as d_state
-template <int c_factor, int d_state>
+// bounds_check covers the d_state values whose warp count does not divide n_head*d_head
+template <int c_factor, int d_state, bool bounds_check>
 __global__ void __launch_bounds__(d_state, 1)
     ssm_scan_f32_group(
         const float * src0_ptr, const float * src1_ptr, const float * src2_ptr,
@@ -170,6 +171,11 @@ __global__ void __launch_bounds__(d_state, 1)
     const int group_off = (head_idx / (n_head / n_group)) * d_state * sizeof(float);
 
     ggml_cuda_pdl_sync();
+
+    if (bounds_check && warp_idx >= n_head*d_head) {
+        return;
+    }
+
     // TODO: refactor strides to be in elements/floats instead of bytes to be cleaner and consistent with the rest of the codebase
     const float * s0_warp = (const float *) ((const char *) src0 + src6[seq_idx] * src0_nb3 + head_idx * src0_nb2 + head_off * d_state);
     const float * x_warp  = (const float *) ((const char *) src1 + (seq_idx * src1_nb3) + (warp_idx * sizeof(float)));
@@ -252,7 +258,7 @@ static void ssm_scan_f32_cuda(const float * src0, const float * src1, const floa
 
             const dim3 blocks((n_head * head_dim + (num_warps - 1)) / num_warps, n_seq, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
-            ggml_cuda_kernel_launch(ssm_scan_f32_group<128/WARP_SIZE, 128>, launch_params,
+            ggml_cuda_kernel_launch(ssm_scan_f32_group<128/WARP_SIZE, 128, false>, launch_params,
                     src0, src1, src2, src3, src4, src5, src6, dst,
                     src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
                     src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok, K);
@@ -262,12 +268,23 @@ static void ssm_scan_f32_cuda(const float * src0, const float * src1, const floa
 
             const dim3 blocks((n_head * head_dim + (num_warps - 1)) / num_warps, n_seq, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
-            ggml_cuda_kernel_launch(ssm_scan_f32_group<256/WARP_SIZE, 256>, launch_params,
+            ggml_cuda_kernel_launch(ssm_scan_f32_group<256/WARP_SIZE, 256, false>, launch_params,
+                    src0, src1, src2, src3, src4, src5, src6, dst,
+                    src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
+                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok, K);
+        } else if (d_state == 96) { // Nemotron-3 Puzzle
+            constexpr int threads   = 96;
+            constexpr int num_warps = threads/WARP_SIZE;
+
+            // n_head*head_dim need not be a multiple of 3 warps, so the last block can run past the end
+            const dim3 blocks((n_head * head_dim + (num_warps - 1)) / num_warps, n_seq, 1);
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
+            ggml_cuda_kernel_launch(ssm_scan_f32_group<96/WARP_SIZE, 96, true>, launch_params,
                     src0, src1, src2, src3, src4, src5, src6, dst,
                     src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
                     src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok, K);
         } else {
-            GGML_ABORT("doesn't support d_state!=(128 or 256).");
+            GGML_ABORT("doesn't support d_state!=(96, 128 or 256).");
         }
     } else {
         // Mamba-1
