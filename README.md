@@ -64,6 +64,7 @@ Two consequences worth knowing before reading any benchmark here:
 - [How the split works](#how-the-split-works)
 - [How a dense model runs](#how-a-dense-model-runs)
 - [How an MoE model runs](#how-an-moe-model-runs)
+  - [Keeping hot experts resident](#keeping-hot-experts-resident--ggml_meta_expert_cache)
 - [Where the memory goes](#where-the-memory-goes)
 - [Benchmarks](#benchmarks)
 - [Flags that matter](#flags-that-matter)
@@ -243,6 +244,102 @@ While the compute stream works on layer L, the copy stream is filling a slot for
 `GGML_META_STAGE_SLOTS` sets the pool size. Slots rotate, so a slot that held layer L's `gate` tensor
 will later hold some other layer's `down` tensor — which turned out to matter a great deal; see
 [the over-read bug](#the-over-read-bug).
+
+### Keeping hot experts resident — `GGML_META_EXPERT_CACHE`
+
+Copying only the routed experts still copies them *again every token*. Routing is not random, though:
+measured over a few hundred decode steps, the median gap between two uses of the same expert in the
+same layer is **3 tokens**, against 32 for uniform routing, and 34-40% of the experts a token needs
+were also used by the token before it. So most of that traffic is re-fetching bytes the GPU had a
+moment ago.
+
+`GGML_META_EXPERT_CACHE=N` keeps the `N` most recently used experts of every offloaded MoE weight in
+a small VRAM pool and moves only the ones a token is missing:
+
+```bat
+set GGML_CUDA_ALLREDUCE=nccl
+set GGML_CUDA_P2P=1
+set GGML_META_PARTIAL_COPY=1
+set GGML_META_EXPERT_CACHE=64
+
+llama-server -m qwen35moe.gguf ^
+  -sm tensor -ngl 99 -ncmoe 99 --ctx-size 16384 ^
+  --load-mode none --flash-attn on -np 1
+```
+
+```
+        SYSTEM RAM (pinned)                          GPU pool, N of 256 experts
+  ┌────────────────────────────┐              ┌──────────────────────────────────┐
+  │ ffn_gate_exps  (256 exp)   │              │ slot 0 │ slot 1 │ ... │ slot N-1 │
+  └─────────────┬──────────────┘              └────┬───────┬───────────────┬─────┘
+                │                                  │       │               │
+     only the misses move  ──────────────────▶  expert 84  expert 12   expert 200
+                                                    ▲
+     ids [84, 12, 200, ...] ────rewritten to───▶ [0, 1, 2, ...]  ──▶ mul_mat_id
+```
+
+Why the ids get rewritten: the pool holds `N` experts, not all 256, so `mul_mat_id` has to index it
+by **slot**, not by expert. The scheduler already reads the router's ids back to the host for the
+partial copy, so it costs nothing to renumber them there. All of a layer's expert weights share one
+LRU, so slot `s` means the same expert in each of their pools and one rewritten ids tensor serves
+`gate`, `up` and `down` alike.
+
+**Choosing N.** N is a count of experts, so the VRAM it costs is `N/n_expert` of the offloaded expert
+bytes — at `N=64` of 256 experts, a quarter. That is the whole trade: spend VRAM, move fewer bytes.
+Start at an eighth of `n_expert` and raise it while VRAM allows; the curve is steep at the low end and
+flattens out. Measured on qwen35moe, 256 experts, 40 layers, `-ncmoe 99`:
+
+| `N` | pool VRAM | bytes moved | decode |
+|---|---|---|---|
+| off | 0 | 622 MiB/token | 16.1 t/s |
+| 8 | 0.6 GiB | 434 | 20.4 |
+| 32 | 2.5 GiB | 247 | 30.3 |
+| 64 | 5.0 GiB | 156 | 39.2 |
+| 128 | 9.9 GiB | 106 | 46.7 |
+
+Note the gains are **sublinear in bytes**: `N=64` moves 4x fewer bytes but runs 2.4x faster, because
+the offload path has a fixed host cost that no amount of saved bandwidth removes. A run that copies
+almost nothing still tops out near 76 t/s against 102 t/s with no offload at all.
+
+Spending the same VRAM the ordinary way — lowering `-ncmoe` so whole layers stay resident — is worth
+much less, because a resident layer only helps the tokens that route into it while a cached expert
+helps every token that wants it:
+
+| VRAM | whole layers (`-ncmoe`) | expert cache |
+|---|---|---|
+| 2.4 GiB | 18.5 t/s | 29.9 t/s |
+| 4.9 GiB | 21.4 t/s | 38.4 t/s |
+| 9.7 GiB | 30.3 t/s | 45.3 t/s |
+
+**Requirements and limits.**
+
+- Needs `GGML_META_PARTIAL_COPY=1` and `-sm tensor`; it hangs off the same ids readback.
+- **Decode only.** A prompt ubatch routes to more experts than the pool holds, so prefill keeps using
+  whole-layer staging. Nothing is lost: it had nothing to gain there.
+- `N` must be below `n_expert`, or the whole tensor fits and a pool is pure overhead.
+- Models with a per-expert bias are **automatically excluded**. `ADD_ID` indexes a full-size bias with
+  the same ids the cache renumbers, so it would silently read the wrong bias. The scheduler looks for
+  the op and disables the cache with a warning rather than trusting a list of architectures. Only
+  `openai-moe` (gpt-oss) has such biases today.
+- The pool is fixed once allocated; `N` cannot change mid-run.
+
+For digging into it: `GGML_META_EXPERT_CACHE_STATS=1` prints the expert bytes a run moved,
+`GGML_META_EXPERT_CACHE_DEBUG=1` says why a weight was refused a pool, `..._IDENTITY=1` pools every
+expert at its own index so the ids renumbering becomes a no-op, and `..._NOSKIP=1` recopies every
+routed expert. The last two separate a bad copy from a pool that is not surviving the token, which
+is how the cur_copy keying bug was found. `GGML_MOE_IDS_TRACE=<file>` logs the routing itself.
+
+Measured across the MoE models on this box, all generating text identical to the uncached run:
+
+| model | experts | `N` | off | cached |
+|---|---|---|---|---|
+| qwen35moe 21 GiB | 256 / 8 | 64 | 15.9 t/s | 31.4 t/s |
+| qwen35moe 34 GiB | 256 / 8 | 64 | 15.1 | 28.0 |
+| nemotron-h-moe 33 GiB | 128 / 6 | 32 | 9.9 | 26.4 |
+| nemotron-h-moe 105 GiB | 512 / 22 | 64 | 4.6 | 8.1 |
+
+gemma4 is unaffected: `-ncmoe` does not put its experts in host memory, so there is nothing for the
+cache to do and it stays out of the way.
 
 ### Who actually does the expert multiply
 
@@ -589,6 +686,8 @@ Recorded so nobody rebuilds them:
 |---|---|---|
 | `GGML_META_PARTIAL_COPY` | off | copy only the experts this ubatch routes to. Big decode win with `-ncmoe` |
 | `GGML_META_PARTIAL_COPY_MAX_BATCH` | 32 | above this batch size the partial copy stops paying |
+| `GGML_META_EXPERT_CACHE` | off | keep N experts of each offloaded MoE weight resident, decode only. Needs `GGML_META_PARTIAL_COPY` |
+| `GGML_META_EXPERT_CACHE_STATS` | off | print the expert bytes a run moved, for checking the cache is paying |
 | `GGML_META_STAGE_SLOTS` | 4 | staging slots per device for offloaded weights |
 | `GGML_META_DEC_CACHE` | 256 | graph decomposition cache entries. Raise if the eviction warning appears |
 | `GGML_META_STAGE_TRACE` | 0 | log N staging events — slot handouts and split boundaries |

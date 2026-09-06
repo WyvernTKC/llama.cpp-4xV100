@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <list>
 #include <unordered_map>
 #include <vector>
 
@@ -1724,11 +1725,196 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// GGML_MOE_IDS_TRACE=<file>: log which experts each ubatch routes to, one line per MoE layer.
+// Rides on the readback the used-experts-only copy already does, so it costs no extra sync.
+static void ggml_backend_sched_trace_moe_ids(long long eval, const char * name, int64_t n_expert,
+        const ggml_tensor * ids_tensor, const std::vector<int32_t> & ids) {
+    static const char * path = getenv("GGML_MOE_IDS_TRACE");
+    if (path == nullptr) {
+        return;
+    }
+    static FILE * out = fopen(path, "w");
+    if (out == nullptr) {
+        return;
+    }
+
+    for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
+        fprintf(out, "%lld %s %lld %lld", eval, name, (long long) n_expert, (long long) i1);
+        for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
+            fprintf(out, " %d", ids[i1*ids_tensor->nb[1]/sizeof(int32_t) + i0*ids_tensor->nb[0]/sizeof(int32_t)]);
+        }
+        fprintf(out, "\n");
+    }
+    fflush(out);
+}
+
+// GGML_META_EXPERT_CACHE_STATS=1: report how many expert bytes the run moved through the range path.
+static void ggml_backend_sched_expert_bytes_add(size_t n) {
+    static const bool on = getenv("GGML_META_EXPERT_CACHE_STATS") != nullptr;
+    if (!on) {
+        return;
+    }
+    static size_t total = 0;
+    static size_t calls = 0;
+    static bool registered = false;
+    if (!registered) {
+        registered = true;
+        atexit([]() {
+            fprintf(stderr, "expert-copy: %.3f GiB in %zu ranges\n", total/1073741824.0, calls);
+            fflush(stderr);
+        });
+    }
+    total += n;
+    calls++;
+}
+
+// GGML_META_EXPERT_CACHE=<n>: keep n experts of every offloaded MoE weight resident in a pool and
+// move only what a ubatch is missing. The plan is made once per layer, from the ids all of that
+// layer's expert weights share, so slot s means the same expert in each of their pools and one
+// remapped ids tensor serves them all.
+struct ggml_expert_cache_layer {
+    std::vector<int32_t> slot_of;   // expert -> slot, -1 when not resident
+    std::vector<int32_t> expert_of; // slot -> expert, -1 when the slot is free
+    std::list<int32_t>   lru;       // slots, front = most recently used
+    std::vector<std::list<int32_t>::iterator> lru_pos;
+};
+
+struct ggml_expert_cache_plan {
+    bool valid = false;
+    int  cap   = 0; // slots the pools must have; the plan's slot indices depend on it
+    bool ids_written = false;
+    std::vector<int32_t> miss_expert;
+    std::vector<int32_t> miss_slot;
+    std::vector<int32_t> remap; // ids rewritten to slot indices
+};
+
+static int ggml_backend_sched_expert_cache_cap() {
+    static const int cap = getenv("GGML_META_EXPERT_CACHE") ? atoi(getenv("GGML_META_EXPERT_CACHE")) : 0;
+    return cap;
+}
+
+static void ggml_backend_sched_expert_cache_plan_make(int64_t n_expert, int cap,
+        const ggml_tensor * ids_tensor, const std::vector<int32_t> & ids, ggml_expert_cache_plan & plan) {
+    static std::unordered_map<const ggml_tensor *, ggml_expert_cache_layer> layers;
+
+    plan.valid = false;
+    plan.ids_written = false;
+    plan.miss_expert.clear();
+    plan.miss_slot.clear();
+    plan.remap.clear();
+
+    // GGML_META_EXPERT_CACHE_IDENTITY=1: pool every expert at its own index, so the ids remap is the
+    // identity. Saves no memory; isolates the pool and copy path from the remap when something is wrong.
+    static const bool identity = getenv("GGML_META_EXPERT_CACHE_IDENTITY") != nullptr;
+    if (identity) {
+        cap = (int) n_expert;
+    }
+    plan.cap = cap;
+    if (cap <= 0 || cap > n_expert || (!identity && cap == n_expert)) {
+        return;
+    }
+    if (ids_tensor->nb[0] != sizeof(int32_t)) {
+        return; // the remap is written back per row, so the ids inside a row must be dense
+    }
+    if (ids_tensor->ne[1] != 1) {
+        // Decode only. A prompt ubatch routes to more experts than the pool holds, so it fell back
+        // anyway, and the wider shapes are not covered by the pool's padding. Not worth the risk for
+        // a path that never had anything to gain.
+        return;
+    }
+
+    ggml_expert_cache_layer & L = layers[ids_tensor];
+    if (L.slot_of.empty()) {
+        L.slot_of.assign(n_expert, -1);
+        L.expert_of.assign(cap, -1);
+        L.lru_pos.resize(cap);
+        for (int32_t sl = cap - 1; sl >= 0; sl--) {
+            L.lru.push_front(sl);
+            L.lru_pos[sl] = L.lru.begin();
+        }
+    }
+
+    const size_t n_ids = size_t(ids_tensor->ne[0])*size_t(ids_tensor->ne[1]);
+    plan.remap.resize(n_ids);
+
+    // hits first, so admitting a miss never evicts an expert this same ubatch still needs
+    auto touch = [&](int32_t sl) {
+        L.lru.splice(L.lru.begin(), L.lru, L.lru_pos[sl]);
+    };
+    for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
+        for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
+            const int32_t id = ids[i1*ids_tensor->nb[1]/sizeof(int32_t) + i0*ids_tensor->nb[0]/sizeof(int32_t)];
+            if (id >= 0 && id < n_expert && L.slot_of[id] >= 0) {
+                touch(L.slot_of[id]);
+            }
+        }
+    }
+
+    for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
+        for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
+            const int32_t id = ids[i1*ids_tensor->nb[1]/sizeof(int32_t) + i0*ids_tensor->nb[0]/sizeof(int32_t)];
+            if (id < 0 || id >= n_expert) {
+                return; // not routing we understand; leave the plan invalid
+            }
+            // GGML_META_EXPERT_CACHE_NOSKIP=1: recopy every routed expert instead of trusting the pool
+            // to still hold it. Separates a broken copy from a pool that does not survive the token.
+            static const bool noskip = getenv("GGML_META_EXPERT_CACHE_NOSKIP") != nullptr;
+            if (noskip && L.slot_of[id] >= 0) {
+                plan.miss_expert.push_back(id);
+                plan.miss_slot.push_back(L.slot_of[id]);
+            }
+            if (L.slot_of[id] < 0) {
+                const int32_t victim = identity ? id : L.lru.back();
+                if (L.expert_of[victim] >= 0) {
+                    L.slot_of[L.expert_of[victim]] = -1;
+                }
+                L.expert_of[victim] = id;
+                L.slot_of[id] = victim;
+                plan.miss_expert.push_back(id);
+                plan.miss_slot.push_back(victim);
+                touch(victim);
+            }
+            plan.remap[i1*ids_tensor->ne[0] + i0] = L.slot_of[id];
+        }
+    }
+
+    // a ubatch routing to more experts than the pool holds would evict what it just admitted
+    if ((int64_t) plan.miss_expert.size() > cap) {
+        L.slot_of.assign(n_expert, -1);
+        L.expert_of.assign(cap, -1);
+        return;
+    }
+
+    plan.valid = true;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    static long long moe_trace_eval = 0;
+    moe_trace_eval++;
+
     struct ggml_backend_sched_split * splits = sched->splits;
 
     ggml_tensor * prev_ids_tensor = nullptr;
+    static bool expert_cache_on = ggml_backend_sched_expert_cache_cap() > 0;
+    if (expert_cache_on) {
+        // The cache renames experts to pool slots, and ADD_ID indexes a full-size per-expert bias with
+        // the same ids, so a model that has one (gpt-oss) would read the wrong bias. Only arch with
+        // expert biases today, but detect the op rather than the arch.
+        static bool checked = false;
+        if (!checked) {
+            checked = true;
+            for (int i = 0; i < sched->graph.n_nodes; i++) {
+                if (sched->graph.nodes[i]->op == GGML_OP_ADD_ID) {
+                    GGML_LOG_WARN("%s: expert cache disabled, this model indexes a per-expert bias with ADD_ID\n",
+                        __func__);
+                    expert_cache_on = false;
+                    break;
+                }
+            }
+        }
+    }
+    ggml_expert_cache_plan expert_cache_plan;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
@@ -1785,6 +1971,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // events, so it does not need the drain below. Draining stops the host queueing ahead, which
                 // is exactly what lets the staged copy overlap with compute. Other backends still drain: the
                 // CUDA peer copy runs on the source stream and is not ordered against the destination's work.
+                // a whole-tensor copy below would overrun a pool bound to cap experts by an earlier
+                // decode; no-op when this weight has no pool
+                if (ggml_backend_is_meta(split_backend)) {
+                    ggml_backend_meta_cache_unbind(split_backend, input);
+                }
                 if (!meta_try_partial && ggml_backend_is_meta(split_backend) && split_backend->iface.cpy_tensor_async &&
                         split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
                     continue;
@@ -1841,7 +2032,40 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                         }
 
+                        ggml_backend_sched_trace_moe_ids(moe_trace_eval, input->name, n_expert, ids_tensor, ids);
+                        if (expert_cache_on) {
+                            ggml_backend_sched_expert_cache_plan_make(n_expert,
+                                ggml_backend_sched_expert_cache_cap(), ids_tensor, ids, expert_cache_plan);
+                        }
+
                         prev_ids_tensor = ids_tensor;
+                    }
+
+                    const bool use_cache = expert_cache_on && expert_cache_plan.valid && meta_try_partial;
+                    if (use_cache) {
+                        if (!ggml_backend_meta_cache_experts(split_backend, input, input_cpy, input->data,
+                                expert_cache_plan.cap, expert_cache_plan.miss_expert.data(),
+                                expert_cache_plan.miss_slot.data(), expert_cache_plan.miss_expert.size())) {
+                            ggml_backend_meta_cache_unbind_all(split_backend);
+                            expert_cache_on = false;
+                        } else {
+                            // the pool is indexed by slot, so the ids have to name slots, not experts.
+                            // ids is a view of one top-k row, so write the remap back a row at a time.
+                            if (!expert_cache_plan.ids_written) {
+                                const size_t row = size_t(ids_tensor->ne[0])*sizeof(int32_t);
+                                for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
+                                    ggml_backend_tensor_set(ids_tensor,
+                                        expert_cache_plan.remap.data() + i1*ids_tensor->ne[0],
+                                        i1*ids_tensor->nb[1], row);
+                                }
+                                expert_cache_plan.ids_written = true;
+                            }
+                            continue;
+                        }
+                    }
+                    if (meta_try_partial) {
+                        // this weight is about to take a copy sized for all of its experts
+                        ggml_backend_meta_cache_unbind(split_backend, input);
                     }
 
                     // group consecutive experts and copy them together
@@ -1853,6 +2077,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         // meta keeps size a multiple of the chunk stride; its padding is zeroed above instead
                         const size_t padding_end = meta_try_partial ? 0 : (last_id < n_expert - 1 ? padding : 0);
+
+                        ggml_backend_sched_expert_bytes_add(expert_size_copy);
 
                         if (meta_try_partial) {
                             // defer: these go through a staging slot, which is padded and zeroed the way

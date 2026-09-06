@@ -92,6 +92,18 @@ extern "C" {
     GGML_API bool ggml_backend_is_meta       (ggml_backend_t backend);
     GGML_API bool ggml_backend_meta_stage_weight_ranges(ggml_backend_t backend, struct ggml_tensor * dst, const void * base,
                                                         const size_t * offsets, const size_t * sizes, size_t n_ranges);
+    // Keep `cap` of a MoE weight's experts resident in a per-tensor pool and move only the experts a
+    // ubatch is missing. The caller owns the LRU and passes the misses as (expert -> pool slot) pairs;
+    // it must then remap the ids tensor to slot indices, since the pool holds cap experts, not all of
+    // them. Returns false if no pool could be set up, in which case nothing was copied.
+    GGML_API bool ggml_backend_meta_cache_experts(ggml_backend_t backend, const struct ggml_tensor * key,
+                                                  struct ggml_tensor * dst, const void * base, int cap,
+                                                  const int32_t * miss_expert, const int32_t * miss_slot,
+                                                  size_t n_miss);
+    // Put a cached weight back on its own buffer and full expert count. Must be called before anything
+    // copies the whole tensor again, or that copy overruns the pool, which only holds cap experts.
+    GGML_API void ggml_backend_meta_cache_unbind(ggml_backend_t backend, const struct ggml_tensor * key);
+    GGML_API void ggml_backend_meta_cache_unbind_all(ggml_backend_t backend);
     GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
     GGML_API bool ggml_backend_buft_is_meta  (ggml_backend_buffer_type_t buft);
 

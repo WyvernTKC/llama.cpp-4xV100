@@ -21,6 +21,7 @@
 #include <thread>
 #include <tuple>
 #include <utility>
+#include <unordered_map>
 #include <vector>
 
 struct ggml_backend_meta_device;
@@ -2182,6 +2183,23 @@ struct ggml_backend_meta_context {
         // one lands in it, because the leftovers are then another tensor's quantized rows, whose F16
         // block scales can decode to inf. So a partial copy is only safe into a slot we already own.
     };
+    // A staging slot holds a whole tensor and rotates, so the experts it accumulates are lost as soon
+    // as another tensor lands in it. An expert pool instead belongs to one tensor for the whole run and
+    // holds only `cap` experts, so a ubatch moves just the experts it is missing. Slot s holds the same
+    // expert in every pool of one layer, which lets one remapped ids tensor serve all its mul_mat_id.
+    struct expert_pool {
+        std::vector<ggml_backend_buffer_ptr> bufs;
+        std::vector<ggml_backend_event_t>    ready;
+        std::vector<ggml_backend_event_t>    release;
+        int     cap      = 0;
+        int64_t orig_ne2 = 0;
+        // ggml_backend_sched cycles cur_copy, so one weight reaches us as several tensors that all
+        // have to point at the same pool - keying the pool on any one of them loses it every token.
+        std::vector<ggml_tensor *> bound_dsts;
+    };
+    std::unordered_map<const ggml_tensor *, expert_pool> expert_pools;
+    std::vector<expert_pool *>                           expert_pools_pending;
+
     std::vector<ggml_backend_t> stage_backends;
     std::vector<stage_slot>     stage_slots;
     std::vector<int>            stage_pending; // slots whose compute is queued but not yet marked released
@@ -2556,6 +2574,161 @@ static void ggml_backend_meta_stage_report_starved(int n_slots) {
         "on the compute stream instead. Raise GGML_META_STAGE_SLOTS to at least the number of "
         "host-resident weight tensors in one split (3 for MoE) to keep the overlap.\n",
         __func__, n_slots);
+}
+
+bool ggml_backend_meta_cache_experts(ggml_backend_t backend, const ggml_tensor * key, ggml_tensor * dst,
+        const void * base, int cap, const int32_t * miss_expert, const int32_t * miss_slot, size_t n_miss) {
+    ggml_backend_meta_context * ctx = (ggml_backend_meta_context *) backend->context;
+    const size_t n_dev = ggml_backend_meta_n_backends(backend);
+
+    const bool dbg = getenv("GGML_META_EXPERT_CACHE_DEBUG") != nullptr;
+    auto bail = [&](const char * why) {
+        if (dbg) { fprintf(stderr, "expert-cache bail %s: %s\n", dst->name, why); fflush(stderr); }
+        return false;
+    };
+    if (cap <= 0 || !ggml_backend_meta_stage_ensure(backend, 0)) {
+        return bail("cap<=0 or stage_ensure");
+    }
+
+    const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(dst, /*assume_sync =*/ false);
+    if (ss.axis < 0 || ss.axis >= GGML_MAX_DIMS || ss.n_segments != 1 || ss.nr[0] != 1) {
+        return bail("split state");
+    }
+    if (dst->ne[2] < cap) {
+        return bail("ne2 < cap");
+    }
+
+    // set_tensor_async_impl splices by chunks of nb[axis+1]; one expert is a whole number of them,
+    // so an expert can be written to any slot by giving it that slot's offset instead of its own.
+    const size_t chunk_full   = dst->nb[ss.axis + 1];
+    const size_t expert_bytes = dst->nb[2];
+    if (chunk_full == 0 || expert_bytes == 0 || expert_bytes % chunk_full != 0) {
+        return bail("chunk geometry");
+    }
+
+    ggml_backend_meta_context::expert_pool & pool = ctx->expert_pools[key];
+    if (pool.cap != 0 && pool.cap != cap) {
+        return bail("cap changed");
+    }
+    if (pool.orig_ne2 == 0) {
+        pool.orig_ne2 = ggml_backend_meta_buffer_simple_tensor(dst, 0)->ne[2];
+    }
+
+    // Shorten the tensors to the experts the pool holds before sizing it. The kernels take the
+    // allocation size from the shape, and mul_mat_vec_q memsets everything between ggml_nbytes and
+    // that size to clear row padding - a pool sized for the expert bytes alone gets written past.
+    const int64_t orig_ne2 = pool.orig_ne2;
+    for (size_t j = 0; j < n_dev; j++) {
+        ggml_tensor * st = ggml_backend_meta_buffer_simple_tensor(dst, j);
+        st->ne[2] = cap;
+        st->nb[3] = st->nb[2]*cap;
+    }
+    auto give_up = [&]() {
+        for (size_t j = 0; j < n_dev; j++) {
+            ggml_tensor * st = ggml_backend_meta_buffer_simple_tensor(dst, j);
+            st->ne[2] = orig_ne2;
+            st->nb[3] = st->nb[2]*orig_ne2;
+        }
+        ctx->expert_pools.erase(key);
+        return false;
+    };
+
+    if (pool.bufs.empty()) {
+        pool.bufs.resize(n_dev);
+        pool.cap = cap;
+        for (size_t j = 0; j < n_dev; j++) {
+            ggml_tensor * st = ggml_backend_meta_buffer_simple_tensor(dst, j);
+            ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+            ggml_backend_dev_t dev = ggml_backend_get_device(simple_backend);
+
+            pool.ready.push_back(ggml_backend_event_new(dev));
+            pool.release.push_back(ggml_backend_event_new(dev));
+            if (pool.ready.back() == nullptr || pool.release.back() == nullptr) {
+                return give_up();
+            }
+
+            // one chunk of headroom on top: MMQ reads a little past the last row it is handed
+            const size_t chunk_j = st->nb[ss.axis + 1];
+            size_t need = chunk_j*(expert_bytes/chunk_full)*cap + chunk_j;
+            if (st->buffer != nullptr) {
+                need = std::max(need, ggml_backend_buffer_get_alloc_size(st->buffer, st));
+            }
+            ggml_backend_buffer_t buf = ggml_backend_alloc_buffer(simple_backend, need);
+            if (buf == nullptr) {
+                GGML_LOG_WARN("%s: no room for a %.0f MiB expert pool for %s, using whole-layer staging\n",
+                    __func__, need/1024.0/1024.0, dst->name);
+                return give_up();
+            }
+            ggml_backend_buffer_clear(buf, 0); // MMQ reads the padding, it must not hold NaNs
+            pool.bufs[j].reset(buf);
+        }
+    }
+
+    for (size_t j = 0; j < n_dev; j++) {
+        ggml_backend_meta_buffer_simple_tensor(dst, j)->data = ggml_backend_buffer_get_base(pool.bufs[j].get());
+    }
+    if (std::find(pool.bound_dsts.begin(), pool.bound_dsts.end(), dst) == pool.bound_dsts.end()) {
+        pool.bound_dsts.push_back(dst);
+    }
+
+    if (n_miss == 0) {
+        return true; // every routed expert is already resident
+    }
+
+    // the pool still holds live experts, so wait for the compute that read them before overwriting
+    for (size_t j = 0; j < n_dev; j++) {
+        ggml_backend_event_wait(ctx->stage_backends[j], pool.release[j]);
+    }
+
+    for (size_t m = 0; m < n_miss; m++) {
+        ggml_backend_meta_set_tensor_async_impl(backend, dst,
+            (const char *) base + size_t(miss_expert[m])*expert_bytes,
+            size_t(miss_slot[m])*expert_bytes, expert_bytes, &ctx->stage_backends);
+    }
+
+    for (size_t j = 0; j < n_dev; j++) {
+        ggml_backend_event_record(pool.ready[j], ctx->stage_backends[j]);
+        ggml_backend_event_wait(ggml_backend_meta_simple_backend(backend, j), pool.ready[j]);
+    }
+    if (std::find(ctx->expert_pools_pending.begin(), ctx->expert_pools_pending.end(), &pool)
+            == ctx->expert_pools_pending.end()) {
+        ctx->expert_pools_pending.push_back(&pool);
+    }
+    return true;
+}
+
+void ggml_backend_meta_cache_unbind(ggml_backend_t backend, const ggml_tensor * key) {
+    ggml_backend_meta_context * ctx = (ggml_backend_meta_context *) backend->context;
+    auto it = ctx->expert_pools.find(key);
+    if (it == ctx->expert_pools.end() || it->second.bound_dsts.empty()) {
+        return;
+    }
+    ggml_backend_meta_context::expert_pool & pool = it->second;
+    const size_t n_dev = ggml_backend_meta_n_backends(backend);
+    for (ggml_tensor * dst : pool.bound_dsts) {
+        const size_t offset = size_t(dst->data) - size_t(ggml_backend_buffer_get_base(dst->buffer));
+        for (size_t j = 0; j < n_dev; j++) {
+            ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(dst, j);
+            if (simple_tensor == nullptr || simple_tensor->view_src != nullptr || simple_tensor->buffer == nullptr) {
+                continue;
+            }
+            simple_tensor->data  = (char *) ggml_backend_buffer_get_base(simple_tensor->buffer) + offset;
+            simple_tensor->ne[2] = pool.orig_ne2;
+            simple_tensor->nb[3] = simple_tensor->nb[2]*pool.orig_ne2;
+        }
+    }
+    pool.bound_dsts.clear();
+}
+
+void ggml_backend_meta_cache_unbind_all(ggml_backend_t backend) {
+    ggml_backend_meta_context * ctx = (ggml_backend_meta_context *) backend->context;
+    std::vector<const ggml_tensor *> keys;
+    for (auto & kv : ctx->expert_pools) {
+        keys.push_back(kv.first);
+    }
+    for (const ggml_tensor * k : keys) {
+        ggml_backend_meta_cache_unbind(backend, k);
+    }
 }
 
 // Same as ggml_backend_meta_stage_weight, but moves only the given byte ranges of dst - the experts this
@@ -3570,6 +3743,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
     }
     backend_ctx->stage_pending.clear();
+
+    // same for the expert pools: their resident experts have been read, so the next ubatch may evict
+    for (ggml_backend_meta_context::expert_pool * pool : backend_ctx->expert_pools_pending) {
+        for (size_t j = 0; j < n_backends; j++) {
+            ggml_backend_event_record(pool->release[j], ggml_backend_meta_simple_backend(backend, j));
+        }
+    }
+    backend_ctx->expert_pools_pending.clear();
 
     return GGML_STATUS_SUCCESS;
 }
