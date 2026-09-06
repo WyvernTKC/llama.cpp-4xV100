@@ -3179,7 +3179,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             D->ctx.reset(ggml_init(params));
             for (size_t j = 0; j < n_backends; j++) {
                 auto & bcj = backend_ctx->backend_configs[j];
-                for (size_t i = 0; i < n_subgraphs; i++) {
+                // D->ctx just replaced the previous arena, so every slot up to the new ceiling needs a
+                // fresh graph here - not just the ones this round uses. A slot left unfilled below
+                // n_subgraphs keeps pointing into the freed arena, and a later call that reuses this
+                // decomposition with a bigger (but still <= D->sized_subgraphs) subgraph count than this
+                // round, without itself growing past the ceiling, would read that dangling pointer.
+                for (size_t i = 0; i < D->sized_subgraphs; i++) {
                     D->graphs[j].cgraphs[i].cgraph_main = ggml_new_graph_custom(D->ctx.get(), cgraph->n_nodes, /*grads =*/ false);
                 }
             }
