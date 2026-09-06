@@ -21,6 +21,7 @@
 #include <string.h>
 #include <algorithm>
 #include <list>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -1890,6 +1891,43 @@ static void ggml_backend_sched_expert_cache_plan_make(int64_t n_expert, int cap,
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+
+    // GGML_META_MMID_DEBUG=1: where each MUL_MAT_ID landed and what the offload decision saw. The
+    // scheduler only moves a host weight to a GPU when op_offload is set and that backend answers yes
+    // to both supports_op and offload_op - see ggml_backend_sched_backend_id_from_cur.
+    if (getenv("GGML_META_MMID_DEBUG")) {
+        static bool mmid_shown = false;
+        if (!mmid_shown) {
+            mmid_shown = true;
+            int printed = 0;
+            for (int i = 0; i < sched->n_splits && printed < 6; i++) {
+                struct ggml_backend_sched_split * sp = &sched->splits[i];
+                for (int j = 0; j < sp->graph.n_nodes && printed < 6; j++) {
+                    ggml_tensor * n = sp->graph.nodes[j];
+                    if (n->op != GGML_OP_MUL_MAT_ID) {
+                        continue;
+                    }
+                    printed++;
+                    ggml_tensor * w = n->src[0];
+                    const bool wgt  = w && w->buffer &&
+                        ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+                    const bool host = w && w->buffer && ggml_backend_buffer_is_host(w->buffer);
+                    fprintf(stderr, "mmid %-26s ran_on=%-28s src0=%-26s buf=%-16s wgt=%d host=%d ne2=%lld",
+                        n->name, ggml_backend_name(sched->backends[sp->backend_id]),
+                        w ? w->name : "?",
+                        (w && w->buffer) ? ggml_backend_buffer_name(w->buffer) : "none",
+                        (int) wgt, (int) host, (long long) (w ? w->ne[2] : -1));
+                    for (int b = 0; b < sched->n_backends; b++) {
+                        fprintf(stderr, " | %s sup=%d off=%d", ggml_backend_name(sched->backends[b]),
+                            (int) ggml_backend_supports_op(sched->backends[b], n),
+                            (int) ggml_backend_offload_op(sched->backends[b], n));
+                    }
+                    fprintf(stderr, " | op_offload=%d\n", (int) sched->op_offload);
+                }
+            }
+            fflush(stderr);
+        }
+    }
     static long long moe_trace_eval = 0;
     moe_trace_eval++;
 
@@ -1966,6 +2004,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     split->graph.nodes[0]->ne[2] <= meta_partial_max_batch &&
                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                     ggml_backend_buffer_is_host(input->buffer);
+
+                // GGML_META_PARTIAL_DEBUG=1: say why a host-resident weight did or did not take the
+                // used-experts-only path, once per weight.
+                if (getenv("GGML_META_PARTIAL_DEBUG") &&
+                        ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                    static std::unordered_map<std::string, bool> seen;
+                    if (seen.emplace(input->name, true).second) {
+                        ggml_tensor * n0 = split->graph.n_nodes > 0 ? split->graph.nodes[0] : nullptr;
+                        fprintf(stderr,
+                            "partial %-34s host=%d meta=%d nodes=%d n0=%s n0src0==cpy=%d n0ne2=%lld -> %d\n",
+                            input->name, (int) ggml_backend_buffer_is_host(input->buffer),
+                            (int) ggml_backend_is_meta(split_backend), split->graph.n_nodes,
+                            n0 ? ggml_op_name(n0->op) : "none",
+                            (int) (n0 && n0->src[0] == input_cpy),
+                            (long long) (n0 ? n0->ne[2] : -1), (int) meta_try_partial);
+                        fflush(stderr);
+                    }
+                }
 
                 // The meta backend stages offloaded weights in its own rotating buffers and orders them with
                 // events, so it does not need the drain below. Draining stops the host queueing ahead, which

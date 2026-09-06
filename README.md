@@ -286,8 +286,10 @@ LRU, so slot `s` means the same expert in each of their pools and one rewritten 
 
 **Choosing N.** N is a count of experts, so the VRAM it costs is `N/n_expert` of the offloaded expert
 bytes — at `N=64` of 256 experts, a quarter. That is the whole trade: spend VRAM, move fewer bytes.
-Start at an eighth of `n_expert` and raise it while VRAM allows; the curve is steep at the low end and
-flattens out. Measured on qwen35moe, 256 experts, 40 layers, `-ncmoe 99`:
+Size it against **`n_expert_used`, not `n_expert`** - the pool has to hold a decent multiple of the
+experts a single token asks for. Roughly `8 x n_expert_used` is a good first try, then raise it while
+VRAM allows; the curve is steep at the low end and flattens once the pool covers the working set.
+Measured on qwen35moe, 256 experts, 8 used, 40 layers, `-ncmoe 99`:
 
 | `N` | pool VRAM | bytes moved | decode |
 |---|---|---|---|
@@ -314,6 +316,9 @@ helps every token that wants it:
 **Requirements and limits.**
 
 - Needs `GGML_META_PARTIAL_COPY=1` and `-sm tensor`; it hangs off the same ids readback.
+- **Do not set `GGML_META_MOE_OFFLOAD_MIN_EXPERTS=0` with it.** That makes the experts compute on the
+  CPU, so nothing is ever copied to the GPU and the cache has no copy to serve - it goes silently
+  inert. The two are alternatives; which wins is per-model, and the cache wins on most.
 - **Decode only.** A prompt ubatch routes to more experts than the pool holds, so prefill keeps using
   whole-layer staging. Nothing is lost: it had nothing to gain there.
 - `N` must be below `n_expert`, or the whole tensor fits and a pool is pure overhead.
@@ -329,6 +334,12 @@ expert at its own index so the ids renumbering becomes a no-op, and `..._NOSKIP=
 routed expert. The last two separate a bad copy from a pool that is not surviving the token, which
 is how the cur_copy keying bug was found. `GGML_MOE_IDS_TRACE=<file>` logs the routing itself.
 
+When the cache does nothing at all, the question is usually whether the experts are being streamed in
+the first place. `GGML_META_PARTIAL_DEBUG=1` prints, per host-resident weight, whether it took the
+used-experts-only path and which condition refused it. `GGML_META_MMID_DEBUG=1` prints where each
+`MUL_MAT_ID` actually ran together with the `supports_op` / `offload_op` answers and `op_offload`
+itself, which is what identified gemma4's opt-out.
+
 Measured across the MoE models on this box, all generating text identical to the uncached run:
 
 | model | experts | `N` | off | cached |
@@ -336,10 +347,19 @@ Measured across the MoE models on this box, all generating text identical to the
 | qwen35moe 21 GiB | 256 / 8 | 64 | 15.9 t/s | 31.4 t/s |
 | qwen35moe 34 GiB | 256 / 8 | 64 | 15.1 | 28.0 |
 | nemotron-h-moe 33 GiB | 128 / 6 | 32 | 9.9 | 26.4 |
-| nemotron-h-moe 105 GiB | 512 / 22 | 64 | 4.6 | 8.1 |
+| nemotron-h-moe 105 GiB | 512 / 22 | 256 | 4.7 | 10.5 |
 
-gemma4 is unaffected: `-ncmoe` does not put its experts in host memory, so there is nothing for the
-cache to do and it stays out of the way.
+The 105 GiB model is the one that shows why the rule is about `n_expert_used`. It routes 22 experts of
+512, so a pool of 64 covers too little and barely helps; sweeping it gives 7.9 at `N=64`, 9.3 at 128,
+10.3 at 192, **10.5 at 256**, 10.4 at 384. Compare 9.7 t/s for computing the experts on the CPU
+instead (`GGML_META_MOE_OFFLOAD_MIN_EXPERTS=0`): the cache only overtakes that from `N=192` up. If a
+model is slower with the cache than without it, the cap is the first thing to raise.
+
+gemma4 is unaffected. It is on the expert-offload opt-out list
+(`llm_arch_supports_sm_tensor_expert_offload`), so `op_offload` is forced off under `-sm tensor` and
+its experts compute on the CPU - nothing streams, and the cache has nothing to attach to. Removing the
+opt-out does not currently work either: its fused `ffn_gate_up_exps` splits as a repeated segment and
+the staging path asserts `nr[0] == 1`.
 
 ### Who actually does the expert multiply
 
@@ -688,6 +708,8 @@ Recorded so nobody rebuilds them:
 | `GGML_META_PARTIAL_COPY_MAX_BATCH` | 32 | above this batch size the partial copy stops paying |
 | `GGML_META_EXPERT_CACHE` | off | keep N experts of each offloaded MoE weight resident, decode only. Needs `GGML_META_PARTIAL_COPY` |
 | `GGML_META_EXPERT_CACHE_STATS` | off | print the expert bytes a run moved, for checking the cache is paying |
+| `GGML_META_PARTIAL_DEBUG` | off | per weight, whether it took the used-experts-only path and what refused it |
+| `GGML_META_MMID_DEBUG` | off | where each `MUL_MAT_ID` ran, with the `supports_op`/`offload_op`/`op_offload` answers |
 | `GGML_META_STAGE_SLOTS` | 4 | staging slots per device for offloaded weights |
 | `GGML_META_DEC_CACHE` | 256 | graph decomposition cache entries. Raise if the eviction warning appears |
 | `GGML_META_STAGE_TRACE` | 0 | log N staging events — slot handouts and split boundaries |
