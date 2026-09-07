@@ -541,15 +541,25 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_simple_buffer(ggml_backend
     return buf_ctx->bufs[index].get();
 }
 
+// A view_src with no buffer was allocated outside ggml-backend (see ggml_gallocr_init_tensor).
+// It has no meta buffer, so it has no split - treat it like a view of host data.
+static bool ggml_backend_meta_view_src_is_host(const struct ggml_tensor * tensor) {
+    if (tensor->view_src == nullptr) {
+        return false;
+    }
+    return tensor->view_src->buffer == nullptr || ggml_backend_buffer_is_host(tensor->view_src->buffer);
+}
+
 static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index) {
     if (!ggml_backend_buffer_is_meta(tensor->buffer)) {
         GGML_ABORT("%s (op %s) is not on a meta buffer but on '%s' (host=%d); view_src=%s (op %s, buffer '%s', host=%d)",
-            tensor->name, ggml_op_name(tensor->op), ggml_backend_buffer_name(tensor->buffer),
-            (int) ggml_backend_buffer_is_host(tensor->buffer),
+            tensor->name, ggml_op_name(tensor->op),
+            tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : "(none)",
+            tensor->buffer ? (int) ggml_backend_buffer_is_host(tensor->buffer) : -1,
             tensor->view_src ? tensor->view_src->name : "(none)",
             tensor->view_src ? ggml_op_name(tensor->view_src->op) : "-",
-            tensor->view_src ? ggml_backend_buffer_name(tensor->view_src->buffer) : "-",
-            tensor->view_src ? (int) ggml_backend_buffer_is_host(tensor->view_src->buffer) : -1);
+            tensor->view_src && tensor->view_src->buffer ? ggml_backend_buffer_name(tensor->view_src->buffer) : "-",
+            tensor->view_src && tensor->view_src->buffer ? (int) ggml_backend_buffer_is_host(tensor->view_src->buffer) : -1);
     }
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     GGML_ASSERT(index < buf_ctx->bufs.size());
@@ -3188,7 +3198,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && ggml_backend_buffer_is_host(node->view_src->buffer)) {
+                if (ggml_backend_meta_view_src_is_host(node)) {
                     // Views of host-resident data end up in this graph even though the meta backend has
                     //   nothing to do with them (s_copy_main, and the reshape of an embedding lookup that
                     //   was scheduled on the CPU). They carry no computation, so pass them through as they
@@ -3327,7 +3337,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         }
                     }
 
-                    if (next->view_src != nullptr && next->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(next->view_src->buffer)) {
+                    if (next->view_src != nullptr && next->view_src->op == GGML_OP_NONE && ggml_backend_meta_view_src_is_host(next)) {
                         continue;
                     }
                     if (!ggml_backend_meta_has_split_state(next) ||
@@ -3369,7 +3379,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             int i_start = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && ggml_backend_buffer_is_host(node->view_src->buffer)) {
+                if (ggml_backend_meta_view_src_is_host(node)) {
                     continue; // see the matching skip where the per-device node lists are built
                 }
                 const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
