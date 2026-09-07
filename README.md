@@ -287,9 +287,17 @@ LRU, so slot `s` means the same expert in each of their pools and one rewritten 
 **Choosing N.** N is a count of experts, so the VRAM it costs is `N/n_expert` of the offloaded expert
 bytes — at `N=64` of 256 experts, a quarter. That is the whole trade: spend VRAM, move fewer bytes.
 Size it against **`n_expert_used`, not `n_expert`** - the pool has to hold a decent multiple of the
-experts a single token asks for. Roughly `8 x n_expert_used` is a good first try, then raise it while
-VRAM allows; the curve is steep at the low end and flattens once the pool covers the working set.
-Measured on qwen35moe, 256 experts, 8 used, 40 layers, `-ncmoe 99`:
+experts a single token asks for. What that multiple buys barely depends on the model. Replaying
+recorded routing (`GGML_MOE_IDS_TRACE`) through the pool for five models spanning `n_expert` 128 to
+512 and `n_expert_used` 6 to 22 gives one curve, to within about 5 points from `4x` up:
+
+| `N` / `n_expert_used` | 2x | 4x | 6x | 8x | 12x | 16x |
+|---|---|---|---|---|---|---|
+| hit rate | 47% | 62% | 71% | 77% | 85% | 89% |
+
+`8x` is the knee and a good first try; past `12x` the curve flattens and the VRAM buys more elsewhere.
+So `N=64` for 8-of-256, but `N=256` for 22-of-512. Measured on qwen35moe, 256 experts, 8 used, 40
+layers, `-ncmoe 99`:
 
 | `N` | pool VRAM | bytes moved | decode |
 |---|---|---|---|
