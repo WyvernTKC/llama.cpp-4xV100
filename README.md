@@ -727,6 +727,7 @@ Recorded so nobody rebuilds them:
 | `GGML_META_STATS` | 0 | print a host-timing breakdown every N graph computes |
 | `GGML_CUDA_ALLREDUCE` | — | set to `nccl` at 4 GPUs; the internal all-reduce is 2-device only |
 | `GGML_CUDA_P2P` | — | set to `1` |
+| `GGML_CUDA_MMQ_DENSE_IDS` | 1 | launch MoE matmul blocks only for the expert/tile pairs that hold work. `0` restores the plain grid |
 
 `GGML_META_STATS` is the most useful of these when tuning. It reports, per call:
 `enqueue (launch, comm, rebuild) / sync`. Bear in mind **`sync` is the host waiting on the GPU**, not

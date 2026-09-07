@@ -148,6 +148,53 @@ static void launch_mm_ids_helper(
         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
 }
 
+#define MMQ_IDS_TILE_MAP_BLOCK 256
+
+// One block scans the per-expert row counts into a dense list of the (expert, tile column) pairs
+// that hold work. Entries past the end get jt_empty, which is beyond any expert's column count, so
+// the callers' existing empty-tile test skips them without a special case.
+static __global__ void mmq_ids_tile_map(
+        const int32_t * __restrict__ expert_bounds, int2 * __restrict__ tile_map,
+        const int n_experts, const int J, const int n_tiles_max, const int jt_empty) {
+    __shared__ int scan[MMQ_IDS_TILE_MAP_BLOCK];
+
+    int base = 0; // tiles written by previous chunks
+
+    for (int e0 = 0; e0 < n_experts; e0 += MMQ_IDS_TILE_MAP_BLOCK) {
+        const int e  = e0 + threadIdx.x;
+        const int nt = e < n_experts ? (expert_bounds[e + 1] - expert_bounds[e] + J - 1) / J : 0;
+
+        scan[threadIdx.x] = nt;
+        __syncthreads();
+        for (int offset = 1; offset < MMQ_IDS_TILE_MAP_BLOCK; offset *= 2) {
+            const int add = threadIdx.x >= offset ? scan[threadIdx.x - offset] : 0;
+            __syncthreads();
+            scan[threadIdx.x] += add;
+            __syncthreads();
+        }
+
+        for (int j = 0, t = base + scan[threadIdx.x] - nt; j < nt; ++j, ++t) {
+            if (t < n_tiles_max) {
+                tile_map[t] = make_int2(e, j);
+            }
+        }
+
+        base += scan[MMQ_IDS_TILE_MAP_BLOCK - 1];
+        __syncthreads();
+    }
+
+    for (int t = base + threadIdx.x; t < n_tiles_max; t += MMQ_IDS_TILE_MAP_BLOCK) {
+        tile_map[t] = make_int2(0, jt_empty);
+    }
+}
+
+void ggml_cuda_launch_mmq_ids_tile_map(
+        const int32_t * expert_bounds, int2 * tile_map,
+        const int n_experts, const int J, const int n_tiles_max, const int jt_empty, cudaStream_t stream) {
+    mmq_ids_tile_map<<<1, MMQ_IDS_TILE_MAP_BLOCK, 0, stream>>>
+        (expert_bounds, tile_map, n_experts, J, n_tiles_max, jt_empty);
+}
+
 void ggml_cuda_launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
