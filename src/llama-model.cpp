@@ -961,11 +961,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         //   those are handled by the per-arch code above or fall through to a single segment
         if ((!hparams.is_recr(il) || in_parallel_attn()) &&
                 (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias))) {
-            const int64_t n_embd      = hparams.n_embd;
+            // the Q portion of the fused tensor is sized by the head dim, which is not always n_embd/n_head
+            //   (e.g. an expanded head_dim like spark2_5's 256 at n_embd=2560, n_head=16)
+            const int64_t n_embd_q    = (int64_t) hparams.n_head(il) * hparams.n_embd_head_k(il);
             const int64_t n_embd_gqa  = hparams.n_embd_v_gqa(il);
             GGML_ASSERT(hparams.n_embd_k_gqa() == n_embd_gqa);
-            GGML_ASSERT(tensor->ne[axis] == n_embd + 2*n_embd_gqa);
-            return {{n_embd, 1}, {n_embd_gqa, 2}};
+            GGML_ASSERT(tensor->ne[axis] == n_embd_q + 2*n_embd_gqa);
+            return {{n_embd_q, 1}, {n_embd_gqa, 2}};
         }
         if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_up_bias)) {
             const int64_t n_ff = hparams.n_ff(il);
