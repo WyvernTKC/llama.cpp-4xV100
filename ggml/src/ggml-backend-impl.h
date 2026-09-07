@@ -104,6 +104,8 @@ extern "C" {
     // copies the whole tensor again, or that copy overruns the pool, which only holds cap experts.
     GGML_API void ggml_backend_meta_cache_unbind(ggml_backend_t backend, const struct ggml_tensor * key);
     GGML_API void ggml_backend_meta_cache_unbind_all(ggml_backend_t backend);
+    // Wait only for the devices a read of this tensor touched, instead of all of them.
+    GGML_API void ggml_backend_meta_synchronize_get(ggml_backend_t backend, const struct ggml_tensor * tensor);
     GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
     GGML_API bool ggml_backend_buft_is_meta  (ggml_backend_buffer_type_t buft);
 

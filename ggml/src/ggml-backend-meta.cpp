@@ -2492,6 +2492,22 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
     }
 }
 
+// Wait only for the devices a read of this tensor touched. get_tensor_async forwards a mirrored read
+// to device 0, so the other three have nothing to wait for - and the router ids are mirrored.
+void ggml_backend_meta_synchronize_get(ggml_backend_t backend, const ggml_tensor * tensor) {
+    const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    if (ggml_nbytes(tensor) > 0) {
+        const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+        if (ss.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && ss.n_segments == 1 && ss.nr[0] == 1) {
+            ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, 0));
+            return;
+        }
+    }
+    for (size_t j = 0; j < n_backends; j++) {
+        ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, j));
+    }
+}
+
 // More slots let the host queue more copies ahead, at one expert tensor of VRAM each. On 4x V100 with
 // DeepSeek V4 Flash, 4 slots reach 94% of the compute-bound ceiling and 12 reach 99%; below 2 the
 // staging is pointless and is turned off.

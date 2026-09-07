@@ -1778,6 +1778,9 @@ struct ggml_expert_cache_layer {
     std::vector<int32_t> expert_of; // slot -> expert, -1 when the slot is free
     std::list<int32_t>   lru;       // slots, front = most recently used
     std::vector<std::list<int32_t>::iterator> lru_pos;
+    // the ids remap lives here, not in the plan: it is the source of an async copy, so it has to
+    // stay valid until the device reads it. This is rewritten only when the layer routes again.
+    std::vector<int32_t> remap;
 };
 
 struct ggml_expert_cache_plan {
@@ -1786,7 +1789,7 @@ struct ggml_expert_cache_plan {
     bool ids_written = false;
     std::vector<int32_t> miss_expert;
     std::vector<int32_t> miss_slot;
-    std::vector<int32_t> remap; // ids rewritten to slot indices
+    const int32_t * remap = nullptr; // ids rewritten to slot indices, owned by the layer
 };
 
 static int ggml_backend_sched_expert_cache_cap() {
@@ -1802,7 +1805,7 @@ static void ggml_backend_sched_expert_cache_plan_make(int64_t n_expert, int cap,
     plan.ids_written = false;
     plan.miss_expert.clear();
     plan.miss_slot.clear();
-    plan.remap.clear();
+    plan.remap = nullptr;
 
     // GGML_META_EXPERT_CACHE_IDENTITY=1: pool every expert at its own index, so the ids remap is the
     // identity. Saves no memory; isolates the pool and copy path from the remap when something is wrong.
@@ -1836,7 +1839,8 @@ static void ggml_backend_sched_expert_cache_plan_make(int64_t n_expert, int cap,
     }
 
     const size_t n_ids = size_t(ids_tensor->ne[0])*size_t(ids_tensor->ne[1]);
-    plan.remap.resize(n_ids);
+    L.remap.resize(n_ids);
+    plan.remap = L.remap.data();
 
     // hits first, so admitting a miss never evicts an expert this same ubatch still needs
     auto touch = [&](int32_t sl) {
@@ -1875,7 +1879,7 @@ static void ggml_backend_sched_expert_cache_plan_make(int64_t n_expert, int cap,
                 plan.miss_slot.push_back(victim);
                 touch(victim);
             }
-            plan.remap[i1*ids_tensor->ne[0] + i0] = L.slot_of[id];
+            L.remap[i1*ids_tensor->ne[0] + i0] = L.slot_of[id];
         }
     }
 
@@ -2036,11 +2040,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
                     continue;
                 }
-                // wait for the split backend to finish using the input before overwriting it
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
-                } else {
-                    ggml_backend_synchronize(split_backend);
+                // wait for the split backend to finish using the input before overwriting it.
+                // sched->events are only allocated when n_copies > 1, so at decode this is a sync of
+                // every device, once per input. An expert weight the cache pools does not need it -
+                // the pool waits on its own release event before it reuses a slot - so defer it to
+                // the staging paths below, which are the ones that overwrite the input.
+                auto wait_for_split = [&]() {
+                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                    } else {
+                        ggml_backend_synchronize(split_backend);
+                    }
+                };
+                // GGML_META_EXPERT_CACHE_SYNC_ALWAYS=1 restores the unconditional sync
+                static const bool sync_always = getenv("GGML_META_EXPERT_CACHE_SYNC_ALWAYS") != nullptr;
+                const bool cache_may_take = meta_try_partial && expert_cache_on && !sync_always;
+                if (!cache_may_take) {
+                    wait_for_split();
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -2075,7 +2091,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (ids_tensor != prev_ids_tensor) {
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
-                        ggml_backend_synchronize(ids_backend);
+                        // the ids are mirrored, so the read came off one device and only that one
+                        // has to be waited on. Safe with the deferred sync above because the ids
+                        // write-back below is issued on each device's own compute stream.
+                        if (!sync_always && ggml_backend_is_meta(ids_backend)) {
+                            ggml_backend_meta_synchronize_get(ids_backend, ids_tensor);
+                        } else {
+                            ggml_backend_synchronize(ids_backend);
+                        }
 
                         // find the used experts
                         used_ids.clear();
@@ -2107,17 +2130,30 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         } else {
                             // the pool is indexed by slot, so the ids have to name slots, not experts.
                             // ids is a view of one top-k row, so write the remap back a row at a time.
+                            // An async write goes on each device's compute stream, so it is ordered
+                            // after the kernels that read the old ids and before the ones that read
+                            // the new, with no sync. The source is the layer's own remap buffer,
+                            // rewritten only when the layer routes again a whole token later.
                             if (!expert_cache_plan.ids_written) {
                                 const size_t row = size_t(ids_tensor->ne[0])*sizeof(int32_t);
                                 for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
-                                    ggml_backend_tensor_set(ids_tensor,
-                                        expert_cache_plan.remap.data() + i1*ids_tensor->ne[0],
-                                        i1*ids_tensor->nb[1], row);
+                                    if (!sync_always) {
+                                        ggml_backend_tensor_set_async(ids_backend, ids_tensor,
+                                            expert_cache_plan.remap + i1*ids_tensor->ne[0],
+                                            i1*ids_tensor->nb[1], row);
+                                    } else {
+                                        ggml_backend_tensor_set(ids_tensor,
+                                            expert_cache_plan.remap + i1*ids_tensor->ne[0],
+                                            i1*ids_tensor->nb[1], row);
+                                    }
                                 }
                                 expert_cache_plan.ids_written = true;
                             }
                             continue;
                         }
+                    }
+                    if (cache_may_take) {
+                        wait_for_split(); // the cache did not take this input, so it is staged after all
                     }
                     if (meta_try_partial) {
                         // this weight is about to take a copy sized for all of its experts
