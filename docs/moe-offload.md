@@ -1,4 +1,4 @@
-# MoE expert offload: `-ncmoe`, `GGML_META_PARTIAL_COPY`, `GGML_META_STAGE_SLOTS`, `GGML_META_MOE_OFFLOAD_MIN_EXPERTS`
+# MoE expert offload: `-ncmoe`, `GGML_META_PARTIAL_COPY`, `GGML_META_STAGE_SLOTS`, `GGML_META_MOE_OFFLOAD_MAX_KIB`
 
 These three knobs control where a MoE model's expert weights live and how they get
 streamed to the GPU(s) when they don't fit in VRAM. They matter most for large MoE
@@ -117,49 +117,61 @@ tensor's size, times however many devices stage concurrently) — don't raise it
 past the point of measurable benefit, and watch for OOM if you're already close
 to the VRAM ceiling from `-ncmoe` residency choices.
 
-## `GGML_META_MOE_OFFLOAD_MIN_EXPERTS` (env var)
+## `GGML_META_MOE_OFFLOAD_MAX_KIB` (env var)
 
 ```
-GGML_META_MOE_OFFLOAD_MIN_EXPERTS=N   # default 64, set 0 to disable
+GGML_META_MOE_OFFLOAD_MAX_KIB=N   # default 5120, set 0 to never offload
 ```
 
 `-sm tensor`-only. The meta backend normally offloads an op only above the CUDA
-backend's batch threshold (~32 tokens), but for `mul_mat_id` it also offloads
-unconditionally once the tensor has at least N experts. The reasoning is that one
-token touches only `n_expert_used/n_expert` of the tensor, divided again by the
-device count, so the transfer is small enough to be worth it at any batch size.
+backend's batch threshold (~32 tokens), but a `mul_mat_id` whose experts live in
+host memory also offloads below it while the transfer stays cheap. The budget is
+KiB moved per token, per expert tensor, per device:
 
-**That gate mispredicts for models with many large experts.** It keys on the
-expert *count* as a proxy for bytes per token, which breaks down when the
-per-layer expert tensors are big. Measured on 4x V100, `-ncmoe` decode (tg128):
+```
+staged  = partial copy ? min(n_tokens*n_expert_used, n_expert) : n_expert
+KiB/tok = nbytes(experts)/n_expert * staged / (n_devices * n_tokens * 1024)
+```
 
-| model | experts | `-sm layer` | `-sm tensor` | `-sm tensor`, `MIN_EXPERTS=0` |
-| --- | --- | --- | --- | --- |
-| granitehybrid 32B | 72 | 14.16 | 1.58 | 14.28 |
-| nemotron_h_moe 33B | 128 | 36.5 | 1.3 | 31.1 |
+The `staged` term is the part that matters. Without `GGML_META_PARTIAL_COPY` the
+whole expert tensor moves every ubatch, so decode drags the entire tensor over
+PCIe per token and the CPU path always wins. With it, only the routed experts
+move and the transfer is small enough to pay off on most models.
 
-Setting it to 0 costs nothing on prefill - at prefill batch sizes the plain
-threshold already streams the experts, so the "always" gate only ever changes
-small-batch behaviour, i.e. exactly decode. Output is byte-identical either way.
+Measured on 4x V100, `-sm tensor` tg32, against the old expert-count gate:
 
-**Tuning:** set `0` for any model with >= 64 experts unless you have measured
-otherwise; leave it alone for the 256-expert models it was tuned on (qwen35moe,
-deepseek4), whose experts are individually much smaller. If it is ever retuned in
-tree it should key on staged bytes per token rather than `ne[2]`.
+| model | experts | MiB/tok/tensor | old gate | budget | old + partial | budget + partial |
+| --- | --- | --- | --- | --- | --- | --- |
+| nemotron_h_moe 33B | 128 / 6 | 7.58 | 1.37 | **34.97** | 17.15 | **33.24** |
+| qwen35moe 35B Q8_0 | 256 / 8 | 2.13 | 0.66 | **14.95** | - | - |
+| qwen35moe 35B Q4_K | 256 / 8 | 1.64 | 0.99 | **24.98** | 15.49 | 15.59 |
+
+Prefill is unaffected in every case (both gates offload at prompt batch sizes),
+and perplexity is unchanged to 4 decimals.
+
+**What the budget does not model** is the other side of the comparison: how long
+the CPU would take to do the same matmul. That is why a Q2_K DeepSeek-V4 wants the
+offload at 3.94 MiB/token while a Q4_K qwen35moe does not at 1.64 - the DeepSeek
+CPU matmul is far slower. The budget is set at 5 MiB so every model measured here
+lands on the right side, but it is a one-sided test. Where the two disagree, the
+expert cache (`GGML_META_EXPERT_CACHE`) beats both and overrides the budget.
+
+`GGML_META_MOE_OFFLOAD_MIN_EXPERTS` still works and replaces the budget with the
+old `n_expert >= N` test when set, so existing command lines keep their behaviour.
 
 ## Quick recipe
 
 For a MoE model too large for VRAM under `-sm tensor`:
 
 ```bash
-GGML_META_STAGE_SLOTS=8 GGML_META_MOE_OFFLOAD_MIN_EXPERTS=0 ./llama-server \
+GGML_META_STAGE_SLOTS=8 ./llama-server \
   -m model.gguf \
   -sm tensor \
   -ncmoe <N>       \
   -lm none         \
   -ub 1024
-# MIN_EXPERTS=0 matters for >= 64 experts; drop it for the 256-expert models
-# add GGML_META_PARTIAL_COPY=1 only if your workload is decode/low-batch heavy
+# add GGML_META_PARTIAL_COPY=1 if your workload is decode/low-batch heavy,
+# and GGML_META_EXPERT_CACHE=<n> on top of it for the best decode
 ```
 
 Use [scripts/estimate-ncmoe.py](../scripts/estimate-ncmoe.py) to get a starting

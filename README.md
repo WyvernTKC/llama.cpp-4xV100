@@ -324,9 +324,9 @@ helps every token that wants it:
 **Requirements and limits.**
 
 - Needs `GGML_META_PARTIAL_COPY=1` and `-sm tensor`; it hangs off the same ids readback.
-- **Do not set `GGML_META_MOE_OFFLOAD_MIN_EXPERTS=0` with it.** That makes the experts compute on the
-  CPU, so nothing is ever copied to the GPU and the cache has no copy to serve - it goes silently
-  inert. The two are alternatives; which wins is per-model, and the cache wins on most.
+- The cache needs the experts to be copied to the GPU at all, so it forces the offload on and
+  overrides the bytes-per-token budget below. Setting `GGML_META_MOE_OFFLOAD_MIN_EXPERTS=0` with the
+  cache on no longer turns it inert - the cache wins.
 - **Decode only.** A prompt ubatch routes to more experts than the pool holds, so prefill keeps using
   whole-layer staging. Nothing is lost: it had nothing to gain there.
 - `N` must be below `n_expert`, or the whole tensor fits and a pool is pure overhead.
@@ -714,6 +714,8 @@ Recorded so nobody rebuilds them:
 |---|---|---|
 | `GGML_META_PARTIAL_COPY` | off | copy only the experts this ubatch routes to. Big decode win with `-ncmoe` |
 | `GGML_META_PARTIAL_COPY_MAX_BATCH` | 32 | above this batch size the partial copy stops paying |
+| `GGML_META_MOE_OFFLOAD_MAX_KIB` | 5120 | offload an offloaded MoE matmul while it moves at most this much per token, per expert tensor, per device. 0 never offloads |
+| `GGML_META_MOE_OFFLOAD_MIN_EXPERTS` | unset | old expert-count gate, kept for existing command lines. Setting it replaces the budget above |
 | `GGML_META_EXPERT_CACHE` | off | keep N experts of each offloaded MoE weight resident, decode only. Needs `GGML_META_PARTIAL_COPY` |
 | `GGML_META_EXPERT_CACHE_STATS` | off | print the expert bytes a run moved, for checking the cache is paying |
 | `GGML_META_PARTIAL_DEBUG` | off | per weight, whether it took the used-experts-only path and what refused it |

@@ -163,24 +163,66 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
         [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_supports_op(simple_dev, op); });
 }
 
-// MoE weights are split over the devices AND copied per used expert, so one token moves about
-// k/n_expert of the tensor divided by the device count - cheap enough to offload at any batch size.
-// This lives here rather than in the CUDA device because it depends on the split: under SPLIT_MODE_LAYER
-// a layer's experts land on one device, and offloading them at batch 1 measures slower than computing
-// on the CPU. A dense matmul has no expert selection at all and keeps the plain batch threshold.
-static bool ggml_backend_meta_moe_offload_always(const ggml_tensor * op) {
-    static const int64_t min_experts = getenv("GGML_META_MOE_OFFLOAD_MIN_EXPERTS")
-        ? atoll(getenv("GGML_META_MOE_OFFLOAD_MIN_EXPERTS")) : 64;
-    return min_experts > 0 && op->op == GGML_OP_MUL_MAT_ID &&
-        op->src[0] != nullptr && op->src[0]->ne[2] >= min_experts;
+// MoE weights are row-split over the devices and copied per used expert, so one token moves only
+// the routed experts. What decides the offload is how many bytes that is per token, not how many
+// experts the tensor holds: 128 large experts cost more per token than 256 small ones, and past a
+// budget the CPU path wins at batch 1. This lives here rather than in the CUDA device because it
+// depends on the split: under SPLIT_MODE_LAYER a layer's experts land on one device. A dense matmul
+// has no expert selection at all and keeps the plain batch threshold.
+static bool ggml_backend_meta_moe_offload_always(const ggml_tensor * op, size_t n_devices) {
+    if (op->op != GGML_OP_MUL_MAT_ID || op->src[0] == nullptr || op->src[2] == nullptr || n_devices == 0) {
+        return false;
+    }
+
+    // the expert cache keeps the hot set resident, so a token only moves the misses
+    static const bool expert_cache = getenv("GGML_META_EXPERT_CACHE")
+        && atoi(getenv("GGML_META_EXPERT_CACHE")) > 0;
+    if (expert_cache) {
+        return true;
+    }
+
+    // GGML_META_MOE_OFFLOAD_MIN_EXPERTS is the old expert-count gate, kept so existing command
+    // lines keep their behaviour. 0 turns the unconditional offload off.
+    if (const char * min_experts_env = getenv("GGML_META_MOE_OFFLOAD_MIN_EXPERTS")) {
+        const int64_t min_experts = atoll(min_experts_env);
+        return min_experts > 0 && op->src[0]->ne[2] >= min_experts;
+    }
+
+    // budget in KiB per token, per expert tensor, per device. Measured on 4x V100: the models the
+    // offload helps sit at 1.6-3.9 MiB, the ones where the CPU path is faster at 7.6 and 15.3 MiB.
+    static const int64_t max_kib = getenv("GGML_META_MOE_OFFLOAD_MAX_KIB")
+        ? atoll(getenv("GGML_META_MOE_OFFLOAD_MAX_KIB")) : 5*1024;
+    if (max_kib <= 0) {
+        return false;
+    }
+
+    const int64_t n_expert = op->src[0]->ne[2];
+    const int64_t n_used   = op->src[2]->ne[0];
+    const int64_t n_tokens = op->ne[2];
+    if (n_expert <= 0 || n_used <= 0 || n_tokens <= 0) {
+        return false;
+    }
+
+    // Only the used-experts-only copy stages a subset; without it the whole tensor moves every
+    // ubatch. Conditions mirror the ones in ggml_backend_sched_compute_splits - keep them in step.
+    static const bool    partial           = getenv("GGML_META_PARTIAL_COPY") != nullptr;
+    static const int64_t partial_max_batch = getenv("GGML_META_PARTIAL_COPY_MAX_BATCH")
+        ? atoll(getenv("GGML_META_PARTIAL_COPY_MAX_BATCH")) : 32;
+
+    // a batch cannot route to more experts than the tensor holds
+    const int64_t n_staged = partial && n_tokens <= partial_max_batch
+        ? std::min(n_tokens*n_used, n_expert) : n_expert;
+    const int64_t kib      = (int64_t) (ggml_nbytes(op->src[0])/n_expert)*n_staged/((int64_t) n_devices*n_tokens*1024);
+
+    return kib <= max_kib;
 }
 
 static bool ggml_backend_meta_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
-    if (ggml_backend_meta_moe_offload_always(op)) {
+    const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+    if (ggml_backend_meta_moe_offload_always(op, meta_dev_ctx->simple_devs.size())) {
         return true;
     }
-    const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
     return std::all_of(meta_dev_ctx->simple_devs.begin(), meta_dev_ctx->simple_devs.end(),
         [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_offload_op(simple_dev, op); });
 }

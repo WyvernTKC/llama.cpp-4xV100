@@ -21,15 +21,13 @@ on why -ncmoe's "first N layers" isn't necessarily a balanced split).
 
 Also prints a ready-to-run llama-server/llama-cli command line with the
 suggested -ncmoe value plugged in, plus --load-mode none, (for -sm tensor)
-GGML_META_STAGE_SLOTS / GGML_META_PARTIAL_COPY /
-GGML_META_MOE_OFFLOAD_MIN_EXPERTS, and (for multi-GPU) GGML_CUDA_ALLREDUCE /
-GGML_CUDA_P2P / GGML_CUDA_P2P_AR_MAX_BYTES, per the recipe in
-docs/moe-offload.md.
+GGML_META_STAGE_SLOTS / GGML_META_PARTIAL_COPY, and (for multi-GPU)
+GGML_CUDA_ALLREDUCE / GGML_CUDA_P2P / GGML_CUDA_P2P_AR_MAX_BYTES, per the recipe
+in docs/moe-offload.md.
 
-GGML_META_MOE_OFFLOAD_MIN_EXPERTS is pinned to 0 for models with >= 64 experts:
-the in-tree default of 64 makes the meta backend stream offloaded experts at
-batch 1 as well, which measured 9-24x slower decode on nemotron_h_moe and
-granitehybrid while leaving prefill unchanged.
+Whether an offloaded expert matmul streams to the GPU at batch 1 is decided in
+tree from bytes moved per token (GGML_META_MOE_OFFLOAD_MAX_KIB), so this script
+no longer pins anything for it.
 
 Usage:
     python scripts/estimate-ncmoe.py model.gguf --vram-gib 32
@@ -293,20 +291,11 @@ def print_command(args, ncmoe, offloading_experts, cmoe_all=False, n_expert=None
         if args.partial_copy:
             env["GGML_META_PARTIAL_COPY"] = "1"
 
-        # ggml_backend_meta_moe_offload_always() streams the offloaded expert matmul at *every*
-        # batch size once n_expert >= GGML_META_MOE_OFFLOAD_MIN_EXPERTS (default 64). That gate is
-        # a proxy for "bytes per token are small", and it mispredicts badly for models with many
-        # large experts: measured on 4x V100, decode went 14.16 -> 1.58 t/s on granitehybrid
-        # (72 experts) and 36.5 -> 1.3 t/s on nemotron_h_moe (128 experts). Setting it to 0 recovers
-        # decode fully and costs nothing on prefill, because at prefill batch sizes the plain CUDA
-        # offload threshold (~32 tokens) already streams them anyway.
+        # ggml_backend_meta_moe_offload_always() decides this from bytes moved per token, so no pin
+        # is needed here any more. GGML_META_MOE_OFFLOAD_MIN_EXPERTS restores the old expert-count
+        # gate for anyone who wants it back.
         if args.moe_offload_min_experts is not None:
             env["GGML_META_MOE_OFFLOAD_MIN_EXPERTS"] = str(args.moe_offload_min_experts)
-        elif n_expert is not None and n_expert >= 64:
-            env["GGML_META_MOE_OFFLOAD_MIN_EXPERTS"] = "0"
-            print(f"(note: n_expert={n_expert} >= 64 would make the meta backend stream offloaded "
-                  "experts at batch 1 too, which costs ~9-24x decode; pinning "
-                  "GGML_META_MOE_OFFLOAD_MIN_EXPERTS=0 below. Prefill is unaffected.)")
     elif args.stage_slots is not None or args.partial_copy:
         print("(note: --stage-slots / --partial-copy only apply under -sm tensor with offloaded "
               "experts; omitted from the command below)")
@@ -392,7 +381,7 @@ def main():
                      help="GGML_META_STAGE_SLOTS to include (only meaningful with -sm tensor and "
                           "offloaded experts; default 4, omitted otherwise)")
     ap.add_argument("--moe-offload-min-experts", type=int, default=None,
-                     help="GGML_META_MOE_OFFLOAD_MIN_EXPERTS to include (only meaningful with "
+                     help="GGML_META_MOE_OFFLOAD_MIN_EXPERTS to include, restoring the old expert-count gate (only meaningful with "
                           "-sm tensor and offloaded experts). Omit to let the script decide: it "
                           "pins 0 when the model has >= 64 experts, which is where the in-tree "
                           "default of 64 starts costing an order of magnitude of decode speed. "
