@@ -10,6 +10,7 @@
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-model.h"
 
 #include <cinttypes>
 #include <cstddef>
@@ -17,6 +18,7 @@
 #include <cstring>
 #include <cstdint>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -65,7 +67,8 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-ts/--tensor-split t0,t1,..] [-v N] [-h/--help]\n",
+           argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -394,6 +397,10 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
     return true;
 }
 
+// a non-uniform --tensor-split for the tensor-split configs, so the sweep exercises the split point
+//   dither rather than only the boundaries that happen to land on a granule
+static std::vector<float> g_tensor_split;
+
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
@@ -404,6 +411,12 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
+    if (split_mode == LLAMA_SPLIT_MODE_TENSOR && !g_tensor_split.empty()) {
+        // llama_model stores the split by copying llama_max_devices() floats out of this pointer
+        GGML_ASSERT(g_tensor_split.size() >= devs.size());
+        g_tensor_split.resize(llama_max_devices(), 0.0f);
+        model_params.tensor_split = g_tensor_split.data();
+    }
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
@@ -477,6 +490,72 @@ static std::vector<float> get_logits(
 
     llama_batch_free(batch);
     return ret;
+}
+
+// llama GGUF from get_gguf_ctx: n_embd 256, n_head 2, n_head_kv 2, n_layer 2
+// attn_k.weight has split axis 1 of size 256 and a granularity of 128 (half the axis),
+// so the one-sided floor to the granularity biases the class-wide split maximally
+static int test_tensor_split_dither() {
+    const float splits[3][2] = {
+        { 0.48f, 0.52f },
+        { 0.72f, 0.28f },
+        { 0.5f,  0.5f  }
+    };
+    const int64_t axis_ne = 256;
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_LLAMA, false);
+    if (!gguf_ctx) {
+        return 1;
+    }
+
+    auto class_ne = [&](const float tensor_split[2]) -> std::vector<int64_t> {
+        llama_model_params model_params = llama_model_default_params();
+        model_params.progress_callback  = silent_model_load_progress;
+        std::vector<ggml_backend_dev_t> devs{ nullptr };
+        model_params.devices      = devs.data();
+        model_params.tensor_split = tensor_split;
+
+        size_t          tmp = 0;
+        llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tmp, model_params));
+        if (!model) {
+            throw std::runtime_error("failed to create llama model");
+        }
+
+        llama_meta_device_get_split_state_userdata ud;
+        ud.n_devices = 2;
+        ud.model     = model.get();
+
+        std::vector<int64_t> ret(2, 0);
+        for (uint32_t il = 0; il < model->hparams.n_layer(); il++) {
+            ggml_tensor t;
+            memset(&t, 0, sizeof(t));
+            t.type = GGML_TYPE_F16;
+            ggml_format_name(&t, "blk.%u.attn_k.weight", il);
+            t.ne[0] = axis_ne;
+            t.ne[1] = axis_ne;
+
+            const ggml_backend_meta_split_state state = llama_meta_device_get_split_state(&t, &ud);
+            GGML_ASSERT(state.n_segments == 1);
+            for (size_t d = 0; d < 2; d++) {
+                ret[d] += state.ne[d];
+            }
+        }
+        return ret;
+    };
+
+    bool ok = true;
+    for (int i = 0; i < 3; i++) {
+        const std::vector<int64_t> ret    = class_ne(splits[i]);
+        const double               ratio0 = double(ret[0]) / double(ret[0] + ret[1]);
+        printf("tensor split dither: -ts %0.2f,%0.2f -> %0.2f/%0.2f\n", splits[i][0], splits[i][1], ratio0,
+               1.0 - ratio0);
+        const double err = ratio0 - double(splits[i][0]);
+        if (err < -0.05 || err > 0.05) {
+            printf("tensor split dither: class-wide split deviates by %0.2f from the requested ratio\n", err);
+            ok = false;
+        }
+    }
+    return ok ? 0 : 1;
 }
 
 static bool moe_mandatory(const llm_arch arch) {
@@ -880,6 +959,18 @@ int main(int argc, char ** argv) {
                 return 1;
             }
         }
+        if (strcmp(argv[i], "-ts") == 0 || strcmp(argv[i], "--tensor-split") == 0) {
+            if (i + 1 < argc) {
+                std::stringstream ss(argv[++i]);
+                std::string       value;
+                while (std::getline(ss, value, ',')) {
+                    g_tensor_split.push_back(std::stof(value));
+                }
+            } else {
+                usage(argv);
+                return 1;
+            }
+        }
         if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--out") == 0) {
             if (i + 1 < argc) {
                 out = argv[++i];
@@ -895,7 +986,11 @@ int main(int argc, char ** argv) {
         if (!out.empty()) {
             return save_models(arch, seed, verbosity, out);
         }
-        return test_backends(arch, seed, verbosity);
+        const int ret = test_backends(arch, seed, verbosity);
+        if (ret != 0) {
+            return ret;
+        }
+        return test_tensor_split_dither();
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;
