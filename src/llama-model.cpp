@@ -1135,6 +1135,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 GGML_ASSERT(segments.size() == 1);
                 return {g_heads};
             }
+            // attn_sinks is one value per query head, same granule as attn_k_b/attn_v_b - it has to
+            //   line up with the Q head split that flash attention sees after the absorption optimization
+            if (std::regex_match(tensor_name, pattern_attn_sinks)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {g_heads};
+            }
             // the output gate is per head in some architectures (BailingMoE3) and per feature of the
             //   attention output in others (Kimi-K3), tell them apart by the size being gated
             if (std::regex_match(tensor_name, pattern_attn_gate_weight)) {
