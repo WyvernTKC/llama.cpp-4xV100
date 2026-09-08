@@ -5778,6 +5778,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         }
         case GGML_OP_IM2COL:
         case GGML_OP_IM2COL_3D:
+            // src0 gives the kernel shape only, its data is never read
+            return ggml_is_contiguous(op->src[1]);
         case GGML_OP_CONV_2D:
             return (ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]));
         case GGML_OP_CONV_2D_DW:
