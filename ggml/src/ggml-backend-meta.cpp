@@ -10,12 +10,14 @@
 #include <cassert>
 #include <cinttypes>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -2200,18 +2202,57 @@ struct ggml_backend_meta_context {
     // Workers take devices 1..n-1 and the calling thread keeps device 0, so a 1-device meta backend
     // spawns nothing. The rendezvous spins and then yields rather than using a condition variable:
     // a subgraph launch is ~130 us apart, and a CV wakeup (10-30 us) against ~130 subgraphs per token
-    // would give back a third of what this saves.
+    // would give back a third of what this saves. Workers park on the condition variable only after
+    // the spin budget runs out, so an idle server does not hold a core per device.
     struct launch_pool {
         std::vector<std::thread> threads;
         std::atomic<uint64_t>    epoch{0};
         std::atomic<int>         done{0};
         std::atomic<bool>        stop{false};
+        std::atomic<int>         n_parked{0};
+        std::mutex               mtx;
+        std::condition_variable  cv;
         size_t                   i_subgraph = 0;
         ggml_status              status[GGML_BACKEND_META_MAX_DEVICES];
 
+        // must cover the gap between two subgraph launches (~130 us) and the host work between tokens
+        static constexpr int64_t spin_budget_us = 5000;
+
+        void wait(uint64_t seen) {
+            for (int spin = 0; spin < 512; ++spin) {
+                if (epoch.load(std::memory_order_acquire) != seen) {
+                    return;
+                }
+            }
+            const int64_t t_park_us = ggml_time_us() + spin_budget_us;
+            while (ggml_time_us() < t_park_us) {
+                if (epoch.load(std::memory_order_acquire) != seen) {
+                    return;
+                }
+                std::this_thread::yield();
+            }
+            // seq_cst here and on the epoch load below pairs with wake(): if wake() misses this park,
+            // then this thread sees the new epoch and does not wait
+            n_parked.fetch_add(1, std::memory_order_seq_cst);
+            {
+                std::unique_lock<std::mutex> lock(mtx);
+                cv.wait(lock, [&] { return epoch.load(std::memory_order_seq_cst) != seen; });
+            }
+            n_parked.fetch_sub(1, std::memory_order_relaxed);
+        }
+
+        void wake() {
+            if (n_parked.load(std::memory_order_seq_cst) == 0) {
+                return;
+            }
+            std::lock_guard<std::mutex> lock(mtx);
+            cv.notify_all();
+        }
+
         ~launch_pool() {
             stop.store(true, std::memory_order_release);
-            epoch.fetch_add(1, std::memory_order_release);
+            epoch.fetch_add(1, std::memory_order_seq_cst);
+            wake();
             for (std::thread & t : threads) {
                 if (t.joinable()) {
                     t.join();
@@ -3753,11 +3794,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 lpp->threads.emplace_back([backend_ctx, lpp, j]() {
                     uint64_t seen = 0;
                     while (true) {
-                        for (int spin = 0; lpp->epoch.load(std::memory_order_acquire) == seen; ++spin) {
-                            if (spin > 512) {
-                                std::this_thread::yield();
-                            }
-                        }
+                        lpp->wait(seen);
                         seen = lpp->epoch.load(std::memory_order_acquire);
                         if (lpp->stop.load(std::memory_order_acquire)) {
                             return;
@@ -3781,7 +3818,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             ggml_backend_meta_context::launch_pool & lp = *backend_ctx->lpool;
             lp.i_subgraph = i;
             lp.done.store(0, std::memory_order_relaxed);
-            lp.epoch.fetch_add(1, std::memory_order_release);
+            lp.epoch.fetch_add(1, std::memory_order_seq_cst);
+            lp.wake();
 
             // device 0 on this thread, so one device costs no rendezvous at all
             auto & bc0 = backend_ctx->backend_configs[0];
