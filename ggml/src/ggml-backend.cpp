@@ -1783,6 +1783,21 @@ struct ggml_expert_cache_plan {
 
 static int ggml_backend_sched_expert_cache_cap() {
     static const int cap = getenv("GGML_META_EXPERT_CACHE") ? atoi(getenv("GGML_META_EXPERT_CACHE")) : 0;
+
+    // The pool only serves the staged path, which the meta backend joins only under
+    // GGML_META_PARTIAL_COPY. Setting the cache alone still forces the unconditional MoE offload
+    // (ggml_backend_meta_moe_offload_always), so a whole layer of experts moves per ubatch and the
+    // cache never gets used - measured 30x slower than leaving both off.
+    if (cap > 0 && !getenv("GGML_META_PARTIAL_COPY")) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            GGML_LOG_WARN("%s: GGML_META_EXPERT_CACHE is set without GGML_META_PARTIAL_COPY=1: the expert "
+                "cache cannot be used and every offloaded MoE weight moves a whole layer per ubatch. "
+                "Set GGML_META_PARTIAL_COPY=1, or unset GGML_META_EXPERT_CACHE.\n", __func__);
+        }
+    }
+
     return cap;
 }
 

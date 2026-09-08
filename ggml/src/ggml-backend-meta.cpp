@@ -479,6 +479,12 @@ struct ggml_backend_meta_simple_tensor_container {
 };
 
 struct ggml_backend_meta_buffer_context {
+    // Bumped when this buffer (re)creates its per-device tensor mirrors. A cached graph
+    // decomposition holds pointers into the mirrors of the buffers it used, so it stays valid
+    // only while their generations are unchanged. Per buffer and not global: a draft model is a
+    // second llama_context that re-allocs its own graph on every draft pass, and one global
+    // counter let that invalidate the target model's decomposition on every step.
+    uint64_t mirror_gen = 0;
     // FIXME
     // Most tensors can simply be stored statically in their own buffer.
     // Externally created views however also need a mapping to simple tensors but they use the buffer of the view source.
@@ -1617,16 +1623,10 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
     return GGML_STATUS_SUCCESS;
 }
 
-// Bumped whenever per-device tensor mirrors are (re)created. A cached decomposition holds pointers
-// into those mirrors, so it is only valid while this is unchanged. Needed because a graph can be
-// rebuilt into a reset ggml_context and come back looking identical - same addresses, ops and shapes
-// - leaving its uid stable while the mirrors underneath have been replaced.
-static std::atomic<uint64_t> g_meta_mirror_gen{0};
-
 static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
-    g_meta_mirror_gen.fetch_add(1, std::memory_order_relaxed);
+    buf_ctx->mirror_gen++;
     buf_ctx->stc_compute_index = buf_ctx->stc_compute_index_next;
     return ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), tensor);
 }
@@ -2274,7 +2274,8 @@ struct ggml_backend_meta_context {
         size_t                          n_subgraphs = 0;
 
         uint64_t uid        = 0;  // the split graph this was built for, 0 = empty
-        uint64_t mirror_gen = 0;  // g_meta_mirror_gen when it was built
+        // the meta buffers this entry mirrors, each with its mirror_gen when it was built
+        std::vector<std::pair<ggml_backend_meta_buffer_context *, uint64_t>> used_bufs;
         uint64_t used       = 0;  // for LRU eviction
         // what this entry was sized for, so a recycled one knows to grow
         int      sized_nnodes    = 0;
@@ -3067,11 +3068,20 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // Reuse the decomposition built for this graph if there is one. ggml_backend_sched hands the same
     // few split graphs round-robin, so a single cached slot missed on every call - keep one per graph.
     // Depends on stable uids from ggml_backend_sched_split_graph; a fresh uid per eval defeats it.
-    const uint64_t mirror_gen = g_meta_mirror_gen.load(std::memory_order_relaxed);
     ggml_backend_meta_context::decomposition * D = nullptr;
     if (cgraph->uid != 0) {
         for (auto & d : backend_ctx->decs) {
-            if (d->uid == cgraph->uid && d->mirror_gen == mirror_gen) {
+            if (d->uid != cgraph->uid) {
+                continue;
+            }
+            bool mirrors_ok = true;
+            for (const auto & ub : d->used_bufs) {
+                if (ub.first->mirror_gen != ub.second) {
+                    mirrors_ok = false;
+                    break;
+                }
+            }
+            if (mirrors_ok) {
                 D = d.get();
                 break;
             }
@@ -3181,8 +3191,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 used_buffers.emplace(cgraph->nodes[i]->buffer);
             }
         }
+        D->used_bufs.clear();
         for (ggml_backend_buffer_t buf : used_buffers) {
             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
+            D->used_bufs.emplace_back(buf_ctx, 0);
             buf_ctx->stc_compute_index_next = buf_ctx->stc_compute_index ^ 1;
             ggml_backend_meta_simple_tensor_container & stc = buf_ctx->stc_compute[buf_ctx->stc_compute_index_next];
             for (ggml_context_ptr & ctx : stc.ctxs) {
@@ -3443,7 +3455,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         backend_ctx->uid         = cgraph->uid;
         D->uid         = cgraph->uid;
-        D->mirror_gen  = mirror_gen;
+        // only now that every mirror exists is the generation the one this entry matches
+        for (auto & ub : D->used_bufs) {
+            ub.second = ub.first->mirror_gen;
+        }
         D->n_subgraphs = n_subgraphs;
 
         if (max_tmp_size > backend_ctx->max_tmp_size) {
