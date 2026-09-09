@@ -2131,7 +2131,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         if (!ggml_backend_meta_cache_experts(split_backend, input, input_cpy, input->data,
                                 expert_cache_plan.cap, expert_cache_plan.miss_expert.data(),
                                 expert_cache_plan.miss_slot.data(), expert_cache_plan.miss_expert.size())) {
-                            ggml_backend_meta_cache_unbind_all(split_backend);
+                            ggml_backend_meta_cache_release_all(split_backend);
                             expert_cache_on = false;
                         } else {
                             // the pool is indexed by slot, so the ids have to name slots, not experts.
