@@ -356,6 +356,22 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
     //
+    // MoE expert cache
+    //
+
+    // How many experts of each offloaded MoE weight stay resident in a per-tensor pool. Seeded from
+    // GGML_META_EXPERT_CACHE, but settable so a tuner can sweep it without reloading the model:
+    // setting it rebuilds the pools at the new size and gives the new cap a clean verdict.
+    // Only meaningful under -sm tensor with GGML_META_PARTIAL_COPY.
+    GGML_API int                  ggml_backend_expert_cache_cap(void);
+    GGML_API void                 ggml_backend_expert_cache_set_cap(int cap);
+
+    // true once the cache has given up for this run, because it could not set up a pool for every
+    // offloaded weight. The cache is all-or-nothing, so this means the cap does not fit the VRAM
+    // left at this context length and decode fell back to whole-layer staging.
+    GGML_API bool                 ggml_backend_expert_cache_degraded(void);
+
+    //
     // Meta backend
     //
 

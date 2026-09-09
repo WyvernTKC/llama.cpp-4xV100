@@ -174,6 +174,17 @@ static std::atomic<bool> g_meta_stage_failed{false};
 // decision has to stop forcing the offload on behalf of a cache that is no longer running.
 static std::atomic<bool> g_meta_expert_cache_gave_up{false};
 
+bool ggml_backend_meta_expert_cache_degraded(void) {
+    return g_meta_expert_cache_gave_up.load(std::memory_order_relaxed);
+}
+
+// Called when the cap changes, so the new cap is judged on its own merits rather than inheriting the
+// previous one's verdict. The pools are not freed here - each is rebuilt where its cap mismatch is
+// noticed, which avoids needing a backend handle for what is a process-wide setting.
+void ggml_backend_meta_expert_cache_rearm(void) {
+    g_meta_expert_cache_gave_up.store(false, std::memory_order_relaxed);
+}
+
 // MoE weights are row-split over the devices and copied per used expert, so one token moves only
 // the routed experts. What decides the offload is how many bytes that is per token, not how many
 // experts the tensor holds: 128 large experts cost more per token than 256 small ones, and past a
@@ -208,8 +219,7 @@ static bool ggml_backend_meta_moe_offload_always(const ggml_tensor * op, size_t 
     // inert, and forcing the offload for one would stream every routed expert with nothing to
     // amortize it - worse than the budget's own answer. GGML_META_EXPERT_CACHE_IDENTITY overrides
     // the cap to the expert count, so any positive value is usable there.
-    static const int  expert_cache_cap      = getenv("GGML_META_EXPERT_CACHE")
-        ? atoi(getenv("GGML_META_EXPERT_CACHE")) : 0;
+    const int         expert_cache_cap      = ggml_backend_expert_cache_cap();
     static const bool expert_cache_identity = getenv("GGML_META_EXPERT_CACHE_IDENTITY") != nullptr;
     if (expert_cache_cap > 0) {
         if (expert_cache_identity || expert_cache_cap < op->src[0]->ne[2]) {
@@ -2849,10 +2859,15 @@ bool ggml_backend_meta_cache_experts(ggml_backend_t backend, const ggml_tensor *
         return bail("chunk geometry");
     }
 
-    ggml_backend_meta_context::expert_pool & pool = ctx->expert_pools[key];
-    if (pool.cap != 0 && pool.cap != cap) {
-        return bail("cap changed");
+    // A cap change (a tuner sweeping it in one model load) leaves this pool the wrong width. Drop it
+    // and build a fresh one at the new size rather than giving up, which would switch the cache off
+    // for the rest of the run. unbind first: the weight's tensors still point into the old pool.
+    if (auto it = ctx->expert_pools.find(key);
+            it != ctx->expert_pools.end() && it->second.cap != 0 && it->second.cap != cap) {
+        ggml_backend_meta_cache_unbind(backend, key);
+        ggml_backend_meta_expert_pool_release(ctx, key);
     }
+    ggml_backend_meta_context::expert_pool & pool = ctx->expert_pools[key];
     if (pool.orig_ne2 == 0) {
         pool.orig_ne2 = ggml_backend_meta_buffer_simple_tensor(dst, 0)->ne[2];
     }

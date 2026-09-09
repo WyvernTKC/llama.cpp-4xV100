@@ -24,6 +24,7 @@
 #include "common.h"
 #include "download.h"
 #include "fit.h"
+#include "ggml-backend.h"
 #include "ggml.h"
 #include "llama.h"
 #include "log.h"
@@ -347,6 +348,8 @@ struct cmd_params {
     std::vector<ggml_type>           type_k;
     std::vector<ggml_type>           type_v;
     std::vector<int>                 n_threads;
+    std::vector<int>                 expert_cache;
+    bool                             profile_cache;
     std::vector<std::string>         cpu_mask;
     std::vector<bool>                cpu_strict;
     std::vector<int>                 poll;
@@ -392,6 +395,8 @@ static const cmd_params cmd_params_defaults = {
     /* type_k               */ { GGML_TYPE_F16 },
     /* type_v               */ { GGML_TYPE_F16 },
     /* n_threads            */ { common_cpu_get_num_math() },
+    /* expert_cache         */ { -1 },   // -1 = leave whatever GGML_META_EXPERT_CACHE says
+    /* profile_cache        */ false,
     /* cpu_mask             */ { "0x0" },
     /* cpu_strict           */ { false },
     /* poll                 */ { 50 },
@@ -469,6 +474,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --poll <0...100>                                  (default: %s)\n", join(cmd_params_defaults.poll, ",").c_str());
     printf("  -ngl, --n-gpu-layers <n>                          (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
     printf("  -ncmoe, --n-cpu-moe <n>                           (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
+    printf("  -xc, --expert-cache <n>                           (default: from GGML_META_EXPERT_CACHE)\n");
+    printf("  --profile-cache                                   sweep -xc in one model load, report the best cap\n");
     printf("  -sm, --split-mode <none|layer|row|tensor>         (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
@@ -531,6 +538,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.output_format        = cmd_params_defaults.output_format;
     params.output_format_stderr = cmd_params_defaults.output_format_stderr;
     params.reps                 = cmd_params_defaults.reps;
+    params.profile_cache        = cmd_params_defaults.profile_cache;
     params.numa                 = cmd_params_defaults.numa;
     params.prio                 = cmd_params_defaults.prio;
     params.delay                = cmd_params_defaults.delay;
@@ -695,6 +703,15 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_threads.insert(params.n_threads.end(), p.begin(), p.end());
+            } else if (arg == "-xc" || arg == "--expert-cache") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                params.expert_cache.insert(params.expert_cache.end(), p.begin(), p.end());
+            } else if (arg == "--profile-cache") {
+                params.profile_cache = true;
             } else if (arg == "-C" || arg == "--cpu-mask") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1151,7 +1168,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
         params.model = cmd_params_defaults.model;
     }
     if (params.n_prompt.empty()) {
-        params.n_prompt = cmd_params_defaults.n_prompt;
+        // The cache is decode-only - prefill routes to more experts than any pool holds and falls
+        // back to whole-layer staging regardless - so a profile spends its time on tg, not pp.
+        params.n_prompt = params.profile_cache ? std::vector<int>{ 0 } : cmd_params_defaults.n_prompt;
     }
     if (params.n_gen.empty()) {
         params.n_gen = cmd_params_defaults.n_gen;
@@ -1219,6 +1238,15 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.n_threads.empty()) {
         params.n_threads = cmd_params_defaults.n_threads;
     }
+    if (params.profile_cache && params.expert_cache.empty()) {
+        // A ladder, not a fine sweep: the hit rate flattens fast (routing is skewed, so a small pool
+        // already catches most reuse) and each rung costs VRAM linearly. Caps at or above the model's
+        // expert count are rejected by the cache itself and get dropped once we know n_expert.
+        params.expert_cache = { 0, 8, 16, 24, 32, 48, 64, 96, 128 };
+    }
+    if (params.expert_cache.empty()) {
+        params.expert_cache = cmd_params_defaults.expert_cache;
+    }
     if (params.cpu_mask.empty()) {
         params.cpu_mask = cmd_params_defaults.cpu_mask;
     }
@@ -1248,6 +1276,9 @@ struct cmd_params_instance {
     ggml_type          type_k;
     ggml_type          type_v;
     int                n_threads;
+    // Deliberately absent from equal_mparams: the cap is a runtime setting, so sweeping it reuses
+    // the loaded model instead of paying a reload per value.
+    int                expert_cache;
     std::string        cpu_mask;
     bool               cpu_strict;
     int                poll;
@@ -1375,6 +1406,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & nkvo : params.no_kv_offload)
     for (const auto & fa : params.flash_attn)
     for (const auto & nt : params.n_threads)
+    for (const auto & xc : params.expert_cache)
     for (const auto & cm : params.cpu_mask)
     for (const auto & cs : params.cpu_strict)
     for (const auto & nd : params.n_depth)
@@ -1393,6 +1425,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .type_k                = */ tk,
                 /* .type_v                = */ tv,
                 /* .n_threads             = */ nt,
+                /* .expert_cache          = */ xc,
                 /* .cpu_mask              = */ cm,
                 /* .cpu_strict            = */ cs,
                 /* .poll                  = */ pl,
@@ -1430,6 +1463,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .type_k                = */ tk,
                 /* .type_v                = */ tv,
                 /* .n_threads             = */ nt,
+                /* .expert_cache          = */ xc,
                 /* .cpu_mask              = */ cm,
                 /* .cpu_strict            = */ cs,
                 /* .poll                  = */ pl,
@@ -1467,6 +1501,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .type_k                = */ tk,
                 /* .type_v                = */ tv,
                 /* .n_threads             = */ nt,
+                /* .expert_cache          = */ xc,
                 /* .cpu_mask              = */ cm,
                 /* .cpu_strict            = */ cs,
                 /* .poll                  = */ pl,
@@ -1507,6 +1542,8 @@ struct test {
     int                      n_batch;
     int                      n_ubatch;
     int                      n_threads;
+    int                      expert_cache;
+    bool                     cache_degraded = false;
     std::string              cpu_mask;
     bool                     cpu_strict;
     int                      poll;
@@ -1547,6 +1584,7 @@ struct test {
         n_batch        = inst.n_batch;
         n_ubatch       = inst.n_ubatch;
         n_threads      = inst.n_threads;
+        expert_cache   = inst.expert_cache;
         cpu_mask       = inst.cpu_mask;
         cpu_strict     = inst.cpu_strict;
         poll           = inst.poll;
@@ -1621,7 +1659,7 @@ struct test {
         static const std::vector<std::string> fields = {
             "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
-            "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
+            "n_ubatch",       "n_threads",      "expert_cache",  "cache_degraded", "cpu_mask",      "cpu_strict",     "poll",
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "lazy_mode",
@@ -1636,7 +1674,11 @@ struct test {
     enum field_type { STRING, BOOL, INT, FLOAT };
 
     static field_type get_field_type(const std::string & field) {
+        if (field == "cache_degraded") {
+            return BOOL;
+        }
         if (field == "build_number" || field == "n_batch" || field == "n_ubatch" || field == "n_threads" ||
+            field == "expert_cache" ||
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
@@ -1705,6 +1747,8 @@ struct test {
                                             std::to_string(n_batch),
                                             std::to_string(n_ubatch),
                                             std::to_string(n_threads),
+                                            std::to_string(expert_cache),
+                                            std::to_string(cache_degraded),
                                             cpu_mask,
                                             std::to_string(cpu_strict),
                                             std::to_string(poll),
@@ -1887,6 +1931,12 @@ struct markdown_printer : public printer {
         if (field == "n_threads") {
             return 7;
         }
+        if (field == "expert_cache") {
+            return 6;
+        }
+        if (field == "cache_degraded") {
+            return 5;
+        }
         if (field == "n_batch") {
             return 7;
         }
@@ -1935,6 +1985,12 @@ struct markdown_printer : public printer {
         }
         if (field == "n_threads") {
             return "threads";
+        }
+        if (field == "expert_cache") {
+            return "xcache";
+        }
+        if (field == "cache_degraded") {
+            return "xoff";
         }
         if (field == "no_kv_offload") {
             return "nkvo";
@@ -1989,6 +2045,10 @@ struct markdown_printer : public printer {
         }
         if (params.n_threads.size() > 1 || params.n_threads != cmd_params_defaults.n_threads || is_cpu_backend) {
             fields.emplace_back("n_threads");
+        }
+        if (params.expert_cache.size() > 1 || params.expert_cache != cmd_params_defaults.expert_cache) {
+            fields.emplace_back("expert_cache");
+            fields.emplace_back("cache_degraded"); // a cap that did not fit reads as a slow row otherwise
         }
         if (params.cpu_mask.size() > 1 || params.cpu_mask != cmd_params_defaults.cpu_mask) {
             fields.emplace_back("cpu_mask");
@@ -2316,6 +2376,9 @@ int llama_bench(int argc, char ** argv) {
     llama_model *               lmodel    = nullptr;
     const cmd_params_instance * prev_inst = nullptr;
 
+    struct cache_profile_row { int cap; double ts; bool degraded; };
+    std::vector<cache_profile_row> cache_profile;
+
     // store the llama_context state at the previous depth that we performed a test
     // ref: https://github.com/ggml-org/llama.cpp/pull/16944#issuecomment-3478151721
     ctx_state cstate;
@@ -2388,6 +2451,13 @@ int llama_bench(int argc, char ** argv) {
         test t(inst, lmodel, ctx);
 
         llama_memory_clear(llama_get_memory(ctx), false);
+
+        // Apply the expert cache cap for this row. -1 means "leave whatever the environment said",
+        // so a run that never mentions -xc behaves exactly as before. Rebuilding the pools is lazy,
+        // so the first ubatch of this row pays for it - which is what the warmup below absorbs.
+        if (t.expert_cache >= 0) {
+            ggml_backend_expert_cache_set_cap(t.expert_cache);
+        }
 
         // cool off before the test
         if (params.delay) {
@@ -2517,6 +2587,15 @@ int llama_bench(int argc, char ** argv) {
             t.samples_ns.push_back(t_ns);
         }
 
+        // The cache is all-or-nothing per run: a cap whose pools did not all fit switches it off and
+        // decode falls back to whole-layer staging, which is slower than never asking for it. Without
+        // this the row just looks slow, which is exactly how a too-large cap gets mistaken for a
+        // tuning result. Read after the runs, and only trust it for rows that set a cap.
+        t.cache_degraded = t.expert_cache > 0 && ggml_backend_expert_cache_degraded();
+        if (params.profile_cache && t.n_gen > 0) {
+            cache_profile.push_back({ t.expert_cache, t.avg_ts(), t.cache_degraded });
+        }
+
         if (p) {
             p->print_test(t);
             fflush(p->fout);
@@ -2535,6 +2614,50 @@ int llama_bench(int argc, char ** argv) {
     }
 
     llama_model_free(lmodel);
+
+    if (params.profile_cache && !cache_profile.empty()) {
+        const cache_profile_row * best = nullptr;   // fastest cap whose pools all fitted
+        const cache_profile_row * base = nullptr;   // cap 0, for the "is it worth it" comparison
+        int worst_fitting = 0, smallest_degraded = 0;
+        for (const auto & r : cache_profile) {
+            if (r.cap == 0) {
+                base = &r;
+                continue;
+            }
+            if (r.degraded) {
+                if (smallest_degraded == 0 || r.cap < smallest_degraded) {
+                    smallest_degraded = r.cap;
+                }
+                continue;
+            }
+            worst_fitting = std::max(worst_fitting, r.cap);
+            if (!best || r.ts > best->ts) {
+                best = &r;
+            }
+        }
+        printf("\nexpert cache profile\n");
+        if (!best) {
+            printf("  no cap fitted - every one switched the cache off mid-run. Raise -ncmoe to free\n"
+                   "  VRAM (a layer moved off-GPU frees far more than its pool costs), or leave the\n"
+                   "  cache unset.\n");
+        } else {
+            printf("  best fitting cap: %d at %.2f t/s", best->cap, best->ts);
+            if (base && base->ts > 0) {
+                printf("  (%+.1f%% vs no cache, %.2f t/s)", 100.0*(best->ts - base->ts)/base->ts, base->ts);
+            }
+            printf("\n  largest cap that fitted: %d\n", worst_fitting);
+            if (base && best->ts <= base->ts) {
+                printf("  NOTE: no cap beat the uncached path here - leave the cache off.\n");
+            }
+        }
+        if (smallest_degraded) {
+            printf("  caps from %d up did not fit and are reported as xoff=1; ignore their timings.\n",
+                   smallest_degraded);
+        }
+        printf("  Caveat: llama-bench sizes the KV to -d + -n and loads no mmproj, so it has more\n"
+               "  free VRAM than a server at a large --ctx-size. Treat the fitting caps as an upper\n"
+               "  bound and confirm the one you pick through the server.\n");
+    }
 
     if (p) {
         p->print_footer();

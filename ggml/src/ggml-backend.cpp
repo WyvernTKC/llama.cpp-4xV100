@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
 #include <list>
 #include <string>
 #include <unordered_map>
@@ -1781,8 +1782,44 @@ struct ggml_expert_cache_plan {
     const int32_t * remap = nullptr; // ids rewritten to slot indices, owned by the layer
 };
 
+// The cap starts from the environment but stays settable, so a tuner can sweep it inside one model
+// load. Everything derived from it - the pools, the per-layer LRU, whether the cache is still on -
+// keys off the generation, so a change invalidates them wherever they are noticed rather than
+// needing a central teardown that would have to reach every backend.
+static std::atomic<int> g_expert_cache_cap{-1};
+static std::atomic<int> g_expert_cache_gen{0};
+static std::atomic<bool> g_expert_cache_on{true};
+
+int ggml_backend_expert_cache_cap(void) {
+    int cap = g_expert_cache_cap.load(std::memory_order_relaxed);
+    if (cap < 0) {
+        cap = getenv("GGML_META_EXPERT_CACHE") ? atoi(getenv("GGML_META_EXPERT_CACHE")) : 0;
+        g_expert_cache_cap.store(cap, std::memory_order_relaxed);
+    }
+    return cap;
+}
+
+int ggml_backend_expert_cache_generation(void) {
+    return g_expert_cache_gen.load(std::memory_order_relaxed);
+}
+
+bool ggml_backend_expert_cache_degraded(void) {
+    // off for the run either way: the pools would not fit, or the model turned the cache down
+    return ggml_backend_meta_expert_cache_degraded() || !g_expert_cache_on.load(std::memory_order_relaxed);
+}
+
+void ggml_backend_expert_cache_set_cap(int cap) {
+    if (cap == ggml_backend_expert_cache_cap()) {
+        return;
+    }
+    g_expert_cache_cap.store(cap < 0 ? 0 : cap, std::memory_order_relaxed);
+    g_expert_cache_gen.fetch_add(1, std::memory_order_relaxed);
+    g_expert_cache_on.store(true, std::memory_order_relaxed);   // give the new cap a clean start
+    ggml_backend_meta_expert_cache_rearm();
+}
+
 static int ggml_backend_sched_expert_cache_cap() {
-    static const int cap = getenv("GGML_META_EXPERT_CACHE") ? atoi(getenv("GGML_META_EXPERT_CACHE")) : 0;
+    const int cap = ggml_backend_expert_cache_cap();
 
     // The pool only serves the staged path, which the meta backend joins only under
     // GGML_META_PARTIAL_COPY. Setting the cache alone still forces the unconditional MoE offload
@@ -1834,6 +1871,11 @@ static void ggml_backend_sched_expert_cache_plan_make(int64_t n_expert, int cap,
     }
 
     ggml_expert_cache_layer & L = layers[ids_tensor];
+    // slot_of/expert_of/lru are all sized to cap, so a cap change has to rebuild them; the residency
+    // they record belongs to pools that are being rebuilt at the new size anyway.
+    if (L.expert_of.size() != (size_t) cap) {
+        L = {};
+    }
     if (L.slot_of.empty()) {
         L.slot_of.assign(n_expert, -1);
         L.expert_of.assign(cap, -1);
@@ -1944,12 +1986,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     struct ggml_backend_sched_split * splits = sched->splits;
 
     ggml_tensor * prev_ids_tensor = nullptr;
-    static bool expert_cache_on = ggml_backend_sched_expert_cache_cap() > 0;
+    // Re-read per graph: a cap change bumps the generation, which re-arms the cache and forces the
+    // ADD_ID scan to run again for the new cap.
+    static int  seen_gen  = -1;
+    const int   cache_gen = ggml_backend_expert_cache_generation();
+    static bool checked   = false;
+    if (seen_gen != cache_gen) {
+        seen_gen = cache_gen;
+        checked  = false;
+    }
+    bool expert_cache_on = g_expert_cache_on.load(std::memory_order_relaxed) &&
+        ggml_backend_sched_expert_cache_cap() > 0;
     if (expert_cache_on) {
         // The cache renames experts to pool slots, and ADD_ID indexes a full-size per-expert bias with
         // the same ids, so a model that has one (gpt-oss) would read the wrong bias. Only arch with
         // expert biases today, but detect the op rather than the arch.
-        static bool checked = false;
         if (!checked) {
             checked = true;
             for (int i = 0; i < sched->graph.n_nodes; i++) {
@@ -1957,6 +2008,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     GGML_LOG_WARN("%s: expert cache disabled, this model indexes a per-expert bias with ADD_ID\n",
                         __func__);
                     expert_cache_on = false;
+                    g_expert_cache_on.store(false, std::memory_order_relaxed);
                     break;
                 }
             }
@@ -2133,6 +2185,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 expert_cache_plan.miss_slot.data(), expert_cache_plan.miss_expert.size())) {
                             ggml_backend_meta_cache_release_all(split_backend);
                             expert_cache_on = false;
+                            g_expert_cache_on.store(false, std::memory_order_relaxed);
                         } else {
                             // the pool is indexed by slot, so the ids have to name slots, not experts.
                             // ids is a view of one top-k row, so write the remap back a row at a time.

@@ -112,6 +112,12 @@ extern "C" {
     // As above, and also frees the pools. For turning the cache off for the rest of the run: keeping
     // the pools allocated with nothing reading them can starve a later allocation that cannot fall back.
     GGML_API void ggml_backend_meta_cache_release_all(ggml_backend_t backend);
+    // true once the expert cache has given up for this run - it could not set up a pool for every
+    // offloaded weight, so the cap is too large for the VRAM left at this context length.
+    GGML_API bool ggml_backend_meta_expert_cache_degraded(void);
+    GGML_API void ggml_backend_meta_expert_cache_rearm    (void);
+    // bumped by ggml_backend_expert_cache_set_cap; anything derived from the cap keys off it
+    GGML_API int  ggml_backend_expert_cache_generation(void);
     // Wait only for the devices a read of this tensor touched, instead of all of them.
     GGML_API void ggml_backend_meta_synchronize_get(ggml_backend_t backend, const struct ggml_tensor * tensor);
     GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
