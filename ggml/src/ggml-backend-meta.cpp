@@ -170,6 +170,10 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
 // process is enough - staging is a per-device resource and every meta backend shares the devices.
 static std::atomic<bool> g_meta_stage_failed{false};
 
+// Set when the expert cache gives up for the rest of the run, for the same reason: the offload
+// decision has to stop forcing the offload on behalf of a cache that is no longer running.
+static std::atomic<bool> g_meta_expert_cache_gave_up{false};
+
 // MoE weights are row-split over the devices and copied per used expert, so one token moves only
 // the routed experts. What decides the offload is how many bytes that is per token, not how many
 // experts the tensor holds: 128 large experts cost more per token than 256 small ones, and past a
@@ -209,15 +213,22 @@ static bool ggml_backend_meta_moe_offload_always(const ggml_tensor * op, size_t 
     static const bool expert_cache_identity = getenv("GGML_META_EXPERT_CACHE_IDENTITY") != nullptr;
     if (expert_cache_cap > 0) {
         if (expert_cache_identity || expert_cache_cap < op->src[0]->ne[2]) {
-            return true;
-        }
-        static bool warned = false;
-        if (!warned) {
-            warned = true;
-            GGML_LOG_WARN("%s: GGML_META_EXPERT_CACHE=%d must be below this model's expert count "
-                "(%lld); the expert cache stays off. Set a cap in 1..%lld.\n",
-                __func__, expert_cache_cap, (long long) op->src[0]->ne[2],
-                (long long) op->src[0]->ne[2] - 1);
+            // Only while the cache is actually running. Once it has given up - no room for its
+            // pools - forcing the offload on its behalf is the worst of both worlds: every routed
+            // expert streams whole with nothing to amortize it. Fall through to the budget below,
+            // which is the answer we would have had if the cache had never been asked for.
+            if (!g_meta_expert_cache_gave_up.load(std::memory_order_relaxed)) {
+                return true;
+            }
+        } else {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                GGML_LOG_WARN("%s: GGML_META_EXPERT_CACHE=%d must be below this model's expert count "
+                    "(%lld); the expert cache stays off. Set a cap in 1..%lld.\n",
+                    __func__, expert_cache_cap, (long long) op->src[0]->ne[2],
+                    (long long) op->src[0]->ne[2] - 1);
+            }
         }
     }
 
@@ -2780,9 +2791,13 @@ static void ggml_backend_meta_stage_report_starved(int n_slots) {
         __func__, n_slots);
 }
 
-// Headroom every expert pool has to leave free on its device. See the call site: allocations that
-// happen after the pools bind are fatal rather than graceful, so the pools stop short of the edge.
-static const size_t GGML_META_EXPERT_POOL_MARGIN = 512ull*1024*1024;
+// Headroom a pool must leave free on its device. This exists ONLY so that the allocations which
+// follow the pools - cudaGraphInstantiate above all, which aborts instead of falling back - still
+// have somewhere to go; it is not meant to decide whether a cap fits. Keep it well under a single
+// pool: at 512 MiB it refused 34 MiB pools with half a gigabyte free, which just moved the point
+// where an over-large cap gave up without changing the outcome. Measured on 4x V100: cap 48 at
+// -ncmoe 24 aborts in cudaGraphInstantiate with no reserve, and degrades cleanly with this one.
+static const size_t GGML_META_EXPERT_POOL_MARGIN = 256ull*1024*1024;
 
 // Buffers free themselves with the pool, but the events are raw handles - dropping the map entry
 // without this leaks four per pool, and expert_pools_pending would keep a dangling pointer to it.
@@ -2882,18 +2897,12 @@ bool ggml_backend_meta_cache_experts(ggml_backend_t backend, const ggml_tensor *
                 need = std::max(need, ggml_backend_buffer_get_alloc_size(st->buffer, st));
             }
 
-            // The pool is an optimization, so it must not take memory the run still needs. The
-            // pools bind on the first decode, and what allocates after them - cudaGraphInstantiate
-            // above all - aborts on failure instead of falling back, so a cap that fits with
-            // nothing to spare kills the run rather than degrading. Leave that headroom free.
             size_t free_mem = 0, total_mem = 0;
             ggml_backend_dev_memory(dev, &free_mem, &total_mem);
             if (free_mem < need + GGML_META_EXPERT_POOL_MARGIN) {
-                GGML_LOG_WARN("%s: a %.0f MiB expert pool for %s would leave only %.0f MiB on the device, "
-                    "under the %.0f MiB reserve; using whole-layer staging. Lower GGML_META_EXPERT_CACHE.\n",
-                    __func__, need/1024.0/1024.0, dst->name,
-                    (free_mem > need ? free_mem - need : 0)/1024.0/1024.0,
-                    GGML_META_EXPERT_POOL_MARGIN/1024.0/1024.0);
+                GGML_LOG_WARN("%s: only %.0f MiB free, not enough for a %.0f MiB expert pool for %s "
+                    "plus the %.0f MiB reserve\n", __func__, free_mem/1024.0/1024.0,
+                    need/1024.0/1024.0, dst->name, GGML_META_EXPERT_POOL_MARGIN/1024.0/1024.0);
                 return give_up();
             }
 
@@ -2980,6 +2989,12 @@ void ggml_backend_meta_cache_unbind_all(ggml_backend_t backend) {
 // with nothing reading them, and the next allocation to fail is fatal.
 void ggml_backend_meta_cache_release_all(ggml_backend_t backend) {
     ggml_backend_meta_context * ctx = (ggml_backend_meta_context *) backend->context;
+    if (!g_meta_expert_cache_gave_up.exchange(true, std::memory_order_relaxed)) {
+        GGML_LOG_WARN("%s: the expert cache could not be set up for every offloaded weight and is "
+            "off for the rest of the run; MoE experts will be computed on the CPU at small batch "
+            "unless the byte budget prefers the offload. Lower GGML_META_EXPERT_CACHE to one that "
+            "fits, or free VRAM.\n", __func__);
+    }
     ggml_backend_meta_cache_unbind_all(backend); // restore the tensors before the pools go away
     std::vector<const ggml_tensor *> keys;
     for (auto & kv : ctx->expert_pools) {
