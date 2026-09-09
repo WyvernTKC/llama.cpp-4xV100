@@ -1818,6 +1818,8 @@ static void ggml_backend_sched_expert_cache_plan_make(int64_t n_expert, int cap,
         cap = (int) n_expert;
     }
     plan.cap = cap;
+    // an unusable cap is reported by ggml_backend_meta_moe_offload_always, which sees every MoE
+    // matmul whether or not it ends up offloaded
     if (cap <= 0 || cap > n_expert || (!identity && cap == n_expert)) {
         return;
     }

@@ -176,11 +176,26 @@ static bool ggml_backend_meta_moe_offload_always(const ggml_tensor * op, size_t 
         return false;
     }
 
-    // the expert cache keeps the hot set resident, so a token only moves the misses
-    static const bool expert_cache = getenv("GGML_META_EXPERT_CACHE")
-        && atoi(getenv("GGML_META_EXPERT_CACHE")) > 0;
-    if (expert_cache) {
-        return true;
+    // The expert cache keeps the hot set resident, so a token only moves the misses. Mirror the cap
+    // range ggml_backend_sched_expert_cache_plan_make accepts: a cap it rejects leaves the cache
+    // inert, and forcing the offload for one would stream every routed expert with nothing to
+    // amortize it - worse than the budget's own answer. GGML_META_EXPERT_CACHE_IDENTITY overrides
+    // the cap to the expert count, so any positive value is usable there.
+    static const int  expert_cache_cap      = getenv("GGML_META_EXPERT_CACHE")
+        ? atoi(getenv("GGML_META_EXPERT_CACHE")) : 0;
+    static const bool expert_cache_identity = getenv("GGML_META_EXPERT_CACHE_IDENTITY") != nullptr;
+    if (expert_cache_cap > 0) {
+        if (expert_cache_identity || expert_cache_cap < op->src[0]->ne[2]) {
+            return true;
+        }
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            GGML_LOG_WARN("%s: GGML_META_EXPERT_CACHE=%d must be below this model's expert count "
+                "(%lld); the expert cache stays off. Set a cap in 1..%lld.\n",
+                __func__, expert_cache_cap, (long long) op->src[0]->ne[2],
+                (long long) op->src[0]->ne[2] - 1);
+        }
     }
 
     // GGML_META_MOE_OFFLOAD_MIN_EXPERTS is the old expert-count gate, kept so existing command
