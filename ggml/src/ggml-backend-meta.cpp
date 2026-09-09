@@ -165,6 +165,11 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
         [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_supports_op(simple_dev, op); });
 }
 
+// Mirrors ctx->stage_failed so the offload decision can see it: that decision is made from the
+// device, which has no way back to the backend that owns the staging slots. One flag for the
+// process is enough - staging is a per-device resource and every meta backend shares the devices.
+static std::atomic<bool> g_meta_stage_failed{false};
+
 // MoE weights are row-split over the devices and copied per used expert, so one token moves only
 // the routed experts. What decides the offload is how many bytes that is per token, not how many
 // experts the tensor holds: 128 large experts cost more per token than 256 small ones, and past a
@@ -173,6 +178,24 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
 // has no expert selection at all and keeps the plain batch threshold.
 static bool ggml_backend_meta_moe_offload_always(const ggml_tensor * op, size_t n_devices) {
     if (op->op != GGML_OP_MUL_MAT_ID || op->src[0] == nullptr || op->src[2] == nullptr || n_devices == 0) {
+        return false;
+    }
+
+    // Without staging slots there is no partial copy - MMQ needs the padded, zeroed destination a
+    // slot provides - so every offloaded expert weight moves whole, per ubatch, on the compute
+    // stream. That is 272 MiB x 66 tensors per token on DeepSeek-V4-Flash-Vision: 0.12 t/s, against
+    // 12 t/s for simply computing those experts on the CPU. So once staging is gone, stop forcing
+    // the offload and let the plain batch threshold below decide, which keeps prefill on the GPU
+    // (a whole-tensor copy amortizes fine over 4096 tokens) and puts decode back on the CPU.
+    // Sticky, like ctx->stage_failed itself: re-enabling it later would change the graph shape
+    // mid-run, and a varying graph costs more under -sm tensor than the offload wins.
+    if (g_meta_stage_failed.load(std::memory_order_relaxed)) {
+        static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+        if (!warned.test_and_set()) {
+            GGML_LOG_WARN("%s: no staging slots, so MoE experts will be computed on the CPU at small "
+                "batch instead of copied whole to the GPU every ubatch. Free some VRAM, or raise "
+                "GGML_META_STAGE_SLOTS if it is below 2.\n", __func__);
+        }
         return false;
     }
 
@@ -2628,6 +2651,14 @@ static int ggml_backend_meta_stage_n_slots() {
     return n;
 }
 
+// Staging is given up on for the whole run, so the global the offload decision reads is set here
+// with it - the two must not disagree, or decode keeps copying whole weights it could compute.
+static bool ggml_backend_meta_stage_fail(ggml_backend_meta_context * ctx) {
+    ctx->stage_failed = true;
+    g_meta_stage_failed.store(true, std::memory_order_relaxed);
+    return false;
+}
+
 // Build the staging backends and slots on first use. Returns false when the devices cannot support it,
 // and the caller then copies on the compute stream as before.
 static bool ggml_backend_meta_stage_ensure(ggml_backend_t backend, size_t need) {
@@ -2638,8 +2669,7 @@ static bool ggml_backend_meta_stage_ensure(ggml_backend_t backend, size_t need) 
     const int    n_slots = ggml_backend_meta_stage_n_slots();
     const size_t n_dev   = ggml_backend_meta_n_backends(backend);
     if (n_slots < 2) {
-        ctx->stage_failed = true;
-        return false;
+        return ggml_backend_meta_stage_fail(ctx);
     }
 
     if (ctx->stage_backends.empty()) {
@@ -2651,8 +2681,7 @@ static bool ggml_backend_meta_stage_ensure(ggml_backend_t backend, size_t need) 
             if (stage_backend == nullptr) {
                 GGML_LOG_INFO("%s: no staging stream for %s, offloaded weights stay on the compute stream\n",
                     __func__, ggml_backend_dev_name(dev));
-                ctx->stage_failed = true;
-                return false;
+                return ggml_backend_meta_stage_fail(ctx);
             }
             ctx->stage_backends.push_back(stage_backend);
         }
@@ -2664,8 +2693,7 @@ static bool ggml_backend_meta_stage_ensure(ggml_backend_t backend, size_t need) 
                 slot.ready.push_back(ggml_backend_event_new(dev));
                 slot.release.push_back(ggml_backend_event_new(dev));
                 if (slot.ready.back() == nullptr || slot.release.back() == nullptr) {
-                    ctx->stage_failed = true;
-                    return false;
+                    return ggml_backend_meta_stage_fail(ctx);
                 }
             }
         }
@@ -2686,8 +2714,7 @@ static bool ggml_backend_meta_stage_ensure(ggml_backend_t backend, size_t need) 
                 if (buf == nullptr) {
                     GGML_LOG_INFO("%s: could not allocate %.0f MiB of staging memory, offloaded weights stay on the compute stream\n",
                         __func__, need/1024.0/1024.0);
-                    ctx->stage_failed = true;
-                    return false;
+                    return ggml_backend_meta_stage_fail(ctx);
                 }
                 ggml_backend_buffer_clear(buf, 0); // the row padding is read by MMQ, it must not hold NaNs
                 slot.bufs[j].reset(buf);
