@@ -14,21 +14,6 @@
 // from overwriting payload a slow rank has not consumed yet.
 #define GGML_CUDA_P2P_AR_NSLOTS 2
 
-struct ggml_cuda_p2p_ar {
-    int    devices[GGML_CUDA_MAX_DEVICES] = {};
-    size_t n_devices                      = 0;
-
-    // Peer-mapped. stage[j] is device j's staging area, laid out [slot][rank][stage_stride].
-    // flag[j] is device j's flag array, laid out [slot][rank][nblocks].
-    float4 *             stage[GGML_CUDA_MAX_DEVICES] = {};
-    unsigned long long * flag [GGML_CUDA_MAX_DEVICES] = {};
-
-    size_t             max_bytes    = 0; // per-rank payload cap, above which the caller uses NCCL
-    int64_t            stage_stride = 0; // float4 elements per (slot, rank) region
-    int                nblocks      = 0; // grid size, also the flag array's last dimension
-    unsigned long long seq          = 0; // monotonic, identical across ranks for a given call
-};
-
 struct ggml_cuda_p2p_ar_args {
     float4 *             stage[GGML_CUDA_MAX_DEVICES];
     unsigned long long * flag [GGML_CUDA_MAX_DEVICES];
@@ -42,6 +27,23 @@ struct ggml_cuda_p2p_ar_args {
     int                slot;
     unsigned int       contrib_mask;
     unsigned long long seq;
+};
+
+struct ggml_cuda_p2p_ar {
+    int    devices[GGML_CUDA_MAX_DEVICES] = {};
+    size_t n_devices                      = 0;
+
+    // Peer-mapped. stage[j] is device j's staging area, laid out [slot][rank][stage_stride].
+    // flag[j] is device j's flag array, laid out [slot][rank][nblocks].
+    float4 *             stage[GGML_CUDA_MAX_DEVICES] = {};
+    unsigned long long * flag [GGML_CUDA_MAX_DEVICES] = {};
+
+    size_t             max_bytes    = 0; // per-rank payload cap, above which the caller uses NCCL
+    int64_t            stage_stride = 0; // float4 elements per (slot, rank) region
+    int                nblocks      = 0; // grid size, also the flag array's last dimension
+    unsigned long long seq          = 0; // monotonic, identical across ranks for a given call
+
+    ggml_cuda_p2p_ar_args args = {}; // the call prepare claimed, read by launch on every rank
 };
 
 static __global__ void ggml_cuda_p2p_ar_kernel(const ggml_cuda_p2p_ar_args a) {
@@ -228,6 +230,30 @@ ggml_cuda_p2p_ar * ggml_cuda_p2p_ar_init(const int * devices, size_t n_devices) 
 }
 
 bool ggml_cuda_p2p_ar_allreduce(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors) {
+    if (!ggml_cuda_p2p_ar_prepare(ar, backends, tensors)) {
+        return false;
+    }
+    for (size_t i = 0; i < ar->n_devices; ++i) {
+        ggml_cuda_p2p_ar_launch(ar, backends, tensors, i);
+    }
+    return true;
+}
+
+void ggml_cuda_p2p_ar_launch(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors, size_t rank) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backends[rank]->context;
+
+    ggml_cuda_p2p_ar_args args = ar->args;
+    args.rank = (int) rank;
+    args.src  = (const float4 *) tensors[rank]->data;
+    args.dst  = (float4 *)       tensors[rank]->data;
+
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    ggml_cuda_p2p_ar_kernel<<<ar->nblocks, GGML_CUDA_P2P_AR_NTHREADS, 0, cuda_ctx->stream()>>>(args);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+bool ggml_cuda_p2p_ar_prepare(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors) {
     if (ar == nullptr) {
         return false;
     }
@@ -266,7 +292,8 @@ bool ggml_cuda_p2p_ar_allreduce(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends
 
     ar->seq++;
 
-    ggml_cuda_p2p_ar_args args = {};
+    ggml_cuda_p2p_ar_args & args = ar->args;
+    args = {};
     for (size_t j = 0; j < n_devices; ++j) {
         args.stage[j] = ar->stage[j];
         args.flag [j] = ar->flag [j];
@@ -277,19 +304,6 @@ bool ggml_cuda_p2p_ar_allreduce(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends
     args.slot         = (int) (ar->seq % GGML_CUDA_P2P_AR_NSLOTS);
     args.contrib_mask = contrib_mask;
     args.seq          = ar->seq;
-
-    for (size_t i = 0; i < n_devices; ++i) {
-        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backends[i]->context;
-
-        args.rank = (int) i;
-        args.src  = (const float4 *) tensors[i]->data;
-        args.dst  = (float4 *)       tensors[i]->data;
-
-        ggml_cuda_set_device(cuda_ctx->device);
-
-        ggml_cuda_p2p_ar_kernel<<<ar->nblocks, GGML_CUDA_P2P_AR_NTHREADS, 0, cuda_ctx->stream()>>>(args);
-        CUDA_CHECK(cudaGetLastError());
-    }
 
     return true;
 }

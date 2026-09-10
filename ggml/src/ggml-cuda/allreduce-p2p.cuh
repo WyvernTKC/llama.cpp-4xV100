@@ -34,3 +34,9 @@ void ggml_cuda_p2p_ar_free(ggml_cuda_p2p_ar * ar);
 // misaligned, non-contiguous); the caller must then fall back. Returns true once the work is
 // enqueued on each device's stream.
 bool ggml_cuda_p2p_ar_allreduce(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors);
+
+// The same in two steps: prepare does the eligibility checks and claims a sequence number, launch
+// enqueues one rank's kernel. launch may run on a different thread per rank, so the meta backend can
+// issue it from the thread that already owns that device's graph launch.
+bool ggml_cuda_p2p_ar_prepare(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors);
+void ggml_cuda_p2p_ar_launch (ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors, size_t rank);

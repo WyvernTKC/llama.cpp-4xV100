@@ -1385,6 +1385,22 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
     return comm_ctx->try_allreduce(comm_ctx, tensors);
 }
 
+// Two-step form for the meta backend's launch threads: only the one-shot P2P path can be split by
+// rank, so prepare declines whatever that path declines and the caller uses the one-step form.
+static bool ggml_backend_cuda_comm_allreduce_prepare(void * comm_ctx_v, struct ggml_tensor ** tensors) {
+    if (comm_ctx_v == nullptr) {
+        return false;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    return comm_ctx->p2p_ar != nullptr &&
+        ggml_cuda_p2p_ar_prepare(comm_ctx->p2p_ar, comm_ctx->backends.data(), tensors);
+}
+
+static void ggml_backend_cuda_comm_allreduce_launch(void * comm_ctx_v, struct ggml_tensor ** tensors, size_t rank) {
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    ggml_cuda_p2p_ar_launch(comm_ctx->p2p_ar, comm_ctx->backends.data(), tensors, rank);
+}
+
 static bool ggml_backend_cuda_comm_allgather_tensor(void * comm_ctx_v, struct ggml_tensor ** srcs, struct ggml_tensor ** dsts) {
     if (comm_ctx_v == nullptr) {
         return false;
@@ -6026,6 +6042,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allgather_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allgather_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_prepare") == 0) {
+        return (void *)ggml_backend_cuda_comm_allreduce_prepare;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_launch") == 0) {
+        return (void *)ggml_backend_cuda_comm_allreduce_launch;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;

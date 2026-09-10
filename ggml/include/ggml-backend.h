@@ -208,6 +208,10 @@ extern "C" {
     typedef void * (*ggml_backend_comm_init_t)(ggml_backend_t * backends, size_t n_backends);
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
+    // Optional two-step form of the allreduce: prepare validates the call and claims it (false = use the
+    // one-step form), launch then enqueues rank i's part and may be called from one thread per rank.
+    typedef bool   (*ggml_backend_comm_allreduce_prepare_t)(void * comm_ctx, struct ggml_tensor ** tensors);
+    typedef void   (*ggml_backend_comm_allreduce_launch_t)(void * comm_ctx, struct ggml_tensor ** tensors, size_t rank);
     // srcs[i] are slices along dim 0 that, concatenated in device order, give dsts[i]; all dsts have the same shape
     typedef bool   (*ggml_backend_comm_allgather_tensor_t)(void * comm_ctx, struct ggml_tensor ** srcs, struct ggml_tensor ** dsts);
 
