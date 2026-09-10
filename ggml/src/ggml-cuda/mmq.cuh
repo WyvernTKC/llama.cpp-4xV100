@@ -1550,6 +1550,25 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
         }
     }
 
+    // ncols_max is the whole batch because one expert could take every token, so the J above is the
+    // worst case. Typically an expert holds only ncols_dst/n_expert columns, and a tile computes all
+    // J of them regardless - only the write back is masked - so the surplus is wasted dp4a work.
+    // GGML_CUDA_MMQ_J pins J for MoE launches to measure that; every J from 8 to 128 is a valid
+    // tiling, and the host-side tile bound ncols_dst/J + n_expert still holds, so CUDA graphs and
+    // the readback-free tile map survive.
+    // A dense launch has no expert dispersion, so its J above is already the exact column count and
+    // there is no surplus - GGML_CUDA_MMQ_J_DENSE is separate so the two regimes can be swept apart.
+    static const int J_env       = getenv("GGML_CUDA_MMQ_J")       ? atoi(getenv("GGML_CUDA_MMQ_J"))       : 0;
+    static const int J_env_dense = getenv("GGML_CUDA_MMQ_J_DENSE") ? atoi(getenv("GGML_CUDA_MMQ_J_DENSE")) : 0;
+
+    const int J_pin = args.ids_dst ? J_env : J_env_dense;
+    if (J_pin >= 8 && J_pin <= 128 && J_pin % 8 == 0) {
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J_pin, fallback, cc);
+        if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
+            J_best = J_pin;
+        }
+    }
+
     switch (J_best) {
         case   8:
             launch_mul_mat_q<type,   8, fallback>(ctx, args, stream);
