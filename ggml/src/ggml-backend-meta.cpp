@@ -641,6 +641,38 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
 
+// Flash attention with q split by head over mirrored k/v: the kv heads that the q heads of device j belong to.
+//   Returns false when they do not spread evenly over those kv heads, the op takes one gqa ratio from the
+//   shapes it gets and cannot express that.
+static bool ggml_backend_meta_fattn_kv_heads(const struct ggml_tensor * fattn, const struct ggml_backend_meta_split_state & ss_q,
+        size_t n_bufs, size_t j, int64_t & kv_head_0, int64_t & n_kv_heads) {
+    const int64_t n_gqa = fattn->src[0]->ne[2] / fattn->src[1]->ne[2];
+    int64_t q0 = 0;
+    int64_t nq = 0;
+    for (size_t jj = 0; jj <= j; jj++) {
+        q0 += nq;
+        nq  = 0;
+        for (size_t s = 0; s < ss_q.n_segments; s++) {
+            nq += ss_q.ne[s*n_bufs + jj] * ss_q.nr[s];
+        }
+    }
+    kv_head_0  = q0 / n_gqa;
+    n_kv_heads = nq == 0 ? 0 : (q0 + nq + n_gqa - 1) / n_gqa - kv_head_0;
+    if (nq == 0) {
+        return true;
+    }
+    if (nq % n_kv_heads != 0) {
+        return false;
+    }
+    const int64_t gqa_dev = nq / n_kv_heads;
+    for (int64_t i = 0; i < nq; i++) {
+        if ((q0 + i) / n_gqa - kv_head_0 != i / gqa_dev) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     ggml_backend_meta_simple_tensor_container & stc, const struct ggml_tensor * tensor, bool assume_sync);
 
@@ -1055,6 +1087,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
         GGML_ASSERT(kv_split || kv_mirrored);
         GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
+        if (kv_mirrored && tensor->src[1]->ne[2] > 1) {
+            // ggml_backend_meta_buffer_init_tensor_impl gives each device only the kv heads of its own q heads
+            for (size_t j = 0; j < n_bufs; j++) {
+                int64_t kv_head_0, n_kv_heads;
+                if (!ggml_backend_meta_fattn_kv_heads(tensor, src_ss[0], n_bufs, j, kv_head_0, n_kv_heads)) {
+                    GGML_ABORT("%s: the q heads of device %zu do not map onto whole kv heads of the mirrored %s",
+                        tensor->name, j, tensor->src[1]->name);
+                }
+            }
+        }
         return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
     };
 
@@ -1643,6 +1685,32 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                 t_ij->src[i] = t_ij;
             } else if (t_ij->src[i] != nullptr && ggml_backend_buffer_is_meta(t_ij->src[i]->buffer)) {
                 t_ij->src[i] = ggml_backend_meta_buffer_simple_tensor(tensor->src[i], j);
+            }
+        }
+
+        // Mirrored k/v under a q split by head: cut out the kv heads that the q heads of this device belong to.
+        //   The op takes the gqa ratio from the shapes it sees, with the full k/v it would spread the q heads
+        //   of the device over every kv head.
+        if (tensor->op == GGML_OP_FLASH_ATTN_EXT && tensor->src[1]->ne[2] > 1 &&
+                ggml_backend_buffer_is_meta(tensor->src[0]->buffer) && ggml_backend_buffer_is_meta(tensor->src[1]->buffer)) {
+            const ggml_backend_meta_split_state ss_q = ggml_backend_meta_get_split_state(tensor->src[0], /*assume_sync =*/ true);
+            const ggml_backend_meta_split_state ss_k = ggml_backend_meta_get_split_state(tensor->src[1], /*assume_sync =*/ true);
+            if (ss_q.axis == GGML_BACKEND_SPLIT_AXIS_2 && ss_k.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                int64_t kv_head_0, n_kv_heads;
+                const bool ok = ggml_backend_meta_fattn_kv_heads(tensor, ss_q, n_simple_bufs, j, kv_head_0, n_kv_heads);
+                GGML_ASSERT(ok);
+                if (n_kv_heads > 0 && n_kv_heads < tensor->src[1]->ne[2]) {
+                    for (int i = 1; i <= 2; i++) {
+                        ggml_tensor * kv = t_ij->src[i];
+                        if (kv == nullptr) {
+                            continue;
+                        }
+                        ggml_tensor * kv_slice = ggml_view_4d(simple_ctx, kv, kv->ne[0], kv->ne[1], n_kv_heads, kv->ne[3],
+                            kv->nb[1], kv->nb[2], kv->nb[3], kv_head_0*kv->nb[2]);
+                        kv_slice->buffer = kv->buffer;
+                        t_ij->src[i] = kv_slice;
+                    }
+                }
             }
         }
 

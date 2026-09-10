@@ -473,6 +473,37 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         uint32_t il;
         size_t   rotation; // when assigning tensor slices, rotate how the rounding is done for more even allocation
+        bool     even_split; // ignore the tensor split weights and give every device the same slice
+    };
+
+    // A layer with fewer kv heads than devices: the q split by whole GQA group (see get_split_granularity)
+    //   leaves the other devices idle for the whole attention block. Split q by n_head/n_devices heads
+    //   instead and mirror the kv path, every device then attends its q heads against the one kv head
+    //   they all belong to - the meta backend cuts that head out of the mirrored k/v for flash attention.
+    //   Needs the heads of a device to fit in one kv head and their width to be a whole granule of the
+    //   q split, so that get_split_granularity does not round it up to more heads.
+    auto q_subgroup_split = [&](uint32_t il) -> bool {
+        const uint32_t n_head    = hparams.n_head(il);
+        const uint32_t n_head_kv = hparams.n_head_kv(il);
+        if (hparams.is_mla() || n_head_kv == 0 || n_head_kv >= ud->n_devices || n_head % ud->n_devices != 0) {
+            return false;
+        }
+        const std::string prefix = "blk." + std::to_string(il) + ".";
+        const ggml_tensor * wq = ud->model->get_tensor((prefix + "attn_q.weight").c_str());
+        const ggml_tensor * wo = ud->model->get_tensor((prefix + "attn_output.weight").c_str());
+        if (wq == nullptr || wo == nullptr) {
+            return false; // fused attn_qkv: its kv part cannot be mirrored on its own
+        }
+        const uint32_t n_head_dev = n_head / ud->n_devices;
+        if (hparams.n_gqa(il) % n_head_dev != 0) {
+            return false;
+        }
+        const int64_t n_embd_q = n_head_dev * hparams.n_embd_head_k(il);
+        int64_t blck_size_perf = std::lcm(ggml_blck_size(wq->type), ggml_blck_size(wo->type));
+        while (blck_size_perf < 128 && blck_size_perf*ud->n_devices < n_embd_q) {
+            blck_size_perf *= 2;
+        }
+        return n_embd_q % blck_size_perf == 0;
     };
 
     auto get_tensor_config_impl = [&](
@@ -519,7 +550,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             tensor_axis_0 = ud->model->get_tensor((prefix + suffix_fallback).c_str());
         }
         GGML_ASSERT(tensor_axis_0 != nullptr);
-        return {axis, tensor_axis_0, il, rotation};
+        // the per-device q heads have to stay inside one kv head, which only the even split guarantees
+        const bool even_split = q_subgroup_split(il) && std::regex_match(ggml_get_name(tensor_axis_0), pattern_attn_out_weight);
+        return {axis, tensor_axis_0, il, rotation, even_split};
     };
 
     // Mamba-2 keeps z, x, B, C and dt in one fused in projection, and x, B, C in one fused conv.
@@ -582,6 +615,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     // A layer with a single kv head has nothing to distribute: a per-head split hands the whole
     //   row to one device and nothing to the others, and attn_k_norm then has to normalize over a
     //   row its device may not hold. Detect those layers so the kv path can be mirrored instead.
+    //   Layers with fewer kv heads than devices are mirrored as well, see q_subgroup_split.
     auto in_mqa_layer = [&]() -> bool {
         uint32_t il = 0;
         if (tensor_name.compare(0, 4, "blk.") == 0) {
@@ -599,7 +633,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         } else {
             return false;
         }
-        return hparams.n_head_kv(il) == 1;
+        return hparams.n_head_kv(il) == 1 || q_subgroup_split(il);
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
@@ -672,7 +706,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         // Multi-query attention: k and v hold one head shared by every q head, so replicate them on
         //   all devices and keep only the q heads and attn_output split. Same shape as the MLA latent
-        //   above. Fused attn_qkv is left alone - its q part still has to be split.
+        //   above. Fused attn_qkv is left alone - its q part still has to be split. Layers with fewer
+        //   kv heads than devices take the same path, see q_subgroup_split.
         if (in_mqa_layer()) {
             if (std::regex_match(tensor_name, pattern_kv_weight) ||
                     std::regex_match(tensor_name, pattern_kv_bias) ||
@@ -1156,7 +1191,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         } else if (hparams.n_head_kv(il) != 0) {
             // regular attention - a layer without kv heads has no attention tensors, and its n_gqa is 0
             const uint32_t n_gqa    = hparams.n_gqa(il);
-            const uint32_t n_embd_q = n_gqa * hparams.n_embd_head_k(il);
+            const uint32_t n_head_q = q_subgroup_split(il) ? hparams.n_head(il) / ud->n_devices : n_gqa;
+            const uint32_t n_embd_q = n_head_q * hparams.n_embd_head_k(il);
 
             // to handle head sizes like 80, only increase granularity while it doesn't cause underutilization
             int64_t blck_size_perf = blck_size;
@@ -1299,7 +1335,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             int64_t low = 0;
             size_t j = 0;
             for (; j < ud->n_devices - 1; j++) {
-                const double  b    = tensor_split_scan.back() == 0.0f ?
+                const double  b    = tensor_split_scan.back() == 0.0f || tc.even_split ?
                                          (double) ne_s * (j + 1) / ud->n_devices :
                                          (double) ne_s * tensor_split_scan[j] / tensor_split_scan.back();
                 const int64_t k0   = (int64_t) (b / g_s);
