@@ -2618,10 +2618,14 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
     auto backend_j = [&](size_t j) {
         return backends_override ? (*backends_override)[j] : ggml_backend_meta_simple_backend(backend, j);
     };
-    // partial copies are allowed; offset and size must land on chunk boundaries, asserted below
-    GGML_ASSERT(ggml_is_contiguous(tensor));
-
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+
+    // partial copies are allowed; offset and size must land on chunk boundaries, asserted below. Only
+    // the chunk splicing needs a contiguous tensor - a mirrored write goes to every device as-is, so a
+    // view (the ids rows of a multi-token ubatch) is fine there, as in get_tensor_async.
+    if (split_state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        GGML_ASSERT(ggml_is_contiguous(tensor));
+    }
 
     // Segmented or repeated splits. A fused weight - gemma4's ffn_gate_up_exps is one segment repeated
     // twice - lays each repetition's per-device slices side by side inside one row, so a device owns

@@ -1771,6 +1771,7 @@ struct ggml_expert_cache_layer {
     // the ids remap lives here, not in the plan: it is the source of an async copy, so it has to
     // stay valid until the device reads it. This is rewritten only when the layer routes again.
     std::vector<int32_t> remap;
+    std::vector<uint8_t> seen;      // scratch, experts routed to by the current ubatch
 };
 
 struct ggml_expert_cache_plan {
@@ -1863,12 +1864,6 @@ static void ggml_backend_sched_expert_cache_plan_make(int64_t n_expert, int cap,
     if (ids_tensor->nb[0] != sizeof(int32_t)) {
         return; // the remap is written back per row, so the ids inside a row must be dense
     }
-    if (ids_tensor->ne[1] != 1) {
-        // Decode only. A prompt ubatch routes to more experts than the pool holds, so it fell back
-        // anyway, and the wider shapes are not covered by the pool's padding. Not worth the risk for
-        // a path that never had anything to gain.
-        return;
-    }
 
     ggml_expert_cache_layer & L = layers[ids_tensor];
     // slot_of/expert_of/lru are all sized to cap, so a cap change has to rebuild them; the residency
@@ -1894,13 +1889,29 @@ static void ggml_backend_sched_expert_cache_plan_make(int64_t n_expert, int cap,
     auto touch = [&](int32_t sl) {
         L.lru.splice(L.lru.begin(), L.lru, L.lru_pos[sl]);
     };
+    L.seen.assign(n_expert, 0);
+    int64_t n_distinct = 0;
     for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
         for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
             const int32_t id = ids[i1*ids_tensor->nb[1]/sizeof(int32_t) + i0*ids_tensor->nb[0]/sizeof(int32_t)];
-            if (id >= 0 && id < n_expert && L.slot_of[id] >= 0) {
+            if (id < 0 || id >= n_expert) {
+                continue;
+            }
+            if (!L.seen[id]) {
+                L.seen[id] = 1;
+                n_distinct++;
+            }
+            if (L.slot_of[id] >= 0) {
                 touch(L.slot_of[id]);
             }
         }
+    }
+    // More distinct experts than slots: once the free slots run out the victims would be this
+    // ubatch's own hits. A single token stays within the cap once resident, a batch of several
+    // tokens can exceed it at any time. Leave the plan invalid before anything is assigned, so the
+    // residency stays intact for the next ubatch.
+    if (n_distinct > cap) {
+        return;
     }
 
     for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
@@ -1929,13 +1940,6 @@ static void ggml_backend_sched_expert_cache_plan_make(int64_t n_expert, int cap,
             }
             L.remap[i1*ids_tensor->ne[0] + i0] = L.slot_of[id];
         }
-    }
-
-    // a ubatch routing to more experts than the pool holds would evict what it just admitted
-    if ((int64_t) plan.miss_expert.size() > cap) {
-        L.slot_of.assign(n_expert, -1);
-        L.expert_of.assign(cap, -1);
-        return;
     }
 
     plan.valid = true;
