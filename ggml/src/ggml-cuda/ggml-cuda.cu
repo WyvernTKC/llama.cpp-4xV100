@@ -8,6 +8,7 @@
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/allreduce-p2p.cuh"
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/expert-cache.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -1922,6 +1923,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    // a pool of cached experts is gathered inside ggml_cuda_mul_mat_id, the fused path would read it stale
+    if (ggml_cuda_expert_cache_is(src0)) {
+        return false;
+    }
+
     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
 
     bool use_mul_mat_vec_f =
@@ -1955,6 +1961,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+
+    // a pool of cached experts is gathered inside ggml_cuda_mul_mat_id, the fused path would read it stale
+    if (ggml_cuda_expert_cache_is(src0)) {
+        return false;
+    }
 
     // fusion is not universally faster on Pascal
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -2067,6 +2078,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+
+    // src0 is a pool of cached experts: bring in the routed ones and read the pool through remapped ids
+    ggml_tensor ids_remap;
+    if (ggml_cuda_expert_cache_is(src0)) {
+        ggml_cuda_expert_cache_gather(ctx, src0, ids, &ids_remap);
+        ids = &ids_remap;
+    }
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -6029,6 +6047,22 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// Expert cache in device memory for a MoE weight left in host memory, see expert-cache.cuh.
+static void * ggml_backend_cuda_expert_cache_create(ggml_backend_dev_t dev, const void * host_buf, size_t host_buf_size,
+        const void * host_ptr, int64_t n_expert, int cap, size_t expert_bytes, size_t chunk_full, size_t chunk_dev,
+        size_t offset_dev, int64_t n_chunks, int max_ids) {
+    if (dev == nullptr || ggml_backend_dev_backend_reg(dev) != ggml_backend_cuda_reg()) {
+        return nullptr;
+    }
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    return ggml_cuda_expert_cache_create(device, host_buf, host_buf_size, host_ptr, n_expert, cap, expert_bytes,
+        chunk_full, chunk_dev, offset_dev, n_chunks, max_ids);
+}
+
+static void ggml_backend_cuda_expert_cache_free(void * cache) {
+    ggml_cuda_expert_cache_free(cache);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -6045,6 +6079,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_prepare") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_prepare;
+    }
+    if (strcmp(name, "ggml_backend_expert_cache_create") == 0) {
+        return (void *)ggml_backend_cuda_expert_cache_create;
+    }
+    if (strcmp(name, "ggml_backend_expert_cache_free") == 0) {
+        return (void *)ggml_backend_cuda_expert_cache_free;
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_launch") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_launch;

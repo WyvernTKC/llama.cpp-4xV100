@@ -105,6 +105,13 @@ extern "C" {
                                                   struct ggml_tensor * dst, const void * base, int cap,
                                                   const int32_t * miss_expert, const int32_t * miss_slot,
                                                   size_t n_miss);
+    // Whether the meta backend reads src, a MoE weight in host memory, itself: it gathers the routed
+    // experts into a device pool inside the MUL_MAT_ID (GGML_META_EXPERT_CACHE_DEVICE=1), so the
+    // scheduler must neither copy the weight into the split nor start a split for it.
+    GGML_API bool ggml_backend_meta_gathers_node(ggml_backend_t backend, const struct ggml_tensor * node, const struct ggml_tensor * src);
+    // Whether the device-side cache already has pools for this host weight, so the host-side expert
+    // cache must leave it alone even for the ubatches the device path declines.
+    GGML_API bool ggml_backend_meta_device_cache_owns(ggml_backend_t backend, const struct ggml_tensor * w);
     // Put a cached weight back on its own buffer and full expert count. Must be called before anything
     // copies the whole tensor again, or that copy overruns the pool, which only holds cap experts.
     GGML_API void ggml_backend_meta_cache_unbind(ggml_backend_t backend, const struct ggml_tensor * key);

@@ -336,6 +336,38 @@ helps every token that wants it:
   `openai-moe` (gpt-oss) has such biases today.
 - The pool is fixed once allocated; `N` cannot change mid-run.
 
+### Gathering on the device — `GGML_META_EXPERT_CACHE_DEVICE=1`
+
+The cache above is driven from the host: every MoE layer reads the router ids back, plans the misses,
+issues their copies and launches the expert matmuls as splits of their own. That round trip is the
+bulk of the idle time on the GPUs at decode. With `GGML_META_EXPERT_CACHE_DEVICE=1` the same pool is
+filled by the GPU itself: the expert weight stays in host memory as the matmul's source, each device
+keeps its own LRU in device memory, and the `MUL_MAT_ID` gathers the missing experts straight from the
+page-locked host buffer before it runs. Nothing about a layer needs the host any more, so when every
+offloaded expert weight is gathered the whole forward pass is one scheduler split and one CUDA graph per
+device instead of ~150 splits. A weight falls back to the copied path, with one warning, when its pools
+do not fit (a 256 MiB reserve is kept), when its split is not a plain row or column split, or when the
+backend has no device cache; a ubatch falls back when `n_tokens * n_expert_used` exceeds the cap. The
+pools are shared by every context of a model, so only one context may decode at a time.
+
+```bat
+set GGML_META_PARTIAL_COPY=1
+set GGML_META_EXPERT_CACHE=128
+set GGML_META_EXPERT_CACHE_DEVICE=1
+```
+
+The copies then sit on the GPU's critical path instead of overlapping the host work they replaced, so
+the win is set by the bytes per token: on test-qwen36-moe (256 experts, 8 used, 4x V100, `-ncmoe 99`)
+decode is 62 t/s at cap 64 like the host cache, 78 t/s at cap 128 against 74, and 81 t/s at cap 192.
+The x8-link GPU takes twice as long per copy and the other devices wait for it in the allreduce; giving
+it half the rows (`-ts 1/1/0.5/1`) adds another 3-6%. On DeepSeek-V4-Flash-Vision (4.25 MiB experts,
+6 of 256 used, `-ncmoe 24`) it matches the host cache: 13.4 vs 13.7 t/s at cap 32 and 14.1 at cap 48 at
+8k depth, because there a single miss is a ~1 MiB copy per device and the copies set the pace either
+way. Multi-token ubatches use the same path as long
+as `n_tokens * n_expert_used` fits in the pool; larger prompt ubatches keep the whole-layer staging.
+Results are the same as the host cache's; the merged graph lets the CUDA backend fuse a few more ops,
+so perplexity differs in the last digits unless fusion is disabled, in which case it is identical.
+
 For digging into it: `GGML_META_EXPERT_CACHE_STATS=1` prints the expert bytes a run moved,
 `GGML_META_EXPERT_CACHE_DEBUG=1` says why a weight was refused a pool, `..._IDENTITY=1` pools every
 expert at its own index so the ids renumbering becomes a no-op, and `..._NOSKIP=1` recopies every

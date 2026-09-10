@@ -642,6 +642,238 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
 
+// Expert cache in device memory (GGML_META_EXPERT_CACHE_DEVICE=1 with GGML_META_EXPERT_CACHE=<cap>). A MoE
+//   weight left in host memory stays the src of its MUL_MAT_ID instead of being copied into the split. Each
+//   device gets a pool of cap experts of its slice, and the device's MUL_MAT_ID gathers the routed experts
+//   from host memory itself, so a layer needs no host round trip and no split of its own. One entry per host
+//   weight, shared by every graph and every context of the model; the pools live as long as a meta backend
+//   does and go when the last one is freed.
+struct ggml_backend_meta_gathered_weight {
+    ggml_backend_meta_split_state        ss;
+    std::vector<ggml_backend_buffer_ptr> pool_bufs;
+    std::vector<ggml_tensor *>           pool_tensors; // one per device, nullptr where the slice is empty
+    std::vector<void *>                  caches;
+    ggml_backend_expert_cache_free_t     cache_free = nullptr;
+    ggml_context_ptr                     pool_ctx;
+    bool                                 failed = false;
+    // what the entry was built for: a tuner can change the cap between graphs, and a reloaded model can
+    // hand out the same tensor address again
+    int                   cap    = 0;
+    const void *          data   = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    ggml_type             type   = GGML_TYPE_COUNT;
+    int64_t               ne[GGML_MAX_DIMS] = {0, 0, 0, 0};
+
+    bool matches(const ggml_tensor * w, int cap_now) const {
+        return !failed && cap == cap_now && data == w->data && buffer == w->buffer && type == w->type &&
+            ne[0] == w->ne[0] && ne[1] == w->ne[1] && ne[2] == w->ne[2] && ne[3] == w->ne[3];
+    }
+};
+
+struct ggml_backend_meta_gather_registry {
+    std::mutex                                                                  mutex;
+    std::unordered_map<const ggml_tensor *, ggml_backend_meta_gathered_weight>  weights;
+    int                                                                         n_backends = 0; // live meta backends
+};
+
+// Heap allocated and never destroyed: the pools are freed when the last meta backend goes, while the
+//   CUDA runtime is still there. A static destructor would free device memory after it has gone.
+static ggml_backend_meta_gather_registry & ggml_backend_meta_gather_reg() {
+    static ggml_backend_meta_gather_registry * reg = new ggml_backend_meta_gather_registry();
+    return *reg;
+}
+
+static const size_t GGML_META_GATHER_POOL_MARGIN = 256ull*1024*1024;
+
+static void ggml_backend_meta_gathered_weight_release(ggml_backend_meta_gathered_weight & gw) {
+    for (void * c : gw.caches) {
+        if (c != nullptr && gw.cache_free != nullptr) {
+            gw.cache_free(c);
+        }
+    }
+    gw.caches.clear();
+    gw.pool_tensors.clear();
+    gw.pool_bufs.clear();
+    gw.pool_ctx.reset();
+}
+
+static void ggml_backend_meta_gather_release_all() {
+    ggml_backend_meta_gather_registry & reg = ggml_backend_meta_gather_reg();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    for (auto & kv : reg.weights) {
+        ggml_backend_meta_gathered_weight_release(kv.second);
+    }
+    reg.weights.clear();
+}
+
+static bool ggml_backend_meta_gather_device_mode() {
+    static const bool on = getenv("GGML_META_EXPERT_CACHE_DEVICE") != nullptr;
+    return on;
+}
+
+// A host weight the device-side cache can take: a MoE expert weight whose split the model describes by name.
+static bool ggml_backend_meta_gathers_weight(ggml_backend_dev_t meta_dev, const ggml_tensor * w, ggml_backend_meta_split_state * ss_out) {
+    if (!ggml_backend_meta_gather_device_mode() || w == nullptr || w->buffer == nullptr || w->view_src != nullptr) {
+        return false;
+    }
+    if (!ggml_backend_buffer_is_host(w->buffer) || ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return false;
+    }
+    const int cap = ggml_backend_expert_cache_cap();
+    if (w->ne[2] <= 1 || !ggml_is_contiguous(w) || cap <= 0 || cap >= w->ne[2]) {
+        return false;
+    }
+    const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
+    const ggml_backend_meta_split_state ss = dev_ctx->get_split_state(w, dev_ctx->get_split_state_ud);
+    if ((ss.axis != GGML_BACKEND_SPLIT_AXIS_0 && ss.axis != GGML_BACKEND_SPLIT_AXIS_1) || ss.n_segments != 1 || ss.nr[0] != 1) {
+        return false;
+    }
+    if (ss_out != nullptr) {
+        *ss_out = ss;
+    }
+    return true;
+}
+
+// The pools of a gathered weight, created on first use and rebuilt when the cap or the weight behind the
+//   address changed. nullptr when the weight is not gathered or the pools could not be set up, in which
+//   case the caller treats the weight like any other host input.
+static ggml_backend_meta_gathered_weight * ggml_backend_meta_gathered_weight_get(ggml_backend_buffer_type_t meta_buft, const ggml_tensor * w) {
+    ggml_backend_dev_t meta_dev = ggml_backend_buft_get_device(meta_buft);
+    ggml_backend_meta_split_state ss;
+    if (!ggml_backend_meta_gathers_weight(meta_dev, w, &ss)) {
+        return nullptr;
+    }
+    const int cap = ggml_backend_expert_cache_cap();
+
+    ggml_backend_meta_gather_registry & reg = ggml_backend_meta_gather_reg();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    auto it = reg.weights.find(w);
+    if (it != reg.weights.end()) {
+        if (it->second.matches(w, cap)) {
+            return &it->second;
+        }
+        if (it->second.failed && it->second.cap == cap && it->second.data == w->data) {
+            return nullptr; // the same weight failed at this cap already, do not retry on every graph
+        }
+        ggml_backend_meta_gathered_weight_release(it->second);
+        reg.weights.erase(it);
+    }
+    ggml_backend_meta_gathered_weight & gw = reg.weights[w];
+    gw.ss     = ss;
+    gw.cap    = cap;
+    gw.data   = w->data;
+    gw.buffer = w->buffer;
+    gw.type   = w->type;
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        gw.ne[i] = w->ne[i];
+    }
+    auto give_up = [&](const char * why) -> ggml_backend_meta_gathered_weight * {
+        static std::set<std::string> reported;
+        if (reported.insert(why).second) {
+            GGML_LOG_WARN("%s: no device expert cache for %s: %s; it is copied into its split instead "
+                "(reported once per reason)\n", __func__, w->name, why);
+        }
+        ggml_backend_meta_gathered_weight_release(gw);
+        gw.failed = true;
+        return nullptr;
+    };
+
+    ggml_backend_reg_t breg = ggml_backend_dev_backend_reg(ggml_backend_meta_dev_simple_dev(meta_dev, 0));
+    auto cache_create = (ggml_backend_expert_cache_create_t) ggml_backend_reg_get_proc_address(breg, "ggml_backend_expert_cache_create");
+    gw.cache_free     = (ggml_backend_expert_cache_free_t)   ggml_backend_reg_get_proc_address(breg, "ggml_backend_expert_cache_free");
+    if (cache_create == nullptr || gw.cache_free == nullptr) {
+        return give_up("the backend has no device expert cache");
+    }
+
+    const size_t n_dev = ggml_backend_meta_buft_n_bufts(meta_buft);
+    const ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*n_dev,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    gw.pool_ctx.reset(ggml_init(params));
+    gw.pool_bufs.resize(n_dev);
+    gw.pool_tensors.assign(n_dev, nullptr);
+    gw.caches.assign(n_dev, nullptr);
+
+    // one expert is n_chunks pieces of chunk_full bytes, each device owns chunk_dev of every piece
+    const int     axis       = ss.axis;
+    const size_t  chunk_full = w->nb[axis + 1];
+    const int64_t n_chunks   = w->nb[2] / chunk_full;
+    int64_t ne_before = 0;
+    for (size_t j = 0; j < n_dev; j++) {
+        const int64_t ne_j = ss.ne[j];
+        if (ne_j == 0) {
+            continue;
+        }
+        int64_t ne[GGML_MAX_DIMS] = { w->ne[0], w->ne[1], cap, 1 };
+        ne[axis] = ne_j;
+        ggml_tensor * pool = ggml_new_tensor(gw.pool_ctx.get(), w->type, GGML_MAX_DIMS, ne);
+        ggml_format_name(pool, "%s (pool %zu)", w->name, j);
+        const size_t chunk_dev  = axis == 0 ? ggml_row_size(w->type, ne_j)      : (size_t) ne_j*w->nb[1];
+        const size_t offset_dev = axis == 0 ? ggml_row_size(w->type, ne_before) : (size_t) ne_before*w->nb[1];
+        GGML_ASSERT(pool->nb[2] == (size_t) n_chunks*chunk_dev);
+        ne_before += ne_j;
+
+        // MMQ reads a little past the last row it is handed, so keep one chunk of headroom like the host
+        // cache. The reserve is for whatever allocates after the pools; cudaGraphInstantiate aborts.
+        ggml_backend_dev_t         dev  = ggml_backend_meta_dev_simple_dev(meta_dev, j);
+        ggml_backend_buffer_type_t buft = ggml_backend_meta_buft_simple_buft(meta_buft, j);
+        const size_t need = std::max(ggml_backend_buft_get_alloc_size(buft, pool), ggml_nbytes(pool)) + chunk_dev;
+        size_t free_mem = 0, total_mem = 0;
+        ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+        if (free_mem < need + GGML_META_GATHER_POOL_MARGIN) {
+            return give_up("not enough free device memory for the pool plus the 256 MiB reserve");
+        }
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, need);
+        if (buf == nullptr) {
+            return give_up("the pool did not fit");
+        }
+        ggml_backend_buffer_clear(buf, 0); // the padding is read by MMQ, it must not hold NaNs
+        gw.pool_bufs[j].reset(buf);
+        pool->buffer = buf;
+        pool->data   = ggml_backend_buffer_get_base(buf);
+        ggml_backend_buffer_init_tensor(buf, pool);
+
+        gw.caches[j] = cache_create(dev, ggml_backend_buffer_get_base(w->buffer), ggml_backend_buffer_get_size(w->buffer),
+            w->data, w->ne[2], cap, w->nb[2], chunk_full, chunk_dev, offset_dev, n_chunks, /*max_ids =*/ cap);
+        if (gw.caches[j] == nullptr) {
+            return give_up("the host memory could not be registered or the state not allocated");
+        }
+        pool->extra        = gw.caches[j];
+        gw.pool_tensors[j] = pool;
+    }
+    static bool reported = false;
+    if (!reported) {
+        reported = true;
+        GGML_LOG_INFO("%s: device expert cache: %d experts per weight, gathered inside MUL_MAT_ID (first weight %s)\n",
+            __func__, cap, w->name);
+    }
+    return &gw;
+}
+
+bool ggml_backend_meta_gathers_node(ggml_backend_t backend, const ggml_tensor * node, const ggml_tensor * src) {
+    if (backend == nullptr || !ggml_backend_is_meta(backend) || node == nullptr || node->op != GGML_OP_MUL_MAT_ID ||
+            src == nullptr || src != node->src[0] || node->src[2] == nullptr) {
+        return false;
+    }
+    // the pool has to hold every expert one ubatch can route to
+    if (node->ne[2]*node->src[2]->ne[0] > ggml_backend_expert_cache_cap()) {
+        return false;
+    }
+    return ggml_backend_meta_gathered_weight_get(ggml_backend_dev_buffer_type(ggml_backend_get_device(backend)), src) != nullptr;
+}
+
+bool ggml_backend_meta_device_cache_owns(ggml_backend_t backend, const ggml_tensor * w) {
+    if (backend == nullptr || !ggml_backend_is_meta(backend) || w == nullptr || !ggml_backend_meta_gather_device_mode()) {
+        return false;
+    }
+    ggml_backend_meta_gather_registry & reg = ggml_backend_meta_gather_reg();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    auto it = reg.weights.find(w);
+    return it != reg.weights.end() && it->second.matches(w, ggml_backend_expert_cache_cap());
+}
+
 // Flash attention with q split by head over mirrored k/v: the kv heads that the q heads of device j belong to.
 //   Returns false when they do not spread evenly over those kv heads, the op takes one gqa ratio from the
 //   shapes it gets and cannot express that.
@@ -1215,6 +1447,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 src_ss[i] = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
                 continue;
             }
+            // a MoE weight in host memory that the device-side expert cache reads: split as the model says
+            if (tensor->op == GGML_OP_MUL_MAT_ID && i == 0 && !ggml_backend_buffer_is_meta(tensor->src[i]->buffer)) {
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
+                ggml_backend_meta_split_state ss_w;
+                if (ggml_backend_meta_gathers_weight(dev, tensor->src[i], &ss_w)) {
+                    src_ss[i] = ss_w;
+                    continue;
+                }
+            }
             src_ss[i] = ggml_backend_meta_get_split_state(stc, tensor->src[i], /*assume_sync =*/ true);
             GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
         }
@@ -1503,7 +1744,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (buf_ctx->debug > 0) {
             std::string srcs_info;
             for (size_t i = 0; i < GGML_MAX_SRC; i++) {
-                if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
+                if (tensor->src[i] == nullptr || tensor->src[i] == tensor || !ggml_backend_buffer_is_meta(tensor->src[i]->buffer)) {
                     continue;
                 }
                 if (!srcs_info.empty()) {
@@ -1686,6 +1927,19 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                 t_ij->src[i] = t_ij;
             } else if (t_ij->src[i] != nullptr && ggml_backend_buffer_is_meta(t_ij->src[i]->buffer)) {
                 t_ij->src[i] = ggml_backend_meta_buffer_simple_tensor(tensor->src[i], j);
+            }
+        }
+
+        // A MoE weight in host memory read through the device expert cache: this device computes on its pool
+        if (tensor->op == GGML_OP_MUL_MAT_ID && tensor->src[0] != nullptr && !ggml_backend_buffer_is_meta(tensor->src[0]->buffer)) {
+            ggml_backend_meta_gathered_weight * gw =
+                ggml_backend_meta_gathered_weight_get(ggml_backend_buffer_get_type(tensor->buffer), tensor->src[0]);
+            if (gw != nullptr) {
+                if (gw->pool_tensors[j] != nullptr) {
+                    t_ij->src[0] = gw->pool_tensors[j];
+                } else {
+                    t_ij->flags &= ~GGML_TENSOR_FLAG_COMPUTE; // this device holds none of the weight
+                }
             }
         }
 
@@ -2584,6 +2838,11 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
     delete backend_ctx;
     delete backend;
+    // the device expert pools outlive one context but not the last one
+    ggml_backend_meta_gather_registry & reg = ggml_backend_meta_gather_reg();
+    if (--reg.n_backends == 0) {
+        ggml_backend_meta_gather_release_all();
+    }
 }
 
 // One device's part of a chunk-split copy: the [offset, offset+size) range of a tensor split along
@@ -4216,6 +4475,7 @@ bool ggml_backend_is_meta(ggml_backend_t backend) {
 
 static ggml_backend_t ggml_backend_meta_device_init_backend(ggml_backend_dev_t dev, const char * params) {
     ggml_backend_meta_context * backend_ctx = new ggml_backend_meta_context(dev, params);
+    ggml_backend_meta_gather_reg().n_backends++;
 
     ggml_backend_t backend = new struct ggml_backend;
     backend->guid    = ggml_backend_meta_guid();

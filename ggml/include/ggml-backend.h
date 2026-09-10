@@ -215,6 +215,15 @@ extern "C" {
     // srcs[i] are slices along dim 0 that, concatenated in device order, give dsts[i]; all dsts have the same shape
     typedef bool   (*ggml_backend_comm_allgather_tensor_t)(void * comm_ctx, struct ggml_tensor ** srcs, struct ggml_tensor ** dsts);
 
+    // Expert cache in device memory for a MoE weight that stays in host memory (meta backend). The handle goes
+    // into the extra of a pool tensor holding cap experts of this device's slice; MUL_MAT_ID on that pool gathers
+    // the routed experts from host memory itself. The slice of one expert is n_chunks pieces of chunk_dev bytes
+    // at offset_dev inside chunks of chunk_full bytes; host_buf/host_buf_size is the buffer to page-lock.
+    typedef void * (*ggml_backend_expert_cache_create_t)(ggml_backend_dev_t dev, const void * host_buf, size_t host_buf_size,
+        const void * host_ptr, int64_t n_expert, int cap, size_t expert_bytes, size_t chunk_full, size_t chunk_dev,
+        size_t offset_dev, int64_t n_chunks, int max_ids);
+    typedef void   (*ggml_backend_expert_cache_free_t)(void * cache);
+
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
     // Set the number of threads for the backend

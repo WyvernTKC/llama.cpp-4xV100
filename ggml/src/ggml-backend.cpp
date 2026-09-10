@@ -1387,7 +1387,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     // by starting a new split, the memory of the previously offloaded weights can be reused
                     if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                         int src_backend_id = tensor_backend_id(src);
-                        if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                        if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id) &&
+                                !ggml_backend_meta_gathers_node(sched->backends[cur_backend_id], node, src)) {
                             need_new_split = true;
                             break;
                         }
@@ -1450,7 +1451,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                 }
 
-                if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id) &&
+                        !ggml_backend_meta_gathers_node(sched->backends[cur_backend_id], node, src)) {
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
@@ -2182,7 +2184,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prev_ids_tensor = ids_tensor;
                     }
 
-                    const bool use_cache = expert_cache_on && expert_cache_plan.valid && meta_try_partial;
+                    // a weight the device-side cache owns keeps its pools there; this ubatch was too wide
+                    // for it, so copy the routed experts through a staging slot and leave the pools alone
+                    const bool use_cache = expert_cache_on && expert_cache_plan.valid && meta_try_partial &&
+                        !ggml_backend_meta_device_cache_owns(split_backend, input);
                     if (use_cache) {
                         if (!ggml_backend_meta_cache_experts(split_backend, input, input_cpy, input->data,
                                 expert_cache_plan.cap, expert_cache_plan.miss_expert.data(),
