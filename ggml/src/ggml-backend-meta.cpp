@@ -63,6 +63,7 @@ struct ggml_backend_meta_device_context {
     std::vector<ggml_backend_dev_t>     simple_devs;
     ggml_backend_meta_get_split_state_t get_split_state;
     void *                              get_split_state_ud;
+    std::vector<ggml_backend_t>         live_backends; // buffer operations borrow the first one's launch workers
 
     std::string name;
     std::string description;
@@ -2117,6 +2118,10 @@ static void ggml_backend_meta_buffer_memset_tensor(
     }
 }
 
+// Per-device part of a buffer operation, on a live backend's launch workers when there is one (defined after the
+//   backend context). The synchronous per-device copies of a graph input otherwise run one after the other.
+static void ggml_backend_meta_buffer_for_each_device(ggml_backend_buffer_t buffer, size_t n_dev, const std::function<void(size_t)> & f);
+
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
@@ -2207,10 +2212,11 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             GGML_ASSERT(offset_j == chunk_size_full);
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
-            for (size_t j = 0; j < n_bufs; j++) {
-                ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                ggml_backend_tensor_set(simple_tensor, data, offset, size);
-            }
+            // every graph input of a token comes through here; each device's copy syncs its own stream, so
+            // spread them over the launch workers instead of paying four round trips in a row
+            ggml_backend_meta_buffer_for_each_device(buffer, n_bufs, [&](size_t j) {
+                ggml_backend_tensor_set(ggml_backend_meta_buffer_simple_tensor(tensor, j), data, offset, size);
+            });
         } break;
         case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
             GGML_ASSERT(tensor->type == GGML_TYPE_F32);
@@ -2836,12 +2842,28 @@ static const char * ggml_backend_meta_get_name(ggml_backend_t backend) {
 static void ggml_backend_meta_free(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_meta(backend));
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+    if (backend->device != nullptr) {
+        std::vector<ggml_backend_t> & live = ((ggml_backend_meta_device_context *) backend->device->context)->live_backends;
+        live.erase(std::remove(live.begin(), live.end(), backend), live.end());
+    }
     delete backend_ctx;
     delete backend;
     // the device expert pools outlive one context but not the last one
     ggml_backend_meta_gather_registry & reg = ggml_backend_meta_gather_reg();
     if (--reg.n_backends == 0) {
         ggml_backend_meta_gather_release_all();
+    }
+}
+
+static void ggml_backend_meta_buffer_for_each_device(ggml_backend_buffer_t buffer, size_t n_dev, const std::function<void(size_t)> & f) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer));
+    const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+    if (!dev_ctx->live_backends.empty()) {
+        ((ggml_backend_meta_context *) dev_ctx->live_backends.front()->context)->for_each_device(n_dev, f);
+        return;
+    }
+    for (size_t j = 0; j < n_dev; j++) {
+        f(j);
     }
 }
 
@@ -4482,6 +4504,7 @@ static ggml_backend_t ggml_backend_meta_device_init_backend(ggml_backend_dev_t d
     backend->iface   = ggml_backend_meta_i;
     backend->device  = dev;
     backend->context = backend_ctx;
+    ((ggml_backend_meta_device_context *) dev->context)->live_backends.push_back(backend);
     return backend;
 }
 
