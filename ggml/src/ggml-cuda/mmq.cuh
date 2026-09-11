@@ -1550,14 +1550,44 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
         }
     }
 
-    // ncols_max is the whole batch because one expert could take every token, so the J above is the
-    // worst case. Typically an expert holds only ncols_dst/n_expert columns, and a tile computes all
-    // J of them regardless - only the write back is masked - so the surplus is wasted dp4a work.
-    // GGML_CUDA_MMQ_J pins J for MoE launches to measure that; every J from 8 to 128 is a valid
-    // tiling, and the host-side tile bound ncols_dst/J + n_expert still holds, so CUDA graphs and
-    // the readback-free tile map survive.
+    // ncols_max has to survive one expert taking every token, so for a MoE launch the J above is the
+    // worst case. An expert typically holds only ncols_dst/n_expert columns, and a tile computes all
+    // J of them regardless - only the write back is masked - so the surplus is wasted dp4a work: at
+    // batch 512 with 256 experts, 89% of it. Derive J from the expected per-expert column count
+    // instead. Every J from 8 to 128 is a valid tiling and the host-side tile bound
+    // sum(ceil(rows/J)) <= ncols_dst/J + n_expert still holds, so there is still no readback and the
+    // dense tile map and CUDA graphs survive. Never raise J above the worst-case value: a batch
+    // smaller than one tile must keep its own smaller J.
+    //
     // A dense launch has no expert dispersion, so its J above is already the exact column count and
-    // there is no surplus - GGML_CUDA_MMQ_J_DENSE is separate so the two regimes can be swept apart.
+    // there is no surplus to reclaim - shrinking it only multiplies x-tile re-reads, which measures
+    // up to 2.3x slower. Dense is therefore left alone.
+    //
+    // Only 16 and 32 are candidates. A tile width that is not a power of two divides badly into the
+    // threads - at I=128 and 256 threads J=24 leaves 12 outputs per thread instead of 16 - and
+    // measures worse than both neighbours: on nemotron-h-moe, whose 24 columns per expert make J=24
+    // the natural choice, J=24 is 1.26x over the worst-case J where J=32 is 1.57x.
+    //
+    // Measured on 4x V100 (sm_70, dp4a) against the worst-case J: 1.46-1.57x prefill across five MoE
+    // models under -sm layer (Q8_0/Q4_K/Q6_K, 128-512 experts) and 1.30-1.40x under -sm tensor,
+    // where row splitting has already cut each device's MMQ share. Below 16 the x-tile re-reads
+    // start to bite. Not measured on the Turing+ MMA path, which shares this function but tiles
+    // differently. GGML_CUDA_MMQ_J_AUTO=0 restores the worst-case J.
+    static const bool J_auto = getenv("GGML_CUDA_MMQ_J_AUTO") ? atoi(getenv("GGML_CUDA_MMQ_J_AUTO")) != 0 : true;
+    if (J_auto && args.ids_dst && args.nchannels_x > 0) {
+        const int64_t cols_per_expert = args.ncols_dst / args.nchannels_x;
+
+        int J_moe = cols_per_expert <= 16 ? 16 : 32;
+        if (J_moe > J_best) J_moe = J_best;
+
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J_moe, fallback, cc);
+        if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
+            J_best = J_moe;
+        }
+    }
+
+    // GGML_CUDA_MMQ_J pins J for MoE launches and GGML_CUDA_MMQ_J_DENSE for dense ones, so the two
+    // regimes can be swept apart. Both override the choices above.
     static const int J_env       = getenv("GGML_CUDA_MMQ_J")       ? atoi(getenv("GGML_CUDA_MMQ_J"))       : 0;
     static const int J_env_dense = getenv("GGML_CUDA_MMQ_J_DENSE") ? atoi(getenv("GGML_CUDA_MMQ_J_DENSE")) : 0;
 
