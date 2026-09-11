@@ -1606,6 +1606,16 @@ private:
                 if (f_keep < 0.5f) {
                     update_cache = true;
                 }
+                // a partial-overlap match (f_keep in [0.5, 1)) means this slot is held by ANOTHER
+                // conversation that happens to share a long prefix. update_cache gates both the save
+                // and the load below, so without this the slot keeps the foreign state, its
+                // checkpoints are invalidated on token mismatch, and the task re-prefills in full
+                // even when its own state is sitting in the prompt cache.
+                // a genuine continuation of the *same* conversation has the slot prompt as a strict
+                // prefix of the incoming task, so f_keep is exactly 1.0 and is excluded here.
+                else if (params_base.slot_sim_use_cache && f_keep < 0.999f) {
+                    update_cache = true;
+                }
             }
         }
 
@@ -3095,6 +3105,24 @@ private:
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
+            // --cont-batch-split: when several slots have pending prompts, give each an even share of
+            // n_batch so all prefills advance together. without it the first slot fills the whole
+            // batch and the others wait out its entire prompt (staggered-prefill starvation, and
+            // slots that finish early then decode behind the remaining big prefills).
+            int32_t n_batch_slot = n_batch;
+            if (params_base.cont_batch_split) {
+                int32_t n_pending_prompts = 0;
+                for (server_slot & slot : slots) {
+                    if (slot.is_processing() &&
+                        (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED)) {
+                        n_pending_prompts++;
+                    }
+                }
+                if (n_pending_prompts > 1) {
+                    n_batch_slot = std::max(1, n_batch / n_pending_prompts);
+                }
+            }
+
             iterate(slots, [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_batch) {
                     return; // batch is full, skip remaining slots
@@ -3505,7 +3533,12 @@ private:
                     const auto last_user_pos = spans.last_user_message_pos();
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    // --cont-batch-split: also cap this slot's share when other prompts are pending.
+                    // only a splittable slot may stop early - a non-splittable one must take its
+                    // whole prompt in one batch or not at all.
+                    const bool prompt_can_split = slot.can_split();
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch &&
+                           (!prompt_can_split || (int32_t) (batch.size() - n_tokens_prev) < n_batch_slot)) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {

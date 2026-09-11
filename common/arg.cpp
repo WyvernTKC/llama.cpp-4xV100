@@ -2582,6 +2582,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CONT_BATCHING"));
     add_opt(common_arg(
+        {"--cont-batch-split"},
+        {"--no-cont-batch-split"},
+        "server: when several slots have pending prompts, give each slot an even share of the prompt batch so all prefills advance together, instead of letting the first slot consume the whole batch (default: disabled)",
+        [](common_params & params, bool value) {
+            params.cont_batch_split = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CONT_BATCH_SPLIT"));
+    add_opt(common_arg(
+        {"--slot-sim-use-cache"},
+        {"--no-slot-sim-use-cache"},
+        "server: when a slot is picked by LCP similarity but only partially overlaps its current prompt, still run the prompt-cache save/load so the task's own cached state can win (default: disabled)",
+        [](common_params & params, bool value) {
+            params.slot_sim_use_cache = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_SIM_USE_CACHE"));
+    add_opt(common_arg(
         {"-mm", "--mmproj"}, "FILE",
         "path to a multimodal projector file. see tools/mtmd/README.md\n"
         "note: if -hf is used, this argument can be omitted",
