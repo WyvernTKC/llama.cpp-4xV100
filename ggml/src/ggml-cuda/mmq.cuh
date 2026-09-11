@@ -6,7 +6,11 @@
 #include <climits>
 #include <cstdint>
 
-#define MMQ_DP4A_MAX_BATCH_SIZE 64 // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
+// Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available. Measured on
+// 4x V100 (sm_70) with Q8_0 weights, MMQ against dequantize + FP16 cuBLAS: 1.26-1.31x at
+// ne11=128, a wash at 160 (0.98x and 1.03x on two models), then 0.88x, 0.72x and 0.62x at 192,
+// 256 and 512. So the crossover is at 160, not 64.
+#define MMQ_DP4A_MAX_BATCH_SIZE 160
 #define MMQ_ITER_K             256
 #define MMQ_ITER_K_FP4         512
 #define MMQ_NWARPS               8
