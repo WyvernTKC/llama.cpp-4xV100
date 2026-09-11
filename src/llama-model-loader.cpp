@@ -1223,6 +1223,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         ggml_backend_buffer_type_t buft = nullptr;
+        bool overridden = false;
 
         // check overrides
         if (tensor_buft_overrides) {
@@ -1242,6 +1243,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                     } else {
                         buft = overrides->buft;
                     }
+
+                    overridden = true;
 
                     LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to %s\n",
                             tensor_name.c_str(),
@@ -1270,13 +1273,25 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         if (buft != buft_list->front().second) {
-            if (n_tensors_moved == 0) {
-                first_tensor_moved_name = t_meta->name;
-                first_tensor_moved_type_name = ggml_type_name(t_meta->type);
-                first_moved_from_buft = buft_list->front().second;
-                first_moved_to_buft   = buft;
+            // A tensor the user redirected is not a tensor the backend refused. Counting both here
+            // made every --n-cpu-moe run report its own offload as a capability failure.
+            if (overridden) {
+                if (n_tensors_overridden == 0) {
+                    first_tensor_overridden_name = t_meta->name;
+                    first_tensor_overridden_type_name = ggml_type_name(t_meta->type);
+                    first_overridden_from_buft = buft_list->front().second;
+                    first_overridden_to_buft   = buft;
+                }
+                n_tensors_overridden++;
+            } else {
+                if (n_tensors_moved == 0) {
+                    first_tensor_moved_name = t_meta->name;
+                    first_tensor_moved_type_name = ggml_type_name(t_meta->type);
+                    first_moved_from_buft = buft_list->front().second;
+                    first_moved_to_buft   = buft;
+                }
+                n_tensors_moved++;
             }
-            n_tensors_moved++;
         }
 
         return buft;
@@ -1397,6 +1412,11 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
         LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %zu others) cannot be used with preferred buffer type %s, using %s instead\n",
             __func__, first_tensor_moved_name.c_str(), first_tensor_moved_type_name.c_str(), n_tensors_moved - 1,
             ggml_backend_buft_name(first_moved_from_buft), ggml_backend_buft_name(first_moved_to_buft));
+    }
+    if (n_tensors_overridden > 0) {
+        LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %zu others) moved from buffer type %s to %s as requested\n",
+            __func__, first_tensor_overridden_name.c_str(), first_tensor_overridden_type_name.c_str(), n_tensors_overridden - 1,
+            ggml_backend_buft_name(first_overridden_from_buft), ggml_backend_buft_name(first_overridden_to_buft));
     }
 }
 

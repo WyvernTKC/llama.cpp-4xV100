@@ -171,6 +171,14 @@ struct llama_model_loader {
     ggml_backend_buffer_type_t first_moved_from_buft = nullptr;
     ggml_backend_buffer_type_t first_moved_to_buft = nullptr;
 
+    // tensors the user redirected with --override-tensor / --n-cpu-moe / --n-cpu-ffn are tracked
+    // separately: they did not fail to fit anywhere, they were placed where they were asked to be:
+    size_t n_tensors_overridden = 0;
+    std::string first_tensor_overridden_name;
+    std::string first_tensor_overridden_type_name;
+    ggml_backend_buffer_type_t first_overridden_from_buft = nullptr;
+    ggml_backend_buffer_type_t first_overridden_to_buft = nullptr;
+
     llama_model_loader(
         struct gguf_context * metadata,
         llama_model_set_tensor_data_t set_tensor_data,
