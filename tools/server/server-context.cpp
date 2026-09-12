@@ -296,6 +296,11 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // n_tokens of the context checkpoint that the current sequence state was restored from, or -1.
+    // valid only until the next decode for this slot - used to skip re-serializing a checkpoint
+    // whose bytes we have just read back unchanged. reset on every new task.
+    int64_t ckpt_restored_n_tokens = -1;
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -1829,6 +1834,9 @@ private:
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
+        // a restored-checkpoint marker is only meaningful within the task that restored it
+        slot.ckpt_restored_n_tokens = -1;
+
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
@@ -2319,6 +2327,28 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
+        const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+
+        // if the sequence state was restored from a checkpoint and nothing has been decoded since,
+        // the checkpoint we are about to write is byte-identical to the one we just read back.
+        // keep that one instead - on recurrent/hybrid models this saves a full state serialization,
+        // which is a fixed cost independent of how few tokens the request actually has to process.
+        // note: any decode advances n_tokens_new past the restored point, so this can only match on
+        //       the first checkpoint of the task that performed the restore
+        if (slot.ckpt_restored_n_tokens == n_tokens_new) {
+            for (auto & cur : slot.prompt.checkpoints) {
+                if (cur.n_tokens == n_tokens_new && cur.pos_min == pos_min && cur.pos_max == pos_max) {
+                    // adopt it into the current task so it is not evicted as "too close to an earlier one"
+                    cur.id_task = id_task;
+
+                    SLT_TRC(slot, "reused restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                            cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+
+                    return;
+                }
+            }
+        }
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
@@ -2350,7 +2380,6 @@ private:
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
         {
-            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if (it->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
@@ -2368,7 +2397,7 @@ private:
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
-        cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+        cur.update_pos(n_tokens_new, pos_min, pos_max);
 
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -3402,6 +3431,9 @@ private:
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+
+                                        // the sequence state is now exactly this checkpoint's bytes
+                                        slot.ckpt_restored_n_tokens = it->n_tokens;
                                     }
 
                                     if (do_reset) {
