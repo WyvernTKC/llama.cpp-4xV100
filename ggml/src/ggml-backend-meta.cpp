@@ -2380,6 +2380,76 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
     /* .reset           = */ ggml_backend_meta_buffer_reset,
 };
 
+size_t ggml_backend_meta_tensor_n_simple(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer)) {
+        return 0;
+    }
+    return ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+}
+
+bool ggml_backend_meta_tensor_simple_range(
+        const ggml_tensor * tensor, size_t offset, size_t size, size_t j,
+        ggml_tensor ** simple, size_t * offset_j, size_t * size_j) {
+    *simple   = nullptr;
+    *offset_j = 0;
+    *size_j   = 0;
+
+    if (tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer)) {
+        return false;
+    }
+    if (j >= ggml_backend_meta_buffer_n_bufs(tensor->buffer)) {
+        return false;
+    }
+
+    ggml_tensor * st = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+    if (st == nullptr) {
+        return false;
+    }
+
+    const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+
+    if (ss.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        *simple   = st;
+        *offset_j = offset;
+        *size_j   = size;
+        return true;
+    }
+
+    // Same rule as ggml_backend_meta_buffer_get_tensor: above the split axis the tensor is a sequence of
+    // "chunks" of nb[axis + 1] bytes, and device j holds a contiguous st->nb[axis + 1] bytes of every chunk
+    // (for a multi-segment split the segments are laid out back to back inside that). So a range of whole
+    // chunks is one contiguous run on every device. get_tensor needs the 2-D copy only to interleave those
+    // runs into the host layout - device to device there is nothing to interleave.
+    switch (ss.axis) {
+        case GGML_BACKEND_SPLIT_AXIS_0:
+        case GGML_BACKEND_SPLIT_AXIS_1:
+        case GGML_BACKEND_SPLIT_AXIS_2:
+            break;
+        default:
+            return false; // PARTIAL holds a partial sum per device, UNKNOWN/NONE are not a layout
+    }
+    if (!ggml_is_contiguous(tensor) || !ggml_is_contiguous(st)) {
+        return false;
+    }
+
+    const size_t chunk_full = tensor->nb[ss.axis + 1];
+    if (chunk_full == 0 || offset % chunk_full != 0 || size % chunk_full != 0) {
+        return false;
+    }
+    const size_t i_start  = offset / chunk_full;
+    const size_t n_chunks = size   / chunk_full;
+    if ((i_start + n_chunks) * chunk_full > ggml_nbytes(tensor)) {
+        return false;
+    }
+
+    const size_t chunk_j = st->nb[ss.axis + 1];
+
+    *simple   = st;
+    *offset_j = i_start  * chunk_j;
+    *size_j   = n_chunks * chunk_j; // 0 for a device whose slice is empty
+    return true;
+}
+
 bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {
     return buf != nullptr && buf->iface.free_buffer == ggml_backend_meta_buffer_iface.free_buffer;
 }

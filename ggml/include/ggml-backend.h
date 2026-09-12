@@ -435,6 +435,17 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
+    // number of simple devices a tensor in a meta buffer is spread over; 0 if the tensor is not in a meta buffer
+    GGML_API size_t ggml_backend_meta_tensor_n_simple(const struct ggml_tensor * tensor);
+
+    // map the byte range [offset, offset + size) of a tensor in a meta buffer to the matching byte range of its
+    // piece on simple device j. Returns false if the tensor is not in a meta buffer, j is out of range, or the
+    // range does not map to one contiguous run on that device. A device whose slice of the tensor is empty
+    // returns true with *size_j == 0.
+    GGML_API bool ggml_backend_meta_tensor_simple_range(
+        const struct ggml_tensor * tensor, size_t offset, size_t size, size_t j,
+        struct ggml_tensor ** simple, size_t * offset_j, size_t * size_j);
+
     //
     // Utils
     //

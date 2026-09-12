@@ -2749,6 +2749,49 @@ private:
     std::vector<uint8_t> temp_buffer;
 };
 
+// A tensor in a meta buffer is spread over several devices, and a fresh tensor allocated in the meta buffer
+// type gets the meta backend's default layout - mirrored - rather than the source's. A snapshot taken there
+// can only be filled through host memory (the layouts never line up for a device copy) and holds a full copy
+// per device. Snapshot each device's piece in that device's own buffer type instead: the copy stays on the
+// device and the storage is the size of the state. A range that is not one contiguous run per device (e.g.
+// the transposed V cache) keeps the meta tensor and takes the slow path; write and read make this decision
+// from the same inputs, so the per-buffer-type lists line up on both sides.
+template <typename T>
+static std::vector<T> llama_io_device_expand(const std::vector<T> & infos) {
+    std::vector<T> res;
+    res.reserve(infos.size());
+
+    for (const auto & info : infos) {
+        const size_t n_simple = ggml_backend_meta_tensor_n_simple(info.tensor);
+        if (n_simple == 0) {
+            res.push_back(info);
+            continue;
+        }
+
+        std::vector<T> pieces;
+        bool ok = true;
+        for (size_t j = 0; j < n_simple && ok; ++j) {
+            ggml_tensor * simple = nullptr;
+            size_t offset_j = 0;
+            size_t size_j   = 0;
+
+            ok = ggml_backend_meta_tensor_simple_range(info.tensor, info.offset, info.size, j, &simple, &offset_j, &size_j);
+            if (ok && size_j > 0) {
+                pieces.push_back({ simple, info.ptr, size_j, offset_j });
+            }
+        }
+
+        if (!ok) {
+            res.push_back(info);
+            continue;
+        }
+
+        res.insert(res.end(), pieces.begin(), pieces.end());
+    }
+
+    return res;
+}
+
 class llama_io_write_device : public llama_io_write_i {
 public:
     llama_io_write_device(uint8_t * p, size_t len, llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs)  {
@@ -2757,7 +2800,9 @@ public:
     ~llama_io_write_device() {
         llama_memory_buffers mbufs_new;
 
-        for (const auto & winfo : winfos) {
+        const auto winfos_dev = llama_io_device_expand(winfos);
+
+        for (const auto & winfo : winfos_dev) {
             auto * buft = ggml_backend_buffer_get_type(winfo.tensor->buffer);
 
             mbufs_new[buft].n_tensors++;
@@ -2777,7 +2822,7 @@ public:
             mbuf.cpy.reserve(mbuf.n_tensors);
         }
 
-        for (const auto & winfo : winfos) {
+        for (const auto & winfo : winfos_dev) {
             auto * buft = ggml_backend_buffer_get_type(winfo.tensor->buffer);
 
             const int64_t n = winfo.size/ggml_element_size(winfo.tensor);
@@ -2889,7 +2934,9 @@ public:
     ~llama_io_read_device() {
         llama_memory_buffers mbufs_new;
 
-        for (const auto & rinfo : rinfos) {
+        const auto rinfos_dev = llama_io_device_expand(rinfos);
+
+        for (const auto & rinfo : rinfos_dev) {
             auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
 
             mbufs_new[buft].n_tensors++;
@@ -2908,7 +2955,7 @@ public:
             mbuf.org.reserve(mbuf.n_tensors);
         }
 
-        for (const auto & rinfo : rinfos) {
+        for (const auto & rinfo : rinfos_dev) {
             auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
 
             const int64_t n = rinfo.size/ggml_element_size(rinfo.tensor);
