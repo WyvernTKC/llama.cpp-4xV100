@@ -153,6 +153,9 @@ struct llama_context {
 
     size_t state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags);
 
+    // release the device buffers held for (seq_id, dev_slot) - see LLAMA_STATE_SEQ_FLAGS_DEV_SLOT
+    void state_seq_free_dev(llama_seq_id seq_id, uint32_t dev_slot);
+
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
 
@@ -371,7 +374,10 @@ private:
     ggml_backend_buffer_ptr buf_output;
 
     // keep copies of the per-sequence memory on the device
-    std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+    // keyed by (seq_id, dev_slot) so several states of one sequence can be resident at once
+    // - see LLAMA_STATE_SEQ_FLAGS_DEV_SLOT
+    std::map<std::pair<llama_seq_id, uint32_t>, llama_memory_buffers> mem_storage;
+
 
     bool has_evaluated_once = false;
 

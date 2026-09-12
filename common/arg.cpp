@@ -1705,6 +1705,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"-ctxcpd", "--ctx-checkpoints-dev"}, "N",
+        string_format("keep context checkpoints in device memory, N per slot (default: %d, 0 = host memory).\n"
+            "much faster to save and restore, but each one costs a full sequence state worth of VRAM and it\n"
+            "replaces --ctx-checkpoints as the per-slot limit, so fewer restore points are kept", params.n_ctx_checkpoints_dev),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("ctx-checkpoints-dev must be non-negative");
+            }
+            params.n_ctx_checkpoints_dev = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_DEV").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cms", "--checkpoint-min-step"}, "N",
         string_format("minimum spacing between context checkpoints in tokens (default: %d, 0 = no minimum)", params.checkpoint_min_step),
         [](common_params & params, int value) {

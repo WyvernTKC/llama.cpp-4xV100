@@ -301,6 +301,31 @@ struct server_slot {
     // whose bytes we have just read back unchanged. reset on every new task.
     int64_t ckpt_restored_n_tokens = -1;
 
+    // free (seq_id, dev_slot) storage ids for device-resident checkpoints, see --ctx-checkpoints-dev
+    std::vector<int> ckpt_dev_free;
+
+    // erase a checkpoint, releasing any device storage it holds first.
+    // a device-resident checkpoint's host blob is metadata only, so it must be erased rather than
+    // merely released - a released one would restore as a silent no-op
+    std::list<common_prompt_checkpoint>::iterator ckpt_erase(std::list<common_prompt_checkpoint>::iterator it) {
+        if (it->dev_slot >= 0) {
+            // return the id to the pool; the device buffers stay allocated for the next checkpoint
+            ckpt_dev_free.push_back(it->dev_slot);
+            it->detach_dev();
+        }
+
+        return prompt.checkpoints.erase(it);
+    }
+
+    // drop every device-resident checkpoint of this slot.
+    // needed wherever the checkpoint list is copied out of the slot (prompt cache, child slots) or
+    // the slot's sequence is reset: the copy would alias device buffers the slot may overwrite
+    void ckpt_drop_dev() {
+        for (auto it = prompt.checkpoints.begin(); it != prompt.checkpoints.end(); ) {
+            it = it->dev_slot >= 0 ? ckpt_erase(it) : std::next(it);
+        }
+    }
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -1299,6 +1324,12 @@ private:
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot();
 
+            // device storage ids available to this slot's checkpoints
+            slot.ckpt_dev_free.clear();
+            for (int j = params_base.n_ctx_checkpoints_dev - 1; j >= 0; --j) {
+                slot.ckpt_dev_free.push_back(j);
+            }
+
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
 
@@ -1659,6 +1690,7 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
+                ret->ckpt_drop_dev(); // device checkpoints cannot be stored in the host prompt cache
                 ret->prompt_save(*prompt_cache);
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
@@ -1727,6 +1759,7 @@ private:
                 // if lora has changed, check to see if the cache should be cleared
                 if (lora_should_clear_cache(slot.lora, task_loras)) {
                     SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task.params.lora.size());
+                    slot.ckpt_drop_dev();
                     slot.prompt.clear();
                 } else {
                     SLT_TRC(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
@@ -2329,6 +2362,15 @@ private:
 
         const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
 
+        // with a device tier the number of storage ids is the real limit, and it is normally much
+        // smaller than n_ctx_checkpoints - a device checkpoint can never be demoted to host memory
+        // (there is no device->host path for a stored slot), so the tier decision is made here, once
+        const bool on_device = params_base.n_ctx_checkpoints_dev > 0;
+
+        const size_t n_ckpt_max = on_device
+            ? (size_t) params_base.n_ctx_checkpoints_dev
+            : (size_t) params_base.n_ctx_checkpoints;
+
         // if the sequence state was restored from a checkpoint and nothing has been decoded since,
         // the checkpoint we are about to write is byte-identical to the one we just read back.
         // keep that one instead - on recurrent/hybrid models this saves a full state serialization,
@@ -2354,13 +2396,13 @@ private:
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin();
-                slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
+                slot.prompt.checkpoints.size() + 1 >= n_ckpt_max &&
                 it != slot.prompt.checkpoints.end(); ) {
             if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
-                it = slot.prompt.checkpoints.erase(it);
+                it = slot.ckpt_erase(it);
                 continue;
             }
 
@@ -2368,14 +2410,14 @@ private:
             ++it;
         }
 
-        while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
+        while (slot.prompt.checkpoints.size() >= n_ckpt_max) {
             // make room for the new checkpoint, if needed
             const auto & cur = slot.prompt.checkpoints.front();
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.ckpt_erase(slot.prompt.checkpoints.begin());
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
@@ -2383,7 +2425,7 @@ private:
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if (it->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
-                    it = slot.prompt.checkpoints.erase(it);
+                    it = slot.ckpt_erase(it);
                 } else {
                     ++it;
                 }
@@ -2393,6 +2435,11 @@ private:
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
         cur.id_task = id_task;
+
+        if (on_device && !slot.ckpt_dev_free.empty()) {
+            cur.dev_slot = slot.ckpt_dev_free.back();
+            slot.ckpt_dev_free.pop_back();
+        }
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
@@ -2477,6 +2524,7 @@ private:
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
+                                slot.ckpt_drop_dev(); // device checkpoints cannot be stored in the host prompt cache
                                 if (slot.prompt_save(*prompt_cache)) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
@@ -2675,6 +2723,7 @@ private:
                             throw std::runtime_error("Invalid tokens in slot save file");
                         }
 
+                        slot->ckpt_drop_dev();
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
                     } catch (const std::exception & err) {
@@ -3002,6 +3051,7 @@ private:
 
                     new_tokens.resize(slot.prompt.tokens.size() - n_discard);
 
+                    slot.ckpt_drop_dev();
                     slot.prompt.clear();
                     slot.prompt.tokens.insert(new_tokens);
                 }
@@ -3451,7 +3501,7 @@ private:
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
-                                        it = slot.prompt.checkpoints.erase(it);
+                                        it = slot.ckpt_erase(it);
                                     } else {
                                         ++it;
                                     }
@@ -3837,6 +3887,7 @@ private:
 
                     GGML_ASSERT(child->state == SLOT_STATE_WAIT_OTHER);
 
+                    slot.ckpt_drop_dev(); // the clone below would alias this slot's device buffers
                     slot.copy_state_to(*child);
                     child->state = SLOT_STATE_DONE_PROMPT;
                 }

@@ -912,10 +912,25 @@ extern "C" {
 #define LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY 1
 
 // Keeps the tensor data on device buffers (i.e. not accessible in host memory, but faster save/load).
-// Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
+// Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag,
+// unless they were taken into a different device storage slot - see LLAMA_STATE_SEQ_FLAGS_DEV_SLOT below.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
+// With LLAMA_STATE_SEQ_FLAGS_ON_DEVICE, bits 8..31 of the flags select one of several independent on-device
+// storage slots for the same seq_id (default slot 0). Each (seq_id, slot) pair keeps its own device buffers, so
+// several states of one sequence can be resident at once - getting a state only invalidates the same slot.
+// Each resident slot costs a full sequence state worth of device memory; release one with llama_state_seq_free_dev().
+#define LLAMA_STATE_SEQ_FLAGS_DEV_SLOT_SHIFT 8
+#define LLAMA_STATE_SEQ_FLAGS_DEV_SLOT(n)  (((uint32_t) (n)) << LLAMA_STATE_SEQ_FLAGS_DEV_SLOT_SHIFT)
+
     typedef uint32_t llama_state_seq_flags;
+
+    // Release the device buffers held for (seq_id, dev_slot). No-op if nothing is resident there.
+    // Any state blob previously obtained for that pair becomes unusable.
+    LLAMA_API void llama_state_seq_free_dev(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                        uint32_t   dev_slot);
 
     LLAMA_API size_t llama_state_seq_get_size_ext(
             struct llama_context * ctx,

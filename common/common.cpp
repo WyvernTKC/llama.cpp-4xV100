@@ -2252,8 +2252,19 @@ bool common_prompt_batch_decode(
     return true;
 }
 
+// a checkpoint with a device slot keeps its tensor bytes in device memory; the host blob then holds
+// only the metadata needed to find them again
+static llama_state_seq_flags common_ckpt_flags(llama_state_seq_flags flags, int dev_slot) {
+    if (dev_slot < 0) {
+        return flags;
+    }
+
+    return flags | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE | LLAMA_STATE_SEQ_FLAGS_DEV_SLOT(dev_slot);
+}
+
 size_t common_prompt_checkpoint::size() const {
-    return data_tgt.size() + data_dft.size() + data_spec.size();
+    // on a device-resident checkpoint data_tgt/data_dft are metadata only - report what it really costs
+    return dev_bytes_tgt + dev_bytes_dft + data_tgt.size() + data_dft.size() + data_spec.size();
 }
 
 bool common_prompt_checkpoint::empty() const {
@@ -2261,6 +2272,11 @@ bool common_prompt_checkpoint::empty() const {
 }
 
 void common_prompt_checkpoint::clear() {
+    // note: the caller must detach_dev() first if this checkpoint held a device slot
+    dev_slot      = -1;
+    dev_bytes_tgt = 0;
+    dev_bytes_dft = 0;
+
     n_tokens = 0;
 
     pos_min = 0;
@@ -2288,11 +2304,18 @@ void common_prompt_checkpoint::update_tgt(
         return;
     }
 
-    const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+    const llama_state_seq_flags flags_eff = common_ckpt_flags(flags, dev_slot);
+
+    if (dev_slot >= 0) {
+        // what the same state would occupy in host memory - i.e. what it costs in device memory
+        dev_bytes_tgt = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+    }
+
+    const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags_eff);
 
     data_tgt.resize(ckpt_size);
 
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
+    const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags_eff);
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
@@ -2306,11 +2329,18 @@ void common_prompt_checkpoint::update_dft(
         return;
     }
 
-    const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+    const llama_state_seq_flags flags_eff = common_ckpt_flags(flags, dev_slot);
+
+    if (dev_slot >= 0) {
+        // what the same state would occupy in host memory - i.e. what it costs in device memory
+        dev_bytes_dft = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+    }
+
+    const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags_eff);
 
     data_dft.resize(ckpt_size);
 
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
+    const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags_eff);
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
@@ -2328,10 +2358,24 @@ void common_prompt_checkpoint::load_tgt(
         return;
     }
 
-    const size_t n = llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
+    const size_t n = llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, common_ckpt_flags(flags, dev_slot));
     if (n != data_tgt.size()) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_tgt.size(), n);
     }
+}
+
+void common_prompt_checkpoint::detach_dev() {
+    if (dev_slot < 0) {
+        return;
+    }
+
+    // the host blob is metadata only, so without the device buffers this checkpoint cannot be restored
+    data_tgt.clear();
+    data_dft.clear();
+
+    dev_slot      = -1;
+    dev_bytes_tgt = 0;
+    dev_bytes_dft = 0;
 }
 
 void common_prompt_checkpoint::load_dft(
@@ -2346,7 +2390,7 @@ void common_prompt_checkpoint::load_dft(
         return;
     }
 
-    const size_t n = llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags);
+    const size_t n = llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, common_ckpt_flags(flags, dev_slot));
     if (n != data_dft.size()) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_dft.size(), n);
     }

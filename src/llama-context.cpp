@@ -3083,6 +3083,10 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
 
 static constexpr uint32_t io_magic = 0xaf143cd8;
 
+void llama_context::state_seq_free_dev(llama_seq_id seq_id, uint32_t dev_slot) {
+    mem_storage.erase({ seq_id, dev_slot });
+}
+
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
     try {
@@ -3099,7 +3103,9 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
 size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
     std::unique_ptr<llama_io_write_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
-        io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
+        const uint32_t dev_slot = flags >> LLAMA_STATE_SEQ_FLAGS_DEV_SLOT_SHIFT;
+
+        io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[{ seq_id, dev_slot }]);
     } else {
         io = std::make_unique<llama_io_write_host>(dst, size);
     }
@@ -3130,9 +3136,11 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
         llama_seq_id seq_id_read;
         io->read(&seq_id_read, sizeof(seq_id_read));
 
-        GGML_ASSERT(mem_storage.find(seq_id_read) != mem_storage.end());
+        const uint32_t dev_slot = flags >> LLAMA_STATE_SEQ_FLAGS_DEV_SLOT_SHIFT;
 
-        io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
+        GGML_ASSERT(mem_storage.find({ seq_id_read, dev_slot }) != mem_storage.end());
+
+        io = std::make_unique<llama_io_read_device>(src, size, mem_storage[{ seq_id_read, dev_slot }]);
     } else {
         io = std::make_unique<llama_io_read_host>(src, size);
     }
@@ -4215,6 +4223,10 @@ size_t llama_state_seq_set_data(llama_context * ctx, const uint8_t * src, size_t
 
 size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) {
     return ctx->state_seq_get_size(seq_id, flags);
+}
+
+void llama_state_seq_free_dev(llama_context * ctx, llama_seq_id seq_id, uint32_t dev_slot) {
+    ctx->state_seq_free_dev(seq_id, dev_slot);
 }
 
 size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {

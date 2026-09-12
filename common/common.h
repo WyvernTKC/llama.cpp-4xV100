@@ -632,6 +632,7 @@ struct common_params {
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
+    int32_t n_ctx_checkpoints_dev = 0;   // keep this many context checkpoints in device memory instead (0 = host)
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
@@ -1176,6 +1177,15 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
+    // >= 0: the tensor bytes live in device memory in this (seq_id, dev_slot) storage slot and
+    //       data_tgt/data_dft hold only the metadata. -1: everything is in host memory.
+    // the owner is responsible for calling detach_dev() before dropping the checkpoint
+    int dev_slot = -1;
+
+    // device bytes held by this checkpoint while dev_slot >= 0 (for reporting / VRAM accounting)
+    size_t dev_bytes_tgt = 0;
+    size_t dev_bytes_dft = 0;
+
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
 
@@ -1212,6 +1222,12 @@ struct common_prompt_checkpoint {
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
+
+    // give up this checkpoint's claim on its device storage slot and make it unrestorable.
+    // the device buffers themselves are deliberately NOT freed: the next checkpoint to take the slot
+    // reuses them in place, and reallocating a full sequence state per checkpoint costs more than the
+    // copy it is meant to save. llama_state_seq_free_dev() releases the memory for real
+    void detach_dev();
 
     void clear_tgt();
     void clear_dft();
