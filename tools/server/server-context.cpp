@@ -2410,14 +2410,30 @@ private:
 
         const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
 
-        // with a device tier the number of storage ids is the real limit, and it is normally much
-        // smaller than n_ctx_checkpoints - a device checkpoint can never be demoted to host memory
-        // (there is no device->host path for a stored slot), so the tier decision is made here, once
+        // Two tiers share the list. Device entries (dev_slot >= 0) are the fast path for the recent past - one per
+        // user boundary, capped at n_ctx_checkpoints_dev, oldest evicted first. Host entries are the deep restore
+        // points: with a device tier they are only taken every checkpoint_min_step tokens of growth, so a branch
+        // 50k tokens back on a 200k conversation restores to within min_step instead of re-prefilling everything,
+        // and the host copy - the cost the device tier exists to avoid - is bounded to one per min_step.
+        // A device checkpoint can never be demoted to host memory (there is no device->host path for a stored
+        // slot), which is why the host copy has to be taken up front rather than on eviction.
+        // Without a device tier every entry is a host entry and this is upstream's policy unchanged.
         const bool on_device = params_base.n_ctx_checkpoints_dev > 0;
 
-        const size_t n_ckpt_max = on_device
-            ? (size_t) params_base.n_ctx_checkpoints_dev
-            : (size_t) params_base.n_ctx_checkpoints;
+        auto is_dev = [](const common_prompt_checkpoint & c) { return c.dev_slot >= 0; };
+
+        bool want_dev  = on_device;
+        bool want_host = true;
+
+        if (on_device) {
+            int64_t last_host = -1;
+            for (const auto & cur : slot.prompt.checkpoints) {
+                if (!is_dev(cur)) {
+                    last_host = std::max(last_host, cur.n_tokens);
+                }
+            }
+            want_host = last_host < 0 || n_tokens_new >= last_host + params_base.checkpoint_min_step;
+        }
 
         // if the sequence state was restored from a checkpoint and nothing has been decoded since,
         // the checkpoint we are about to write is byte-identical to the one we just read back.
@@ -2431,78 +2447,128 @@ private:
                     // adopt it into the current task so it is not evicted as "too close to an earlier one"
                     cur.id_task = id_task;
 
+                    if (is_dev(cur)) {
+                        want_dev = false;
+                    } else {
+                        want_host = false;
+                    }
+
                     SLT_TRC(slot, "reused restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                             cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
-
-                    return;
                 }
             }
         }
 
-        // evict checkpoints within min-step of a previous checkpoint, unless they were
-        // created by the current task
-        // only when the list is full, otherwise short prompts keep just the oldest checkpoint
-        int64_t last = -1;
-        for (auto it = slot.prompt.checkpoints.begin();
-                slot.prompt.checkpoints.size() + 1 >= n_ckpt_max &&
-                it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
-                SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                        it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
-
-                it = slot.ckpt_erase(it);
-                continue;
-            }
-
-            last = it->n_tokens;
-            ++it;
+        if (!want_dev && !want_host) {
+            return;
         }
 
-        while (slot.prompt.checkpoints.size() >= n_ckpt_max) {
-            // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+        auto n_in_tier = [&](bool dev) {
+            return (size_t) std::count_if(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
+                    [&](const common_prompt_checkpoint & c) { return is_dev(c) == dev; });
+        };
 
-            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+        // fill a freshly emplaced entry from the live sequence state
+        auto fill = [&](common_prompt_checkpoint & cur) {
+            cur.id_task = id_task;
+
+            // [TAG_CHECKPOINTS_FIX_POS_MIN]
+            // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
+            //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
+            cur.update_pos(n_tokens_new, pos_min, pos_max);
+
+            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            // stash the draft's speculative state with the checkpoint
+            common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+
+            SLT_TRC(slot,
+                    "created %s context checkpoint (%zu host / %zu device) (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                    cur.dev_slot >= 0 ? "device" : "host", n_in_tier(false), n_in_tier(true),
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+        };
 
-            slot.ckpt_erase(slot.prompt.checkpoints.begin());
-        }
-
-        // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
-        {
+        // erase the entries of one tier that sit at the position we are about to write
+        auto supersede = [&](bool dev) {
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-                if (it->n_tokens == n_tokens_new) {
-                    SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
+                if (is_dev(*it) == dev && it->n_tokens == n_tokens_new) {
+                    SLT_TRC(slot, "superseding %s context checkpoint at n_tokens = %" PRId64 "\n", dev ? "device" : "host", it->n_tokens);
                     it = slot.ckpt_erase(it);
                 } else {
                     ++it;
                 }
             }
+        };
+
+        // the host entry goes first so that a device entry at the same position is found first by the
+        // reverse search on restore
+        if (want_host) {
+            const size_t n_max = (size_t) params_base.n_ctx_checkpoints;
+
+            // evict host checkpoints within min-step of a previous one, unless they were created by the
+            // current task - only when the tier is full, otherwise short prompts keep just the oldest checkpoint
+            int64_t last = -1;
+            for (auto it = slot.prompt.checkpoints.begin(); n_in_tier(false) + 1 >= n_max && it != slot.prompt.checkpoints.end(); ) {
+                if (is_dev(*it)) {
+                    ++it;
+                    continue;
+                }
+                if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
+                    SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                            it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
+
+                    it = slot.ckpt_erase(it);
+                    continue;
+                }
+
+                last = it->n_tokens;
+                ++it;
+            }
+
+            while (n_in_tier(false) >= n_max) {
+                // make room for the new checkpoint: the oldest host entry goes
+                auto it = std::find_if(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
+                        [&](const common_prompt_checkpoint & c) { return !is_dev(c); });
+
+                SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                        it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
+
+                slot.ckpt_erase(it);
+            }
+
+            supersede(/*dev =*/ false);
+
+            fill(slot.prompt.checkpoints.emplace_back());
         }
 
-        auto & cur = slot.prompt.checkpoints.emplace_back();
+        if (want_dev) {
+            const size_t n_max = (size_t) params_base.n_ctx_checkpoints_dev;
 
-        cur.id_task = id_task;
+            while (n_in_tier(true) >= n_max) {
+                // the device tier is a plain window over the recent past: the oldest device entry goes
+                auto it = std::find_if(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(), is_dev);
 
-        if (on_device && !slot.ckpt_dev_free.empty()) {
-            cur.dev_slot = slot.ckpt_dev_free.back();
-            slot.ckpt_dev_free.pop_back();
+                SLT_TRC(slot, "evicting oldest device context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ")\n",
+                        it->pos_min, it->pos_max, it->n_tokens);
+
+                slot.ckpt_erase(it);
+            }
+
+            supersede(/*dev =*/ true);
+
+            if (slot.ckpt_dev_free.empty()) {
+                // cannot happen after the eviction above unless storage ids were lost; do not fall back to a
+                // second host copy, the host tier has its own cadence
+                SLT_WRN(slot, "%s", "no free device checkpoint storage id, skipping device checkpoint\n");
+            } else {
+                auto & cur = slot.prompt.checkpoints.emplace_back();
+
+                cur.dev_slot = slot.ckpt_dev_free.back();
+                slot.ckpt_dev_free.pop_back();
+
+                fill(cur);
+            }
         }
-
-        // [TAG_CHECKPOINTS_FIX_POS_MIN]
-        // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
-        //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
-        cur.update_pos(n_tokens_new, pos_min, pos_max);
-
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        // stash the draft's speculative state with the checkpoint
-        common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
-
-        SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
     }
 
     // returns false to decline the task, it is offered again after the decode is done
