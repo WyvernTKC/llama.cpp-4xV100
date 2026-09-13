@@ -4,7 +4,8 @@
 #include "convert.cuh"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-#if defined(TURING_MMA_AVAILABLE)
+// the wmma path needs only fp16 wmma fragments (m8n32k16), which Volta has - keep the body for sm_70 as well
+#if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)
 
 typedef union {
     int2 i2;
@@ -210,7 +211,7 @@ static __global__ void lightning_indexer_kernel_wmma(
     }
 }
 
-#else // defined(TURING_MMA_AVAILABLE)
+#else // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)
 
 template <int WARPS_PER_BLOCK, int K_VECS_PER_BLOCK, int64_t N_EMBD, int64_t N_HEAD, ggml_type TYPE_K>
 static __global__ void lightning_indexer_kernel_wmma(
@@ -233,7 +234,7 @@ static __global__ void lightning_indexer_kernel_wmma(
     NO_DEVICE_CODE;
 }
 
-#endif // defined(TURING_MMA_AVAILABLE)
+#endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 // TODO there is one ugly assumption used in this kernel - that WARP_SIZE is equal to 32
@@ -448,7 +449,9 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     if (n_embd == 128 && n_head == 64) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-        if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16) {
+        // wmma fp16 fragments (m8n32k16) exist on Volta; nothing in the kernel needs Turing's mma.sync/ldmatrix,
+        // and the scalar fallback is the depth-scaling term of DeepSeek-V4 prefill on V100
+        if (GGML_CUDA_CC_IS_NVIDIA(cc) && fp16_mma_hardware_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16) {
             // use wmma kernel
             constexpr int K_VECS_PER_BLOCK = 32;
             constexpr int WARPS_PER_BLOCK = 8;
@@ -489,7 +492,9 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
     } else if (n_embd == 128 && n_head == 32) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-        if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16) {
+        // wmma fp16 fragments (m8n32k16) exist on Volta; nothing in the kernel needs Turing's mma.sync/ldmatrix,
+        // and the scalar fallback is the depth-scaling term of DeepSeek-V4 prefill on V100
+        if (GGML_CUDA_CC_IS_NVIDIA(cc) && fp16_mma_hardware_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16) {
             // use wmma kernel
             constexpr int K_VECS_PER_BLOCK = 32;
             constexpr int WARPS_PER_BLOCK = 8;
