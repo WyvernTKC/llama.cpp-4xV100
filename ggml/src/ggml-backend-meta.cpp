@@ -1334,10 +1334,26 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
     };
 
+    // The indexer's inputs are all mirrored (one key head, mirrored projections), and so was its output - every
+    //   device scored every query against every key, n_devices times the work. The score rows are independent
+    //   per query, so split the queries instead: each device scores n_tokens/n_devices of them from views of
+    //   the mirrored q/weights/mask (ggml_backend_meta_buffer_init_tensor_impl builds those), top-k stays per
+    //   row, and the model gathers the top-k rows back (GGML_TENSOR_FLAG_MIRRORED on their flattening).
+    //   Prefill only: a decode-sized batch is not worth the gather. An even split only, so that no device is
+    //   left with a zero-sized slice. GGML_META_LID_SPLIT=0 restores the mirrored indexer for A/B.
     auto handle_lightning_indexer = [&](
             const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         for (size_t i = 0; i < 4; i++) {
             GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+        static const bool lid_split = getenv("GGML_META_LID_SPLIT") == nullptr || atoi(getenv("GGML_META_LID_SPLIT")) != 0;
+        const int64_t n_tokens = tensor->ne[1]; // score is [n_kv, n_tokens, 1, n_stream]
+        if (lid_split && n_bufs > 1 && n_tokens >= 64*int64_t(n_bufs) && n_tokens % int64_t(n_bufs) == 0) {
+            ggml_backend_meta_split_state ret = {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+            for (size_t j = 0; j < n_bufs; j++) {
+                ret.ne[j] = n_tokens / int64_t(n_bufs);
+            }
+            return ret;
         }
         return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
     };
@@ -1664,7 +1680,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
             } break;
         }
-        if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
+        // a split that a handler originated from mirrored srcs (the lightning indexer slicing its queries) has
+        //   no src to take the ratio from and filled ne itself
+        const bool ne_from_handler = tensor->op == GGML_OP_LIGHTNING_INDEXER && split_state.axis == GGML_BACKEND_SPLIT_AXIS_1;
+        if (!ne_from_handler && split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
             bool first_src_split_by_axis = true;
             const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
 
@@ -1968,6 +1987,34 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                     }
                 }
             }
+        }
+
+        // The lightning indexer under a token split (handle_lightning_indexer) scores this device's queries only:
+        //   hand it views of the mirrored q [n_embd, n_head, n_tokens, n_stream], weights [n_head, n_tokens, 1, n_stream]
+        //   and mask [n_kv, n_tokens, 1, n_stream_mask] restricted to those tokens. The kernel reads all three by
+        //   (i_batch, i_stream) strides, so a view with the original nb and a token offset is all it needs.
+        if (tensor->op == GGML_OP_LIGHTNING_INDEXER && split_state.axis == GGML_BACKEND_SPLIT_AXIS_1) {
+            GGML_ASSERT(split_state.n_segments == 1);
+            int64_t t0 = 0;
+            for (size_t jj = 0; jj < j; jj++) {
+                t0 += split_state.ne[jj];
+            }
+            const int64_t nt = split_state.ne[j];
+            auto slice_tokens = [&](int i, int dim) {
+                ggml_tensor * src = t_ij->src[i];
+                if (src == nullptr) {
+                    return;
+                }
+                int64_t ne[GGML_MAX_DIMS] = { src->ne[0], src->ne[1], src->ne[2], src->ne[3] };
+                ne[dim] = nt;
+                ggml_tensor * v = ggml_view_4d(simple_ctx, src, ne[0], ne[1], ne[2], ne[3],
+                    src->nb[1], src->nb[2], src->nb[3], t0*src->nb[dim]);
+                v->buffer = src->buffer;
+                t_ij->src[i] = v;
+            };
+            slice_tokens(0, 2); // q
+            slice_tokens(2, 1); // weights
+            slice_tokens(3, 1); // mask
         }
 
         simple_tensors.push_back(t_ij);
@@ -2827,6 +2874,9 @@ struct ggml_backend_meta_context {
     // optional two-step allreduce, so each launch thread can issue its own rank's part
     ggml_backend_comm_allreduce_prepare_t comm_allreduce_prepare = nullptr;
     ggml_backend_comm_allreduce_launch_t  comm_allreduce_launch  = nullptr;
+    // one per backend, recorded before the fallback all-gather copies so that no src stream writes into a dst
+    //   device that is still busy (created on first use, nullptr where the backend has no events)
+    std::vector<ggml_backend_event_t>     gather_events;
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -2888,6 +2938,9 @@ struct ggml_backend_meta_context {
             }
         }
         stage_slots.clear();
+        for (ggml_backend_event_t ev : gather_events) {
+            ggml_backend_event_free(ev);
+        }
         for (ggml_backend_t b : stage_backends) {
             ggml_backend_free(b);
         }
@@ -4374,6 +4427,38 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         const int64_t n_rows = ggml_nrows(dsts[0]);
 
+        // ggml_backend_tensor_copy_async runs each copy on the src stream and only makes the dst stream wait
+        //   for it afterwards. Nothing stops the copy from landing while the dst device is still executing
+        //   earlier nodes whose memory the gather output aliases, and a late write there garbles the gathered
+        //   rows (seen as an illegal set_rows on the lightning indexer's top-k lists). So every src stream
+        //   first waits until every dst stream has drained what it has queued up to here.
+        if (backend_ctx->gather_events.empty()) {
+            for (size_t j = 0; j < n_backends; j++) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend_ctx->backend_configs[j].backend);
+                backend_ctx->gather_events.push_back(ggml_backend_event_new(dev));
+            }
+        }
+        bool have_events = true;
+        for (ggml_backend_event_t ev : backend_ctx->gather_events) {
+            have_events = have_events && ev != nullptr;
+        }
+        if (have_events) {
+            for (size_t j = 0; j < n_backends; j++) {
+                ggml_backend_event_record(backend_ctx->gather_events[j], backend_ctx->backend_configs[j].backend);
+            }
+            for (size_t s = 0; s < n_backends; s++) {
+                for (size_t j = 0; j < n_backends; j++) {
+                    if (j != s) {
+                        ggml_backend_event_wait(backend_ctx->backend_configs[s].backend, backend_ctx->gather_events[j]);
+                    }
+                }
+            }
+        } else {
+            for (size_t j = 0; j < n_backends; j++) {
+                ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+            }
+        }
+
         for (size_t s = 0; s < n_backends; s++) {
             if (srcs[s]->ne[0] == 0) {
                 continue;
@@ -4481,7 +4566,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         if (n_backends > 1 && D->subgraph_comm[i] == ggml_backend_meta_context::SUBGRAPH_COMM_ALLGATHER) {
             bool backend_allgather_success = false;
-            if (backend_ctx->comm_ctx && backend_ctx->comm_allgather) {
+            // GGML_META_ALLGATHER_FALLBACK=1 skips the backend collective, to exercise the generic copy path
+            static const bool force_fallback = getenv("GGML_META_ALLGATHER_FALLBACK") != nullptr;
+            if (!force_fallback && backend_ctx->comm_ctx && backend_ctx->comm_allgather) {
                 std::vector<ggml_tensor *> srcs, dsts;
                 get_allgather_nodes(i, srcs, dsts);
                 backend_allgather_success = backend_ctx->comm_allgather(backend_ctx->comm_ctx, srcs.data(), dsts.data());

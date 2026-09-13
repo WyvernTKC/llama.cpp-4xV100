@@ -670,7 +670,17 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
     }
 
     const uint32_t n_top_k = indexer_score->ne[0] < hparams.indexer_top_k ? indexer_score->ne[0] : hparams.indexer_top_k;
-    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));
+    ggml_tensor * top_k = ggml_top_k(ctx0, indexer_score, n_top_k);
+
+    // Under -sm tensor the indexer scores a slice of the queries per device (see handle_lightning_indexer in the
+    //   meta backend), so these rows are split by token and every device needs all of them to build the mask.
+    //   The all-gather concatenates along dim 0, so hand it the token-major flattening: each device's slice is
+    //   then one contiguous block. On one device, or when the indexer stayed mirrored, this is a plain copy.
+    ggml_tensor * top_k_flat = ggml_cont(ctx0, ggml_reshape_2d(ctx0, top_k, n_top_k*top_k->ne[1], top_k->ne[3]));
+    top_k_flat->flags |= GGML_TENSOR_FLAG_MIRRORED;
+    cb(top_k_flat, "lid_top_k_gathered", il);
+
+    top_k = ggml_reshape_4d(ctx0, top_k_flat, n_top_k, top_k->ne[1], 1, top_k->ne[3]);
     cb(top_k, "lid_top_k", il);
 
     return top_k;

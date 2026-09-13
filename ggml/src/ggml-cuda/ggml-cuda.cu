@@ -1120,8 +1120,12 @@ static bool ggml_backend_cuda_comm_allgather_nccl(
     const size_t n_backends = comm_ctx->backends.size();
 
     const ggml_type type = dsts[0]->type;
-    if (type != GGML_TYPE_F32) {
-        return false;
+    ncclDataType_t nccl_type;
+    switch (type) {
+        case GGML_TYPE_F32: nccl_type = ncclFloat; break;
+        case GGML_TYPE_F16: nccl_type = ncclHalf;  break;
+        case GGML_TYPE_I32: nccl_type = ncclInt32; break; // the top-k index rows of a token-split lightning indexer
+        default:            return false;
     }
 
     const int64_t ne0    = dsts[0]->ne[0];
@@ -1157,7 +1161,7 @@ static bool ggml_backend_cuda_comm_allgather_nccl(
         NCCL_CHECK(ncclGroupStart());
         for (size_t i = 0; i < n_backends; ++i) {
             ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
-            NCCL_CHECK(ncclAllGather(srcs[i]->data, dsts[i]->data, srcs[i]->ne[0], ncclFloat,
+            NCCL_CHECK(ncclAllGather(srcs[i]->data, dsts[i]->data, srcs[i]->ne[0], nccl_type,
                 comm_ctx->comms[i], cuda_ctx->stream()));
         }
         NCCL_CHECK(ncclGroupEnd());
@@ -1174,7 +1178,7 @@ static bool ggml_backend_cuda_comm_allgather_nccl(
                 ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
                 const void * sendbuf = (const char *) srcs[i]->data + r*srcs[i]->nb[1];
                 void       * recvbuf =       (char *) dsts[i]->data + r*dsts[i]->nb[1] + offset[s]*dsts[i]->nb[0];
-                NCCL_CHECK(ncclBroadcast(sendbuf, recvbuf, srcs[s]->ne[0], ncclFloat, s,
+                NCCL_CHECK(ncclBroadcast(sendbuf, recvbuf, srcs[s]->ne[0], nccl_type, s,
                     comm_ctx->comms[i], cuda_ctx->stream()));
             }
         }
