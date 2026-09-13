@@ -1719,9 +1719,16 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
-    // calculate checkpoints size to see if it will fit with the prompt
+    // device-resident checkpoints stay with the slot: their host blob is metadata only, and the device buffers
+    // it points at belong to the slot's storage pool, which the slot is free to reuse. The cache keeps the host ones
+    std::list<common_prompt_checkpoint> checkpoints_host;
+
     size_t checkpoints_size = 0;
     for (const auto & ckpt : prompt.checkpoints) {
+        if (ckpt.dev_slot >= 0) {
+            continue;
+        }
+        checkpoints_host.push_back(ckpt);
         checkpoints_size += ckpt.size();
     }
 
@@ -1779,7 +1786,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
+            /*.checkpoints =*/ std::move(checkpoints_host),
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
@@ -1790,7 +1797,11 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, bool * replaced) {
+    if (replaced) {
+        *replaced = false;
+    }
+
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1860,6 +1871,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
 
         prompt = std::move(it_best->prompt);
+
+        if (replaced) {
+            *replaced = true;
+        }
 
         states.erase(it_best);
     }

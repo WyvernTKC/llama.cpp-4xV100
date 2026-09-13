@@ -187,6 +187,16 @@ struct common_chat_msg_spans {
         }
         return -1;
     }
+
+    // one past the last token of the last user message, or -1 if there is none
+    int32_t last_user_message_end() const {
+        for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+            if (it->role == COMMON_CHAT_ROLE_USER) {
+                return (int32_t) (it->pos + it->len);
+            }
+        }
+        return -1;
+    }
 };
 
 struct common_chat_msg_delimiter {
