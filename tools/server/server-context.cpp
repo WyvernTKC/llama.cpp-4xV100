@@ -3826,10 +3826,16 @@ private:
                         // diverges a few tokens before the prompt end
                         {
                             const int32_t user_end = slot.task->params.message_spans.last_user_message_end();
+                            const int64_t n_prompt  = slot.prompt.n_tokens();
 
-                            slot.n_prompt_gen_start = user_end >= 0
-                                ? std::min<int64_t>(user_end, slot.prompt.n_tokens())
-                                : slot.prompt.n_tokens();
+                            if (user_end >= 0) {
+                                slot.n_prompt_gen_start = std::min<int64_t>(user_end, n_prompt);
+                            } else {
+                                // no spans for this template (e.g. DeepSeek's <|User|>/<|Assistant|> markers): the
+                                // generation prompt is the only part of the prompt a closed turn renders differently,
+                                // so everything before it is content the client will send back verbatim
+                                slot.n_prompt_gen_start = std::max<int64_t>(0, n_prompt - slot.task->params.n_gen_prompt_tokens);
+                            }
                         }
 
                         GGML_ASSERT(batch.size() > 0);
@@ -4559,6 +4565,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     data);
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
+
+            // length of the template's generation prompt, for the slot's own-generation marker
+            {
+                const std::string gen_prompt = json_value(data, "generation_prompt", std::string());
+                if (!gen_prompt.empty()) {
+                    task.params.n_gen_prompt_tokens = (int32_t) common_tokenize(ctx_server.vocab, gen_prompt, false, true).size();
+                }
+            }
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;

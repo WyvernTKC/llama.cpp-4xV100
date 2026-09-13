@@ -94,6 +94,11 @@ struct task_params {
     // message spans for checkpointing
     common_chat_msg_spans message_spans;
 
+    // tokens the chat template appends after the last message to open the assistant turn
+    // (its generation prompt), 0 if unknown. Used with message_spans to tell a slot's own
+    // generation from foreign context when the template yields no spans.
+    int32_t n_gen_prompt_tokens = 0;
+
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
 
