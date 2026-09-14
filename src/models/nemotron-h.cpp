@@ -165,8 +165,13 @@ void llama_model_nemotron_h::load_arch_tensors(llama_model_loader & ml) {
         }
 
         if (has_ffn) {
-            const int64_t n_ff_exp = hparams.n_ff_exp(i) ? (int64_t)hparams.n_ff_exp(i)
-                                                         : n_ff / (int64_t)hparams.n_expert_used(i);
+            const int64_t n_expert_used_i = hparams.n_expert_used(i);
+            const int64_t n_ff_exp_i      = hparams.n_ff_exp(i);
+            if (n_ff_exp_i == 0 && n_expert_used_i == 0) {
+                throw std::runtime_error(format("%s: layer %d declares neither expert_feed_forward_length nor expert_used_count, "
+                                                "cannot determine the expert FFN size", __func__, i));
+            }
+            const int64_t n_ff_exp = n_ff_exp_i ? n_ff_exp_i : n_ff / n_expert_used_i;
 
             layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), {n_embd}, mtp_flags);
 
