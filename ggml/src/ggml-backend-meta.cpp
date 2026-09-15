@@ -1607,9 +1607,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_PAD_REFLECT_1D:
             case GGML_OP_ROLL:
-            case GGML_OP_ARANGE:
             case GGML_OP_TIMESTEP_EMBEDDING: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
+            // the sequence comes from the op params and has no src, so every device builds the same
+            //   one. handle_generic() derives the state from the srcs and aborts when there are none.
+            case GGML_OP_ARANGE: {
+                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
             } break;
             case GGML_OP_ARGSORT:
             case GGML_OP_TOP_K: {
