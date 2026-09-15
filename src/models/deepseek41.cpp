@@ -560,30 +560,53 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
             idx_w->ne[0], idx_w->ne[1]/n_stream, idx_w->ne[2], n_stream,
             idx_w->nb[1], idx_w->nb[2]/n_stream, idx_w->nb[3]/n_stream, 0);
 
-    idx_q = ggml_permute(ctx0, idx_q, 0, 2, 1, 3);
-    idx_k = ggml_permute(ctx0, idx_k, 0, 2, 1, 3);
-
-    ggml_tensor * score = ggml_mul_mat(ctx0, idx_k, idx_q);
-    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
-
-    score = ggml_relu(ctx0, score);
-    score = ggml_mul(ctx0, score, idx_w);
-    score = ggml_sum_rows(ctx0, score);
-    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
-
-    // the attention mask is F16 when flash attention is on, and this score is F32. the mask only
-    // ever holds 0 or -inf, so widening it is exact.
     ggml_tensor * mask = inp_comp.kq_mask;
-    if (mask->type != score->type) {
-        mask = ggml_cast(ctx0, mask, score->type);
-    }
 
-    score = ggml_add(ctx0, score, mask);
-    cb(score, "idx_score", il);
+    ggml_tensor * score = nullptr;
+
+    // The fused op takes the mask as F16. V4 hands it the "lid" mask, which llama-graph types from
+    //   fused_lid itself, but V4.1 scores against the compressed positions the attention already
+    //   masks, so it shares that stream's mask and gets F16 only when flash attention is on. Fall
+    //   back rather than cast: the widened mask below is the very tensor the fused path avoids.
+    if (cparams.fused_lid && mask->type == GGML_TYPE_F16) {
+        score = ggml_lightning_indexer(ctx0, idx_q, idx_k, idx_w, mask);
+        cb(score, "idx_score", il);
+        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
+    } else {
+        idx_q = ggml_permute(ctx0, idx_q, 0, 2, 1, 3);
+        idx_k = ggml_permute(ctx0, idx_k, 0, 2, 1, 3);
+
+        score = ggml_mul_mat(ctx0, idx_k, idx_q);
+        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
+
+        score = ggml_relu(ctx0, score);
+        score = ggml_mul(ctx0, score, idx_w);
+        score = ggml_sum_rows(ctx0, score);
+        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
+
+        // the attention mask is F16 when flash attention is on, and this score is F32. the mask only
+        // ever holds 0 or -inf, so widening it is exact.
+        if (mask->type != score->type) {
+            mask = ggml_cast(ctx0, mask, score->type);
+        }
+
+        score = ggml_add(ctx0, score, mask);
+        cb(score, "idx_score", il);
+    }
 
     const uint32_t n_top_k = score->ne[0] < hparams.indexer_top_k ? score->ne[0] : hparams.indexer_top_k;
 
-    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, score, n_top_k));
+    ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_k);
+
+    // Under -sm tensor the indexer scores a slice of the queries per device (see handle_lightning_indexer in the
+    //   meta backend), so these rows are split by token and every device needs all of them to build the mask.
+    //   The all-gather concatenates along dim 0, so hand it the token-major flattening: each device's slice is
+    //   then one contiguous block. On one device, or when the indexer stayed mirrored, this is a plain copy.
+    ggml_tensor * top_k_flat = ggml_cont(ctx0, ggml_reshape_2d(ctx0, top_k, n_top_k*top_k->ne[1], top_k->ne[3]));
+    top_k_flat->flags |= GGML_TENSOR_FLAG_MIRRORED;
+    cb(top_k_flat, "idx_top_k_gathered", il);
+
+    top_k = ggml_reshape_4d(ctx0, top_k_flat, n_top_k, top_k->ne[1], 1, top_k->ne[3]);
     cb(top_k, "idx_top_k", il);
 
     return top_k;
