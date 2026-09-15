@@ -1093,11 +1093,13 @@ void launch_fattn(
     const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
 
     const int32_t n_kv_max = use_sparse ? ggml_get_op_params_i32(KQV, 4) : 0;
+    // a tile's queries wrap modulo Q->ne[1], so a batch narrower than the tile has fewer distinct ones
+    const int64_t ncols1_eff = std::min<int64_t>(ncols1, Q->ne[1]);
     if (use_sparse) {
         GGML_ASSERT(mask != nullptr);
         GGML_ASSERT(n_kv_max > 0);
-        // one index row per (tile of ncols1 queries, sequence), ncols1*n_kv_max entries each
-        KV_max.alloc(size_t(ncols1) * n_kv_max * ntiles_x * mask->ne[3]);
+        // one index row per (tile of ncols1_eff distinct queries, sequence), ncols1_eff*n_kv_max entries each
+        KV_max.alloc(size_t(ncols1_eff) * n_kv_max * ntiles_x * mask->ne[3]);
         ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, n_kv_max, ncols1, Q->ne[1], main_stream);
     }
 
@@ -1127,7 +1129,7 @@ void launch_fattn(
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 
-    const int64_t n_kv = use_sparse ? int64_t(ncols1) * n_kv_max : K->ne[1];
+    const int64_t n_kv = use_sparse ? ncols1_eff * n_kv_max : K->ne[1];
     const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
 
     dim3 blocks_num;

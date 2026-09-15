@@ -23,7 +23,9 @@ static __global__ void flash_attn_mask_to_sparse_indices(
     const int lane     = tid % WARP_SIZE;
     const int sequence = blockIdx.y;
     const int tile     = blockIdx.x;
-    const int n_kv_row = ncols1*n_kv_max;
+    // a tile's queries are ncols1 consecutive indices modulo ne01, so only the first min(ncols1, ne01)
+    //   of them are distinct - a batch narrower than the tile needs a correspondingly shorter row
+    const int n_kv_row = min(ncols1, ne01)*n_kv_max;
 
     const half * mask = mask_ptr + sequence*s33;
     int32_t * indices = indices_ptr + (int64_t(sequence)*gridDim.x + tile)*n_kv_row;
@@ -47,6 +49,9 @@ static __global__ void flash_attn_mask_to_sparse_indices(
             if (i < ne30) {
 #pragma unroll
                 for (int j = 0; j < ncols1; ++j) {
+                    if (j >= ne01) {
+                        break; // the remaining queries of the tile wrap onto ones already scanned
+                    }
                     const int query = (tile*ncols1 + j) % ne01;
                     selected |= isfinite(__half2float(mask[int64_t(query)*s31 + i]));
                 }
@@ -129,15 +134,14 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
-bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int ncols1) {
+static bool ggml_cuda_fattn_sparse_applicable(const int cc, const ggml_tensor * dst, int ncols1) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-    GGML_UNUSED_VARS(ctx, dst, ncols1);
+    GGML_UNUSED_VARS(cc, dst, ncols1);
     return false;
 #else
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * mask = dst->src[3];
-    const int cc = ggml_cuda_info().devices[ctx.device].cc;
 
     float max_bias = 0.0f;
     float logit_softcap = 0.0f;
@@ -164,6 +168,23 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
+bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int ncols1) {
+    return ggml_cuda_fattn_sparse_applicable(ggml_cuda_info().devices[ctx.device].cc, dst, ncols1);
+}
+
+// Volta has no device code below 32 columns, so its sparse tile is 4 queries of 8 heads each
+static constexpr int GGML_CUDA_VOLTA_SPARSE_NCOLS1 = 4;
+static constexpr int GGML_CUDA_VOLTA_SPARSE_NCOLS2 = 8;
+
+// only the shapes that reach that tile in switch_ncols2() / switch_ncols1() can use it
+static bool ggml_cuda_fattn_volta_sparse_tile_ok(const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    return Q->ne[0] == 512 && V->ne[0] == 512 && K->ne[2] > 0 &&
+        Q->ne[2] % (GGML_CUDA_VOLTA_SPARSE_NCOLS2*K->ne[2]) == 0;
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -177,9 +198,9 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
         }
     }
     // Volta has no device code below 32 columns: its sparse tile is 4 queries wide with a union index row
-    if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 4, ncols2)) {
-        if (volta_mma_available(cc) && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst, 4)) {
-            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 4, ncols2>(ctx, dst);
+    if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, GGML_CUDA_VOLTA_SPARSE_NCOLS1, ncols2)) {
+        if (volta_mma_available(cc) && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst, GGML_CUDA_VOLTA_SPARSE_NCOLS1)) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, GGML_CUDA_VOLTA_SPARSE_NCOLS1, ncols2>(ctx, dst);
             return;
         }
     }
@@ -687,6 +708,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        // A sparse launch gathers ncols1_eff*n_kv_max keys where the tile kernel reads the whole cache, so
+        //   it wins for a single token too - without this DeepSeek-V4 token generation stays dense at every
+        //   depth. A tile narrower than its own width still pays for the index rows, so the break-even
+        //   scales with the effective width: measured on a V100 at 16 heads on 1 kv head and n_kv_max 640,
+        //   sparse is 1.03x of the tile kernel at 8k keys and 2.18x at 33k for one query, but only 0.86x at
+        //   8k and 1.06x at 12k for two.
+        const int64_t ncols1_eff = std::min<int64_t>(GGML_CUDA_VOLTA_SPARSE_NCOLS1, Q->ne[1]);
+        const int64_t sparse_break_even = 10*ncols1_eff*ggml_get_op_params_i32(dst, 4);
+        if (gqa_opt_applies && ggml_cuda_fattn_volta_sparse_tile_ok(dst) && K->ne[1] >= sparse_break_even &&
+                ggml_cuda_fattn_sparse_applicable(cc, dst, GGML_CUDA_VOLTA_SPARSE_NCOLS1)) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
