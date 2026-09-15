@@ -772,6 +772,13 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
     ggml_tensor * top_k = nullptr;
     if (hparams.dsv41_is_index_source(il)) {
         top_k = build_indexer_top_k(model, inp_dsv4, inp_comp, qr, cur, inp_pos, il);
+        topk_idxs = top_k;
+    } else {
+        const int32_t src = hparams.dsv41_topk_source[il];
+        GGML_ASSERT(src >= 0 && topk_idxs && "a compressed layer reads a pick no earlier layer made");
+        // the pick indexes its source's rows, so the two layers must read the same stream
+        GGML_ASSERT(hparams.dsv4_compress_ratios[src] == hparams.dsv4_compress_ratios[il]);
+        top_k = topk_idxs;
     }
 
     ggml_tensor * k_rot = inp_attn->self_k_rot;
@@ -805,16 +812,12 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
     cb(k_all, "k_all", il);
 
     ggml_tensor * raw_mask  = inp_attn->get_kq_mask();
-    ggml_tensor * comp_mask = top_k
-        ? build_top_k_mask(inp_comp.kq_mask, top_k, "comp_top_k_mask", il)
-        : inp_comp.kq_mask;
+    ggml_tensor * comp_mask = build_top_k_mask(inp_comp.kq_mask, top_k, "comp_top_k_mask", il);
 
     ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
     cb(kq_mask, "kq_mask", il);
 
-    const int64_t n_kv_max = top_k
-        ? std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0]
-        : 0;
+    const int64_t n_kv_max = std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0];
 
     out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks,
             nullptr, n_kv_max, kq_scale, il);

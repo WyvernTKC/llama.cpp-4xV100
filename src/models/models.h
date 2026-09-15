@@ -1384,6 +1384,11 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
     struct graph : public llama_model_deepseek4::graph {
         graph(const llama_model & model, const llm_graph_params & params);
 
+        // The compressed positions the last index source picked, for the layers after it to reuse.
+        // Layers are built in order and a source always writes before its readers, so the reference
+        // keeps one slot for this too (SharedAttentionRuntime.topk_idxs).
+        mutable ggml_tensor * topk_idxs = nullptr;
+
         // gather the n-gram rows of layer il: [engram_key_length * n_hash_cols, n_tokens]
         ggml_tensor * build_inp_engram(
                 const llama_model & model,
