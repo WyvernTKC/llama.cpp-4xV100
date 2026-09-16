@@ -97,6 +97,28 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
             throw std::runtime_error("engram prime of zero would divide by zero in the hash");
         }
     }
+
+    // Optional: a file written before these keys existed simply runs without the second level,
+    // which is also what the first level does below topk_blocks * block_size positions.
+    uint32_t cand_src = 0;
+    if (ml.get_key(LLM_KV_ATTENTION_CANDIDATE_SOURCE_LAYER, cand_src, false)) {
+        hparams.dsv41_candidate_source = (int32_t) cand_src;
+    }
+    ml.get_key(LLM_KV_ATTENTION_CANDIDATE_TOPK_BLOCKS,  hparams.dsv41_candidate_topk_blocks, false);
+    ml.get_key(LLM_KV_ATTENTION_CANDIDATE_BLOCK_SIZE,   hparams.dsv41_candidate_block_size,  false);
+
+    if (hparams.dsv41_candidate_source >= 0) {
+        if (hparams.dsv41_candidate_topk_blocks == 0 || hparams.dsv41_candidate_block_size == 0) {
+            throw std::runtime_error("DeepSeek-V4.1 candidate source needs a block size and a block count");
+        }
+        if (hparams.dsv41_candidate_source >= (int32_t) hparams.n_layer()) {
+            throw std::runtime_error("DeepSeek-V4.1 candidate source layer is out of range");
+        }
+        // pooling reduces whole blocks, and the compressed plan pads n_kv to a multiple of 256
+        if (256 % hparams.dsv41_candidate_block_size != 0) {
+            throw std::runtime_error("DeepSeek-V4.1 candidate block size must divide 256");
+        }
+    }
 }
 
 void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
@@ -252,6 +274,14 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
             throw std::runtime_error(format("layer %d compresses %u tokens per row but has no pooling gate",
                                             i, hparams.dsv4_compress_ratios[i]));
         }
+    }
+
+    // the block scores come from the source's own index scores, so it has to compute them.
+    // checked here rather than in load_arch_hparams, where the roles are not derived yet.
+    if (hparams.dsv41_candidate_source >= 0 &&
+            !hparams.dsv41_is_index_source(hparams.dsv41_candidate_source)) {
+        throw std::runtime_error(format("layer %d is the candidate source but does not run an indexer",
+                                        hparams.dsv41_candidate_source));
     }
 }
 
@@ -500,6 +530,116 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_tail(
     return out;
 }
 
+// Which block holds each query's newest compressed position. The reference pins that block into
+// the candidate set, so it is one int per query and it comes from the position alone.
+class llm_graph_input_dsv41_pin : public llm_graph_input_i {
+public:
+    llm_graph_input_dsv41_pin(uint32_t ratio, uint32_t block_size, int64_t n_blocks) :
+        ratio(ratio), block_size(block_size), n_blocks(n_blocks) {}
+    virtual ~llm_graph_input_dsv41_pin() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override {
+        return idxs->ne[1]*idxs->ne[2] == params.ubatch.n_tokens;
+    }
+
+    ggml_tensor * idxs = nullptr;  // I32 [1, n_tokens/n_stream, n_stream]
+
+    const uint32_t ratio;
+    const uint32_t block_size;
+    const int64_t  n_blocks;
+};
+
+void llm_graph_input_dsv41_pin::set_input(const llama_ubatch * ubatch) {
+    const int64_t n_tokens = ubatch->n_tokens;
+
+    std::vector<int32_t> v(n_tokens);
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        // a latent stands for `ratio` tokens, so a query at pos p can see (p + 1) / ratio of them
+        const int64_t n_seen = (ubatch->pos[i] + 1) / (int64_t) ratio;
+        // with nothing compressed yet the whole row is masked out anyway, so block 0 is harmless
+        const int64_t blk = n_seen > 0 ? (n_seen - 1) / (int64_t) block_size : 0;
+        v[i] = (int32_t) std::min(blk, n_blocks - 1);
+    }
+
+    ggml_backend_tensor_set(idxs, v.data(), 0, v.size()*ggml_element_size(idxs));
+}
+
+// Level one of the two level top-k. The source layer pools its own index scores into blocks of
+// candidate_block_size, keeps the best candidate_topk_blocks of them, and publishes a mask that the
+// index sources after it fold into their attention mask. Below topk_blocks*block_size compressed
+// positions every block survives, so the mask is all zeros and changes nothing.
+//
+// The reference drops picks that scored -inf. That is left out here: a block scores -inf only when
+// every position in it is masked for that query, and the consumer adds this to a mask that already
+// holds -inf there.
+ggml_tensor * llama_model_deepseek41::graph::build_candidate_mask(
+        ggml_tensor * score,
+        ggml_tensor * like,
+        int il) const {
+    const int64_t block_size = hparams.dsv41_candidate_block_size;
+    const int64_t n_comp     = score->ne[0];
+    const int64_t nt         = score->ne[1];
+    const int64_t n_stream   = score->ne[3];
+
+    GGML_ASSERT(n_comp == like->ne[0] && nt == like->ne[1]);
+    GGML_ASSERT(n_comp % block_size == 0);
+    const int64_t n_blocks = n_comp / block_size;
+
+    // a block scores as its best position, the reference's amax
+    ggml_tensor * blk = ggml_pool_1d(ctx0, score, GGML_OP_POOL_MAX, block_size, block_size, 0);
+    cb(blk, "cand_blk", il);
+
+    // Under -sm tensor the score is split by token, but the consumers fold this mask into their
+    //   mirrored kq_mask, so gather here. Pooling first makes this block_size times less traffic,
+    //   and the flatten is token-major so each device's slice is one contiguous block.
+    ggml_tensor * blk_flat = ggml_cont(ctx0, ggml_reshape_2d(ctx0, blk, n_blocks*nt, n_stream));
+    blk_flat->flags |= GGML_TENSOR_FLAG_MIRRORED;
+    cb(blk_flat, "cand_blk_gathered", il);
+
+    // pin the block holding this query's newest position: it carries the most recent context but
+    //   could otherwise be outscored by an older block that is full
+    auto inp = std::make_unique<llm_graph_input_dsv41_pin>(
+            hparams.dsv4_compress_ratios[il], (uint32_t) block_size, n_blocks);
+    inp->idxs = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 1, nt, n_stream);
+    ggml_set_input(inp->idxs);
+    ggml_tensor * pin_idxs = inp->idxs;
+    res->add_input(std::move(inp));
+
+    ggml_tensor * blk_rows = ggml_reshape_4d(ctx0, blk_flat, 1, n_blocks, nt, n_stream);
+
+    ggml_tensor * infs = ggml_fill(ctx0,
+            ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, 1, nt, n_stream), INFINITY);
+
+    blk = ggml_set_rows(ctx0, blk_rows, infs, pin_idxs);
+    blk = ggml_reshape_4d(ctx0, blk, n_blocks, nt, 1, n_stream);
+    cb(blk, "cand_blk_pinned", il);
+
+    const int64_t n_top = std::min<int64_t>(hparams.dsv41_candidate_topk_blocks, n_blocks);
+
+    ggml_tensor * top_b = ggml_top_k(ctx0, blk, n_top);
+
+    // 0 where a block survived, -inf elsewhere; same scatter as build_top_k_mask
+    ggml_tensor * keep = ggml_fill(ctx0,
+            ggml_new_tensor_4d(ctx0, like->type, 1, n_blocks, nt, n_stream), -INFINITY);
+
+    ggml_tensor * top_b_3d = ggml_view_4d(ctx0, top_b, top_b->ne[0], top_b->ne[1], top_b->ne[3], 1,
+            top_b->nb[1], top_b->nb[2], top_b->ne[3]*top_b->nb[3], 0);
+
+    ggml_tensor * zeros = ggml_fill(ctx0,
+            ggml_new_tensor_4d(ctx0, like->type, 1, n_top, nt, n_stream), 0.0f);
+
+    keep = ggml_set_rows(ctx0, keep, zeros, top_b_3d);
+
+    // one mask entry per block becomes block_size entries per position, in position order
+    ggml_tensor * mask = ggml_repeat_4d(ctx0, keep, block_size, n_blocks, nt, n_stream);
+    mask = ggml_reshape_4d(ctx0, mask, n_comp, nt, 1, n_stream);
+    cb(mask, "cand_mask", il);
+
+    return mask;
+}
+
 // Score this layer's queries against the shared index keys and keep the best compressed positions.
 // The keys were published by an earlier layer, so this only builds the query side.
 ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
@@ -562,6 +702,16 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
 
     ggml_tensor * mask = inp_comp.kq_mask;
 
+    // Level two: an index source after the candidate source scores with its own weights but only
+    //   inside the blocks that source picked. Folded into the mask rather than added to the score,
+    //   so the fused op masks as it goes instead of writing a second tensor the size of the score.
+    const int32_t cand_src = hparams.dsv41_candidate_source;
+    if (cand_src >= 0 && il > cand_src) {
+        GGML_ASSERT(candidates && "an index source reads candidate blocks no earlier layer picked");
+        mask = ggml_add(ctx0, mask, candidates);
+        cb(mask, "idx_mask_cand", il);
+    }
+
     ggml_tensor * score = nullptr;
 
     // The fused op takes the mask as F16. V4 hands it the "lid" mask, which llama-graph types from
@@ -592,6 +742,12 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
 
         score = ggml_add(ctx0, score, mask);
         cb(score, "idx_score", il);
+    }
+
+    // Level one, from this layer's own scores. The reference picks the blocks before its own
+    //   top-k and does not mask itself with them, so this sits after the score and before it.
+    if (il == cand_src) {
+        candidates = build_candidate_mask(score, inp_comp.kq_mask, il);
     }
 
     const uint32_t n_top_k = score->ne[0] < hparams.indexer_top_k ? score->ne[0] : hparams.indexer_top_k;

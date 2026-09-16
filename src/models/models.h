@@ -1384,6 +1384,15 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
     struct graph : public llama_model_deepseek4::graph {
         graph(const llama_model & model, const llm_graph_params & params);
 
+        // Level one of the two level top-k, published by the candidate source layer and folded
+        // into the attention mask of the index sources after it.
+        mutable ggml_tensor * candidates = nullptr;
+
+        ggml_tensor * build_candidate_mask(
+                ggml_tensor * score,
+                ggml_tensor * like,
+                int il) const;
+
         // The compressed positions the last index source picked, for the layers after it to reuse.
         // Layers are built in order and a source always writes before its readers, so the reference
         // keeps one slot for this too (SharedAttentionRuntime.topk_idxs).

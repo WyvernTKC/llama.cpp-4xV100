@@ -236,6 +236,11 @@ class Keys:
         # absent means the mix projection is full rank (DeepSeek-V4 behaviour)
         LOW_RANK             = "{arch}.hyper_connection.low_rank"
 
+    class Candidate:
+        SOURCE_LAYER = "{arch}.attention.candidate.source_layer"
+        TOPK_BLOCKS  = "{arch}.attention.candidate.topk_blocks"
+        BLOCK_SIZE   = "{arch}.attention.candidate.block_size"
+
     class Engram:
         LAYER_IDS      = "{arch}.engram.layer_ids"
         HEAD_COUNT     = "{arch}.engram.head_count"

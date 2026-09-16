@@ -1277,6 +1277,16 @@ class DeepseekV41Model(DeepseekV4Model):
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         hparams = self.hparams
+
+        # The second level of the indexer top-k. Absent means the runtime keeps every block, which
+        # is what the first level does anyway below topk_blocks * block_size compressed positions.
+        cand_src = hparams.get("candidate_source_layer_id", -1)
+        if cand_src is not None and cand_src >= 0:
+            arch = self.gguf_writer.arch
+            self.gguf_writer.add_uint32(gguf.Keys.Candidate.SOURCE_LAYER.format(arch=arch), int(cand_src))
+            self.gguf_writer.add_uint32(gguf.Keys.Candidate.TOPK_BLOCKS.format(arch=arch), hparams["candidate_topk_blocks"])
+            self.gguf_writer.add_uint32(gguf.Keys.Candidate.BLOCK_SIZE.format(arch=arch), hparams["candidate_block_size"])
+
         if (engram_ids := hparams.get("engram_layer_ids")) is not None:
             # These MUST carry the arch prefix, not a literal "deepseek4.". llama.cpp resolves
             # every LLM_KV_* as "{arch}.{key}", so a hardcoded prefix means the runtime looks up

@@ -314,6 +314,12 @@ struct llama_hparams {
     std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_index_key_source;
     std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_topk_source;
 
+    // two level top-k: the source layer scores blocks, the index sources after it keep only
+    //   the positions inside its picks. -1 disables it.
+    int32_t  dsv41_candidate_source      = -1;
+    uint32_t dsv41_candidate_topk_blocks = 0;
+    uint32_t dsv41_candidate_block_size  = 0;
+
     bool dsv41_is_kv_source   (uint32_t il) const { return dsv41_kv_source[il]        == (int32_t) il; }
     bool dsv41_owns_index_k   (uint32_t il) const { return dsv41_index_key_source[il] == (int32_t) il; }
     bool dsv41_is_index_source(uint32_t il) const { return dsv41_topk_source[il]      == (int32_t) il; }
