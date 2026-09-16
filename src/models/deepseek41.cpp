@@ -1,4 +1,5 @@
 #include "llama-hparams.h"
+#include "llama-impl.h"
 #include "models.h"
 
 #include "llama-kv-cache-dsv4.h"
@@ -29,9 +30,11 @@
 // it derives index keys from that shared latent rather than from a second compressor. See
 // build_attention_v41().
 //
-// Not implemented: the two level candidate mask. Measured against the reference, it selects every
-// block until the compressed length passes candidate_topk_blocks * candidate_block_size, so it
-// changes nothing below that and the context is capped there instead.
+// The two level candidate mask: the candidate source pools its index scores per block and keeps
+// the best candidate_topk_blocks; the index sources after it pick their top-k inside those blocks
+// only. Every block is a candidate until the compressed length passes
+// candidate_topk_blocks * candidate_block_size, so below that it changes nothing. See
+// build_candidate_mask(). The published GGUF carries no candidate keys, --override-kv supplies them.
 
 // mean over the hyper-connection copies; deepseek4.cpp keeps its own copy of this
 static ggml_tensor * dsv41_hc_mean(ggml_context * ctx, ggml_tensor * x) {
@@ -278,10 +281,16 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
 
     // the block scores come from the source's own index scores, so it has to compute them.
     // checked here rather than in load_arch_hparams, where the roles are not derived yet.
-    if (hparams.dsv41_candidate_source >= 0 &&
-            !hparams.dsv41_is_index_source(hparams.dsv41_candidate_source)) {
-        throw std::runtime_error(format("layer %d is the candidate source but does not run an indexer",
-                                        hparams.dsv41_candidate_source));
+    if (hparams.dsv41_candidate_source >= 0) {
+        const int32_t src = hparams.dsv41_candidate_source;
+        if (!hparams.dsv41_is_index_source(src)) {
+            throw std::runtime_error(format("layer %d is the candidate source but does not run an indexer", src));
+        }
+        // below this many tokens every block is a candidate and the mask changes nothing
+        const uint32_t n_inert = hparams.dsv4_compress_ratios[src] *
+                                 hparams.dsv41_candidate_topk_blocks * hparams.dsv41_candidate_block_size;
+        LLAMA_LOG_INFO("%s: candidate mask from layer %d, %u blocks of %u rows, inert below %u tokens\n",
+                __func__, src, hparams.dsv41_candidate_topk_blocks, hparams.dsv41_candidate_block_size, n_inert);
     }
 }
 
