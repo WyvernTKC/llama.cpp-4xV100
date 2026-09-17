@@ -317,6 +317,23 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     quantize &= name.find("engram_q.weight") == std::string::npos;
     quantize &= name.find("engram_k.weight") == std::string::npos;
 
+    // DeepSeek-V4.1 hyper-connection mixes and sparse attention: these pick discrete candidates
+    // that every later layer reads, and together they are a fraction of a percent of the file
+    if (arch == LLM_ARCH_DEEPSEEK41) {
+        static const char * const keep[] = {
+            "hc_attn_fn.weight",
+            "hc_ffn_fn.weight",
+            "attn_compressor_gate.weight",
+            "attn_compressor_kv.weight",
+            "indexer.proj.weight",
+            "indexer.attn_k.weight",
+            "indexer.attn_q_b.weight",
+        };
+        for (const char * n : keep) {
+            quantize &= name.find(n) == std::string::npos;
+        }
+    }
+
     // these are not too big so keep them as it is
     quantize &= name.find("per_layer_model_proj") == std::string::npos;
 
