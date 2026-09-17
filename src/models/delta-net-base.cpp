@@ -602,5 +602,16 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
 
+    // the op only emits post-token states, so a batch shorter than K leaves the slot that rolls
+    // back past its first token unwritten. that slot is the state this batch started from
+    if (n_seq_tokens < K) {
+        ggml_tensor * dst_pre = ggml_view_2d(ctx0, ssm_states_all,
+            D, n_seqs,
+            ssm_states_all->nb[1],
+            ((size_t) n_seq_tokens * mem_size + kv_head) * row_size);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, s, dst_pre));
+    }
+
     return output;
 }

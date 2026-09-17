@@ -2793,6 +2793,15 @@ static std::vector<T> llama_io_device_expand(const std::vector<T> & infos) {
     return res;
 }
 
+// a view takes ne0 in elements, but a quantized type sizes one block, not one element
+static int64_t llama_io_n_elements(const ggml_tensor * tensor, size_t size) {
+    const size_t type_size = ggml_type_size(tensor->type);
+
+    GGML_ASSERT(size % type_size == 0);
+
+    return (int64_t) (size/type_size) * ggml_blck_size(tensor->type);
+}
+
 class llama_io_write_device : public llama_io_write_i {
 public:
     llama_io_write_device(uint8_t * p, size_t len, llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs)  {
@@ -2826,7 +2835,7 @@ public:
         for (const auto & winfo : winfos_dev) {
             auto * buft = ggml_backend_buffer_get_type(winfo.tensor->buffer);
 
-            const int64_t n = winfo.size/ggml_element_size(winfo.tensor);
+            const int64_t n = llama_io_n_elements(winfo.tensor, winfo.size);
 
             auto & mbuf = mbufs_new[buft];
 
@@ -2959,7 +2968,7 @@ public:
         for (const auto & rinfo : rinfos_dev) {
             auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
 
-            const int64_t n = rinfo.size/ggml_element_size(rinfo.tensor);
+            const int64_t n = llama_io_n_elements(rinfo.tensor, rinfo.size);
 
             auto & mbuf = mbufs_new[buft];
 
@@ -3026,8 +3035,9 @@ public:
 
                 const size_t n_copy = std::min(src_size - src_off, dst_size - dst_off);
 
-                const size_t   el   = ggml_element_size(src_t);
-                const int64_t n_el = (int64_t) (n_copy / el);
+                GGML_ASSERT(src_t->type == dst_t->type);
+
+                const int64_t n_el = llama_io_n_elements(src_t, n_copy);
 
                 auto * src_v = ggml_view_1d(ctx_scratch, src_t, n_el, src_off);
                 ggml_backend_view_init(src_v);
