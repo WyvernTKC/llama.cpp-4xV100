@@ -3,10 +3,12 @@
 #include "models.h"
 
 #include "llama-kv-cache-dsv4.h"
+#include "llama-mmap.h"
 
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -388,6 +390,24 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
                 idx[i*n_cols + b] = (int32_t) (rolling % prime[b] + offset[b]);
             }
         }
+    }
+
+    // every row id of this batch is known now, so ask for them in one go. the engram tables are
+    // mmap-backed and never resident, so the gather otherwise takes one major fault per row
+    static const bool prefetch = getenv("LLAMA_ENGRAM_PREFETCH_DISABLE") == nullptr;
+
+    const ggml_tensor * table = pmodel.layers[hp.engram_layer_ids[eg]].engram_embd;
+
+    // a decode batch cannot see its own future rows, and the hints would cost more than they save
+    if (prefetch && n_tokens >= 32 && table->data && ggml_backend_buffer_is_host(table->buffer)) {
+        std::vector<const void *> addrs(idx.size());
+        std::vector<size_t>       sizes(idx.size(), ggml_row_size(table->type, table->ne[0]));
+
+        for (size_t i = 0; i < idx.size(); ++i) {
+            addrs[i] = (const uint8_t *) table->data + (size_t) idx[i]*table->nb[1];
+        }
+
+        llama_prefetch_ranges(addrs.data(), sizes.data(), addrs.size());
     }
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
