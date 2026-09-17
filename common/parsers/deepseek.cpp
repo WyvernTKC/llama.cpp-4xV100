@@ -94,15 +94,55 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
     const std::string DSML         = "｜DSML｜";
     const std::string THINK_START  = "<think>";
     const std::string THINK_END    = "</think>";
-    const std::string TC_BLOCK     = is_v4 ? "tool_calls" : "function_calls";
-    const std::string FC_START     = "<" + DSML + TC_BLOCK + ">";
-    const std::string FC_END       = "</" + DSML + TC_BLOCK + ">";
-    const std::string INVOKE_START = "<" + DSML + "invoke";
-    const std::string INVOKE_END   = "</" + DSML + "invoke>";
-    const std::string PARAM_START  = "<" + DSML + "parameter";
-    const std::string PARAM_END    = "</" + DSML + "parameter>";
+    // V3.2 calls the tool call block "function_calls"; V4 renamed it to "tool_calls"; V4.1
+    // renamed it again to " calls" and put a leading space on the invoke and parameter keywords
+    // too, so each is a single leading-space BPE token instead of an awkward split. Accept every
+    // spelling rather than picking one from the template: guessing wrong fails silently, because
+    // the PEG simply never triggers and a well formed tool call is handed back as raw content.
+    const std::vector<std::string> TC_BLOCKS = is_v4
+        ? std::vector<std::string>{ "tool_calls", " calls" }
+        : std::vector<std::string>{ "function_calls" };
+    // only V4.1 spaces the keywords, but accepting the unspaced form costs nothing
+    const std::vector<std::string> KW_PAD = is_v4
+        ? std::vector<std::string>{ "", " " }
+        : std::vector<std::string>{ "" };
+
+    auto spellings = [&](const std::string & open, const std::vector<std::string> & mids,
+                         const std::string & close) {
+        std::vector<std::string> out;
+        out.reserve(mids.size());
+        for (const auto & mid : mids) {
+            out.push_back(open + DSML + mid + close);
+        }
+        return out;
+    };
+
+    std::vector<std::string> invoke_mids;
+    std::vector<std::string> param_mids;
+    for (const auto & pad : KW_PAD) {
+        invoke_mids.push_back(pad + "invoke");
+        param_mids.push_back(pad + "parameter");
+    }
+
+    const std::vector<std::string> FC_STARTS     = spellings("<",  TC_BLOCKS,   ">");
+    const std::vector<std::string> FC_ENDS       = spellings("</", TC_BLOCKS,   ">");
+    const std::vector<std::string> INVOKE_STARTS = spellings("<",  invoke_mids, "");
+    const std::vector<std::string> INVOKE_ENDS   = spellings("</", invoke_mids, ">");
+    const std::vector<std::string> PARAM_STARTS  = spellings("<",  param_mids,  "");
+    const std::vector<std::string> PARAM_ENDS    = spellings("</", param_mids,  ">");
     const std::string GEN_PROMPT   = "<｜Assistant｜>";
     const std::string TC_SEPARATOR = "\n\n";
+
+    // every way a tool call block can open, with and without the blank line before it
+    std::vector<std::string> FC_START_STOPS;
+    for (const auto & fc : FC_STARTS) {
+        FC_START_STOPS.push_back(TC_SEPARATOR + fc);
+    }
+    for (const auto & fc : FC_STARTS) {
+        FC_START_STOPS.push_back(fc);
+    }
+    std::vector<std::string> REASONING_STOPS = FC_START_STOPS;
+    REASONING_STOPS.push_back(THINK_END);
 
     data.prompt = common_chat_template_direct_apply_impl(
         tmpl, inputs, adjusted_messages, std::nullopt, additional_context);
@@ -111,7 +151,8 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
     data.format             = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.supports_thinking  = true;
     data.thinking_start_tag = THINK_START;
-    data.thinking_end_tags  = {THINK_END, FC_START};
+    data.thinking_end_tags  = {THINK_END};
+    data.thinking_end_tags.insert(data.thinking_end_tags.end(), FC_STARTS.begin(), FC_STARTS.end());
     data.preserved_tokens   = {
         DSML,
         THINK_START,
@@ -140,6 +181,16 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
     bool has_tool_calls = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+        // match any accepted spelling of a marker, with an optional common suffix
+        auto any_literal = [&](const std::vector<std::string> & alts, const std::string & suffix = "") {
+            std::vector<common_peg_parser> ps;
+            ps.reserve(alts.size());
+            for (const auto & alt : alts) {
+                ps.push_back(p.literal(alt + suffix));
+            }
+            return p.choice(ps);
+        };
+
         auto generation_prompt = p.literal(GEN_PROMPT);
         auto end               = p.end();
 
@@ -156,13 +207,13 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
                     bool is_string = param.schema->may_be_string();
 
                     auto arg = p.tool_arg(
-                        p.tool_arg_open(p.literal(PARAM_START + " name=\"") + p.tool_arg_name(p.literal(param.name)) +
+                        p.tool_arg_open(any_literal(PARAM_STARTS, " name=\"") + p.tool_arg_name(p.literal(param.name)) +
                                         p.literal("\" string=\"" + std::string(is_string ? "true" : "false") + "\">")) +
                         (is_string ?
-                             p.tool_arg_string_value(p.until(PARAM_END)) :
+                             p.tool_arg_string_value(p.until_one_of(PARAM_ENDS)) :
                              p.tool_arg_json_value(p.schema(p.json(), "tool-" + name + "-arg-" + param.name + "-schema",
                                                             doc, *param.schema))) +
-                        p.tool_arg_close(p.literal(PARAM_END)));
+                        p.tool_arg_close(any_literal(PARAM_ENDS)));
 
                     auto named_arg = p.rule("tool-" + name + "-arg-" + param.name, arg);
                     if (param.required) {
@@ -189,9 +240,9 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
                 }
 
                 common_peg_parser invoke_body = args_seq;
-                auto              func_parser = p.tool(p.tool_open(p.literal(INVOKE_START + " name=\"") +
+                auto              func_parser = p.tool(p.tool_open(any_literal(INVOKE_STARTS, " name=\"") +
                                                                    p.tool_name(p.literal(name)) + p.literal("\">\n")) +
-                                                       invoke_body + p.space() + p.tool_close(p.literal(INVOKE_END)));
+                                                       invoke_body + p.space() + p.tool_close(any_literal(INVOKE_ENDS)));
 
                 tool_choice |= p.rule("tool-" + name, func_parser);
             });
@@ -200,11 +251,11 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
         common_peg_parser tool_calls = p.eps();
         if (inputs.parallel_tool_calls) {
             tool_calls = p.trigger_rule("tool-call",
-                p.literal(FC_START) + p.space() + tool_choice +
-                p.zero_or_more(p.space() + tool_choice) + p.space() + p.literal(FC_END));
+                any_literal(FC_STARTS) + p.space() + tool_choice +
+                p.zero_or_more(p.space() + tool_choice) + p.space() + any_literal(FC_ENDS));
         } else {
             tool_calls = p.trigger_rule("tool-call",
-                p.literal(FC_START) + p.space() + tool_choice + p.space() + p.literal(FC_END));
+                any_literal(FC_STARTS) + p.space() + tool_choice + p.space() + any_literal(FC_ENDS));
         }
 
         auto reasoning = p.eps();
@@ -219,7 +270,7 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
         if (extract_reasoning && inputs.enable_thinking) {
             reasoning = p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
             reasoning_with_tc = THINK_START +
-                p.reasoning(p.until_one_of({ TC_SEPARATOR + FC_START, FC_START, THINK_END })) +
+                p.reasoning(p.until_one_of(REASONING_STOPS)) +
                 p.space() + obligatory_tool_calls;
             allow_reasoning_with_tc = true;
         } else if (extract_reasoning) {
@@ -244,7 +295,7 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
         }
 
         auto content_before_tools = p.negate(p.literal(THINK_START)) +
-            p.content(p.until_one_of({ TC_SEPARATOR + FC_START, FC_START })) +
+            p.content(p.until_one_of(FC_START_STOPS)) +
             p.space();
         return allow_reasoning_with_tc ? generation_prompt + (reasoning_with_tc | (reasoning + content_before_tools + tool_calls)) + end :
             generation_prompt + reasoning + content_before_tools + tool_calls + end;
@@ -258,9 +309,10 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
             parser.build_grammar(builder, data.grammar_lazy);
         });
 
-        data.grammar_triggers = {
-            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, FC_START },
-        };
+        data.grammar_triggers.clear();
+        for (const auto & fc : FC_STARTS) {
+            data.grammar_triggers.push_back({ COMMON_GRAMMAR_TRIGGER_TYPE_WORD, fc });
+        }
     }
 
     return data;
