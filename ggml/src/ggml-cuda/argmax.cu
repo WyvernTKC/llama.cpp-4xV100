@@ -20,8 +20,9 @@ static __device__ __forceinline__ void argmax_warp_reduce(float & maxval, int & 
 static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __restrict__ dst, const int64_t ncols) {
     const int64_t row = blockIdx.x;
 
-    float maxval = -FLT_MAX;
-    int   argmax = -1;
+    // a row that is all -inf or NaN must still give back a valid index
+    float maxval = -INFINITY;
+    int   argmax = 0;
     const float * rowx = x + row * ncols;
 
     for (int32_t col = threadIdx.x; col < ncols; col += blockDim.x) {
@@ -78,8 +79,8 @@ static __global__ void argmax_f32_tile(
     const int64_t beg  = tile * ARGMAX_TILE;
     const int64_t end  = beg + ARGMAX_TILE < ncols ? beg + ARGMAX_TILE : ncols;
 
-    float maxval = -FLT_MAX;
-    int   argmax = -1;
+    float maxval = -INFINITY;
+    int   argmax = (int) beg;
 
     for (int64_t col = beg + threadIdx.x; col < end; col += ARGMAX_BLOCK) {
         const float val = x[row * ncols + col];
@@ -109,8 +110,8 @@ static __global__ void argmax_f32_combine(
         int32_t * __restrict__ dst, const int64_t ntiles) {
     const int64_t row = blockIdx.x;
 
-    float maxval = -FLT_MAX;
-    int   argmax = -1;
+    float maxval = -INFINITY;
+    int   argmax = 0;
 
     for (int i = threadIdx.x; i < ntiles; i += WARP_SIZE) {
         const float val = part_val[row * ntiles + i];
