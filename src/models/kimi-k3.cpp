@@ -376,8 +376,12 @@ static ggml_tensor * kimi_k3_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
 
     // group s holds the conv window s tokens back.
     // [TAG_RECURRENT_ROLLBACK_SPLITS]: the last K_rs tokens must share one ubatch.
-    for (int64_t s = 0; s < K_rs; ++s) {
-        const int64_t s_idx = std::max<int64_t>(0, n_seq_tokens - s);
+    // a batch shorter than K_rs carries no window for the deeper groups, so leave those with the
+    //   history an earlier batch put there rather than filling them with this batch's oldest window
+    const int64_t s_last = std::min<int64_t>(n_seq_tokens, K_rs - 1);
+
+    for (int64_t s = 0; s <= s_last; ++s) {
+        const int64_t s_idx = n_seq_tokens - s;
         ggml_tensor * conv_x_s = ggml_view_3d(ctx0, conv_x, d_conv - 1, d_inner, n_seqs,
             conv_x->nb[1], conv_x->nb[2], s_idx * conv_x->nb[0]);
         ggml_build_forward_expand(gf,

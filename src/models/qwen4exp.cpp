@@ -1417,8 +1417,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
 
     const int64_t n_slots = (int64_t) cparams.n_rs_seq + 1;
 
-    for (int64_t slot = 0; slot < n_slots; ++slot) {
-        const int64_t s_idx = std::max<int64_t>(0, conv_input->ne[0] - state_cols - slot);
+    // a batch shorter than n_slots carries no window for the deeper slots, so leave those with the
+    //   history an earlier batch put there rather than filling them with this batch's oldest window
+    const int64_t n_seq_tokens = conv_input->ne[0] - state_cols;
+    const int64_t slot_last    = std::min<int64_t>(n_seq_tokens, n_slots - 1);
+
+    for (int64_t slot = 0; slot <= slot_last; ++slot) {
+        const int64_t s_idx = n_seq_tokens - slot;
 
         ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
                 state_cols, channels, n_seqs,
