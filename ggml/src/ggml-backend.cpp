@@ -1083,18 +1083,40 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
-// A node's identity for caching: where it is, what it does, what shape it has. Pointers alone are not
-// enough - llama.cpp rebuilds into a reset ggml_context so addresses recur, and prefill and decode
-// reuse the same addresses with the same node count but different ne[]. Reusing a graph decomposition
-// across that would be silently wrong.
+static void ggml_backend_sched_sig_mix(uint64_t * h, uint64_t v) {
+    *h = (*h ^ v) * 1099511628211ULL; // FNV-1a
+}
+
+// A node's identity for caching. The pointer alone is not enough: llama.cpp rebuilds into a reset
+//   ggml_context, so addresses recur and prefill and decode share them with different ne[]. Shape is not
+//   enough either: two graphs at the same addresses with the same shapes can still differ in what a node
+//   reads or writes - a view into a cache at another offset (the recurrent state slot of a different
+//   sequence), an op parameter, a source. A reused uid makes ggml-cuda skip its own per-node comparison,
+//   so cover what that comparison would have seen.
 static uint64_t ggml_backend_sched_node_sig(const struct ggml_tensor * node) {
-    uint64_t h = 1469598103934665603ULL; // FNV-1a
-    const uint64_t vals[6] = {
-        (uint64_t) (uintptr_t) node, (uint64_t) node->op,
-        (uint64_t) node->ne[0], (uint64_t) node->ne[1], (uint64_t) node->ne[2], (uint64_t) node->ne[3],
-    };
-    for (int i = 0; i < 6; i++) {
-        h = (h ^ vals[i]) * 1099511628211ULL;
+    uint64_t h = 1469598103934665603ULL;
+
+    ggml_backend_sched_sig_mix(&h, (uint64_t) (uintptr_t) node);
+    ggml_backend_sched_sig_mix(&h, (uint64_t) node->op);
+    ggml_backend_sched_sig_mix(&h, (uint64_t) (uintptr_t) node->data);
+    ggml_backend_sched_sig_mix(&h, (uint64_t) node->view_offs);
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        ggml_backend_sched_sig_mix(&h, (uint64_t) node->ne[i]);
+        ggml_backend_sched_sig_mix(&h, (uint64_t) node->nb[i]);
+    }
+    for (size_t i = 0; i < GGML_MAX_OP_PARAMS / sizeof(int32_t); i++) {
+        ggml_backend_sched_sig_mix(&h, (uint64_t) (uint32_t) node->op_params[i]);
+    }
+    for (int j = 0; j < GGML_MAX_SRC; j++) {
+        const struct ggml_tensor * src = node->src[j];
+        ggml_backend_sched_sig_mix(&h, (uint64_t) (uintptr_t) src);
+        if (src == NULL) {
+            continue;
+        }
+        ggml_backend_sched_sig_mix(&h, (uint64_t) (uintptr_t) src->data);
+        for (int i = 0; i < GGML_MAX_DIMS; i++) {
+            ggml_backend_sched_sig_mix(&h, (uint64_t) src->ne[i]);
+        }
     }
     return h;
 }
