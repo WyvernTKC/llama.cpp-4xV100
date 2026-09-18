@@ -526,6 +526,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return ret;
         };
 
+        // a layer that reads another layer's kv cache has to put its q heads on the devices that hold
+        //   those kv heads, so it takes the rotation of the layer it borrows from rather than its own
+        auto get_rotation = [&](const uint32_t il) {
+            const int32_t il_kv = hparams.kv_reuse_layer(il);
+            return get_il_eff(il_kv < 0 ? il : (uint32_t) il_kv) % ud->n_devices;
+        };
+
         uint32_t il;
         std::string prefix;
         size_t rotation;
@@ -534,13 +541,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             GGML_ASSERT(length_prefix != std::string::npos);
             prefix = tensor_name.substr(0, length_prefix + 1);
             il = std::stoull(tensor_name.substr(4, length_prefix));
-            rotation = get_il_eff(il) % ud->n_devices;
+            rotation = get_rotation(il);
         } else if (tensor_name.substr(0, 6) == "cache_") {
             const size_t layer_index_start = tensor_name.find("_l", 6);
             GGML_ASSERT(layer_index_start != std::string::npos);
             il = std::stoull(tensor_name.substr(layer_index_start + 2));
             prefix = "blk." + std::to_string(il) + ".";
-            rotation = get_il_eff(il) % ud->n_devices;
+            rotation = get_rotation(il);
         } else {
             il = 0;
             rotation = hparams.n_layer() % ud->n_devices;

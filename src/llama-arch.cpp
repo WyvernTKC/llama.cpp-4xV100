@@ -1192,7 +1192,6 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_MPT:
         // MLA without the absorption optimization: uses the unsplit attn_kv_b instead of attn_k_b/attn_v_b
         case LLM_ARCH_MINICPM3:
-        case LLM_ARCH_GEMMA3N:
         case LLM_ARCH_OLMO2:
         case LLM_ARCH_OLMOE:
         case LLM_ARCH_DOTS3NOTE:

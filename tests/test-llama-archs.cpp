@@ -100,9 +100,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_ff   = 192;
         n_layer = 5; // need at least 5 for swa_pattern (every 5th is full_attention)
     } else if (arch == LLM_ARCH_GEMMA3N) {
-        n_embd = 64;
-        n_head = 1;
-        n_ff   = 96;
+        // head size 64 with more than one head, so that the per-head split of tensor parallelism is
+        //   exercised - a single head leaves nothing to distribute and q falls back to an axis 0 split
+        n_embd = 128;
+        n_head = 2;
+        n_ff   = 192;
         n_layer = 22; // hparams.n_layer_kv_from_start = 20 is hardcoded
     } else if (arch == LLM_ARCH_DEEPSEEK4) {
         // head size 64 so that GPU flash attention kernels support the model

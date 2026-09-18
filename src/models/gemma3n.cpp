@@ -392,7 +392,10 @@ ggml_tensor * llama_model_gemma3n::graph::laurel(ggml_tensor * cur, int il) {
 // input x shape: [n_embd, n_tokens]
 // output  shape: [n_embd, n_tokens]
 ggml_tensor * llama_model_gemma3n::graph::gaussian_topk(ggml_tensor * x) {
-    ggml_tensor * mean = ggml_mean(ctx0, x);
+    // sum and divide rather than ggml_mean: under tensor parallelism the row is split over the
+    //   devices, and a sum of the parts is still the sum of the whole while a mean of the parts is
+    //   not. The divisor is the full row width, so it has to be applied after the parts are reduced
+    ggml_tensor * mean = ggml_scale(ctx0, ggml_sum_rows(ctx0, x), 1.0f / (float) x->ne[0]);
     ggml_tensor * std  = ggml_sqrt(ctx0, ggml_scale(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, ggml_sub(ctx0, x, mean))),
                                                     1.0f / (float) (x->ne[0] - 1)));
     ggml_tensor * cutoff_x = ggml_add(ctx0, mean, ggml_scale(ctx0, std, f_sparsity_std_mul));
