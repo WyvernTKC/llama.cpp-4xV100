@@ -347,6 +347,17 @@ bool llama_hparams::has_kv(uint32_t il) const {
     return true;
 }
 
+int32_t llama_hparams::kv_reuse_layer(uint32_t il) const {
+    if (n_layer_kv_from_start < 0 || il < (uint32_t) n_layer_kv_from_start) {
+        return -1;
+    }
+
+    GGML_ASSERT(n_layer_kv_from_start >= 2);
+
+    // the last layer of each window type before the cache ends is the one that still holds rows
+    return n_layer_kv_from_start - (is_swa(il) ? 2 : 1);
+}
+
 bool llama_hparams::has_rope(uint32_t il) const {
     // the router layer stores adapter routing signal, not positional info,
     // so it must not be RoPE-shifted

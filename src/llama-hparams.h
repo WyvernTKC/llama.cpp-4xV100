@@ -488,6 +488,11 @@ struct llama_hparams {
 
     bool has_kv(uint32_t il) const;
 
+    // the layer whose KV cache layer il reads instead of having one of its own, or -1 when it has one.
+    // the memory module maps the cache with this, and the tensor split has to place the reading layer's
+    // q heads on the devices that hold those kv heads, so both sides must ask the same question here
+    int32_t kv_reuse_layer(uint32_t il) const;
+
     bool has_rope(uint32_t il) const;
 
     // number of effective layers (excludes nextn layers)

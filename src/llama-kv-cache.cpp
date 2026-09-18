@@ -260,17 +260,20 @@ llama_kv_cache::llama_kv_cache(
                 continue;
             }
 
-            // A layer the filter rejected has no storage of its own, which is the case that most
-            // needs to borrow another layer's. Owning storage and reading storage are separate
-            // questions, so only a layer with no KV at all is skipped here.
-            if (!hparams.has_kv(il)) {
-                LLAMA_LOG_DEBUG("%s: - layer %3d: does not have KV cache\n", __func__, il);
+            // Owning storage and reading storage are separate questions. A layer with no storage of
+            // its own is exactly the one that needs to borrow, so neither has_kv() nor the filter
+            // decides this. What decides it is whether this cache holds the source rows: an iswa
+            // pair gives both halves the same callback and each half owns only one window type.
+            const auto it = map_layer_ids.find(il_reuse);
+
+            if (it == map_layer_ids.end()) {
+                GGML_ASSERT(filter && !filter(il) && "reuse source layer is missing from the cache that serves it");
+
+                LLAMA_LOG_DEBUG("%s: - layer %3d: source layer %d is in the other cache\n", __func__, il, il_reuse);
                 continue;
             }
 
-            GGML_ASSERT(map_layer_ids.find(il_reuse) != map_layer_ids.end());
-
-            map_layer_ids[il] = map_layer_ids[il_reuse];
+            map_layer_ids[il] = it->second;
 
             LLAMA_LOG_DEBUG("%s: - layer %3d: reuse layer %d, is_swa = %d\n", __func__, il, il_reuse, hparams.is_swa(il));
         }

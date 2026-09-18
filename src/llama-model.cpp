@@ -3211,15 +3211,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     llama_kv_cache::layer_share_cb share = nullptr;
 
                     if (arch == LLM_ARCH_GEMMA3N || arch == LLM_ARCH_GEMMA4) {
-                        reuse = [&](uint32_t il) {
-                            GGML_ASSERT(hparams.n_layer_kv_from_start >= 2);
-
-                            if (il >= (uint32_t)hparams.n_layer_kv_from_start) {
-                                return hparams.n_layer_kv_from_start - (hparams.is_swa(il) ? 2 : 1);
-                            }
-
-                            return -1;
-                        };
+                        reuse = [&](uint32_t il) { return hparams.kv_reuse_layer(il); };
                     }
 
                     // don't filter when n_layer_nextn is repurposed for a router layer the trunk attends
