@@ -206,9 +206,12 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
 
         const int64_t row_count = (d_conv - 1) * (d_inner + 2 * n_group * d_state);
         const size_t  row_size  = ggml_row_size(conv_states_all->type, row_count);
-        const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+        // slot j is the window ending n_seq_tokens - j tokens into this batch, so at j == n_seq_tokens
+        //   it is the window this batch started from, which conv_x carries at offset 0. Without that
+        //   slot a rollback of exactly n_seq_tokens tokens reads whatever an earlier batch left there
+        const int64_t slot_last = std::min<int64_t>(n_seq_tokens, K - 1);
 
-        for (int64_t slot = 0; slot < n_written; ++slot) {
+        for (int64_t slot = 0; slot <= slot_last; ++slot) {
             ggml_tensor * last_conv = ggml_view_3d(ctx0, conv_x, d_conv - 1, d_inner + 2 * n_group * d_state, n_seqs,
                                                    conv_x->nb[1], conv_x->nb[2], (n_seq_tokens - slot) * conv_x->nb[0]);
 
@@ -253,8 +256,20 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
         // use the states and the indices provided by build_recurrent_state
         // (this is necessary in order to properly use the states before they are overwritten,
         //  while avoiding to make unnecessary copies of the states)
+        // the scan only emits post-token states, so the slot that rolls back past this batch's first
+        //   token has to come from the state the batch started from - gather it while the ids are here
+        ggml_tensor * ssm_pre = nullptr;
+
         auto get_ssm_rows = [&](ggml_context * ctx, ggml_tensor * states, ggml_tensor * ids) {
             ggml_tensor * ssm = ggml_reshape_4d(ctx, states, d_state, head_dim, n_head, state_slots);
+
+            if (n_seq_tokens < K) {
+                ssm_pre = ggml_get_rows(ctx, states, ids);
+
+                // this has to read the state before the scan's snapshots are written back over it,
+                //   and it is not a dependency of anything that runs earlier, so place it here
+                ggml_build_forward_expand(gf, ssm_pre);
+            }
 
             // TODO: use semistructured matrices to implement state-space duality
             // => {d_inner, n_seq_tokens, n_seqs} and {d_state, d_inner, n_seqs}
@@ -275,6 +290,13 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
                                       y_row_size, y_row_size * n_seqs, state_offset),
                          ggml_view_3d(ctx0, ssm_states_all, D, n_seqs, n_written,
                                       ssm_states_all->nb[1], (size_t) mem_size * row_size, kv_head * row_size)));
+
+        if (ssm_pre) {
+            ggml_build_forward_expand(
+                gf, ggml_cpy(ctx0, ssm_pre,
+                             ggml_view_2d(ctx0, ssm_states_all, D, n_seqs, ssm_states_all->nb[1],
+                                          ((size_t) n_seq_tokens * mem_size + kv_head) * row_size)));
+        }
 
         ggml_tensor * y = ggml_view_4d(ctx0, y_ssm, head_dim, n_head, n_seq_tokens, n_seqs, x->nb[1], n_head * x->nb[1],
                                        n_seq_tokens * n_head * x->nb[1], 0);
