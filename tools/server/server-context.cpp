@@ -542,6 +542,13 @@ struct server_slot {
             return 0;
         }
 
+        // a request may cap its own draft length, or opt out of speculation entirely
+        const int32_t n_draft_req = task->params.speculative_n_max;
+
+        if (n_draft_req == 0) {
+            return 0;
+        }
+
         // determine the max draft that fits the current slot state
         // note: slot.prompt is not yet expanded with the `id` token sampled above
         //       also, need to leave space for 1 extra token to allow context shifts
@@ -549,6 +556,10 @@ struct server_slot {
 
         if (n_remaining() > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
+        }
+
+        if (n_draft_req > 0) {
+            n_draft_max = std::min(n_draft_max, n_draft_req);
         }
 
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);

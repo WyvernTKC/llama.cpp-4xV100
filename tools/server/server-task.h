@@ -78,6 +78,15 @@ struct task_params {
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
 
+    // per-request cap on the speculative draft length:
+    //   -1 = use the server's own configuration, 0 = no speculation for this request,
+    //    N = draft at most N tokens
+    // this can only lower the configured length, never raise it: the drafter is built once at
+    //   startup and a request is served by truncating whatever it produced
+    // note: a cap below the configured n_min disables drafting for the request, because every
+    //   impl throws away a draft shorter than n_min (see common/speculative.cpp)
+    int32_t speculative_n_max = -1;
+
     // response formatting
     bool               verbose  = false;
     task_response_type res_type = TASK_RESPONSE_TYPE_NONE;

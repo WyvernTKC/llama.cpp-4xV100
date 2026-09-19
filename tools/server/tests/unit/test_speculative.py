@@ -65,6 +65,57 @@ def test_with_and_without_draft():
     assert res.body["tokens"] == tokens_no_draft
 
 
+def test_per_request_speculative_n_max():
+    global server
+    request = {
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "top_k": 1,
+        "seed": 4242,
+        "n_predict": 32,
+        "return_tokens": True,
+    }
+
+    create_server()
+    # the fixture drafts n_min=4 .. n_max=8
+    server.start()
+
+    # by default a request uses the server's own configuration
+    res = server.make_request("POST", "/completion", data=request)
+    assert res.status_code == 200
+    draft_n_default = res.body["timings"]["draft_n"]
+    assert draft_n_default > 0
+    tokens_default = res.body["tokens"]
+
+    # 0 opts this one request out of speculation - draft_n is only reported when drafting happened
+    res = server.make_request("POST", "/completion", data={**request, "speculative.n_max": 0})
+    assert res.status_code == 200
+    assert "draft_n" not in res.body["timings"]
+    assert res.body["tokens"] == tokens_default
+
+    # a cap at n_min still drafts, but less than the uncapped request, and never changes the output
+    res = server.make_request("POST", "/completion", data={**request, "speculative.n_max": 4})
+    assert res.status_code == 200
+    assert 0 < res.body["timings"]["draft_n"] < draft_n_default
+    assert res.body["tokens"] == tokens_default
+
+    # a cap below n_min disables drafting: a draft shorter than n_min is discarded by the impl
+    res = server.make_request("POST", "/completion", data={**request, "speculative.n_max": 2})
+    assert res.status_code == 200
+    assert "draft_n" not in res.body["timings"]
+    assert res.body["tokens"] == tokens_default
+
+    # the cap can only lower the configured length, never raise it
+    res = server.make_request("POST", "/completion", data={**request, "speculative.n_max": 4096})
+    assert res.status_code == 200
+    assert res.body["timings"]["draft_n"] == draft_n_default
+    assert res.body["tokens"] == tokens_default
+
+    # out of range is rejected
+    res = server.make_request("POST", "/completion", data={**request, "speculative.n_max": -5})
+    assert res.status_code == 400
+
+
 def test_different_draft_min_draft_max():
     global server
     test_values = [

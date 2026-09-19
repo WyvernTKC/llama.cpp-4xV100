@@ -226,6 +226,16 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_desc("Minimum hits at ngram lookup for mgram to be proposed"));
 #endif
 
+    add((new field_num("speculative.n_max", params.speculative_n_max))
+        ->set_hard_limits(-1, INT32_MAX)
+        ->set_desc("Cap the speculative draft length for this request: -1 uses the server "
+                   "configuration, 0 disables speculation for this request, N drafts at most N "
+                   "tokens. It can only lower the configured length, never raise it above the "
+                   "server's own --spec-*-n-max, and a value below --spec-*-n-min disables "
+                   "drafting for the request, because a draft shorter than n_min is discarded. "
+                   "Speculation trades compute for latency, so it pays on an idle server and "
+                   "costs throughput when slots are busy"));
+
     add((new field_json("lora"))
         ->set_desc("A list of LoRA adapters to apply to this request. Each entry must have `id` and `scale` fields. Adapters not listed default to scale 0.0")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
