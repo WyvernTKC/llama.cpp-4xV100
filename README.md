@@ -368,11 +368,23 @@ as `n_tokens * n_expert_used` fits in the pool; larger prompt ubatches keep the 
 Results are the same as the host cache's; the merged graph lets the CUDA backend fuse a few more ops,
 so perplexity differs in the last digits unless fusion is disabled, in which case it is identical.
 
-For digging into it: `GGML_META_EXPERT_CACHE_STATS=1` prints the expert bytes a run moved,
+For digging into it: `GGML_META_EXPERT_CACHE_STATS=1` prints the expert bytes a run moved, and with the
+device gather one `expert-cache-dev:` line per pool and device when the pool is freed (calls, misses,
+MiB per call), so a cap sweep gives the hit rate per layer without a trace;
 `GGML_META_EXPERT_CACHE_DEBUG=1` says why a weight was refused a pool, `..._IDENTITY=1` pools every
 expert at its own index so the ids renumbering becomes a no-op, and `..._NOSKIP=1` recopies every
 routed expert. The last two separate a bad copy from a pool that is not surviving the token, which
-is how the cur_copy keying bug was found. `GGML_MOE_IDS_TRACE=<file>` logs the routing itself.
+is how the cur_copy keying bug was found. `GGML_MOE_IDS_TRACE=<file>` logs the routing itself, each
+row followed by ` | ` and the routing weights of the picks (host cache path only).
+
+DeepSeek-V4.1's engram tables stay on the host, so their `get_rows` is a CPU split in the middle of
+the forward. By default the rows are gathered and dequantized in `set_input` and the graph gets an F32
+input instead, which keeps the decode forward as one graph launch (+4-6% decode on 4x V100);
+`LLAMA_ENGRAM_HOST_GATHER=0` restores the graph-side `get_rows`.
+A one-token ubatch attends over the 512 picked rows of each compressed K stream (gathered with the
+top-k indices, mask included) instead of the whole stream concatenated and masked; this needs flash
+attention and an f16 K cache, and it pays off with context depth (+18% decode at 64k tokens, -3% at
+zero depth from the extra nodes). `LLAMA_DSV4_GATHER_K=0` restores the dense path.
 
 When the cache does nothing at all, the question is usually whether the experts are being streamed in
 the first place. `GGML_META_PARTIAL_DEBUG=1` prints, per host-resident weight, whether it took the
