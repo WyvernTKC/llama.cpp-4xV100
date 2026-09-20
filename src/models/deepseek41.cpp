@@ -316,10 +316,14 @@ public:
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_kv_cache_dsv4_context *>(params.mctx)->get_raw();
         const int64_t n_cols = (pmodel.hparams.engram_max_ngram_size - 1) * pmodel.hparams.engram_n_head;
+        if (emb != nullptr) {
+            return emb->ne[1] == params.ubatch.n_tokens;
+        }
         return rows->ne[0] == n_cols * params.ubatch.n_tokens;
     }
 
     ggml_tensor * rows = nullptr;   // I32 [n_cols * n_tokens]
+    ggml_tensor * emb  = nullptr;   // F32 [key_len * n_cols, n_tokens] when the gather runs on the host
 
     const llama_model_deepseek41 & pmodel;
 
@@ -331,7 +335,28 @@ public:
 
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
+    std::vector<float>       gathered;
 };
+
+// an env var of "0" turns one of the two decode-path defaults below off
+static bool env_default_on(const char * name) {
+    const char * env = getenv(name);
+    return env == nullptr || atoi(env) != 0;
+}
+
+// decode attends over the gathered top-k rows of the compressed stream (LLAMA_DSV4_GATHER_K=0 opts out)
+static bool dsv4_gather_k_enabled() {
+    static const bool on = env_default_on("LLAMA_DSV4_GATHER_K");
+    return on;
+}
+
+// The table lives on the host, so with the gather on the host too the graph sees only device work:
+// no CPU split in the middle of the forward, no device-wide sync at its boundary (LLAMA_ENGRAM_HOST_GATHER=0 opts out).
+static bool engram_host_gather(const ggml_tensor * table) {
+    static const bool on = env_default_on("LLAMA_ENGRAM_HOST_GATHER");
+    return on && table->data != nullptr && ggml_backend_buffer_is_host(table->buffer) &&
+        ggml_get_type_traits(table->type)->to_float != nullptr;
+}
 
 void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
     const auto & hp = pmodel.hparams;
@@ -410,6 +435,18 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
         llama_prefetch_ranges(addrs.data(), sizes.data(), addrs.size());
     }
 
+    if (emb != nullptr) {
+        const int64_t key_len = table->ne[0];
+        const auto * traits = ggml_get_type_traits(table->type);
+        gathered.resize(idx.size()*key_len);
+        for (size_t i = 0; i < idx.size(); ++i) {
+            const uint8_t * row = (const uint8_t *) table->data + (size_t) idx[i]*table->nb[1];
+            traits->to_float(row, gathered.data() + i*key_len, key_len);
+        }
+        ggml_backend_tensor_set(emb, gathered.data(), 0, gathered.size()*sizeof(float));
+        return;
+    }
+
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
 
@@ -424,6 +461,15 @@ ggml_tensor * llama_model_deepseek41::graph::build_inp_engram(
     const auto * mctx_cur = static_cast<const llama_kv_cache_dsv4_context *>(mctx);
 
     auto inp = std::make_unique<llm_graph_input_engram>(pmodel, mctx_cur->get_raw(), pmodel.engram_index(il));
+
+    if (engram_host_gather(model.layers[il].engram_embd)) {
+        inp->emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, key_len * n_cols, n_tokens);
+        ggml_set_input(inp->emb);
+        ggml_tensor * emb = inp->emb;
+        res->add_input(std::move(inp));
+        cb(emb, "engram_embd", il);
+        return emb;
+    }
 
     inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_cols * n_tokens);
     ggml_set_input(inp->rows);
@@ -993,13 +1039,44 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
             comp_k->nb[1], comp_k->nb[2], comp_k->nb[3], 0);
     cb(comp_k, "comp_k", il);
 
-    ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
+    ggml_tensor * raw_mask = inp_attn->get_kq_mask();
+    ggml_tensor * k_all    = nullptr;
+    ggml_tensor * kq_mask  = nullptr;
+
+    // At decode every query shares one pick, so gather the picked rows of the compressed K and their
+    // mask entries instead of copying the whole stream and masking all of it. get_rows returns f32.
+    if (dsv4_gather_k_enabled() && nt == 1 && cparams.flash_attn &&
+            comp_k->type == GGML_TYPE_F16 && raw_mask->type == GGML_TYPE_F16 && top_k->ne[1] == 1) {
+        const int64_t n_top = top_k->ne[0];
+        const int64_t ns    = comp_k->ne[3];
+        GGML_ASSERT(top_k->ne[3] == ns && inp_comp.kq_mask->ne[3] == ns && raw_mask->ne[3] == ns);
+
+        ggml_tensor * idx = ggml_view_2d(ctx0, top_k, n_top, ns, top_k->nb[3], 0);
+
+        ggml_tensor * comp_rows = ggml_view_3d(ctx0, comp_k, comp_k->ne[0], n_comp, ns, comp_k->nb[2], comp_k->nb[3], 0);
+        ggml_tensor * k_sel = ggml_get_rows(ctx0, comp_rows, idx);
+        k_sel = ggml_cast(ctx0, k_sel, comp_k->type);
+        k_sel = ggml_reshape_4d(ctx0, k_sel, comp_k->ne[0], 1, n_top, ns);
+        cb(k_sel, "comp_k_sel", il);
+
+        k_all = ggml_concat(ctx0, raw_k, k_sel, 2);
+
+        ggml_tensor * mask_rows = ggml_view_3d(ctx0, inp_comp.kq_mask, 1, n_comp, ns,
+                inp_comp.kq_mask->nb[0], inp_comp.kq_mask->nb[3], 0);
+        ggml_tensor * m_sel = ggml_get_rows(ctx0, mask_rows, idx);
+        m_sel = ggml_cast(ctx0, m_sel, raw_mask->type);
+        m_sel = ggml_reshape_4d(ctx0, m_sel, n_top, 1, 1, ns);
+        m_sel = ggml_repeat_4d(ctx0, m_sel, n_top, raw_mask->ne[1], 1, ns);
+        cb(m_sel, "comp_mask_sel", il);
+
+        kq_mask = ggml_concat(ctx0, raw_mask, m_sel, 0);
+    } else {
+        k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
+
+        ggml_tensor * comp_mask = build_top_k_mask(inp_comp.kq_mask, top_k, "comp_top_k_mask", il);
+        kq_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
+    }
     cb(k_all, "k_all", il);
-
-    ggml_tensor * raw_mask  = inp_attn->get_kq_mask();
-    ggml_tensor * comp_mask = build_top_k_mask(inp_comp.kq_mask, top_k, "comp_top_k_mask", il);
-
-    ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
     cb(kq_mask, "kq_mask", il);
 
     const int64_t n_kv_max = std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0];
