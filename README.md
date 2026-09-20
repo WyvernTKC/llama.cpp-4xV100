@@ -381,10 +381,12 @@ DeepSeek-V4.1's engram tables stay on the host, so their `get_rows` is a CPU spl
 the forward. By default the rows are gathered and dequantized in `set_input` and the graph gets an F32
 input instead, which keeps the decode forward as one graph launch (+4-6% decode on 4x V100);
 `LLAMA_ENGRAM_HOST_GATHER=0` restores the graph-side `get_rows`.
-A one-token ubatch attends over the 512 picked rows of each compressed K stream (gathered with the
-top-k indices, mask included) instead of the whole stream concatenated and masked; this needs flash
-attention and an f16 K cache, and it pays off with context depth (+18% decode at 64k tokens, -3% at
-zero depth from the extra nodes). `LLAMA_DSV4_GATHER_K=0` restores the dense path.
+On DeepSeek-V4.1 a one-token ubatch attends over the 512 picked rows of each compressed K stream
+(gathered with the top-k indices, mask included) instead of the whole stream concatenated and masked;
+this needs flash attention and an f16 or q8_0 K cache, and it pays off with context depth (+18%
+decode at 64k tokens, -3% at zero depth from the extra nodes). `LLAMA_DSV4_GATHER_K=0` restores the
+dense path. DeepSeek-V4's compressed streams are 4x shorter and the same path measured a wash there
+(-3% at d0, +2% at 64k on DS4-FV), so V4 keeps the dense path unless `LLAMA_DSV4_GATHER_K=1`.
 
 When the cache does nothing at all, the question is usually whether the experts are being streamed in
 the first place. `GGML_META_PARTIAL_DEBUG=1` prints, per host-resident weight, whether it took the

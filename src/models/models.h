@@ -1323,6 +1323,23 @@ struct llama_model_deepseek4 : public llama_model_base {
                 const char * name,
                 int il) const;
 
+        // a one-token ubatch attends over the picked rows of a compressed stream instead of the whole
+        // stream masked; fills k_all/kq_mask and returns false when the dense path has to be used.
+        // default_on is the arch's choice, LLAMA_DSV4_GATHER_K=0/1 overrides it
+        bool build_picked_k(
+                ggml_tensor * raw_k,
+                ggml_tensor * comp_k,
+                int64_t n_comp,
+                ggml_tensor * raw_mask,
+                ggml_tensor * comp_mask,
+                ggml_tensor * top_k,
+                int64_t nt,
+                const char * tag,
+                int il,
+                bool default_on,
+                ggml_tensor ** k_all,
+                ggml_tensor ** kq_mask) const;
+
         ggml_tensor * build_csa_lid_attention(
                 const llama_model & model,
                 llm_graph_input_dsv4 * inp_dsv4,

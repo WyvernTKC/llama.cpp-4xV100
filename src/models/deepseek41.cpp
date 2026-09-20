@@ -338,22 +338,13 @@ public:
     std::vector<float>       gathered;
 };
 
-// an env var of "0" turns one of the two decode-path defaults below off
-static bool env_default_on(const char * name) {
-    const char * env = getenv(name);
-    return env == nullptr || atoi(env) != 0;
-}
-
-// decode attends over the gathered top-k rows of the compressed stream (LLAMA_DSV4_GATHER_K=0 opts out)
-static bool dsv4_gather_k_enabled() {
-    static const bool on = env_default_on("LLAMA_DSV4_GATHER_K");
-    return on;
-}
-
 // The table lives on the host, so with the gather on the host too the graph sees only device work:
 // no CPU split in the middle of the forward, no device-wide sync at its boundary (LLAMA_ENGRAM_HOST_GATHER=0 opts out).
 static bool engram_host_gather(const ggml_tensor * table) {
-    static const bool on = env_default_on("LLAMA_ENGRAM_HOST_GATHER");
+    static const bool on = [] {
+        const char * env = getenv("LLAMA_ENGRAM_HOST_GATHER");
+        return env == nullptr || atoi(env) != 0;
+    }();
     return on && table->data != nullptr && ggml_backend_buffer_is_host(table->buffer) &&
         ggml_get_type_traits(table->type)->to_float != nullptr;
 }
@@ -1043,34 +1034,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
     ggml_tensor * k_all    = nullptr;
     ggml_tensor * kq_mask  = nullptr;
 
-    // At decode every query shares one pick, so gather the picked rows of the compressed K and their
-    // mask entries instead of copying the whole stream and masking all of it. get_rows returns f32.
-    if (dsv4_gather_k_enabled() && nt == 1 && cparams.flash_attn &&
-            comp_k->type == GGML_TYPE_F16 && raw_mask->type == GGML_TYPE_F16 && top_k->ne[1] == 1) {
-        const int64_t n_top = top_k->ne[0];
-        const int64_t ns    = comp_k->ne[3];
-        GGML_ASSERT(top_k->ne[3] == ns && inp_comp.kq_mask->ne[3] == ns && raw_mask->ne[3] == ns);
-
-        ggml_tensor * idx = ggml_view_2d(ctx0, top_k, n_top, ns, top_k->nb[3], 0);
-
-        ggml_tensor * comp_rows = ggml_view_3d(ctx0, comp_k, comp_k->ne[0], n_comp, ns, comp_k->nb[2], comp_k->nb[3], 0);
-        ggml_tensor * k_sel = ggml_get_rows(ctx0, comp_rows, idx);
-        k_sel = ggml_cast(ctx0, k_sel, comp_k->type);
-        k_sel = ggml_reshape_4d(ctx0, k_sel, comp_k->ne[0], 1, n_top, ns);
-        cb(k_sel, "comp_k_sel", il);
-
-        k_all = ggml_concat(ctx0, raw_k, k_sel, 2);
-
-        ggml_tensor * mask_rows = ggml_view_3d(ctx0, inp_comp.kq_mask, 1, n_comp, ns,
-                inp_comp.kq_mask->nb[0], inp_comp.kq_mask->nb[3], 0);
-        ggml_tensor * m_sel = ggml_get_rows(ctx0, mask_rows, idx);
-        m_sel = ggml_cast(ctx0, m_sel, raw_mask->type);
-        m_sel = ggml_reshape_4d(ctx0, m_sel, n_top, 1, 1, ns);
-        m_sel = ggml_repeat_4d(ctx0, m_sel, n_top, raw_mask->ne[1], 1, ns);
-        cb(m_sel, "comp_mask_sel", il);
-
-        kq_mask = ggml_concat(ctx0, raw_mask, m_sel, 0);
-    } else {
+    if (!build_picked_k(raw_k, comp_k, n_comp, raw_mask, inp_comp.kq_mask, top_k, nt, "comp", il, /*default_on =*/ true, &k_all, &kq_mask)) {
         k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
 
         ggml_tensor * comp_mask = build_top_k_mask(inp_comp.kq_mask, top_k, "comp_top_k_mask", il);

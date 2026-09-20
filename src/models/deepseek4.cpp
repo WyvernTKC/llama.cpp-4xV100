@@ -733,6 +733,62 @@ ggml_tensor * llama_model_deepseek4::graph::build_top_k_mask(
     return kq_mask_top_k;
 }
 
+// LLAMA_DSV4_GATHER_K=0/1 overrides the arch default; unset keeps it
+static bool dsv4_gather_k_enabled(bool default_on) {
+    static const int env = [] {
+        const char * s = getenv("LLAMA_DSV4_GATHER_K");
+        return s == nullptr ? -1 : (atoi(s) != 0 ? 1 : 0);
+    }();
+    return env < 0 ? default_on : env == 1;
+}
+
+bool llama_model_deepseek4::graph::build_picked_k(
+        ggml_tensor * raw_k,
+        ggml_tensor * comp_k,
+        int64_t n_comp,
+        ggml_tensor * raw_mask,
+        ggml_tensor * comp_mask,
+        ggml_tensor * top_k,
+        int64_t nt,
+        const char * tag,
+        int il,
+        bool default_on,
+        ggml_tensor ** k_all,
+        ggml_tensor ** kq_mask) const {
+    if (!dsv4_gather_k_enabled(default_on) || nt != 1 || !cparams.flash_attn || top_k->ne[1] != 1) {
+        return false;
+    }
+    // one query row per stream, so the concatenated mask keeps one row too
+    if (raw_mask->ne[1] != 1 || comp_mask->type != raw_mask->type) {
+        return false;
+    }
+    const ggml_type kt = comp_k->type;
+    if (comp_k->ne[0] % ggml_blck_size(kt) != 0) {
+        return false;
+    }
+
+    const int64_t n_top = top_k->ne[0];
+    const int64_t ns    = comp_k->ne[3];
+    GGML_ASSERT(top_k->ne[3] == ns && comp_mask->ne[3] == ns && raw_mask->ne[3] == ns);
+
+    ggml_tensor * idx = ggml_view_2d(ctx0, top_k, n_top, ns, top_k->nb[3], 0);
+
+    // the rows are copied unchanged, so any K cache type stays exact
+    ggml_tensor * comp_rows = ggml_view_3d(ctx0, comp_k, comp_k->ne[0], n_comp, ns, comp_k->nb[2], comp_k->nb[3], 0);
+    ggml_tensor * k_sel = ggml_get_rows_same_type(ctx0, comp_rows, idx);
+    k_sel = ggml_reshape_4d(ctx0, k_sel, comp_k->ne[0], 1, n_top, ns);
+    cb(k_sel, (std::string(tag) + "_k_sel").c_str(), il);
+
+    ggml_tensor * mask_rows = ggml_view_3d(ctx0, comp_mask, 1, n_comp, ns, comp_mask->nb[0], comp_mask->nb[3], 0);
+    ggml_tensor * m_sel = ggml_get_rows_same_type(ctx0, mask_rows, idx);
+    m_sel = ggml_reshape_4d(ctx0, m_sel, n_top, 1, 1, ns);
+    cb(m_sel, (std::string(tag) + "_mask_sel").c_str(), il);
+
+    *k_all   = ggml_concat(ctx0, raw_k, k_sel, 2);
+    *kq_mask = ggml_concat(ctx0, raw_mask, m_sel, 0);
+    return true;
+}
+
 ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
         const llama_model & model,
         llm_graph_input_dsv4 * inp_dsv4,
@@ -776,13 +832,18 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
             csa_k->nb[1], csa_k->nb[2], csa_k->nb[3], 0);
     cb(csa_k, "csa_comp_k", il);
 
-    ggml_tensor * k_all = ggml_concat(ctx0, raw_k, csa_k, 2);
-    cb(k_all, "csa_k_all", il);
-
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
-    ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
+    ggml_tensor * k_all    = nullptr;
+    ggml_tensor * kq_mask  = nullptr;
+    // off by default here: V4's CSA stream is 4x shorter than V4.1's, so the concat it replaces is
+    // small and the extra nodes cost more than they save (-3% at d0, +2% at 64k on DS4-FV)
+    if (!build_picked_k(raw_k, csa_k, n_csa, raw_mask, inp_csa.kq_mask, top_k, cur->ne[1], "csa", il, /*default_on =*/ false, &k_all, &kq_mask)) {
+        k_all = ggml_concat(ctx0, raw_k, csa_k, 2);
 
-    ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
+        ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
+        kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
+    }
+    cb(k_all, "csa_k_all", il);
     cb(kq_mask, "csa_lid_kq_mask", il);
 
     const int64_t n_kv_max = std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0];
