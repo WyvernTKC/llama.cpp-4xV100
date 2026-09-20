@@ -439,6 +439,70 @@ void get_rows_cuda(
     }
 }
 
+// rows copied unchanged in units of T, for a dst of the same (quantized) type as src0
+template <typename T>
+static __global__ void k_get_rows_bytes(
+        const char * src0, const int32_t * src1, char * dst,
+        const int64_t n_units, const int64_t ne11, const uint3 ne12_fdv,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        const size_t s10, const size_t s11, const size_t s12) {
+    for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
+        const int   i10 = blockIdx.x;
+        const uint2 dm  = fast_div_modulo((uint32_t) z, ne12_fdv);
+        const int   i11 = dm.x;
+        const int   i12 = dm.y;
+
+        const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+        const T * src_row = (const T *) (src0 + i01*nb01 + i11*nb02 + i12*nb03);
+        T       * dst_row = (T       *) (dst  + i10*nb1  + i11*nb2  + i12*nb3);
+
+        for (int64_t i = blockIdx.y*blockDim.x + threadIdx.x; i < n_units; i += gridDim.y*blockDim.x) {
+            dst_row[i] = src_row[i];
+        }
+    }
+}
+
+static void get_rows_cuda_bytes(
+        const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, cudaStream_t stream) {
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const size_t row_size = ggml_row_size(src0->type, ne00);
+
+    const size_t s10 = nb10 / sizeof(int32_t);
+    const size_t s11 = nb11 / sizeof(int32_t);
+    const size_t s12 = nb12 / sizeof(int32_t);
+
+    GGML_ASSERT(ne12 > 0);
+    GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
+    const uint3 ne12_fdv = init_fastdiv_values(ne12);
+
+    // the widest unit that divides the row and every stride and address
+    auto fits = [&](size_t u) {
+        return row_size % u == 0 && nb01 % u == 0 && nb02 % u == 0 && nb03 % u == 0 &&
+            nb1 % u == 0 && nb2 % u == 0 && nb3 % u == 0 &&
+            ((uintptr_t) src0->data) % u == 0 && ((uintptr_t) dst->data) % u == 0;
+    };
+    const size_t unit = fits(16) ? 16 : fits(8) ? 8 : fits(4) ? 4 : 1;
+
+    const int64_t n_units = row_size / unit;
+    const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
+    const int   block_num_y = (n_units + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
+    const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+
+    const char    * src0_d = (const char    *) src0->data;
+    const int32_t * src1_d = (const int32_t *) src1->data;
+    char          * dst_d  = (char          *) dst->data;
+
+    switch (unit) {
+        case 16: k_get_rows_bytes<int4>   <<<block_nums, block_dims, 0, stream>>>(src0_d, src1_d, dst_d, n_units, ne11, ne12_fdv, nb01, nb02, nb03, nb1, nb2, nb3, s10, s11, s12); break;
+        case  8: k_get_rows_bytes<int2>   <<<block_nums, block_dims, 0, stream>>>(src0_d, src1_d, dst_d, n_units, ne11, ne12_fdv, nb01, nb02, nb03, nb1, nb2, nb3, s10, s11, s12); break;
+        case  4: k_get_rows_bytes<int32_t><<<block_nums, block_dims, 0, stream>>>(src0_d, src1_d, dst_d, n_units, ne11, ne12_fdv, nb01, nb02, nb03, nb1, nb2, nb3, s10, s11, s12); break;
+        default: k_get_rows_bytes<int8_t> <<<block_nums, block_dims, 0, stream>>>(src0_d, src1_d, dst_d, n_units, ne11, ne12_fdv, nb01, nb02, nb03, nb1, nb2, nb3, s10, s11, s12); break;
+    }
+}
+
 void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -453,6 +517,11 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
     GGML_ASSERT(dst->nb[0]  == ggml_type_size(dst->type));
+
+    if (dst->type == src0->type && ggml_is_quantized(src0->type)) {
+        get_rows_cuda_bytes(src0, src1, dst, stream);
+        return;
+    }
 
     get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
         ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);

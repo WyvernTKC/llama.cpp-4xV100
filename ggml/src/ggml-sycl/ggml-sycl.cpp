@@ -6409,6 +6409,9 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                      op->src[0]->ne[3] == op->src[1]->ne[3])) &&
                    op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_GET_ROWS:
+            if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_I32) {
+                return false; // ggml_get_rows_same_type
+            }
             {
                 switch (op->src[0]->type) {
                     case GGML_TYPE_I32:

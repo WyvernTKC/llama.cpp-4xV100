@@ -2338,13 +2338,14 @@ struct test_get_rows : public test_case {
     const int be2; // batch size
     const bool v; // view src1
     const bool vs0; // view src0
+    const bool same; // ggml_get_rows_same_type
 
     std::string vars() override {
-        return VARS_TO_STR8(type, n, m, r, be1, be2, v, vs0);
+        return VARS_TO_STR9(type, n, m, r, be1, be2, v, vs0, same);
     }
 
-    test_get_rows(ggml_type type = GGML_TYPE_F32, int n = 10, int m = 5, int r = 3, int be1 = 1, int be2 = 1, bool v = false, bool vs0 = false)
-        : type(type), n(n), m(m), r(r), be1(be1), be2(be2), v(v), vs0(vs0) {}
+    test_get_rows(ggml_type type = GGML_TYPE_F32, int n = 10, int m = 5, int r = 3, int be1 = 1, int be2 = 1, bool v = false, bool vs0 = false, bool same = false)
+        : type(type), n(n), m(m), r(r), be1(be1), be2(be2), v(v), vs0(vs0), same(same) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * in;
@@ -2369,13 +2370,13 @@ struct test_get_rows : public test_case {
             ggml_set_name(rows, "view_of_rows");
         }
 
-        const bool grad_supported = !vs0 && ggml_is_matrix(in) && ggml_is_vector(rows);
+        const bool grad_supported = !vs0 && !same && ggml_is_matrix(in) && ggml_is_vector(rows);
         if (grad_supported) {
             ggml_set_param(in);
             // rows is a constant input -> no gradients
         }
 
-        ggml_tensor * out = ggml_get_rows(ctx, in, rows);
+        ggml_tensor * out = same ? ggml_get_rows_same_type(ctx, in, rows) : ggml_get_rows(ctx, in, rows);
         ggml_set_name(out, "out");
 
         return out;
@@ -9107,6 +9108,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        test_cases.emplace_back(new test_get_rows(type, 256, 5, 4, 1, 1, false, false, true));
+        test_cases.emplace_back(new test_get_rows(type, 576, 9, 7, 2, 1, false, true,  true));
+    }
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
             for (bool v : {false, true}) {

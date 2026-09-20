@@ -5143,11 +5143,54 @@ static void ggml_compute_forward_get_rows_f32(
     }
 }
 
+// dst has the type of src0: the rows are copied byte for byte, whatever the type
+static void ggml_compute_forward_get_rows_bytes(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const size_t  row_size = ggml_row_size(src0->type, ne00);
+    const int64_t nr       = ggml_nelements(src1);
+
+    assert(ne0  == ne00);
+    assert(ne02 == ne11);
+    assert(ggml_nrows(dst) == nr);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int dr = (nr + nth - 1)/nth;
+
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t i = ir0; i < ir1; ++i) {
+        const int64_t i12 = i/(ne11*ne10);
+        const int64_t i11 = (i - i12*ne11*ne10)/ne10;
+        const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
+        const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+
+        GGML_ASSERT(i01 >= 0 && i01 < ne01);
+
+        memcpy((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3,
+               (char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03, row_size);
+    }
+}
+
 void ggml_compute_forward_get_rows(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
+
+    if (dst->type == src0->type && src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_I32) {
+        ggml_compute_forward_get_rows_bytes(params, dst);
+        return;
+    }
 
     switch (src0->type) {
         case GGML_TYPE_Q1_0:

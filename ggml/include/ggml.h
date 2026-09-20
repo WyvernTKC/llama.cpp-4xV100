@@ -1729,6 +1729,12 @@ extern "C" {
             struct ggml_tensor  * a,  // data
             struct ggml_tensor  * b); // row indices
 
+    // same as ggml_get_rows, but the rows are copied unchanged and the result has the type of a
+    GGML_API struct ggml_tensor * ggml_get_rows_same_type(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // data
+            struct ggml_tensor  * b); // row indices
+
     GGML_API struct ggml_tensor * ggml_get_rows_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // gradients of ggml_get_rows result

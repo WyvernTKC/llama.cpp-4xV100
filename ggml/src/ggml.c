@@ -3951,20 +3951,16 @@ struct ggml_tensor * ggml_transpose(
 
 // ggml_get_rows
 
-struct ggml_tensor * ggml_get_rows(
+static struct ggml_tensor * ggml_get_rows_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
-        struct ggml_tensor  * b) {
+        struct ggml_tensor  * b,
+        enum   ggml_type      type) {
     GGML_ASSERT(a->ne[2] == b->ne[1]);
     GGML_ASSERT(a->ne[3] == b->ne[2]);
     GGML_ASSERT(b->ne[3] == 1);
     GGML_ASSERT(b->type == GGML_TYPE_I32);
 
-    // TODO: implement non F32 return
-    enum ggml_type type = GGML_TYPE_F32;
-    if (a->type == GGML_TYPE_I32) {
-        type = a->type;
-    }
     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, a->ne[0], b->ne[0], b->ne[1], b->ne[2]);
 
     result->op     = GGML_OP_GET_ROWS;
@@ -3972,6 +3968,21 @@ struct ggml_tensor * ggml_get_rows(
     result->src[1] = b;
 
     return result;
+}
+
+struct ggml_tensor * ggml_get_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    // the rows are converted to F32, except for I32 which is copied
+    return ggml_get_rows_impl(ctx, a, b, a->type == GGML_TYPE_I32 ? a->type : GGML_TYPE_F32);
+}
+
+struct ggml_tensor * ggml_get_rows_same_type(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    return ggml_get_rows_impl(ctx, a, b, a->type);
 }
 
 // ggml_get_rows_back
