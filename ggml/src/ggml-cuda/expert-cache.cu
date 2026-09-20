@@ -1,6 +1,8 @@
 #include "expert-cache.cuh"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <mutex>
 #include <vector>
@@ -27,6 +29,7 @@ struct ggml_cuda_expert_cache_dev {
     int32_t  * miss_expert; // [max_ids]
     int32_t  * miss_slot;   // [max_ids]
     int32_t  * n_miss;      // [1]
+    uint32_t * stats;       // [2] calls, misses - GGML_META_EXPERT_CACHE_STATS
 };
 
 struct ggml_cuda_expert_cache {
@@ -128,6 +131,8 @@ static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_dev d, con
     if (threadIdx.x == 0) {
         *d.n_miss = s_n_miss;
         *d.clock  = clock + 1 + n_ids;
+        d.stats[0] += 1;
+        d.stats[1] += s_n_miss;
     }
 }
 
@@ -239,7 +244,7 @@ void * ggml_cuda_expert_cache_create(int device, const void * host_buf, size_t h
     c->d.max_ids      = max_ids;
     c->align = expert_cache_align({(size_t) (uintptr_t) dev_ptr, expert_bytes, chunk_full, chunk_dev, offset_dev, c->d.slot_bytes});
 
-    const size_t n_i32 = (size_t) n_expert + 2*cap + 1 + 3*max_ids + 1;
+    const size_t n_i32 = (size_t) n_expert + 2*cap + 1 + 3*max_ids + 1 + 2;
     ggml_cuda_set_device(device);
     if (cudaMalloc(&c->state, n_i32*sizeof(int32_t)) != cudaSuccess) {
         (void) cudaGetLastError();
@@ -254,7 +259,9 @@ void * ggml_cuda_expert_cache_create(int device, const void * host_buf, size_t h
     c->d.remap       = p; p += max_ids;
     c->d.miss_expert = p; p += max_ids;
     c->d.miss_slot   = p; p += max_ids;
-    c->d.n_miss      = p;
+    c->d.n_miss      = p; p += 1;
+    c->d.stats       = (uint32_t *) p;
+    CUDA_CHECK(cudaMemset(c->d.stats,     0,    2*sizeof(uint32_t)));
     CUDA_CHECK(cudaMemset(c->d.slot_of,   0xff, (size_t) n_expert*sizeof(int32_t)));
     CUDA_CHECK(cudaMemset(c->d.expert_of, 0xff, (size_t) cap*sizeof(int32_t)));
     CUDA_CHECK(cudaMemset(c->d.last_used, 0,    (size_t) cap*sizeof(uint32_t)));
@@ -269,6 +276,17 @@ void ggml_cuda_expert_cache_free(void * cache) {
         return;
     }
     ggml_cuda_set_device(c->device);
+    static const bool stats = getenv("GGML_META_EXPERT_CACHE_STATS") != nullptr;
+    if (stats) {
+        uint32_t st[2] = {0, 0};
+        cudaDeviceSynchronize();
+        if (cudaMemcpy(st, c->d.stats, sizeof(st), cudaMemcpyDeviceToHost) == cudaSuccess && st[0] > 0) {
+            fprintf(stderr, "expert-cache-dev: dev %d cap %d n_expert %d slot_bytes %zu calls %u misses %u miss/call %.4f MiB/call %.3f\n",
+                c->device, c->d.cap, c->d.n_expert, c->d.slot_bytes, st[0], st[1], (double) st[1]/st[0],
+                (double) st[1]/st[0]*c->d.slot_bytes/1048576.0);
+        }
+        (void) cudaGetLastError();
+    }
     cudaFree(c->state);
     delete c;
 }

@@ -1742,7 +1742,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
 // GGML_MOE_IDS_TRACE=<file>: log which experts each ubatch routes to, one line per MoE layer.
 // Rides on the readback the used-experts-only copy already does, so it costs no extra sync.
-static void ggml_backend_sched_trace_moe_ids(long long eval, const char * name, int64_t n_expert,
+static void ggml_backend_sched_trace_moe_ids(ggml_backend_sched_t sched, long long eval, const char * name, int64_t n_expert,
         const ggml_tensor * ids_tensor, const std::vector<int32_t> & ids) {
     static const char * path = getenv("GGML_MOE_IDS_TRACE");
     if (path == nullptr) {
@@ -1753,10 +1753,39 @@ static void ggml_backend_sched_trace_moe_ids(long long eval, const char * name, 
         return;
     }
 
+    // the routing weights too: the last ffn_moe_weights* node of this layer is the one the expert
+    // outputs are scaled with, computed before the experts and kept until that mul runs
+    std::vector<float> w;
+    int il = -1;
+    if (sscanf(name, "blk.%d.", &il) == 1) {
+        char suffix[32];
+        snprintf(suffix, sizeof(suffix), "-%d", il);
+        const size_t ls = strlen(suffix);
+        const ggml_tensor * wt = nullptr;
+        for (int i = 0; i < sched->graph.n_nodes; i++) {
+            const ggml_tensor * n = sched->graph.nodes[i];
+            const size_t ln = strlen(n->name);
+            if (strncmp(n->name, "ffn_moe_weights", 15) == 0 && ln > ls && strcmp(n->name + ln - ls, suffix) == 0) {
+                wt = n;
+            }
+        }
+        if (wt != nullptr && wt->type == GGML_TYPE_F32 && wt->buffer != nullptr && wt->data != nullptr &&
+                ggml_is_contiguous(wt) && ggml_nelements(wt) == ggml_nelements(ids_tensor)) {
+            w.resize(ggml_nelements(wt));
+            ggml_backend_tensor_get(wt, w.data(), 0, ggml_nbytes(wt));
+        }
+    }
+
     for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
         fprintf(out, "%lld %s %lld %lld", eval, name, (long long) n_expert, (long long) i1);
         for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
             fprintf(out, " %d", ids[i1*ids_tensor->nb[1]/sizeof(int32_t) + i0*ids_tensor->nb[0]/sizeof(int32_t)]);
+        }
+        if (!w.empty()) {
+            fprintf(out, " |");
+            for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
+                fprintf(out, " %.5f", w[i1*ids_tensor->ne[0] + i0]);
+            }
         }
         fprintf(out, "\n");
     }
@@ -2201,7 +2230,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                         }
 
-                        ggml_backend_sched_trace_moe_ids(moe_trace_eval, input->name, n_expert, ids_tensor, ids);
+                        ggml_backend_sched_trace_moe_ids(sched, moe_trace_eval, input->name, n_expert, ids_tensor, ids);
                         if (expert_cache_on) {
                             ggml_backend_sched_expert_cache_plan_make(n_expert,
                                 ggml_backend_sched_expert_cache_cap(), ids_tensor, ids, expert_cache_plan);

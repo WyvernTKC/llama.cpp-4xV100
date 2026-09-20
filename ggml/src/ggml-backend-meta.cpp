@@ -686,7 +686,12 @@ static ggml_backend_meta_gather_registry & ggml_backend_meta_gather_reg() {
 
 static const size_t GGML_META_GATHER_POOL_MARGIN = 256ull*1024*1024;
 
-static void ggml_backend_meta_gathered_weight_release(ggml_backend_meta_gathered_weight & gw) {
+static void ggml_backend_meta_gathered_weight_release(ggml_backend_meta_gathered_weight & gw, const ggml_tensor * w = nullptr) {
+    // GGML_META_EXPERT_CACHE_STATS: name the pool before the per-device cache lines that follow
+    static const bool stats = getenv("GGML_META_EXPERT_CACHE_STATS") != nullptr;
+    if (stats && w != nullptr && !gw.caches.empty()) {
+        fprintf(stderr, "expert-cache-dev: pool %s\n", w->name);
+    }
     for (void * c : gw.caches) {
         if (c != nullptr && gw.cache_free != nullptr) {
             gw.cache_free(c);
@@ -702,7 +707,7 @@ static void ggml_backend_meta_gather_release_all() {
     ggml_backend_meta_gather_registry & reg = ggml_backend_meta_gather_reg();
     std::lock_guard<std::mutex> lock(reg.mutex);
     for (auto & kv : reg.weights) {
-        ggml_backend_meta_gathered_weight_release(kv.second);
+        ggml_backend_meta_gathered_weight_release(kv.second, kv.first);
     }
     reg.weights.clear();
 }
@@ -756,7 +761,7 @@ static ggml_backend_meta_gathered_weight * ggml_backend_meta_gathered_weight_get
         if (it->second.failed && it->second.cap == cap && it->second.data == w->data) {
             return nullptr; // the same weight failed at this cap already, do not retry on every graph
         }
-        ggml_backend_meta_gathered_weight_release(it->second);
+        ggml_backend_meta_gathered_weight_release(it->second, it->first);
         reg.weights.erase(it);
     }
     ggml_backend_meta_gathered_weight & gw = reg.weights[w];
