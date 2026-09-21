@@ -10,13 +10,304 @@
 #include <array>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <future>
+#include <mutex>
 #include <regex>
+#include <thread>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
+
+// number of readers to run concurrently over one tensor. a single synchronous reader leaves one
+// request in flight, which is fine for a local NVMe but caps a network share well below its link
+// rate - an SMB share needs several outstanding reads to fill the pipe.
+static size_t llama_load_n_threads() {
+    static const size_t n_threads = []() -> size_t {
+        if (const char * env = getenv("LLAMA_LOAD_THREADS")) {
+            const int v = atoi(env);
+            return v > 0 ? std::min<size_t>((size_t) v, 32) : 1;
+        }
+        return 4;
+    }();
+
+    return n_threads;
+}
+
+// bytes of staging buffers that may be in flight at once. one tensor larger than this is still
+// admitted on its own, so the peak never exceeds max(window, largest tensor) - and the largest
+// tensor is what the serial path already had to hold.
+static size_t llama_load_window_bytes() {
+    static const size_t window = []() -> size_t {
+        if (const char * env = getenv("LLAMA_LOAD_WINDOW_MB")) {
+            const long long v = atoll(env);
+            if (v > 0) {
+                return (size_t) v*MiB;
+            }
+        }
+        return 4*GiB;
+    }();
+
+    return window;
+}
+
+// size of one unit of work handed to a reader. small enough that several readers share even a
+// modest tensor, large enough that each read is still a bulk transfer
+static const size_t LLAMA_LOAD_JOB_SIZE = 16*MiB;
+
+// Read-ahead pipeline for the no-mmap load path.
+//
+// The serial path reads a tensor, uploads it, frees the staging buffer, and only then starts the
+// next read, so the file sits idle for every upload and every staging allocation. It also rebuilds
+// its read concurrency once per tensor, and tensors are far too small for that to reach steady
+// state on a network share.
+//
+// Here a fixed set of reader threads pull fixed-size chunk jobs off one queue that spans several
+// tensors, so they never idle at a tensor boundary, while the main thread consumes finished
+// tensors in order and its uploads overlap the reads that follow.
+struct llama_load_pipeline {
+    struct entry {
+        ggml_tensor * tensor = nullptr;
+        uint32_t      file   = 0;
+        size_t        offs   = 0;   // within the file
+        size_t        size   = 0;
+        uint8_t *     dst    = nullptr;
+
+        // staging buffer, empty when dst points straight at a host tensor's own memory
+        std::vector<no_init<uint8_t>> buf;
+
+        std::atomic<size_t> jobs_left{0};
+        std::exception_ptr  error;
+    };
+
+    struct job {
+        entry * e      = nullptr;
+        size_t  offset = 0;   // within the entry
+        size_t  size   = 0;
+    };
+
+    llama_load_pipeline(const llama_files & files, bool check_tensors)
+            : files(files), check_tensors(check_tensors) {}
+
+    // opened on the first submit(), so an mmap load - which reads nothing here - does not pay for
+    // a pool of handles it will never use
+    void start_pool() {
+        const size_t n_want = llama_load_n_threads();
+        if (n_want <= 1) {
+            return;
+        }
+
+        // every reader needs its own handle on every file: sharing one handle is safe but not
+        // parallel, because Windows serialises all I/O on a synchronous file object
+        for (size_t r = 0; r < n_want; ++r) {
+            std::vector<std::unique_ptr<llama_file>> row;
+            row.reserve(files.size());
+            for (const auto & file : files) {
+                auto handle = file->reopen();
+                if (!handle) {
+                    // no path to reopen (a llama_file built from a FILE *) - give up on the pool
+                    // rather than let readers share the caller's handle
+                    handles.clear();
+                    return;
+                }
+                row.emplace_back(std::move(handle));
+            }
+            handles.emplace_back(std::move(row));
+        }
+
+        for (size_t r = 0; r < handles.size(); ++r) {
+            readers.emplace_back([this, r] { run_reader(r); });
+        }
+    }
+
+    // readers hold raw pointers into in_flight, so they must be stopped and joined here, in the
+    // destructor body, before any member is destroyed
+    ~llama_load_pipeline() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+            jobs.clear();   // abandon queued work; only reached on an error path or after drain()
+        }
+        cv_jobs.notify_all();
+        for (auto & reader : readers) {
+            reader.join();
+        }
+    }
+
+    size_t n_readers() const { return std::max<size_t>(readers.size(), 1); }
+
+    // hand a tensor to the pipeline. dst is where the bytes go; pass nullptr to have the pipeline
+    // allocate a staging buffer and upload it to the tensor once it is complete.
+    void submit(ggml_tensor * tensor, uint32_t file, size_t offs, size_t size, uint8_t * dst) {
+        if (!pool_started) {
+            start_pool();
+            pool_started = true;
+        }
+
+        if (readers.empty()) {
+            read_and_finish(tensor, file, offs, size, dst);
+            return;
+        }
+
+        // make room: a tensor bigger than the whole window is admitted alone
+        while (!in_flight.empty() && bytes_in_flight + size > llama_load_window_bytes()) {
+            consume_one();
+        }
+
+        auto e = std::make_unique<entry>();
+        e->tensor = tensor;
+        e->file   = file;
+        e->offs   = offs;
+        e->size   = size;
+        if (dst) {
+            e->dst = dst;
+        } else {
+            const auto t0 = ggml_time_us();
+            e->buf.resize(size);
+            t_alloc += (ggml_time_us() - t0)/1e6;
+            e->dst = reinterpret_cast<uint8_t *>(e->buf.data());
+        }
+
+        const size_t n_jobs = std::max<size_t>((size + LLAMA_LOAD_JOB_SIZE - 1)/LLAMA_LOAD_JOB_SIZE, 1);
+        e->jobs_left.store(n_jobs);
+
+        entry * raw = e.get();
+        in_flight.emplace_back(std::move(e));
+        bytes_in_flight += size;
+
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (size_t i = 0; i < n_jobs; ++i) {
+                const size_t offset = i*LLAMA_LOAD_JOB_SIZE;
+                jobs.push_back({ raw, offset, std::min(LLAMA_LOAD_JOB_SIZE, size - offset) });
+            }
+        }
+        cv_jobs.notify_all();
+    }
+
+    void drain() {
+        while (!in_flight.empty()) {
+            consume_one();
+        }
+    }
+
+    double t_read   = 0.0;   // wall time the main thread spent waiting on reads
+    double t_upload = 0.0;
+    double t_alloc  = 0.0;
+    size_t n_read   = 0;
+
+private:
+    void run_reader(size_t r) {
+        while (true) {
+            job j;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                cv_jobs.wait(lock, [this] { return stopping || !jobs.empty(); });
+                if (jobs.empty()) {
+                    if (stopping) {
+                        return;
+                    }
+                    continue;
+                }
+                j = jobs.front();
+                jobs.pop_front();
+            }
+
+            try {
+                handles[r][j.e->file]->read_raw_at(j.e->dst + j.offset, j.size, j.e->offs + j.offset);
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (!j.e->error) {
+                    j.e->error = std::current_exception();
+                }
+            }
+
+            if (j.e->jobs_left.fetch_sub(1) == 1) {
+                std::lock_guard<std::mutex> lock(mutex);
+                cv_done.notify_all();
+            }
+        }
+    }
+
+    // wait for the oldest tensor, then validate and upload it
+    void consume_one() {
+        auto e = std::move(in_flight.front());
+        in_flight.pop_front();
+
+        const auto t0 = ggml_time_us();
+        std::exception_ptr error;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            cv_done.wait(lock, [&] { return e->jobs_left.load() == 0; });
+            error = e->error;
+        }
+        const auto t1 = ggml_time_us();
+
+        bytes_in_flight -= e->size;
+        t_read += (t1 - t0)/1e6;
+        n_read += e->size;
+
+        if (error) {
+            std::rethrow_exception(error);
+        }
+
+        finish(e->tensor, e->dst, e->size, !e->buf.empty());
+    }
+
+    // fallback when there is no reader pool: exactly the old serial path
+    void read_and_finish(ggml_tensor * tensor, uint32_t file, size_t offs, size_t size, uint8_t * dst) {
+        std::vector<no_init<uint8_t>> buf;
+        if (!dst) {
+            const auto t0 = ggml_time_us();
+            buf.resize(size);
+            t_alloc += (ggml_time_us() - t0)/1e6;
+            dst = reinterpret_cast<uint8_t *>(buf.data());
+        }
+
+        const auto t0 = ggml_time_us();
+        llama_file * f = files.at(file).get();
+        f->seek(offs, SEEK_SET);
+        f->read_raw(dst, size);
+        t_read += (ggml_time_us() - t0)/1e6;
+        n_read += size;
+
+        finish(tensor, dst, size, !buf.empty());
+    }
+
+    void finish(ggml_tensor * tensor, uint8_t * data, size_t size, bool upload) {
+        if (check_tensors && !ggml_validate_row_data(tensor->type, data, size)) {
+            throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(tensor)));
+        }
+
+        if (upload) {
+            const auto t0 = ggml_time_us();
+            ggml_backend_tensor_set(tensor, data, 0, size);
+            t_upload += (ggml_time_us() - t0)/1e6;
+        }
+    }
+
+    const llama_files & files;
+    const bool          check_tensors;
+
+    bool                                                  pool_started = false;
+    std::vector<std::vector<std::unique_ptr<llama_file>>> handles;  // [reader][file]
+    std::vector<std::thread>                              readers;
+
+    std::mutex              mutex;
+    std::condition_variable cv_jobs;
+    std::condition_variable cv_done;
+    std::deque<job>         jobs;
+    bool                    stopping = false;
+
+    // main thread only
+    std::deque<std::unique_ptr<entry>> in_flight;
+    size_t                             bytes_in_flight = 0;
+};
 
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
@@ -1643,6 +1934,10 @@ bool llama_model_loader::load_all_data(
         });
     }
 
+    // reads the file ahead of the uploads, over several handles at once
+    const auto t_load_start = ggml_time_us();
+    llama_load_pipeline pipeline(files, check_tensors);
+
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1694,13 +1989,8 @@ bool llama_model_loader::load_all_data(
             const auto & file = files.at(weight->idx);
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
-                file->seek(weight->offs, SEEK_SET);
-                file->read_raw(cur->data, n_size);
-                if (check_tensors) {
-                    validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
-                        return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
-                    }));
-                }
+                // the pipeline validates host tensors itself, so no future is queued here
+                pipeline.submit(cur, weight->idx, weight->offs, n_size, (uint8_t *) cur->data);
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
                 if (upload_backend) {
@@ -1756,19 +2046,23 @@ bool llama_model_loader::load_all_data(
                         buffer_idx %= n_buffers;
                     }
                 } else {
-                    // scoped to one tensor so only one staging buffer is alive at a time
-                    std::vector<no_init<uint8_t>> read_buf(n_size);
-                    file->seek(weight->offs, SEEK_SET);
-                    file->read_raw(read_buf.data(), n_size);
-                    ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
-                    if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
-                        throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
-                    }
+                    // the pipeline owns the staging buffer and bounds how many are alive at once
+                    pipeline.submit(cur, weight->idx, weight->offs, n_size, nullptr);
                 }
             }
         }
 
         size_done += n_size;
+    }
+
+    // everything still in flight must land before the caller frees the file or checks size_done
+    pipeline.drain();
+
+    if (pipeline.n_read > 0) {
+        const double t_total = (ggml_time_us() - t_load_start)/1e6;
+        LLAMA_LOG_INFO("%s: read %.2f GiB in %.1fs wall (%.2f Gbps) | read-wait %.1fs | alloc %.1fs | upload %.1fs | %zu readers\n",
+            __func__, pipeline.n_read/(double)GiB, t_total, pipeline.n_read*8/(t_total*1e9),
+            pipeline.t_read, pipeline.t_alloc, pipeline.t_upload, pipeline.n_readers());
     }
 
     // free temporary resources used for async uploads

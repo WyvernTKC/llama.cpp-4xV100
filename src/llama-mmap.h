@@ -31,6 +31,19 @@ struct llama_file {
     void read_aligned_chunk(void * dest, size_t size);
     uint32_t read_u32();
 
+    // positional read: does not use or disturb the shared file position, so several threads may
+    // call it concurrently on the same llama_file. leaves the file position undefined - always
+    // seek() before going back to the sequential read_raw() path.
+    //
+    // concurrent calls on ONE llama_file are safe but not parallel: on Windows the I/O manager
+    // serialises every request on a synchronous file object. use reopen() to give each thread its
+    // own handle when the point is to overlap the reads.
+    void read_raw_at(void * ptr, size_t len, size_t offset) const;
+
+    // open an independent handle on the same file, or nullptr if this llama_file was built from a
+    // FILE * and has no path to reopen
+    std::unique_ptr<llama_file> reopen() const;
+
     void write_raw(const void * ptr, size_t len) const;
     void write_u32(uint32_t val) const;
 

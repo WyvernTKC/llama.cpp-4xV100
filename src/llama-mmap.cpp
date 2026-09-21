@@ -84,7 +84,8 @@ struct llama_file::impl {
         return ret;
     }
 
-    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) {
+    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false)
+            : fname(fname), open_mode(mode) {
         fp = ggml_fopen(fname, mode);
         if (fp == NULL) {
             throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
@@ -144,6 +145,36 @@ struct llama_file::impl {
         }
     }
 
+    // ReadFile with an OVERLAPPED offset takes the position from the OVERLAPPED instead of the
+    // shared file pointer, so it is safe to call from several threads. note that it does NOT make
+    // those reads run in parallel: a handle opened without FILE_FLAG_OVERLAPPED is a synchronous
+    // file object and the I/O manager serialises every request on it. measured on an SMB share,
+    // 1/4/8 threads sharing one handle all give 4.5 Gbps, while a handle *per thread* gives 8.3.
+    // so to actually overlap reads, give each thread its own llama_file via reopen().
+    void read_raw_at(void * ptr, size_t len, size_t offset) const {
+        size_t bytes_read = 0;
+        while (bytes_read < len) {
+            const size_t chunk_size = std::min<size_t>(len - bytes_read, 64*1024*1024);
+            const size_t pos = offset + bytes_read;
+
+            OVERLAPPED ov = {};
+            ov.Offset     = (DWORD) (pos & 0xFFFFFFFFull);
+            ov.OffsetHigh = (DWORD) (pos >> 32);
+
+            DWORD chunk_read = 0;
+            BOOL result = ReadFile(fp_win32, reinterpret_cast<char *>(ptr) + bytes_read,
+                    (DWORD) chunk_size, &chunk_read, &ov);
+            if (!result) {
+                throw std::runtime_error(format("read error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
+            }
+            if (chunk_read < chunk_size || chunk_read == 0) {
+                throw std::runtime_error("unexpectedly reached end of file");
+            }
+
+            bytes_read += chunk_read;
+        }
+    }
+
     uint32_t read_u32() {
         uint32_t val;
         read_raw(&val, sizeof(val));
@@ -180,8 +211,12 @@ struct llama_file::impl {
             std::fclose(fp);
         }
     }
+
+    std::string fname;
+    std::string open_mode;
 #else
-    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname) {
+    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false)
+            : fname(fname), open_mode(mode), direct_io_requested(use_direct_io) {
 #ifdef __linux__
         // Try unbuffered I/O for read only
         if (use_direct_io && std::strcmp(mode, "rb") == 0) {
@@ -349,6 +384,66 @@ struct llama_file::impl {
         }
     }
 
+    // pread the whole range; pad with zeroes if it runs past EOF and pad_eof is set (only the
+    // alignment tail of a direct-io read is allowed to do that)
+    void pread_all(int rfd, void * ptr, size_t len, off_t offset, bool pad_eof) const {
+        size_t bytes_read = 0;
+        while (bytes_read < len) {
+            const ssize_t ret = ::pread(rfd, reinterpret_cast<char *>(ptr) + bytes_read,
+                    len - bytes_read, offset + (off_t) bytes_read);
+            if (ret == -1) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                throw std::runtime_error(format("read error: %s", strerror(errno)));
+            }
+            if (ret == 0) {
+                if (pad_eof && (size_t) (offset + (off_t) bytes_read) >= size) {
+                    std::memset(reinterpret_cast<char *>(ptr) + bytes_read, 0, len - bytes_read);
+                    return;
+                }
+                throw std::runtime_error("unexpectedly reached end of file");
+            }
+            bytes_read += (size_t) ret;
+        }
+    }
+
+    // positional read; safe to call concurrently, see the declaration in llama-mmap.h
+    void read_raw_at(void * ptr, size_t len, size_t offset) const {
+        if (len == 0) {
+            return;
+        }
+        errno = 0;
+
+        if (has_direct_io()) {
+            // O_DIRECT wants an aligned offset and buffer, so bounce this range through one
+            const off_t  aligned_offset = (off_t) offset & ~(off_t) (alignment - 1);
+            const size_t skip           = offset - (size_t) aligned_offset;
+            const size_t bytes_to_read  = (skip + len + alignment - 1) & ~(alignment - 1);
+
+            void * raw_buffer = nullptr;
+            const int ret = posix_memalign(&raw_buffer, alignment, bytes_to_read);
+            if (ret != 0) {
+                throw std::runtime_error(format("posix_memalign failed with error %d", ret));
+            }
+            struct aligned_buffer_deleter {
+                void operator()(void * p) const { free(p); }
+            };
+            std::unique_ptr<void, aligned_buffer_deleter> buffer(raw_buffer);
+
+            pread_all(fd, buffer.get(), bytes_to_read, aligned_offset, true);
+            std::memcpy(ptr, reinterpret_cast<char *>(buffer.get()) + skip, len);
+            return;
+        }
+
+#if defined(fileno)
+        const int rfd = fd != -1 ? fd : fileno(fp);
+#else
+        const int rfd = fd != -1 ? fd : ::fileno(fp);
+#endif
+        pread_all(rfd, ptr, len, (off_t) offset, false);
+    }
+
     uint32_t read_u32() {
         uint32_t ret;
         read_raw(&ret, sizeof(ret));
@@ -383,6 +478,8 @@ struct llama_file::impl {
     }
     int fd = -1;
     std::string fname;
+    std::string open_mode;
+    bool direct_io_requested = false;
 #endif
 
     size_t read_alignment() const {
@@ -431,6 +528,28 @@ void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw(ptr, 
 #else
 void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsafe(ptr, len); }
 #endif
+
+void llama_file::read_raw_at(void * ptr, size_t len, size_t offset) const { pimpl->read_raw_at(ptr, len, offset); }
+
+std::unique_ptr<llama_file> llama_file::reopen() const {
+    if (pimpl->fname.empty()) {
+        // constructed from a FILE * we do not own - there is no path to open again
+        return nullptr;
+    }
+
+#if defined(_WIN32)
+    const bool direct_io = false;
+#else
+    const bool direct_io = pimpl->direct_io_requested;
+#endif
+
+    try {
+        return std::make_unique<llama_file>(pimpl->fname.c_str(), pimpl->open_mode.c_str(), direct_io);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_DEBUG("%s: could not reopen %s: %s\n", __func__, pimpl->fname.c_str(), err.what());
+        return nullptr;
+    }
+}
 
 uint32_t llama_file::read_u32() { return pimpl->read_u32(); }
 
