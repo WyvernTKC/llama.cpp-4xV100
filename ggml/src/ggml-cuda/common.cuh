@@ -1570,6 +1570,31 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    // q8_1-quantized copies of matmul inputs, reused by later matmuls that read the same tensor.
+    // One norm output typically feeds several projections, which would otherwise quantize it once
+    // each. Entries live for one graph_compute and own their pool allocation until it ends.
+    struct q8_1_input {
+        const ggml_tensor * src1 = nullptr;
+        int64_t ne[GGML_MAX_DIMS] = {0};
+        int64_t nb[GGML_MAX_DIMS] = {0};
+        int64_t ne_padded = 0;
+        int stream_no = -1; // reuse only on the producing stream, nothing orders the other ones
+        std::unique_ptr<ggml_cuda_pool_alloc<char>> buf;
+    };
+
+    std::unordered_map<const void *, q8_1_input> q8_1_inputs;
+
+    // a node is about to overwrite this buffer, so any quantized copy of it is stale
+    void q8_1_input_invalidate(const void * data) {
+        if (!q8_1_inputs.empty()) {
+            q8_1_inputs.erase(data);
+        }
+    }
+
+    void q8_1_input_reset() {
+        q8_1_inputs.clear();
+    }
 };
 
 struct ggml_cuda_mm_fusion_args_host {

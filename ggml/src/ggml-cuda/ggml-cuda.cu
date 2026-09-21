@@ -4717,9 +4717,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                cuda_ctx->q8_1_input_invalidate(node->data);
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    for (int j = i; j <= i + nodes_to_skip; j++) {
+                        cuda_ctx->q8_1_input_invalidate(cgraph->nodes[j]->data);
+                    }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -4816,6 +4821,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    // every tensor is written again this pass, so no quantized copy from the last one survives
+    cuda_ctx->q8_1_input_reset();
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
