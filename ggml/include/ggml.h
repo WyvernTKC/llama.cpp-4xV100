@@ -2684,6 +2684,11 @@ extern "C" {
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
 
+    // the score matmul runs in reduced precision by default; GGML_PREC_F32 asks for a full f32 accumulation
+    GGML_API void ggml_lightning_indexer_set_prec(
+            struct ggml_tensor * a,
+            enum ggml_prec       prec);
+
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
     // using a richer representation through streams.

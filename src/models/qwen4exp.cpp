@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
@@ -736,6 +737,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
     return ggml_mul(ctx0, normalized, gated);
 }
 
+// LLAMA_QSA_FUSED_MIN_TOKENS: tokens per stream from which the QSA indexer scores with one lightning-indexer op
+//   over per-cell keys instead of the block matmul plus a per-layer expansion of the scores. Off by default:
+//   on 4x V100 it is +2.5% prefill at 64k context (+4.8% with LLAMA_QSA_FUSED_F16), and the top-k picks move
+//   with the scoring arithmetic, wikitext PPL 2.5956 -> 2.5984 (f32) / 2.6031 (f16) over 3 chunks at n_ctx 8192.
+static int64_t qwen4exp_qsa_fused_min_tokens() {
+    static const int64_t n = [] {
+        const char * env = getenv("LLAMA_QSA_FUSED_MIN_TOKENS");
+        return env ? atoll(env) : 0;
+    }();
+    return n;
+}
+
 // QSA attends to a budget of whole blocks of compress_ratio tokens, plus the incomplete tail
 // one mean-pooled indexer key scores each block; set_input resolves the cache layout
 class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
@@ -747,6 +760,10 @@ public:
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
         mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+        if (ones != nullptr) {
+            std::vector<float> v(ggml_nelements(ones), 1.0f);
+            ggml_backend_tensor_set(ones, v.data(), 0, ggml_nbytes(ones));
+        }
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -772,6 +789,7 @@ public:
         res &= blk_pos->ne[0]   == 4*n_blocks*n_stream;
         res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
         res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
+        res &= ones == nullptr || ones->ne[1] == params.ubatch.n_tokens/n_stream;
 
         return res;
     }
@@ -782,6 +800,11 @@ public:
     ggml_tensor * blk_cells = nullptr;   // I32 [ratio*n_blocks, n_stream]
     ggml_tensor * blk_pos   = nullptr;   // I32 [4*n_blocks*n_stream]
     ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
+    ggml_tensor * ones      = nullptr;   // F32 [n_idx_h, n_tokens/n_stream, 1, n_stream], fused path only
+
+    // fused path: the per-cell mask (bias expanded to cells plus the KQ mask) does not depend on the layer,
+    //   so the layers sharing this input share one
+    ggml_tensor * fused_mask = nullptr;  // F16 [n_kv, n_tokens/n_stream, 1, n_stream]
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t ratio;
@@ -821,6 +844,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
         cparams.causal_attn && !hparams.use_alibi;
 
+    // Fused scoring: one lightning-indexer op over per-cell keys replaces the block matmul and the per-layer
+    //   expansion of the block scores to cells. Under -sm tensor the meta backend splits that op by query token
+    //   (handle_lightning_indexer) and the top-k rows are gathered back, so the mirrored indexer work drops
+    //   n_devices-fold. The per-cell keys cost compress_ratio times the block matmul on one device, so only
+    //   a large batch takes it.
+    const int64_t fused_min = qwen4exp_qsa_fused_min_tokens();
+    const bool    fused     = cparams.fused_lid && fused_min > 0 && n_tps >= fused_min;
+
     // nothing above depends on the layer, so the layers sharing a ratio share one input set
     llm_graph_input_qsa * inp = nullptr;
 
@@ -840,6 +871,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_set_input(qsa->blk_cells);
         ggml_set_input(qsa->blk_pos);
         ggml_set_input(qsa->bias);
+
+        if (fused) {
+            qsa->ones = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_idx_h, n_tps, 1, n_stream);
+            ggml_set_input(qsa->ones);
+        }
 
         inp = qsa.get();
         res->add_input(std::move(qsa));
@@ -892,6 +928,58 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ext_factor, attn_factor, beta_fast, beta_slow);
     cb(q, "indexer_q", il);
 
+    // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
+    const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
+
+    if (fused) {
+        // every cell scores against its block's pooled key: the same value the expansion below would copy
+        ggml_tensor * k_cells = ggml_get_rows(ctx0, pooled, inp->cell_blk);
+        k_cells = ggml_reshape_4d(ctx0, k_cells, idx_dim, 1, n_kv, n_stream);
+        cb(k_cells, "indexer_k_cells", il);
+
+        if (inp->fused_mask == nullptr) {
+            ggml_tensor * m = nullptr;
+            if (blk_bias) {
+                ggml_tensor * bias_t = ggml_cont(ctx0, ggml_permute(ctx0, inp->bias, 1, 0, 2, 3));
+                m = ggml_get_rows(ctx0, bias_t, inp->cell_blk);
+                m = ggml_cont(ctx0, ggml_permute(ctx0, m, 1, 0, 2, 3));
+                ggml_tensor * mask = kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+                m = ggml_add(ctx0, m, ggml_reshape_3d(ctx0, mask, n_kv, n_tps, n_stream));
+            } else {
+                m = inp->bias;
+            }
+            // the forced-block bias is 1e9, past f16; -inf has to stay -inf
+            m = ggml_clamp(ctx0, m, -INFINITY, 60000.0f);
+            m = ggml_cast(ctx0, m, GGML_TYPE_F16);
+            inp->fused_mask = ggml_reshape_4d(ctx0, m, n_kv, n_tps, 1, n_stream);
+            cb(inp->fused_mask, "indexer_mask", il);
+        }
+
+        ggml_tensor * q4    = ggml_reshape_4d(ctx0, q, idx_dim, n_idx_h, n_tps, n_stream);
+        ggml_tensor * score = ggml_lightning_indexer(ctx0, q4, k_cells, inp->ones, inp->fused_mask);
+        // LLAMA_QSA_FUSED_F16=1 takes the tensor-core product; the default keeps the f32 scores of the block matmul
+        static const bool prec_f16 = getenv("LLAMA_QSA_FUSED_F16") != nullptr;
+        if (!prec_f16) {
+            ggml_lightning_indexer_set_prec(score, GGML_PREC_F32);
+        }
+        cb(score, "indexer_score_tokens", il);
+        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
+
+        ggml_tensor * top_k = ggml_top_k(ctx0, score, width);
+
+        // Under -sm tensor each device scored a slice of the queries and every device needs all rows for the mask.
+        //   The all-gather concatenates along dim 0, so hand it the token-major flattening: one contiguous block
+        //   per device. On one device, or when the indexer stayed mirrored, this is a plain copy.
+        ggml_tensor * flat = ggml_cont(ctx0, ggml_reshape_2d(ctx0, top_k, width*n_tps, n_stream));
+        flat->flags |= GGML_TENSOR_FLAG_MIRRORED;
+        cb(flat, "indexer_top_k_gathered", il);
+
+        top_k = ggml_reshape_4d(ctx0, flat, width, n_tps, 1, n_stream);
+        cb(top_k, "indexer_top_k", il);
+
+        return top_k;
+    }
+
     // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
     // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
     ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
@@ -928,9 +1016,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         expanded = ggml_add(ctx0, expanded, inp->bias);
     }
     cb(expanded, "indexer_score_tokens", il);
-
-    // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
-    const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
 
     ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
 

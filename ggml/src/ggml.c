@@ -6465,6 +6465,14 @@ struct ggml_tensor * ggml_lightning_indexer(
     return result;
 }
 
+void ggml_lightning_indexer_set_prec(
+        struct ggml_tensor * a,
+        enum ggml_prec       prec) {
+    GGML_ASSERT(a->op == GGML_OP_LIGHTNING_INDEXER);
+
+    ggml_set_op_params_i32(a, 0, (int32_t) prec);
+}
+
 // ggml_dsv4_hc_comb
 
 struct ggml_tensor * ggml_dsv4_hc_comb(

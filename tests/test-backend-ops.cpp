@@ -11132,6 +11132,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // the qwen4exp QSA indexer: 4 heads, no wmma/vec instantiation, so the cuBLAS path at any batch size
+    for (int bs : { 1, 8, 256 }) {
+        for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+            test_cases.emplace_back(new test_lightning_indexer(128, 4, 4096, bs, 1, 1, type_K));
+        }
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER

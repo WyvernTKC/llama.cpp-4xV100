@@ -436,7 +436,35 @@ static __global__ void lightning_indexer_gemm_reduce(
     dst[ib*sd + i_kv] = s + __half2float(M[ib*sm + i_kv]);
 }
 
+// the strides the cuBLAS path can read; no constraint on the head count
+static bool ggml_cuda_lightning_indexer_gemm_ok(const ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+
+    const int64_t n_embd = q->ne[0];
+    const int64_t n_head = q->ne[1];
+    const size_t  tsk    = ggml_type_size(k->type);
+
+    // Q columns (one per head of each token) and K rows must be on a regular stride
+    if (q->nb[1] % sizeof(float) != 0 || q->nb[1]/sizeof(float) < (size_t) n_embd || q->nb[2] != (size_t) n_head*q->nb[1]) {
+        return false;
+    }
+    if (k->nb[2] % tsk != 0 || k->nb[2]/tsk < (size_t) n_embd) {
+        return false;
+    }
+    // K that is not F32 is converted first, which needs packed rows
+    const bool k_convert = k->type != GGML_TYPE_F32;
+    if (k_convert && (k->nb[2] != n_embd*tsk || ggml_get_to_fp32_cuda(k->type) == nullptr)) {
+        return false;
+    }
+    return true;
+}
+
 static bool ggml_cuda_lightning_indexer_gemm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (!ggml_cuda_lightning_indexer_gemm_ok(dst)) {
+        return false;
+    }
+
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * k = dst->src[1];
     const ggml_tensor * w = dst->src[2];
@@ -459,21 +487,15 @@ static bool ggml_cuda_lightning_indexer_gemm(ggml_backend_cuda_context & ctx, gg
 
     const size_t tsk = ggml_type_size(k->type);
 
-    // Q columns (one per head of each token) and K rows must be on a regular stride
-    if (nbq1 % sizeof(float) != 0 || nbq1/sizeof(float) < (size_t) n_embd || nbq2 != (size_t) n_head*nbq1) {
-        return false;
-    }
-    if (nbk2 % tsk != 0 || nbk2/tsk < (size_t) n_embd) {
-        return false;
-    }
-    // K that is not F32 is converted first, which needs packed rows
     const bool k_convert = k->type != GGML_TYPE_F32;
-    if (k_convert && (nbk2 != n_embd*tsk || ggml_get_to_fp32_cuda(k->type) == nullptr)) {
-        return false;
-    }
 
     const int64_t nb_chunk = std::max<int64_t>(1, std::min<int64_t>(
         n_batch, LID_GEMM_MAX_SCRATCH / ((int64_t) n_head*n_kv*(int64_t) sizeof(float))));
+
+    // the scores pick the top-k, so a caller may ask for the full f32 product instead of the tensor-core one
+    const bool prec_f32 = ggml_get_op_params_i32(dst, 0) == GGML_PREC_F32;
+    const cublasComputeType_t compute = prec_f32 ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_FAST_16F;
+    const cublasGemmAlgo_t    algo    = prec_f32 ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
 
     cudaStream_t   stream = ctx.stream();
     cublasHandle_t handle = ctx.cublas_handle();
@@ -509,7 +531,7 @@ static bool ggml_cuda_lightning_indexer_gemm(ggml_backend_cuda_context & ctx, gg
                     &alpha, k_ptr, CUDA_R_32F, ldk,
                             q_b,   CUDA_R_32F, (int) (nbq1/sizeof(float)),
                     &beta,  g_alloc.get(), CUDA_R_32F, (int) n_kv,
-                    CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                    compute, algo));
 
             const dim3 block(256, 1, 1);
             const dim3 grid((n_kv + 255)/256, nb, 1);
@@ -572,7 +594,15 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int device = ggml_cuda_get_device();
     const int cc     = ggml_cuda_info().devices[device].cc;
 
+    // the wmma/vec kernels exist for the DeepSeek indexer shapes only; other head counts (the qwen4exp QSA indexer
+    //   has 4) take the cuBLAS path, which ggml_cuda_lightning_indexer_supported admitted them for
+    const bool kernel_shape = n_embd == 128 && (n_head == 64 || n_head == 32);
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (!kernel_shape) {
+        GGML_ASSERT(ggml_cuda_lightning_indexer_gemm(ctx, dst));
+        return;
+    }
+
     // On Volta the wmma kernel below is the faster of the two for few query rows and the GEMM wins from about
     //   8 rows on - measured on a V100, cuBLAS/wmma is 0.5x at 1 row, 1.0x at 4 and 1.5-1.6x from 8 rows up,
     //   nearly flat in the kv size. F32 and BF16 keys have no wmma path at all and would run the scalar kernel
@@ -696,12 +726,13 @@ bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst) 
     GGML_TENSOR_LOCALS(int64_t, ne, dst, ne)
     GGML_TENSOR_LOCALS(size_t,  nb, dst, nb)
 
-    if (neq0 != 128) {
+    if (neq0 != 128 || (neq1 != 64 && neq1 != 32)) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        // no kernel instantiation for this shape: the cuBLAS path takes any head count
+        return ggml_cuda_lightning_indexer_gemm_ok(dst);
+#else
         return false;
-    }
-
-    if (neq1 != 64 && neq1 != 32) {
-        return false;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     }
 
     // alignment checks
