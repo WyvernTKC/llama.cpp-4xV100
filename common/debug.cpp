@@ -147,10 +147,6 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     const struct ggml_tensor * src0 = t->src[0];
     const struct ggml_tensor * src1 = t->src[1];
 
-    if (ask) {
-        return true;  // Always retrieve data
-    }
-
     bool matches_filter = pimpl->tensor_filters.empty();
 
     if (!matches_filter) {
@@ -160,6 +156,10 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
                 break;
             }
         }
+    }
+
+    if (ask) {
+        return matches_filter; // only retrieve the tensors that will be printed
     }
 
     char src1_str[128] = { 0 };
@@ -175,7 +175,7 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
 
     const bool is_host = ggml_backend_buffer_is_host(t->buffer);
 
-    if (!is_host) {
+    if (!is_host && matches_filter) {
         auto n_bytes = ggml_nbytes(t);
         pimpl->data.resize(n_bytes);
         ggml_backend_tensor_get(t, pimpl->data.data(), 0, n_bytes);
