@@ -1938,14 +1938,10 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
 
                 // The offset can be internal to the data split, in those cases the view offset should not be scaled.
                 // If however, the offset is larger than the data split then it needs to be scaled proportionally.
-                bool split_internal_offset = t_ij->view_offs <= tensor->view_src->nb[split_dim_view_src];
-                for (int i = 0; i < GGML_MAX_DIMS; i++) {
-                    const size_t dim_size = tensor->ne[i] * tensor->nb[i];
-                    if (tensor->view_offs <= dim_size && dim_size < tensor->nb[split_dim]) {
-                        split_internal_offset = true;
-                        break;
-                    }
-                }
+                // An offset that stays inside the first slice of the split dim addresses the same bytes on every device,
+                //   e.g. the v part of a fused per-head [q|k|v] projection viewed with the head as the split dim.
+                const bool split_internal_offset = t_ij->view_offs <= tensor->view_src->nb[split_dim_view_src] ||
+                                                   t_ij->view_offs <  tensor->nb[split_dim];
                 if (!split_internal_offset) {
                     t_ij->view_offs = t_ij->view_offs * ne[split_dim]/tensor->ne[split_dim];
                 }
