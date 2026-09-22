@@ -76,33 +76,24 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
 
     size_t temp_storage_bytes = 0;
 
-    bool is_capturing = false;
-#ifdef USE_CUDA_GRAPH
-    // Currently (confirmed for CCCL <= 3.2) DeviceSegmentedSort does not support stream capture, while DeviceSegmentedRadixSort does.
+    // DeviceSegmentedSort bins the segments by size and reads the bin counts back with a blocking
+    // D2H copy, which stalls the calling thread until the stream drains. On a backend that streams
+    // weights over PCIe that stall stops the host from queueing the next copies. Our segments are
+    // all ncols long, so the binning buys nothing. DeviceSegmentedRadixSort never syncs, and it is
+    // also the only one of the two that supports stream capture (CCCL <= 3.2), so use it always.
     // See https://github.com/NVIDIA/cccl/issues/5661#issuecomment-3229037149
-    // TODO: constrain this to the CCCL versions that have this issue once it's resolved in a future CCCL release.
-    cudaStreamCaptureStatus capture_status;
-    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
-    is_capturing = (capture_status != cudaStreamCaptureStatusNone);
-#endif  // USE_CUDA_GRAPH
 
     if (order == GGML_SORT_ORDER_ASC) {
         if (nrows == 1) {
             CUDA_CHECK(DeviceRadixSort::SortPairs(nullptr, temp_storage_bytes, temp_keys, temp_keys_out,  // keys in, keys out
                                                   temp_indices, dst,  // values (indices)
                                                   ncols, 0, sizeof(float) * 8, stream));
-        } else if (is_capturing) {
+        } else {
             CUDA_CHECK(DeviceSegmentedRadixSort::SortPairs(
                 nullptr, temp_storage_bytes, temp_keys, temp_keys_out,  // keys in, keys out
                 temp_indices, dst,                                  // values (indices)
                 ncols * nrows, nrows,                               // num items, num segments
                 offset_iterator, offset_iterator + 1, 0, sizeof(float) * 8, stream));
-        } else {
-            CUDA_CHECK(DeviceSegmentedSort::SortPairs(nullptr, temp_storage_bytes, temp_keys,
-                                                      temp_keys_out, // keys out
-                                                      temp_indices, dst,     // values (indices)
-                                                      ncols * nrows, nrows,  // num items, num segments
-                                                      offset_iterator, offset_iterator + 1, stream));
         }
     } else {
         if (nrows == 1) {
@@ -110,14 +101,10 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
                                                             temp_keys_out, // keys out
                                                             temp_indices, dst,  // values (indices)
                                                             ncols, 0, sizeof(float) * 8, stream));
-        } else if (is_capturing) {
+        } else {
             CUDA_CHECK(DeviceSegmentedRadixSort::SortPairsDescending(
                 nullptr, temp_storage_bytes, temp_keys, temp_keys_out, temp_indices, dst, ncols * nrows, nrows,
                 offset_iterator, offset_iterator + 1, 0, sizeof(float) * 8, stream));
-        } else {
-            CUDA_CHECK(DeviceSegmentedSort::SortPairsDescending(nullptr, temp_storage_bytes, temp_keys, temp_keys_out,
-                                                                temp_indices, dst, ncols * nrows, nrows,
-                                                                offset_iterator, offset_iterator + 1, stream));
         }
     }
 
@@ -130,14 +117,10 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
                                                   temp_keys_out, // keys out
                                                   temp_indices, dst,  // values (indices)
                                                   ncols, 0, sizeof(float) * 8, stream));
-        } else if (is_capturing) {
+        } else {
             CUDA_CHECK(DeviceSegmentedRadixSort::SortPairs(d_temp_storage, temp_storage_bytes, temp_keys, temp_keys_out,
                                                            temp_indices, dst, ncols * nrows, nrows, offset_iterator,
                                                            offset_iterator + 1, 0, sizeof(float) * 8, stream));
-        } else {
-            CUDA_CHECK(DeviceSegmentedSort::SortPairs(d_temp_storage, temp_storage_bytes, temp_keys, temp_keys_out,
-                                                      temp_indices, dst, ncols * nrows, nrows, offset_iterator,
-                                                      offset_iterator + 1, stream));
         }
     } else {
         if (nrows == 1) {
@@ -145,14 +128,10 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
                                                             temp_keys_out, // keys out
                                                             temp_indices, dst,  // values (indices)
                                                             ncols, 0, sizeof(float) * 8, stream));
-        } else if (is_capturing) {
+        } else {
             CUDA_CHECK(DeviceSegmentedRadixSort::SortPairsDescending(
                 d_temp_storage, temp_storage_bytes, temp_keys, temp_keys_out, temp_indices, dst, ncols * nrows, nrows,
                 offset_iterator, offset_iterator + 1, 0, sizeof(float) * 8, stream));
-        } else {
-            CUDA_CHECK(DeviceSegmentedSort::SortPairsDescending(d_temp_storage, temp_storage_bytes, temp_keys,
-                                                                temp_keys_out, temp_indices, dst, ncols * nrows, nrows,
-                                                                offset_iterator, offset_iterator + 1, stream));
         }
     }
 }
