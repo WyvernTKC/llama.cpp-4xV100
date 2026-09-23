@@ -1111,6 +1111,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int  nwarps = calc_nwarps(type, c_ncols_dst, table_id);
         bool       use    = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
 
+        // On Volta the rows sharing a block reuse the activations and keep more loads in flight at any K, and
+        // each row still sums in the same order. It only loses once the grid drops below ~8 blocks per SM
+        // (measured, one token: q4_K 17408x5120 -17%, MoE mxfp4 512x4096 x6 -17%, q8_0 256x4096 +15%).
+        const bool is_nvidia_volta = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA && cc < GGML_CUDA_CC_TURING;
+        if (is_nvidia_volta && c_ncols_dst == 1 && nwarps > 1) {
+            const int64_t nblocks = int64_t((nrows_x + nwarps - 1) / nwarps) * nchannels_dst * nsamples_dst;
+            use = use || nblocks >= 8*ggml_cuda_info().devices[device].nsm;
+        }
+
         constexpr std::array<ggml_type, 2> iq_slow_turing = {
             GGML_TYPE_IQ3_XXS,
             GGML_TYPE_IQ3_S,
