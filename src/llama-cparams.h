@@ -48,6 +48,8 @@ struct llama_cparams {
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;
     bool auto_fhc;
+    bool fused_qsa_pool;     // pool the qwen4exp QSA indexer keys with one ggml_get_rows_mean
+    bool auto_fqsa;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
