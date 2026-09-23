@@ -2853,6 +2853,9 @@ struct test_rms_norm_mul_rope : public test_case {
     const bool broadcast; // multiply by a 1D [ne0] weight, as model norm weights are
     const ggml_type set_rows_type;
     int mode;
+    const int n_rot; // rotated channels, 0 for all of them
+    const int n_offs; // ggml_rope_set_offset: the rotated channels start here
+    const bool reshape; // norm [ne0, ne2] rows, reshaped to [ne0, 1, ne2] before the rope (ne1 must be 1)
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -2862,17 +2865,27 @@ struct test_rms_norm_mul_rope : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR9(ne, eps, multi_add, mul, rope, set_rows, broadcast, mode, set_rows_type);
+        std::string res = VARS_TO_STR9(ne, eps, multi_add, mul, rope, set_rows, broadcast, mode, set_rows_type);
+        if (n_rot != 0) {
+            res += "," + VARS_TO_STR1(n_rot);
+        }
+        if (n_offs != 0 || reshape) {
+            res += "," + VARS_TO_STR2(n_offs, reshape);
+        }
+        return res;
     }
 
     test_rms_norm_mul_rope(std::array<int64_t, 4> ne, float eps = 1e-6f, bool multi_add = false,
                            bool set_rows = false, bool broadcast = false, int mode = GGML_ROPE_TYPE_NORMAL,
-                           bool mul = true, bool rope = true, ggml_type set_rows_type = GGML_TYPE_F16)
+                           bool mul = true, bool rope = true, ggml_type set_rows_type = GGML_TYPE_F16, int n_rot = 0,
+                           int n_offs = 0, bool reshape = false)
         : ne(ne), eps(eps), multi_add(multi_add), mul(mul), rope(rope), set_rows(set_rows), broadcast(broadcast),
-          set_rows_type(set_rows_type), mode(mode) {}
+          set_rows_type(set_rows_type), mode(mode), n_rot(n_rot), n_offs(n_offs), reshape(reshape) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+        GGML_ASSERT(!reshape || (ne[1] == 1 && broadcast && !multi_add));
+        ggml_tensor * a = reshape ? ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[2], 1, ne[3])
+                                  : ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
 
         ggml_tensor * b = nullptr;
         ggml_tensor * c = nullptr;
@@ -2898,16 +2911,27 @@ struct test_rms_norm_mul_rope : public test_case {
             a = ggml_mul(ctx, a, w);
         }
 
+        if (reshape) {
+            a = ggml_reshape_4d(ctx, a, ne[0], 1, ne[2], ne[3]);
+        }
+
         if (rope) {
             const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;
             ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ne[2] * (is_mrope ? 4 : 1));
 
             if (is_mrope) {
-                const int n_dims = ne[0];
+                const int n_dims = n_rot != 0 ? n_rot : ne[0];
+                // a partial rotation takes the Qwen3.5 text sections, whose pairs fill n_dims = 64
                 int sections[4] = { n_dims/3, n_dims/3, n_dims/3, 0 };
+                if (n_rot != 0) {
+                    sections[0] = 11; sections[1] = 11; sections[2] = 10;
+                }
                 a = ggml_rope_multi(ctx, a, pos, nullptr, n_dims, sections, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
             } else {
-                a = ggml_rope(ctx, a, pos, ne[0], mode);
+                a = ggml_rope(ctx, a, pos, n_rot != 0 ? n_rot : ne[0], mode);
+            }
+            if (n_offs != 0) {
+                a = ggml_rope_set_offset(a, n_offs);
             }
         }
 
@@ -10081,6 +10105,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));
+    // DeepSeek V4 rotates the last 64 of 512 channels: the q heads are normed without a weight, the kv norm is
+    //   reshaped into one head, the compressed kv goes straight into its cache
+    for (auto set_rows : {false, true}) {
+        test_cases.emplace_back(new test_rms_norm_mul_rope({512, 16, 3, 1}, 1e-6f, false, set_rows, false, GGML_ROPE_TYPE_NORMAL, false, true, GGML_TYPE_F16, 64, 448));
+        test_cases.emplace_back(new test_rms_norm_mul_rope({512, 1, 3, 1}, 1e-6f, false, set_rows, true, GGML_ROPE_TYPE_NORMAL, true, true, GGML_TYPE_F16, 64, 448, true));
+        test_cases.emplace_back(new test_rms_norm_mul_rope({512, 1, 2, 1}, 1e-6f, false, set_rows, true, GGML_ROPE_TYPE_NORMAL, true, true, GGML_TYPE_F16, 64, 448));
+    }
+    // a partial rotation, as the Qwen3.5 q/k norms have: 64 of 256 channels, the rest passed through
+    for (auto mode : {GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_IMROPE}) {
+        for (auto set_rows : {false, true}) {
+            test_cases.emplace_back(new test_rms_norm_mul_rope({256, 4, 3, 1}, 1e-6f, false, set_rows, true, mode, true, true, GGML_TYPE_F16, 64));
+            test_cases.emplace_back(new test_rms_norm_mul_rope({256, 16, 1, 1}, 1e-6f, false, set_rows, true, mode, true, true, GGML_TYPE_F16, 64));
+        }
+    }
 
     for (auto multi_add : {false, true}) {
         for (auto set_rows : {false, true}) {
