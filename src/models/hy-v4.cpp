@@ -415,7 +415,7 @@ ggml_tensor * llama_model_hy_v4::graph::build_indexer_top_k(
 
     const uint32_t n_top_k = score->ne[0] < (int64_t) hparams.indexer_top_k ? score->ne[0] : hparams.indexer_top_k;
 
-    return ggml_cont(ctx0, ggml_top_k(ctx0, score, n_top_k));
+    return ggml_top_k(ctx0, score, n_top_k);
 }
 
 ggml_tensor * llama_model_hy_v4::graph::build_attention_dsa(

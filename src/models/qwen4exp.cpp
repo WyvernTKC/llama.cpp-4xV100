@@ -1017,7 +1017,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     }
     cb(expanded, "indexer_score_tokens", il);
 
-    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
+    ggml_tensor * top_k = ggml_top_k(ctx0, expanded, width);
 
     // build_attn_qsa reads [n_top_k, n_batch, 1, n_stream], matching the KQ mask.
     top_k = ggml_reshape_4d(ctx0, top_k, width, n_tps, 1, n_stream);

@@ -318,7 +318,7 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
 
                 // get indices of top k indexer scores
                 uint32_t n_top_k = indexer_score->ne[0] < n_indexer_top_k ? indexer_score->ne[0] : n_indexer_top_k;
-                top_k = ggml_cont(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));
+                top_k = ggml_top_k(ctx0, indexer_score, n_top_k);
                 cb(top_k, "top_k", il);
             }
 
