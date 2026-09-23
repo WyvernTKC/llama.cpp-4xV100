@@ -28,6 +28,28 @@ static __device__ __forceinline__ int get_int_b4(const void * x, const int & i32
     return ((const int *) x)[i32]; // assume at least 4 byte alignment
 }
 
+// n consecutive ints from a byte-aligned buffer as aligned 32-bit loads shifted into place, where get_int_b1
+// costs four byte loads per int. Only an unaligned run reads one word more, which ends inside the aligned
+// word holding the run's last byte, so nothing past the buffer's size rounded up to 4 bytes is read.
+template <int n>
+static __device__ __forceinline__ void get_ints_b1_aligned(const void * x, int * dst) {
+    const uintptr_t  addr  = (uintptr_t) x;
+    const uint32_t * p     = (const uint32_t *) (addr & ~(uintptr_t) 3);
+    const uint32_t   shift = 8*(addr & 3);
+
+    uint32_t w[n + 1];
+#pragma unroll
+    for (int l = 0; l < n; ++l) {
+        w[l] = p[l];
+    }
+    w[n] = p[shift ? n : n - 1];
+
+#pragma unroll
+    for (int l = 0; l < n; ++l) {
+        dst[l] = (int) (((uint64_t) w[l + 1] << 32 | w[l]) >> shift);
+    }
+}
+
 // q4 contains 8 indices with 4 bit each.
 // This function selects those bytes from table that are at those indices and returns them as int2.
 // The first int contains the bytes with even indices in q4, the second int contains the bytes with odd indices in q4.
@@ -314,11 +336,14 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
 
     const int * q8 = (const int *) bq8_1->qs + iqs;
 
+    // the 17-byte blocks leave the nibbles byte-aligned
+    int aux_q4[VDR_MXFP4_Q8_1_MMVQ];
+    get_ints_b1_aligned<VDR_MXFP4_Q8_1_MMVQ>(bq4->qs + 4*iqs, aux_q4);
+
     int sumi = 0;
 #pragma unroll
     for (int l = 0; l < VDR_MXFP4_Q8_1_MMVQ; ++l) {
-        const int aux_q4 = get_int_b1(bq4->qs, iqs + l);
-        const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+        const int2 v = get_int_from_table_16(aux_q4[l], kvalues_mxfp4);
 
         sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
         sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);

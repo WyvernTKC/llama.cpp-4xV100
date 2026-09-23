@@ -1593,7 +1593,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
         const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i*stride + kbx;
 
-        const int aux_q4 = get_int_b1(bxi->qs, kqsx);
+        int aux_q4;
+        get_ints_b1_aligned<1>(bxi->qs + 4*kqsx, &aux_q4);
         const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
         const int k0 = kbx * (2 * QI_MXFP4) + kqsx;
 
