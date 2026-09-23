@@ -5260,6 +5260,73 @@ void ggml_compute_forward_get_rows(
     //}
 }
 
+// ggml_compute_forward_get_rows_mean
+
+void ggml_compute_forward_get_rows_mean(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int n_group = ggml_get_op_params_i32(dst, 0);
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(nb00 == ggml_type_size(src0->type));
+    GGML_ASSERT(ne10 == n_group*ne1);
+
+    ggml_to_float_t const to_float = src0->type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(src0->type)->to_float;
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || to_float != nullptr);
+
+    const int64_t nc = ne00;
+    const int64_t nr = ggml_nrows(dst);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    float * tmp = (float *) params->wdata + (nc + CACHE_LINE_SIZE_F32) * ith;
+
+    for (int64_t i = ir0; i < ir1; ++i) {
+        const int64_t i12 = i/(ne11*ne1);
+        const int64_t i11 = (i - i12*ne11*ne1)/ne1;
+        const int64_t i1  =  i - i12*ne11*ne1 - i11*ne1;
+
+        float * dst_row = (float *) ((char *) dst->data + i1*nb1 + i11*nb2 + i12*nb3);
+
+        // add the rows in index order, then scale, the same arithmetic as get_rows + add + scale
+        for (int g = 0; g < n_group; ++g) {
+            const int64_t i10 = i1*n_group + g;
+            const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+
+            GGML_ASSERT(i01 >= 0 && i01 < ne01);
+
+            const char * src_row = (const char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03;
+            float * row = g == 0 ? dst_row : tmp;
+            if (to_float) {
+                to_float(src_row, row, nc);
+            } else {
+                memcpy(row, src_row, nc*sizeof(float));
+            }
+            if (g > 0) {
+                for (int64_t k = 0; k < nc; ++k) {
+                    dst_row[k] += tmp[k];
+                }
+            }
+        }
+
+        const float scale = 1.0f/n_group;
+        for (int64_t k = 0; k < nc; ++k) {
+            dst_row[k] *= scale;
+        }
+    }
+}
+
 template<typename src_t, typename idx_t>
 static void ggml_compute_forward_set_rows_impl(
         const ggml_compute_params * params,

@@ -585,6 +585,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_GET_ROWS_MEAN,
 
         GGML_OP_UNARY,
 
@@ -1734,6 +1735,14 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // data
             struct ggml_tensor  * b); // row indices
+
+    // mean of each group of n_group consecutive rows that b picks, as F32
+    // a [n_embd, ne1, ne2, ne3], b I32 [n_group*n_rows, ne2, ne3] -> [n_embd, n_rows, ne2, ne3]
+    GGML_API struct ggml_tensor * ggml_get_rows_mean(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // data
+            struct ggml_tensor  * b,  // row indices
+            int                   n_group);
 
     GGML_API struct ggml_tensor * ggml_get_rows_back(
             struct ggml_context * ctx,

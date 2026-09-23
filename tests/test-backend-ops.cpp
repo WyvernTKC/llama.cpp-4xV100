@@ -2434,6 +2434,60 @@ struct test_get_rows : public test_case {
     }
 };
 
+// GGML_OP_GET_ROWS_MEAN
+struct test_get_rows_mean : public test_case {
+    const ggml_type type;
+    const int n;       // cols
+    const int m;       // rows in the source
+    const int n_out;   // rows out
+    const int n_group; // source rows averaged into each row out
+    const int be1;     // batch size
+    const int be2;     // batch size
+    const bool vs0;    // view src0 with a row offset
+
+    std::string vars() override {
+        return VARS_TO_STR8(type, n, m, n_out, n_group, be1, be2, vs0);
+    }
+
+    test_get_rows_mean(ggml_type type = GGML_TYPE_F32, int n = 128, int m = 20, int n_out = 5, int n_group = 4,
+            int be1 = 1, int be2 = 1, bool vs0 = false)
+        : type(type), n(n), m(m), n_out(n_out), n_group(n_group), be1(be1), be2(be2), vs0(vs0) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * in = ggml_new_tensor_4d(ctx, type, n, vs0 ? m + 3 : m, be1, be2);
+        ggml_set_name(in, "in");
+        if (vs0) {
+            in = ggml_view_4d(ctx, in, n, m, be1, be2, in->nb[1], in->nb[2], in->nb[3], 3*in->nb[1]);
+            ggml_set_name(in, "in_view");
+        }
+
+        ggml_tensor * rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_group*n_out, be1, be2);
+        ggml_set_name(rows, "rows");
+
+        ggml_tensor * out = ggml_get_rows_mean(ctx, in, rows, n_group);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = rand() % m;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GET_ROWS_BACK
 struct test_get_rows_back : public test_case {
     const ggml_type type;
@@ -9225,6 +9279,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16, 3, 50, 70, 2, 1, false, true, 2));
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 5, 40, 30, 2, 3, true));
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16, 8, 30, 40, 2, 1, false, false, 0, true));
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+        for (bool vs0 : {false, true}) {
+            test_cases.emplace_back(new test_get_rows_mean(type, 128, 50, 12, 4, 2, 1, vs0));
+        }
+    }
+    test_cases.emplace_back(new test_get_rows_mean(GGML_TYPE_F32, 6, 10, 3, 3, 2, 3));
+    test_cases.emplace_back(new test_get_rows_mean(GGML_TYPE_Q8_0, 128, 4096, 1024, 4));
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
         // 576 is the DeepSeek MLA cache row, but a row must hold whole blocks
         const int n_view = 576 % ggml_blck_size(type) == 0 ? 576 : 512;
@@ -11261,6 +11322,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // get_rows of one-float rows: the qwen4exp QSA score expansion at decode, and a MoE weight gather at prefill
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 22592, 90368));
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 128, 8, 2048));
+    // qwen4exp QSA key pooling at 90k context: 4 q8_0 cells per block
+    test_cases.emplace_back(new test_get_rows_mean(GGML_TYPE_Q8_0, 128, 90368, 22592, 4));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

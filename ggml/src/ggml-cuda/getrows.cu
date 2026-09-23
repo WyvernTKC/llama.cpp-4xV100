@@ -572,6 +572,126 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
 }
 
+// a pair of consecutive elements of a float row, in the shape of the dequantize_kernel_t with qk = qr = 1
+template<typename src_t>
+static __device__ __forceinline__ void dequantize_float_pair(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    GGML_UNUSED(iqs);
+    const src_t * x = (const src_t *) vx;
+    v.x = ggml_cuda_cast<float>(x[ib + 0]);
+    v.y = ggml_cuda_cast<float>(x[ib + 1]);
+}
+
+// one thread per pair of output elements: the n_group gathered members are added in index order and the
+// sum is scaled, the same arithmetic as get_rows + add + scale (__fadd_rn keeps the dequant multiply out of an FMA)
+template<int qk, int qr, dequantize_kernel_t dequantize_kernel>
+static __global__ void k_get_rows_mean(
+        const void * __restrict__ src0, const int32_t * __restrict__ src1, float * __restrict__ dst,
+        const int64_t n, const int n_group, const float scale,
+        const uint3 ne00h_fdv, const uint3 ne1_fdv, const uint3 ne2_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+
+    ggml_cuda_pdl_sync();
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x*blockDim.x) {
+        const uint2 r00 = fast_div_modulo((uint32_t) i, ne00h_fdv); // row, pair
+        const uint2 r1  = fast_div_modulo(r00.x, ne1_fdv);          // z,   i1
+        const uint2 r2  = fast_div_modulo(r1.x,  ne2_fdv);          // i12, i11
+        const int i00 = 2*r00.y;
+        const int i1  = r1.y;
+        const int i11 = r2.y;
+        const int i12 = r2.x;
+
+        const int ib   =  i00/qk;
+        const int iqs  = (i00%qk)/qr;
+        const int iybs = i00 - i00%qk;
+        const int y_offset = qr == 1 ? 1 : qk/2;
+
+        float2 acc = make_float2(0.0f, 0.0f);
+        for (int g = 0; g < n_group; ++g) {
+            const int i01 = src1[(i1*n_group + g)*s10 + i11*s11 + i12*s12];
+
+            float2 v;
+            dequantize_kernel((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03, ib, iqs, v);
+
+            acc.x = g == 0 ? v.x : __fadd_rn(acc.x, v.x);
+            acc.y = g == 0 ? v.y : __fadd_rn(acc.y, v.y);
+        }
+
+        float * dst_row = dst + i1*s1 + i11*s2 + i12*s3;
+        dst_row[iybs + iqs + 0]        = scale*acc.x;
+        dst_row[iybs + iqs + y_offset] = scale*acc.y;
+    }
+}
+
+template<int qk, int qr, dequantize_kernel_t dq>
+static void get_rows_mean_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const int n_group, cudaStream_t stream) {
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    // fastdiv sums two 32-bit terms, so the flat index must stay below 2^31
+    const int64_t n = (ne00/2)*ne1*ne2*ne3;
+    GGML_ASSERT(n <= std::numeric_limits<int32_t>::max());
+    if (n == 0) {
+        return;
+    }
+
+    const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
+    const dim3 block_nums((n + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
+
+    k_get_rows_mean<qk, qr, dq><<<block_nums, block_dims, 0, stream>>>(
+        src0->data, (const int32_t *) src1->data, (float *) dst->data,
+        n, n_group, 1.0f/n_group,
+        init_fastdiv_values(ne00/2), init_fastdiv_values(ne1), init_fastdiv_values(ne2),
+        nb1/sizeof(float), nb2/sizeof(float), nb3/sizeof(float),
+        nb01, nb02, nb03,
+        nb10/sizeof(int32_t), nb11/sizeof(int32_t), nb12/sizeof(int32_t));
+}
+
+bool ggml_cuda_get_rows_mean_supported(const ggml_tensor * op) {
+    if (op->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_I32 || op->src[0]->ne[0] % 2 != 0) {
+        return false;
+    }
+    switch (op->src[0]->type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+            return true;
+        default:
+            return false;
+    }
+}
+
+void ggml_cuda_op_get_rows_mean(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    const int n_group = ggml_get_op_params_i32(dst, 0);
+
+    GGML_ASSERT(ggml_cuda_get_rows_mean_supported(dst));
+    GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
+    GGML_ASSERT(src1->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(dst->nb[0]  == sizeof(float));
+
+    cudaStream_t stream = ctx.stream();
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:  get_rows_mean_cuda<1, 1, dequantize_float_pair<float>>      (src0, src1, dst, n_group, stream); break;
+        case GGML_TYPE_F16:  get_rows_mean_cuda<1, 1, dequantize_float_pair<half>>       (src0, src1, dst, n_group, stream); break;
+        case GGML_TYPE_BF16: get_rows_mean_cuda<1, 1, dequantize_float_pair<nv_bfloat16>>(src0, src1, dst, n_group, stream); break;
+        case GGML_TYPE_Q4_0: get_rows_mean_cuda<QK4_0, QR4_0, dequantize_q4_0>(src0, src1, dst, n_group, stream); break;
+        case GGML_TYPE_Q4_1: get_rows_mean_cuda<QK4_1, QR4_1, dequantize_q4_1>(src0, src1, dst, n_group, stream); break;
+        case GGML_TYPE_Q5_0: get_rows_mean_cuda<QK5_0, QR5_0, dequantize_q5_0>(src0, src1, dst, n_group, stream); break;
+        case GGML_TYPE_Q5_1: get_rows_mean_cuda<QK5_1, QR5_1, dequantize_q5_1>(src0, src1, dst, n_group, stream); break;
+        case GGML_TYPE_Q8_0: get_rows_mean_cuda<QK8_0, QR8_0, dequantize_q8_0>(src0, src1, dst, n_group, stream); break;
+        default: GGML_ABORT("%s: unsupported src0 type: %s\n", __func__, ggml_type_name(src0->type));
+    }
+}
+
 void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0]; // gradients of forward pass output
     const ggml_tensor * src1 = dst->src[1]; // src1 in forward pass

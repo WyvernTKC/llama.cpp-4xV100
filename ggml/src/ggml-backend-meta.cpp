@@ -1578,7 +1578,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_TRANSPOSE: {
                 split_state = handle_transpose(src_ss);
             } break;
-            case GGML_OP_GET_ROWS: {
+            case GGML_OP_GET_ROWS:
+            case GGML_OP_GET_ROWS_MEAN: {
                 split_state = handle_get_rows(src_ss);
             } break;
             case GGML_OP_GET_ROWS_BACK: {
