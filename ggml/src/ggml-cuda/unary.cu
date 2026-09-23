@@ -719,3 +719,47 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
     }
 }
+
+/* fused mul + add + sigmoid + scale */
+
+// every step rounds like its own kernel would, so the result is bit-identical to the unfused chain
+static __global__ void mul_add_sigmoid_scale_f32(const float * x, const float * m, const float * a, float * dst,
+        const int ne0, const int k, const int64_t s1, const int ne_m, const int ne_a, const float scale, const float bias) {
+    ggml_cuda_pdl_lc();
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    const int i0 = i % ne0;
+    const int i1 = i / ne0;
+    const float v = op_sigmoid(__fadd_rn(__fmul_rn(x[i1*s1 + i0], m[i0 % ne_m]), a[i0 % ne_a]));
+    dst[i] = scale * v + bias;
+}
+
+void ggml_cuda_op_mul_add_sigmoid_scale(ggml_backend_cuda_context & ctx, ggml_tensor * mul_node, ggml_tensor * add_node,
+        ggml_tensor * scale_node) {
+    const ggml_tensor * x = mul_node->src[0];
+    const ggml_tensor * m = mul_node->src[1];
+    const ggml_tensor * a = add_node->src[1];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && m->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale_node->type == GGML_TYPE_F32 && ggml_is_contiguous(scale_node));
+    GGML_ASSERT(x->nb[0] == sizeof(float) && ggml_nrows(x) == x->ne[1]);
+    GGML_ASSERT(ggml_is_contiguous(m) && ggml_nrows(m) == 1 && x->ne[0] % m->ne[0] == 0);
+    GGML_ASSERT(ggml_is_contiguous(a) && ggml_nrows(a) == 1 && x->ne[0] % a->ne[0] == 0);
+
+    float scale;
+    float bias;
+    memcpy(&scale, (const float *) scale_node->op_params + 0, sizeof(float));
+    memcpy(&bias,  (const float *) scale_node->op_params + 1, sizeof(float));
+
+    const int k = ggml_nelements(scale_node);
+    const int num_blocks = (k + CUDA_SIGMOID_BLOCK_SIZE - 1) / CUDA_SIGMOID_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_SIGMOID_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(mul_add_sigmoid_scale_f32, launch_params,
+        (const float *) x->data, (const float *) m->data, (const float *) a->data, (float *) scale_node->data,
+        (int) x->ne[0], k, (int64_t) (x->nb[1] / sizeof(float)), (int) m->ne[0], (int) a->ne[0], scale, bias);
+}

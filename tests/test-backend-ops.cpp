@@ -4179,6 +4179,72 @@ struct test_relu_sqr : public test_case {
     }
 };
 
+// GGML_OP_MUL + GGML_OP_ADD + GGML_OP_UNARY(SIGMOID) + GGML_OP_SCALE (fused operation), the DeepSeek V4
+// hyper-connection coefficients: a column slice of the mixes times a weight scalar plus a weight vector.
+struct test_mul_add_sigmoid_scale : public test_case {
+    const int64_t n_tokens;
+    const int64_t off; // first mixes column of the slice, -1 for the head (whole mixes, no views)
+    const float s;
+    const float b;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_ADD_SIGMOID_SCALE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    // the scale and base are model weights, and the fusion only accepts views of constant tensors
+    bool use_weight_context() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_tokens, off, s, b);
+    }
+
+    test_mul_add_sigmoid_scale(int64_t n_tokens = 1, int64_t off = 0, float s = 1.0f, float b = 0.0f)
+        : n_tokens(n_tokens), off(off), s(s), b(b) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_ASSERT(!use_weight_context());
+        return build_graph(ctx, nullptr);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        GGML_ASSERT(ctx_weights);
+        const int64_t hc = 4;
+
+        ggml_tensor * x;
+        ggml_tensor * m;
+        ggml_tensor * a;
+        if (off < 0) {
+            x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+            m = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, 1);
+            a = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, hc);
+            ggml_set_name(x, "mixes");
+            ggml_set_name(m, "scale");
+            ggml_set_name(a, "base");
+        } else {
+            ggml_tensor * mixes = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (2 + hc)*hc, n_tokens);
+            ggml_tensor * scale = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, 3);
+            ggml_tensor * base  = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, (2 + hc)*hc);
+            ggml_set_name(mixes, "mixes");
+            ggml_set_name(scale, "scale");
+            ggml_set_name(base,  "base");
+            x = ggml_view_2d(ctx, mixes, hc, n_tokens, mixes->nb[1], off*sizeof(float));
+            m = ggml_view_1d(ctx, scale, 1, (off/hc)*sizeof(float));
+            a = ggml_view_1d(ctx, base, hc, off*sizeof(float));
+        }
+
+        ggml_tensor * out = ggml_mul(ctx, x, m);
+        out = ggml_add(ctx, out, a);
+        out = ggml_sigmoid(ctx, out);
+        out = ggml_scale_bias(ctx, out, s, b);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_UNARY(GELU|SILU|SIGMOID|SOFTPLUS) + GGML_OP_MUL (fused operation).
 struct test_unary_mul : public test_case {
     const ggml_unary_op op;
@@ -9261,6 +9327,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         test_cases.emplace_back(new test_relu_sqr(type, { 128, 2, 2, 2 }));
         test_cases.emplace_back(new test_relu_sqr(type, { 5, 7, 11, 13 }));
+    }
+
+    // fused mul + add + sigmoid + scale (DeepSeek V4 hyper-connection pre, post and head coefficients)
+    for (int64_t n_tokens : { 1, 7 }) {
+        test_cases.emplace_back(new test_mul_add_sigmoid_scale(n_tokens,  0, 1.0f, 1e-6f));
+        test_cases.emplace_back(new test_mul_add_sigmoid_scale(n_tokens,  4, 2.0f, 0.0f));
+        test_cases.emplace_back(new test_mul_add_sigmoid_scale(n_tokens, -1, 1.0f, 1e-6f));
     }
 
     // fused unary + mul (gated activations that are not expressed as GGML_OP_GLU)
