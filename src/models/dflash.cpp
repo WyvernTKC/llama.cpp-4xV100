@@ -285,7 +285,11 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     // confidence head is optional
     const bool has_conf = model.dspark_conf_proj != nullptr;
 
-    ggml_tensor * base = res->t_logits; // [n_vocab, n_tokens]
+    // under -sm tensor the target's head is split over the vocab dim, but the argmax chain below reads whole
+    //   rows. gather the logits first.
+    ggml_tensor * base = ggml_cont(ctx0, res->t_logits); // [n_vocab, n_tokens]
+    base->flags |= GGML_TENSOR_FLAG_MIRRORED;
+    ggml_format_name(base, "dspark_logits_mirrored");
     const int64_t n_vocab = base->ne[0];
     const int64_t n_tok   = base->ne[1];
 

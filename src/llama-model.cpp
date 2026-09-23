@@ -897,7 +897,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         // output
         if (std::regex_match(tensor_name, pattern_output_weight)) {
-            if (is_dsv4) {
+            // a DSpark draft's own head stays whole; the targets' head is split like any other, which on
+            //   DeepSeek V4 cuts the 1 GiB BF16 head each device reads per token (~0.9 ms) and holds to a quarter
+            if (is_dsv4 && ud->model->arch == LLM_ARCH_DFLASH) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
