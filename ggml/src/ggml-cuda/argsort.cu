@@ -50,13 +50,14 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
                               ggml_sort_order  order,
                               cudaStream_t     stream) {
     ggml_cuda_pool_alloc<int>   temp_indices_alloc(pool, ncols * nrows);
-    ggml_cuda_pool_alloc<float> temp_keys_alloc(pool, ncols * nrows);
     // Device*Sort algorithms currently do not allow for in-place sorting/aliasing of input/outputs
     ggml_cuda_pool_alloc<float> temp_keys_out_alloc(pool, ncols * nrows);
 
     int *   temp_indices = temp_indices_alloc.get();
-    float * temp_keys    = temp_keys_alloc.get();
     float * temp_keys_out = temp_keys_out_alloc.get();
+
+    // the pointer overloads of Device*RadixSort never write d_keys_in, so x needs no copy
+    const float * temp_keys = x;
 
     static const int block_size = 256;
     const dim3 grid_size((ncols + block_size - 1) / block_size, nrows);
@@ -72,8 +73,6 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
     const dim3                offset_grid((nrows_offset + block_size - 1) / block_size);
     init_offsets<<<offset_grid, block_size, 0, stream>>>(offset_iterator, ncols, nrows);
 #endif
-    CUDA_CHECK(cudaMemcpyAsync(temp_keys, x, ncols * nrows * sizeof(float), cudaMemcpyDeviceToDevice, stream));
-
     size_t temp_storage_bytes = 0;
 
     // DeviceSegmentedSort bins the segments by size and reads the bin counts back with a blocking
