@@ -11383,6 +11383,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             true, 16, 8, b, false, true, false));
     }
 
+    // one token over enough rows that Volta puts four of them in a block: short rows, a tall matrix, and the
+    // fused gate on the short rows
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  4096, 1,  512, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 16384, 1, 2048, {1, 1}, {1, 1}));
+    }
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (bool with_bias : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 4096, 512,
+                false, 1, 1, false, with_bias, true, false, {1, 1}));
+        }
+    }
+
     // Fused row-pair coverage: minimum rows, an even pair, and an odd tail.
     // TODO: the max_nmse_err() for these cases is not estimated correctly causing sporadic false failures.
     //for (ggml_glu_op glu_op : { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU }) {
