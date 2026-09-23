@@ -2931,6 +2931,49 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
     return true;
 }
 
+// the qwen4exp QSA key pooling: get_rows_mean -> reshape -> rms_norm * weight -> reshape -> multi-section rope,
+// one token per pooled row; the caller checked the edges
+static bool ggml_cuda_should_fuse_get_rows_mean_norm_rope(const ggml_tensor * get_rows_mean, const ggml_tensor * rms_norm,
+                                                          const ggml_tensor * mul, const ggml_tensor * rope) {
+    const ggml_tensor * src0 = get_rows_mean->src[0];
+    const ggml_tensor * w    = mul->src[1];
+
+    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+    if (src0->nb[0] != ggml_type_size(src0->type) || get_rows_mean->src[1]->nb[0] != sizeof(int32_t)) {
+        return false;
+    }
+
+    // one warp per row, 4 columns per lane
+    if (get_rows_mean->ne[0] != 128 || !ggml_is_contiguous(get_rows_mean) || ggml_nrows(get_rows_mean) > INT32_MAX) {
+        return false;
+    }
+
+    if (rms_norm->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || rope->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_are_same_shape(rms_norm, mul) || w->ne[0] != 128 || ggml_nelements(w) != 128 || !ggml_is_contiguous(w)) {
+        return false;
+    }
+
+    const int mode = ((const int32_t *) rope->op_params)[2];
+    if (!(mode & GGML_ROPE_TYPE_MROPE) || (mode & GGML_ROPE_TYPE_NEOX) || mode == GGML_ROPE_TYPE_VISION) {
+        return false;
+    }
+
+    // a lane owns both channels of a pair
+    const int n_dims = ((const int32_t *) rope->op_params)[1];
+    const int n_offs = ((const int32_t *) rope->op_params)[15];
+    if ((n_dims != 64 && n_dims != 128) || n_offs != 0 || rope->src[2] != nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * x = rope->src[0];
+    return x->ne[0] == 128 && x->ne[1] == 1 && x->ne[2] == ggml_nrows(get_rows_mean) && x->ne[3] == 1 &&
+        ggml_is_contiguous(rope) && rope->src[1]->type == GGML_TYPE_I32;
+}
+
 // match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
 // (slot i -> rollback group i, slot 0 newest), so the kernel can write them and skip the cpy.
 static int ggml_cuda_try_gdn_cache_fusion(
@@ -3576,6 +3619,19 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             int out_nodes[] = { node_idx + 2 };
             return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
         }
+    }
+
+    std::initializer_list<enum ggml_op> get_rows_mean_norm_rope_ops = { GGML_OP_GET_ROWS_MEAN, GGML_OP_RESHAPE, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_ROPE };
+
+    if (is_equal(get_rows_mean_norm_rope_ops, ops)) {
+        if (ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 5 }) &&
+            ggml_check_edges(cgraph, node_idx, {{1, 0, 0}, {2, 0, 1}, {3, 0, 2}, {4, 0, 3}, {5, 0, 4}}) &&
+            ggml_cuda_should_fuse_get_rows_mean_norm_rope(cgraph->nodes[node_idx], cgraph->nodes[node_idx + 2],
+                cgraph->nodes[node_idx + 3], cgraph->nodes[node_idx + 5])) {
+            int out_nodes[] = { node_idx + 5 };
+            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
+        }
+        return false;
     }
 
     std::initializer_list<enum ggml_op> rms_norm_mul_rope_ops          = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE };
@@ -4522,6 +4578,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_GET_ROWS_MEAN, GGML_OP_RESHAPE, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_ROPE }, {})) {
+        ggml_cuda_op_get_rows_mean_norm_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 2], cgraph->nodes[i + 3], cgraph->nodes[i + 5]);
+        return 5;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {

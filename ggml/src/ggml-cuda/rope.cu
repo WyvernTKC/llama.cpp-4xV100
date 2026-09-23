@@ -196,6 +196,39 @@ static __global__ void rope_neox(const T *            x,
     dst[idst + n_offs/2 + n_dims / 2] = ggml_cuda_cast<D>(x0 * sin_theta + x1 * cos_theta);
 }
 
+// the angle of rotated channel pair iw/2 of token i2, from the position of the section the pair belongs to
+static __device__ __forceinline__ float rope_multi_theta_base(
+        const int32_t * pos, const int i2, const int ne02, const int iw, const float theta_scale,
+        const mrope_sections sections, const bool is_imrope) {
+    const int sect_dims = sections.v[0] + sections.v[1] + sections.v[2] + sections.v[3];
+    const int sec_w = sections.v[1] + sections.v[0];
+    const int sector = (iw / 2) % sect_dims;
+
+    float theta_base = 0.0;
+    if (is_imrope) {
+        if (sector % 3 == 1 && sector < 3 * sections.v[1]) {         // h
+            theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, iw / 2.0f);
+        } else if (sector % 3 == 2 && sector < 3 * sections.v[2]) {  // w
+            theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, iw / 2.0f);
+        } else if (sector % 3 == 0 && sector < 3 * sections.v[0]) {  // t
+            theta_base = pos[i2] * powf(theta_scale, iw / 2.0f);
+        } else {
+            theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, iw / 2.0f);
+        }
+    } else {
+        if (sector < sections.v[0]) {
+            theta_base = pos[i2] * powf(theta_scale, iw / 2.0f);
+        } else if (sector >= sections.v[0] && sector < sec_w) {
+            theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, iw / 2.0f);
+        } else if (sector >= sec_w && sector < sec_w + sections.v[2]) {
+            theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, iw / 2.0f);
+        } else if (sector >= sec_w + sections.v[2]) {
+            theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, iw / 2.0f);
+        }
+    }
+    return theta_base;
+}
+
 template <bool forward, bool has_ff, typename T>
 static __global__ void rope_multi(const T *            x,
                                   T *                  dst,
@@ -248,32 +281,7 @@ static __global__ void rope_multi(const T *            x,
 
     const int iw = i0 - n_offs; // relative idx
 
-    const int sect_dims = sections.v[0] + sections.v[1] + sections.v[2] + sections.v[3];
-    const int sec_w = sections.v[1] + sections.v[0];
-    const int sector = (iw / 2) % sect_dims;
-
-    float theta_base = 0.0;
-    if (is_imrope) {
-        if (sector % 3 == 1 && sector < 3 * sections.v[1]) {         // h
-            theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, iw / 2.0f);
-        } else if (sector % 3 == 2 && sector < 3 * sections.v[2]) {  // w
-            theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, iw / 2.0f);
-        } else if (sector % 3 == 0 && sector < 3 * sections.v[0]) {  // t
-            theta_base = pos[i2] * powf(theta_scale, iw / 2.0f);
-        } else {
-            theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, iw / 2.0f);
-        }
-    } else {
-        if (sector < sections.v[0]) {
-            theta_base = pos[i2] * powf(theta_scale, iw / 2.0f);
-        } else if (sector >= sections.v[0] && sector < sec_w) {
-            theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, iw / 2.0f);
-        } else if (sector >= sec_w && sector < sec_w + sections.v[2]) {
-            theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, iw / 2.0f);
-        } else if (sector >= sec_w + sections.v[2]) {
-            theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, iw / 2.0f);
-        }
-    }
+    const float theta_base = rope_multi_theta_base(pos, i2, ne02, iw, theta_scale, sections, is_imrope);
 
     const float freq_factor = has_ff ? freq_factors[iw/2] : 1.0f;
 
@@ -938,4 +946,180 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
     } else {
         GGML_ABORT("fatal error");
     }
+}
+
+// fused GET_ROWS_MEAN + RESHAPE + RMS_NORM + MUL + RESHAPE + ROPE (multi-section): the qwen4exp QSA key pooling
+// One warp per pooled row of 128, lane l owns the columns l + 32*k. Every step repeats the arithmetic of the
+// unfused kernels in their order, so the result is bitwise the same: the member sum and scale of k_get_rows_mean,
+// the two-level sum of rms_norm_f32<256>, where each column is the only element of one thread, and rope_multi.
+template <typename T>
+static __device__ __forceinline__ float get_rows_mean_norm_rope_load(const char * row, const int col) {
+    if constexpr (std::is_same_v<T, block_q8_0>) {
+        const block_q8_0 * b = (const block_q8_0 *) row + col/QK8_0;
+        const float d = b->d;
+        float v = b->qs[col % QK8_0];
+        v *= d;
+        return v;
+    } else {
+        return ggml_cuda_cast<float>(((const T *) row)[col]);
+    }
+}
+
+template <typename T, int n_group_fixed, int n_dims_64>
+static __global__ void get_rows_mean_norm_rope_f32(
+        const char * src0, const int32_t * src1, float * dst,
+        const int nrows, const int ncols, const int n_group, const float group_scale,
+        const uint3 ne1_fdv, const uint3 ne2_fdv,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12,
+        const float eps, const float * mul, const int32_t * pos,
+        const float freq_scale, const float ext_factor, const float attn_factor,
+        const rope_corr_dims corr_dims, const float theta_scale,
+        const mrope_sections sections, const bool is_imrope) {
+    constexpr int nk     = 128/WARP_SIZE;
+    constexpr int n_dims = 64*n_dims_64;
+    constexpr int k_half = n_dims/2/WARP_SIZE; // the slot that holds the second channel of a pair
+
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int row  = blockIdx.x*(blockDim.x/WARP_SIZE) + threadIdx.x/WARP_SIZE;
+    if (row >= nrows) {
+        return;
+    }
+
+    const uint2 r1  = fast_div_modulo((uint32_t) row, ne1_fdv); // z,   i1
+    const uint2 r2  = fast_div_modulo(r1.x, ne2_fdv);           // i12, i11
+    const int   i1  = r1.y;
+    const int   i11 = r2.y;
+    const int   i12 = r2.x;
+
+    const int ng = n_group_fixed > 0 ? n_group_fixed : n_group;
+
+    ggml_cuda_pdl_sync();
+
+    float x[nk] = {0.0f};
+#pragma unroll
+    for (int g = 0; g < ng; ++g) {
+        const int i01 = src1[(i1*ng + g)*s10 + i11*s11 + i12*s12];
+        const char * src_row = src0 + i01*nb01 + i11*nb02 + i12*nb03;
+#pragma unroll
+        for (int k = 0; k < nk; ++k) {
+            const float v = get_rows_mean_norm_rope_load<T>(src_row, lane + k*WARP_SIZE);
+            x[k] = g == 0 ? v : __fadd_rn(x[k], v);
+        }
+    }
+
+    // warp k of the unfused block holds the columns of slot k, and lane k of its second pass the sum of that warp
+    float sum = 0.0f;
+#pragma unroll
+    for (int k = 0; k < nk; ++k) {
+        x[k] = group_scale*x[k];
+        const float p = warp_reduce_sum(x[k]*x[k]);
+        sum = lane == k ? p : sum;
+    }
+    sum = warp_reduce_sum(sum);
+
+    const float mean  = sum / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+#pragma unroll
+    for (int k = 0; k < nk; ++k) {
+        x[k] = scale * x[k] * mul[lane + k*WARP_SIZE];
+    }
+
+    float * dst_row = dst + (int64_t) row*128;
+#pragma unroll
+    for (int k = 0; k < nk; ++k) {
+        const int col = lane + k*WARP_SIZE;
+        if (k >= 2*k_half) {
+            dst_row[col] = x[k];
+            continue;
+        }
+        if (k >= k_half) {
+            continue;
+        }
+
+        const int   iw          = 2*col;
+        const float theta_base  = rope_multi_theta_base(pos, row, nrows, iw, theta_scale, sections, is_imrope);
+        const float freq_factor = 1.0f;
+
+        float cos_theta;
+        float sin_theta;
+        rope_yarn<true>(theta_base/freq_factor, freq_scale, corr_dims, iw, ext_factor, attn_factor, cos_theta, sin_theta);
+
+        const float x0 = x[k];
+        const float x1 = x[k + k_half];
+
+        dst_row[col]            = x0*cos_theta - x1*sin_theta;
+        dst_row[col + n_dims/2] = x0*sin_theta + x1*cos_theta;
+    }
+}
+
+template <typename T>
+static auto get_rows_mean_norm_rope_kernel(const int n_group, const int n_dims) {
+    if (n_group == 4) {
+        return n_dims == 64 ? get_rows_mean_norm_rope_f32<T, 4, 1> : get_rows_mean_norm_rope_f32<T, 4, 2>;
+    }
+    return n_dims == 64 ? get_rows_mean_norm_rope_f32<T, 0, 1> : get_rows_mean_norm_rope_f32<T, 0, 2>;
+}
+
+void ggml_cuda_op_get_rows_mean_norm_rope_fused(ggml_backend_cuda_context & ctx,
+        ggml_tensor * get_rows_mean, ggml_tensor * rms_norm, ggml_tensor * mul, ggml_tensor * rope) {
+    const ggml_tensor * src0 = get_rows_mean->src[0];
+    const ggml_tensor * src1 = get_rows_mean->src[1];
+    const ggml_tensor * w    = mul->src[1];
+
+    GGML_ASSERT(get_rows_mean->ne[0] == 128 && w->type == GGML_TYPE_F32 && rope->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nrows(get_rows_mean) <= INT32_MAX);
+
+    const int n_group = ggml_get_op_params_i32(get_rows_mean, 0);
+
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+
+    const int n_dims     = ((const int32_t *) rope->op_params)[1];
+    const int mode       = ((const int32_t *) rope->op_params)[2];
+    const int n_ctx_orig = ((const int32_t *) rope->op_params)[4];
+
+    float freq_base;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
+    mrope_sections sections;
+
+    memcpy(&freq_base,   (const int32_t *) rope->op_params +  5, sizeof(float));
+    memcpy(&freq_scale,  (const int32_t *) rope->op_params +  6, sizeof(float));
+    memcpy(&ext_factor,  (const int32_t *) rope->op_params +  7, sizeof(float));
+    memcpy(&attn_factor, (const int32_t *) rope->op_params +  8, sizeof(float));
+    memcpy(&beta_fast,   (const int32_t *) rope->op_params +  9, sizeof(float));
+    memcpy(&beta_slow,   (const int32_t *) rope->op_params + 10, sizeof(float));
+    memcpy(&sections.v,  (const int32_t *) rope->op_params + 11, sizeof(int)*4);
+
+    rope_corr_dims corr_dims;
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims.v);
+
+    const float theta_scale = powf(freq_base, -2.0f/n_dims);
+
+    decltype(&get_rows_mean_norm_rope_f32<float, 4, 1>) kernel = nullptr;
+    switch (src0->type) {
+        case GGML_TYPE_F32:  kernel = get_rows_mean_norm_rope_kernel<float>     (n_group, n_dims); break;
+        case GGML_TYPE_F16:  kernel = get_rows_mean_norm_rope_kernel<half>      (n_group, n_dims); break;
+        case GGML_TYPE_Q8_0: kernel = get_rows_mean_norm_rope_kernel<block_q8_0>(n_group, n_dims); break;
+        default:             GGML_ABORT("fatal error");
+    }
+
+    const int  nrows          = (int) ggml_nrows(get_rows_mean);
+    const int  rows_per_block = 256/WARP_SIZE;
+    const dim3 block_nums((nrows + rows_per_block - 1)/rows_per_block, 1, 1);
+    const dim3 block_dims(rows_per_block*WARP_SIZE, 1, 1);
+
+    kernel<<<block_nums, block_dims, 0, ctx.stream()>>>(
+        (const char *) src0->data, (const int32_t *) src1->data, (float *) rope->data,
+        nrows, (int) get_rows_mean->ne[0], n_group, 1.0f/n_group,
+        init_fastdiv_values(get_rows_mean->ne[1]), init_fastdiv_values(get_rows_mean->ne[2]),
+        src0->nb[1], src0->nb[2], src0->nb[3],
+        src1->nb[0]/sizeof(int32_t), src1->nb[1]/sizeof(int32_t), src1->nb[2]/sizeof(int32_t),
+        eps, (const float *) w->data, (const int32_t *) rope->src[1]->data,
+        freq_scale, ext_factor, attn_factor, corr_dims, theta_scale, sections, mode == GGML_ROPE_TYPE_IMROPE);
 }

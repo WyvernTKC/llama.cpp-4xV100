@@ -2490,6 +2490,75 @@ struct test_get_rows_mean : public test_case {
     }
 };
 
+// GET_ROWS_MEAN -> RMS_NORM * weight -> multi-section ROPE: the qwen4exp QSA key pooling, which CUDA fuses
+struct test_get_rows_mean_norm_rope : public test_case {
+    const ggml_type type;
+    const int m;        // rows in the source
+    const int n_out;    // rows out per stream
+    const int n_stream;
+    const int n_dims;
+    const int mode;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GET_ROWS_MEAN_NORM_ROPE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, m, n_out, n_stream, n_dims, mode);
+    }
+
+    test_get_rows_mean_norm_rope(ggml_type type = GGML_TYPE_Q8_0, int m = 64, int n_out = 16, int n_stream = 1,
+            int n_dims = 64, int mode = GGML_ROPE_TYPE_IMROPE)
+        : type(type), m(m), n_out(n_out), n_stream(n_stream), n_dims(n_dims), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int n = 128;
+
+        ggml_tensor * in = ggml_new_tensor_3d(ctx, type, n, m, n_stream);
+        ggml_set_name(in, "in");
+        ggml_tensor * rows = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4*n_out, n_stream);
+        ggml_set_name(rows, "rows");
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_set_name(w, "w");
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4*n_out*n_stream);
+        ggml_set_name(pos, "pos");
+
+        // the reshapes of src/models/qwen4exp.cpp: rms_norm counts rows along ne1, rope one token per row
+        ggml_tensor * out = ggml_get_rows_mean(ctx, in, rows, 4);
+        out = ggml_reshape_3d(ctx, out, n, n_out*n_stream, 1);
+        out = ggml_mul(ctx, ggml_rms_norm(ctx, out, 1e-6f), w);
+        out = ggml_reshape_3d(ctx, out, n, 1, n_out*n_stream);
+        int sections[4] = { 11, 11, 10, 0 };
+        out = ggml_rope_multi(ctx, out, pos, nullptr, n_dims, sections, mode, 0, 10000000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        out = ggml_reshape_3d(ctx, out, n, n_out, n_stream);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I32) {
+                // small positions: at large angles the fast-math sin/cos of the CUDA rope drift from the CPU ones
+                const int range = strcmp(t->name, "rows") == 0 ? m : 512;
+                std::vector<int> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = rand() % range;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GET_ROWS_BACK
 struct test_get_rows_back : public test_case {
     const ggml_type type;
@@ -9292,6 +9361,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
         test_cases.emplace_back(new test_get_rows_mean(type, 128, 50, 12, 4, 2, 1, true, 1));
     }
+    // the fused QSA key pooling: a row count that leaves a partial block, two streams, both rope layouts
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int n_dims : {64, 128}) {
+            for (int mode : {GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_IMROPE}) {
+                test_cases.emplace_back(new test_get_rows_mean_norm_rope(type, 64, 13, 2, n_dims, mode));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_get_rows_mean_norm_rope(GGML_TYPE_Q8_0, 16384, 4096, 1));
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
         // 576 is the DeepSeek MLA cache row, but a row must hold whole blocks
         const int n_view = 576 % ggml_blck_size(type) == 0 ? 576 : 512;
@@ -11330,6 +11408,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 128, 8, 2048));
     // qwen4exp QSA key pooling at 90k context: 4 q8_0 cells per block
     test_cases.emplace_back(new test_get_rows_mean(GGML_TYPE_Q8_0, 128, 90368, 22592, 4));
+    test_cases.emplace_back(new test_get_rows_mean_norm_rope(GGML_TYPE_Q8_0, 90368, 22592, 1));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
