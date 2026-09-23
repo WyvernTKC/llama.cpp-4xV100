@@ -512,7 +512,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_compressed_kv_from_state(
     ggml_tensor * weights = ggml_soft_max(ctx0, scores);
     ggml_tensor * comp = ggml_mul(ctx0, values, weights);
     comp = ggml_sum_rows(ctx0, comp);
-    comp = ggml_cont(ctx0, ggml_permute(ctx0, comp, 1, 0, 2, 3));
+    // sum_rows leaves a size-1 first dim, so the transpose back is only a reshape
+    comp = ggml_reshape_4d(ctx0, comp, comp->ne[1], 1, comp->ne[2], comp->ne[3]);
     cb(comp, name, il);
 
     comp = build_norm(comp, norm, nullptr, LLM_NORM_RMS, il);
@@ -591,7 +592,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_overlap_compressed_kv_from_sta
     ggml_tensor * weights = ggml_soft_max(ctx0, scores);
     ggml_tensor * comp = ggml_mul(ctx0, values, weights);
     comp = ggml_sum_rows(ctx0, comp);
-    comp = ggml_cont(ctx0, ggml_permute(ctx0, comp, 1, 0, 2, 3));
+    // sum_rows leaves a size-1 first dim, so the transpose back is only a reshape
+    comp = ggml_reshape_4d(ctx0, comp, comp->ne[1], 1, comp->ne[2], comp->ne[3]);
     cb(comp, name, il);
 
     comp = build_norm(comp, norm, nullptr, LLM_NORM_RMS, il);
@@ -899,7 +901,11 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
     ggml_tensor * hca_mask = inp_hca.kq_mask;
 
-    ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, hca_mask, 0);
+    // both halves are graph inputs, so every HCA layer shares one concatenation
+    if (hca_kq_mask_all == nullptr || hca_kq_mask_all->src[0] != raw_mask || hca_kq_mask_all->src[1] != hca_mask) {
+        hca_kq_mask_all = ggml_concat(ctx0, raw_mask, hca_mask, 0);
+    }
+    ggml_tensor * kq_mask = hca_kq_mask_all;
     cb(kq_mask, "hca_kq_mask", il);
 
     ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, 0, kq_scale, il);

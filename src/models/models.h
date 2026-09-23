@@ -1232,6 +1232,9 @@ struct llama_model_deepseek4 : public llama_model_base {
         graph(const llm_graph_params & params) : llm_graph_context(params) {}
         graph(const llama_model & model, const llm_graph_params & params);
 
+        // the HCA mask does not depend on the layer, so the first HCA layer builds it for all of them
+        mutable ggml_tensor * hca_kq_mask_all = nullptr;
+
         void build_hc_mixes(
                 ggml_tensor *  x,
                 ggml_tensor *  hc_fn,
