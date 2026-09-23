@@ -509,6 +509,31 @@ static __global__ void k_get_rows_bytes(
     }
 }
 
+// rows narrower than a block: one thread per unit over every gathered row, so a block covers many rows
+template <typename T>
+static __global__ void k_get_rows_bytes_narrow(
+        const char * src0, const int32_t * src1, char * dst,
+        const int64_t n, const uint3 n_units_fdv, const uint3 ne10_fdv, const uint3 ne12_fdv,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        const size_t s10, const size_t s11, const size_t s12) {
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x*blockDim.x) {
+        const uint2 ru  = fast_div_modulo((uint32_t) i, n_units_fdv); // row, unit
+        const uint2 r10 = fast_div_modulo(ru.x, ne10_fdv);             // z,   i10
+        const uint2 r12 = fast_div_modulo(r10.x, ne12_fdv);            // i11, i12
+        const int i10 = r10.y;
+        const int i11 = r12.x;
+        const int i12 = r12.y;
+
+        const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+        const T * src_row = (const T *) (src0 + i01*nb01 + i11*nb02 + i12*nb03);
+        T       * dst_row = (T       *) (dst  + i10*nb1  + i11*nb2  + i12*nb3);
+
+        dst_row[ru.y] = src_row[ru.y];
+    }
+}
+
 static void get_rows_cuda_bytes(
         const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, cudaStream_t stream) {
     GGML_TENSOR_BINARY_OP_LOCALS
@@ -540,11 +565,29 @@ static void get_rows_cuda_bytes(
     const int32_t * src1_d = (const int32_t *) src1->data;
     char          * dst_d  = (char          *) dst->data;
 
+    // a row narrower than a block leaves most of a block-per-row launch idle
+    // fastdiv sums two 32-bit terms, so the flat index must stay below 2^31
+    const int64_t n_narrow = n_units*ne10*ne11*ne12;
+    const bool    narrow   = n_units < CUDA_GET_ROWS_BLOCK_SIZE && n_narrow > 0 && n_narrow <= std::numeric_limits<int32_t>::max();
+
+    auto launch = [&](auto unit_t) {
+        using T = decltype(unit_t);
+        if (narrow) {
+            const dim3 block_nums_narrow((n_narrow + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
+            k_get_rows_bytes_narrow<T><<<block_nums_narrow, block_dims, 0, stream>>>(src0_d, src1_d, dst_d,
+                n_narrow, init_fastdiv_values(n_units), init_fastdiv_values(ne10), ne12_fdv,
+                nb01, nb02, nb03, nb1, nb2, nb3, s10, s11, s12);
+        } else {
+            k_get_rows_bytes<T><<<block_nums, block_dims, 0, stream>>>(src0_d, src1_d, dst_d,
+                n_units, ne11, ne12_fdv, nb01, nb02, nb03, nb1, nb2, nb3, s10, s11, s12);
+        }
+    };
+
     switch (unit) {
-        case 16: k_get_rows_bytes<int4>   <<<block_nums, block_dims, 0, stream>>>(src0_d, src1_d, dst_d, n_units, ne11, ne12_fdv, nb01, nb02, nb03, nb1, nb2, nb3, s10, s11, s12); break;
-        case  8: k_get_rows_bytes<int2>   <<<block_nums, block_dims, 0, stream>>>(src0_d, src1_d, dst_d, n_units, ne11, ne12_fdv, nb01, nb02, nb03, nb1, nb2, nb3, s10, s11, s12); break;
-        case  4: k_get_rows_bytes<int32_t><<<block_nums, block_dims, 0, stream>>>(src0_d, src1_d, dst_d, n_units, ne11, ne12_fdv, nb01, nb02, nb03, nb1, nb2, nb3, s10, s11, s12); break;
-        default: k_get_rows_bytes<int8_t> <<<block_nums, block_dims, 0, stream>>>(src0_d, src1_d, dst_d, n_units, ne11, ne12_fdv, nb01, nb02, nb03, nb1, nb2, nb3, s10, s11, s12); break;
+        case 16: launch(int4{});    break;
+        case  8: launch(int2{});    break;
+        case  4: launch(int32_t{}); break;
+        default: launch(int8_t{});  break;
     }
 }
 

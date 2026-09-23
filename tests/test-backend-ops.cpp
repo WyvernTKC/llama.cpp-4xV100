@@ -9376,6 +9376,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_get_rows(type, 256,    5, 4, 1, 1, false, false, 0, true));
         test_cases.emplace_back(new test_get_rows(type, n_view, 9, 7, 2, 1, false, true,  0, true));
     }
+    // quantized rows narrower than a block are copied one unit per thread: the qwen4exp K/V cell, batches with
+    // strided indices, a 34-byte row copied bytewise, and a 4 KiB row that keeps the block per row
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q8_0, 512,  3000, 2304, 1, 1, false, false, 0, true));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q8_0, 512,   300,   50, 2, 3, true,  false, 0, true));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q8_0, 32,     40,   30, 2, 1, true,  true,  0, true));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q8_0, 4096,   20,   10, 1, 1, false, false, 0, true));
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
             for (bool v : {false, true}) {
@@ -11409,6 +11415,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // qwen4exp QSA key pooling at 90k context: 4 q8_0 cells per block
     test_cases.emplace_back(new test_get_rows_mean(GGML_TYPE_Q8_0, 128, 90368, 22592, 4));
     test_cases.emplace_back(new test_get_rows_mean_norm_rope(GGML_TYPE_Q8_0, 90368, 22592, 1));
+    // the qwen4exp gathered K/V at an MTP verify step: 4 tokens x 2304 picked cells of 512 q8_0 values
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q8_0, 512, 90368, 2304, 1, 1, false, false, 0, true));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q8_0, 512, 90368, 9216, 1, 1, false, false, 0, true));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
