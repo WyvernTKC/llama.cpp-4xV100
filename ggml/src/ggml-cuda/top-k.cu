@@ -229,6 +229,151 @@ static void top_k_radix_cuda_impl(
             src, dst, states, ncols, k, blocks_per_row);
 }
 
+// block-wide exclusive scan of v, and the block total
+template<int BLOCK_SIZE>
+static __device__ __forceinline__ int top_k_block_exclusive_scan(const int v, int & total, int * warp_sums) {
+    constexpr int NWARPS = BLOCK_SIZE / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+
+    int x = v;
+#pragma unroll
+    for (int offset = 1; offset < WARP_SIZE; offset *= 2) {
+        const int y = __shfl_up_sync(0xffffffff, x, offset);
+        x += lane >= offset ? y : 0;
+    }
+    if (lane == WARP_SIZE - 1) {
+        warp_sums[warp] = x;
+    }
+    __syncthreads();
+
+    int before = 0;
+    total = 0;
+#pragma unroll
+    for (int w = 0; w < NWARPS; ++w) {
+        before += w < warp ? warp_sums[w] : 0;
+        total  += warp_sums[w];
+    }
+    __syncthreads();
+    return before + x - v;
+}
+
+// rows of at most NPER*BLOCK_SIZE columns: one block per row runs the whole radix select on keys held in
+//   registers, in one launch. The indices come out in column order, the keys above the k-th first.
+template<int BLOCK_SIZE, int NPER>
+static __global__ void top_k_radix_small(
+        const float * __restrict__ src,
+        int * __restrict__ dst,
+        int ncols,
+        int k) {
+    constexpr int RADIX_BITS = 8;
+    constexpr int NBINS = 1 << RADIX_BITS;
+    static_assert(NBINS == BLOCK_SIZE, "one bin per thread");
+
+    const int tid = threadIdx.x;
+    const int lane = tid % WARP_SIZE;
+    const int warp = tid / WARP_SIZE;
+    const float * row_src = src + (size_t) blockIdx.x * ncols;
+    int * row_dst = dst + (size_t) blockIdx.x * k;
+
+    __shared__ int histogram[NBINS];
+    __shared__ int warp_sums[BLOCK_SIZE / WARP_SIZE];
+    __shared__ uint32_t sel_prefix;
+    __shared__ int sel_rank;
+
+    uint32_t key[NPER];
+#pragma unroll
+    for (int i = 0; i < NPER; ++i) {
+        const int col = i*BLOCK_SIZE + tid;
+        key[i] = col < ncols ? top_k_float_to_ordered(row_src[col]) : 0;
+    }
+
+    uint32_t prefix = 0;
+    uint32_t prefix_mask = 0;
+    int rank = k;
+    for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
+        histogram[tid] = 0;
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < NPER; ++i) {
+            if (i*BLOCK_SIZE + tid < ncols && (key[i] & prefix_mask) == prefix) {
+                atomicAdd(&histogram[(key[i] >> shift) & (NBINS - 1)], 1);
+            }
+        }
+        __syncthreads();
+
+        // keys whose digit is >= this thread's bin: a suffix sum within the warp, plus the warps above
+        const int own = histogram[tid];
+        int ge = own;
+#pragma unroll
+        for (int offset = 1; offset < WARP_SIZE; offset *= 2) {
+            const int y = __shfl_down_sync(0xffffffff, ge, offset);
+            ge += lane + offset < WARP_SIZE ? y : 0;
+        }
+        if (lane == 0) {
+            warp_sums[warp] = ge;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int w = 0; w < BLOCK_SIZE / WARP_SIZE; ++w) {
+            ge += w > warp ? warp_sums[w] : 0;
+        }
+
+        // exactly one bin holds the key of the wanted rank
+        if (ge - own < rank && rank <= ge) {
+            sel_prefix = prefix | (uint32_t) tid << shift;
+            sel_rank   = rank - (ge - own);
+        }
+        __syncthreads();
+        prefix       = sel_prefix;
+        rank         = sel_rank;
+        prefix_mask |= (uint32_t) (NBINS - 1) << shift;
+    }
+
+    // prefix is now the k-th key and rank the number of keys equal to it that are taken
+    int n_greater = 0;
+    int n_equal   = 0;
+#pragma unroll
+    for (int i = 0; i < NPER; ++i) {
+        const int  col     = i*BLOCK_SIZE + tid;
+        const bool valid   = col < ncols;
+        const bool greater = valid && key[i] > prefix;
+        const bool equal   = valid && key[i] == prefix;
+
+        // both counts are at most BLOCK_SIZE, so they share one scan
+        int total;
+        const int pos = top_k_block_exclusive_scan<BLOCK_SIZE>((int) greater | (int) equal << 16, total, warp_sums);
+        if (greater) {
+            row_dst[n_greater + (pos & 0xFFFF)] = col;
+        }
+        if (equal && n_equal + (pos >> 16) < rank) {
+            row_dst[k - rank + n_equal + (pos >> 16)] = col;
+        }
+        n_greater += total & 0xFFFF;
+        n_equal   += total >> 16;
+    }
+}
+
+static void top_k_radix_small_cuda(const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
+    constexpr int BLOCK_SIZE = 256;
+    const int nper = (ncols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    GGML_ASSERT(nper <= 16);
+    auto launch = [&](auto kernel) {
+        kernel<<<nrows, BLOCK_SIZE, 0, stream>>>(src, dst, ncols, k);
+    };
+    if (nper <= 1) {
+        launch(top_k_radix_small<BLOCK_SIZE, 1>);
+    } else if (nper <= 2) {
+        launch(top_k_radix_small<BLOCK_SIZE, 2>);
+    } else if (nper <= 4) {
+        launch(top_k_radix_small<BLOCK_SIZE, 4>);
+    } else if (nper <= 8) {
+        launch(top_k_radix_small<BLOCK_SIZE, 8>);
+    } else {
+        launch(top_k_radix_small<BLOCK_SIZE, 16>);
+    }
+}
+
 static void top_k_radix_cuda(
         ggml_cuda_pool & pool,
         const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
@@ -269,10 +414,15 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
     }
 #elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
-    // CUB has a fast single-tile sort up to 4096; above that it falls back to a much slower
-    //   multi-pass sort of the whole row just to keep k elements
+    // above 4096 CUB falls back to a multi-pass sort of the whole row just to keep k elements
     if (ncols > 4096) {
         top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        return;
+    }
+    // up to 4096 keys a row fits one block, so the select is a single launch: on a V100 2-6x the argsort for one
+    //   row and 10x for a thousand rows of 1024. Only many rows of a few keys pack tighter into the bitonic sort.
+    if (ncols > 64 || nrows <= 64) {
+        top_k_radix_small_cuda(src0_d, dst_d, ncols, nrows, k, stream);
         return;
     }
     // Fall back to argsort + copy

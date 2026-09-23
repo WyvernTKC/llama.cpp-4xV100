@@ -10869,6 +10869,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2049, 2, 1, 3}, k));
     }
 
+    // rows of up to 4096 keys take the one-block radix select: the DeepSeek-V4 CSA pick at ~15k context,
+    //   k near the row length, many rows at once, and ties
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 3772,   1, 1, 1 },  512));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 1000,   3, 1, 1 },  999));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 4096, 512, 1, 1 },  512));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 3000,   2, 1, 3 },  700, true));
+
     // Large-k, including multi-row and ties (qwen4exp)
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 1024,  1, 1, 1 }, 1024));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 2048,  2, 1, 1 }, 1024));
