@@ -573,17 +573,41 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 // a pair of consecutive elements of a float row, in the shape of the dequantize_kernel_t with qk = qr = 1
-template<typename src_t>
+// aligned: the pair is one half2/float2 load, which the caller checked the addresses allow
+template<typename src_t, bool aligned>
 static __device__ __forceinline__ void dequantize_float_pair(const void * vx, const int64_t ib, const int iqs, float2 & v) {
     GGML_UNUSED(iqs);
     const src_t * x = (const src_t *) vx;
-    v.x = ggml_cuda_cast<float>(x[ib + 0]);
-    v.y = ggml_cuda_cast<float>(x[ib + 1]);
+    if constexpr (aligned && std::is_same_v<src_t, half>) {
+        const half2 h = *(const half2 *) (x + ib);
+        v.x = __low2float(h);
+        v.y = __high2float(h);
+    } else if constexpr (aligned && std::is_same_v<src_t, float>) {
+        v = *(const float2 *) (x + ib);
+    } else {
+        v.x = ggml_cuda_cast<float>(x[ib + 0]);
+        v.y = ggml_cuda_cast<float>(x[ib + 1]);
+    }
+}
+
+// a q8_0 pair in one 16-bit load: blocks are 34 bytes with the quants at offset 2, and iqs is even
+static __device__ __forceinline__ void dequantize_q8_0_pair(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_q8_0 * x = (const block_q8_0 *) vx;
+
+    const float d = x[ib].d;
+    const char2 q = *(const char2 *) (x[ib].qs + iqs);
+
+    v.x = q.x;
+    v.y = q.y;
+
+    v.x *= d;
+    v.y *= d;
 }
 
 // one thread per pair of output elements: the n_group gathered members are added in index order and the
 // sum is scaled, the same arithmetic as get_rows + add + scale (__fadd_rn keeps the dequant multiply out of an FMA)
-template<int qk, int qr, dequantize_kernel_t dequantize_kernel>
+// n_group_fixed > 0 unrolls the member loop, so every member load is in flight at once
+template<int qk, int qr, dequantize_kernel_t dequantize_kernel, int n_group_fixed>
 static __global__ void k_get_rows_mean(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, float * __restrict__ dst,
         const int64_t n, const int n_group, const float scale,
@@ -602,14 +626,15 @@ static __global__ void k_get_rows_mean(
         const int i11 = r2.y;
         const int i12 = r2.x;
 
-        const int ib   =  i00/qk;
-        const int iqs  = (i00%qk)/qr;
-        const int iybs = i00 - i00%qk;
-        const int y_offset = qr == 1 ? 1 : qk/2;
+        const int ib  =  i00/qk;
+        const int iqs = (i00%qk)/qr;
+
+        const int ng = n_group_fixed > 0 ? n_group_fixed : n_group;
 
         float2 acc = make_float2(0.0f, 0.0f);
-        for (int g = 0; g < n_group; ++g) {
-            const int i01 = src1[(i1*n_group + g)*s10 + i11*s11 + i12*s12];
+#pragma unroll
+        for (int g = 0; g < ng; ++g) {
+            const int i01 = src1[(i1*ng + g)*s10 + i11*s11 + i12*s12];
 
             float2 v;
             dequantize_kernel((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03, ib, iqs, v);
@@ -619,8 +644,14 @@ static __global__ void k_get_rows_mean(
         }
 
         float * dst_row = dst + i1*s1 + i11*s2 + i12*s3;
-        dst_row[iybs + iqs + 0]        = scale*acc.x;
-        dst_row[iybs + iqs + y_offset] = scale*acc.y;
+        if constexpr (qr == 1) {
+            // dst is contiguous with an even row length, so an even element is 8-byte aligned
+            *(float2 *) (dst_row + i00) = make_float2(scale*acc.x, scale*acc.y);
+        } else {
+            const int iybs = i00 - i00%qk;
+            dst_row[iybs + iqs + 0]    = scale*acc.x;
+            dst_row[iybs + iqs + qk/2] = scale*acc.y;
+        }
     }
 }
 
@@ -638,7 +669,9 @@ static void get_rows_mean_cuda(const ggml_tensor * src0, const ggml_tensor * src
     const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
     const dim3 block_nums((n + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
 
-    k_get_rows_mean<qk, qr, dq><<<block_nums, block_dims, 0, stream>>>(
+    // 4 is the qwen4exp compress ratio
+    auto kernel = n_group == 4 ? k_get_rows_mean<qk, qr, dq, 4> : k_get_rows_mean<qk, qr, dq, 0>;
+    kernel<<<block_nums, block_dims, 0, stream>>>(
         src0->data, (const int32_t *) src1->data, (float *) dst->data,
         n, n_group, 1.0f/n_group,
         init_fastdiv_values(ne00/2), init_fastdiv_values(ne1), init_fastdiv_values(ne2),
@@ -679,15 +712,38 @@ void ggml_cuda_op_get_rows_mean(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
     cudaStream_t stream = ctx.stream();
 
+    // a pair load needs the pair's alignment at every row start
+    auto aligned = [&](size_t a) {
+        return (uintptr_t) src0->data % a == 0 && src0->nb[1] % a == 0 && src0->nb[2] % a == 0 && src0->nb[3] % a == 0;
+    };
+
     switch (src0->type) {
-        case GGML_TYPE_F32:  get_rows_mean_cuda<1, 1, dequantize_float_pair<float>>      (src0, src1, dst, n_group, stream); break;
-        case GGML_TYPE_F16:  get_rows_mean_cuda<1, 1, dequantize_float_pair<half>>       (src0, src1, dst, n_group, stream); break;
-        case GGML_TYPE_BF16: get_rows_mean_cuda<1, 1, dequantize_float_pair<nv_bfloat16>>(src0, src1, dst, n_group, stream); break;
+        case GGML_TYPE_F32:
+            if (aligned(8)) {
+                get_rows_mean_cuda<1, 1, dequantize_float_pair<float, true>>(src0, src1, dst, n_group, stream);
+            } else {
+                get_rows_mean_cuda<1, 1, dequantize_float_pair<float, false>>(src0, src1, dst, n_group, stream);
+            }
+            break;
+        case GGML_TYPE_F16:
+            if (aligned(4)) {
+                get_rows_mean_cuda<1, 1, dequantize_float_pair<half, true>>(src0, src1, dst, n_group, stream);
+            } else {
+                get_rows_mean_cuda<1, 1, dequantize_float_pair<half, false>>(src0, src1, dst, n_group, stream);
+            }
+            break;
+        case GGML_TYPE_BF16: get_rows_mean_cuda<1, 1, dequantize_float_pair<nv_bfloat16, false>>(src0, src1, dst, n_group, stream); break;
         case GGML_TYPE_Q4_0: get_rows_mean_cuda<QK4_0, QR4_0, dequantize_q4_0>(src0, src1, dst, n_group, stream); break;
         case GGML_TYPE_Q4_1: get_rows_mean_cuda<QK4_1, QR4_1, dequantize_q4_1>(src0, src1, dst, n_group, stream); break;
         case GGML_TYPE_Q5_0: get_rows_mean_cuda<QK5_0, QR5_0, dequantize_q5_0>(src0, src1, dst, n_group, stream); break;
         case GGML_TYPE_Q5_1: get_rows_mean_cuda<QK5_1, QR5_1, dequantize_q5_1>(src0, src1, dst, n_group, stream); break;
-        case GGML_TYPE_Q8_0: get_rows_mean_cuda<QK8_0, QR8_0, dequantize_q8_0>(src0, src1, dst, n_group, stream); break;
+        case GGML_TYPE_Q8_0:
+            if (aligned(2)) {
+                get_rows_mean_cuda<QK8_0, QR8_0, dequantize_q8_0_pair>(src0, src1, dst, n_group, stream);
+            } else {
+                get_rows_mean_cuda<QK8_0, QR8_0, dequantize_q8_0>(src0, src1, dst, n_group, stream);
+            }
+            break;
         default: GGML_ABORT("%s: unsupported src0 type: %s\n", __func__, ggml_type_name(src0->type));
     }
 }
