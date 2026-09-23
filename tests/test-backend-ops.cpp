@@ -9219,6 +9219,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    // rows narrower than a CUDA block take a flat per-element kernel: many rows, batches, strided src and rows
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 22592, 90368));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 4, 100, 500, 3, 2, true, true));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16, 3, 50, 70, 2, 1, false, true, 2));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 5, 40, 30, 2, 3, true));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16, 8, 30, 40, 2, 1, false, false, 0, true));
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
         // 576 is the DeepSeek MLA cache row, but a row must hold whole blocks
         const int n_view = 576 % ggml_blck_size(type) == 0 ? 576 : 512;
@@ -11251,6 +11257,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // get_rows of one-float rows: the qwen4exp QSA score expansion at decode, and a MoE weight gather at prefill
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 22592, 90368));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 128, 8, 2048));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

@@ -101,6 +101,36 @@ static __global__ void k_get_rows_float(
     }
 }
 
+// rows narrower than a block: one thread per element over every gathered row, so a block covers many rows
+template<typename src0_t, typename dst_t>
+static __global__ void k_get_rows_float_narrow(
+        const src0_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr,
+        const int64_t n, const uint3 ne00_fdv, const uint3 ne10_fdv, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+
+    ggml_cuda_pdl_lc();
+    const src0_t  * GGML_CUDA_RESTRICT src0 = src0_ptr;
+    const int32_t * GGML_CUDA_RESTRICT src1 = src1_ptr;
+    dst_t         * GGML_CUDA_RESTRICT dst  = dst_ptr;
+    ggml_cuda_pdl_sync();
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x*blockDim.x) {
+        const uint2 r00 = fast_div_modulo((uint32_t) i, ne00_fdv); // row, i00
+        const uint2 r10 = fast_div_modulo(r00.x, ne10_fdv);         // z,   i10
+        const uint2 r12 = fast_div_modulo(r10.x, ne12_fdv);         // i11, i12
+        const int i00 = r00.y;
+        const int i10 = r10.y;
+        const int i11 = r12.x;
+        const int i12 = r12.y;
+
+        const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+        const src0_t * src0_row = (const src0_t *)((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03);
+        dst[i10*s1 + i11*s2 + i12*s3 + i00] = ggml_cuda_cast<dst_t>(src0_row[i00]);
+    }
+}
+
 template<typename dst_t>
 static __global__ void k_get_rows_float_vec(
         const dst_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr,
@@ -253,6 +283,21 @@ static void get_rows_cuda_float(
     GGML_ASSERT(ne12 > 0);
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
+
+    // a row narrower than a block leaves most of a block-per-row launch idle
+    // fastdiv sums two 32-bit terms, so the flat index must stay below 2^31
+    const int64_t n_narrow = ne00*ne10*ne11*ne12;
+    if (ne00 < CUDA_GET_ROWS_BLOCK_SIZE && n_narrow > 0 && n_narrow <= std::numeric_limits<int32_t>::max()) {
+        const dim3 block_nums((n_narrow + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
+        ggml_cuda_kernel_launch(k_get_rows_float_narrow<src0_t, dst_t>, launch_params,
+            src0_d, src1_d, dst_d,
+            n_narrow, init_fastdiv_values(ne00), init_fastdiv_values(ne10), ne12_fdv,
+            s1, s2, s3,
+            nb01, nb02, nb03,
+            s10, s11, s12);
+        return;
+    }
 
     if constexpr (std::is_same<src0_t, dst_t>::value) {
         constexpr int VEC = 16 / sizeof(dst_t);
