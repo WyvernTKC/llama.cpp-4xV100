@@ -749,6 +749,21 @@ static int64_t qwen4exp_qsa_fused_min_tokens() {
     return n;
 }
 
+// LLAMA_QSA_GATHER_KV: 0 keeps the decode attention over every cell under the top-k mask, 1 gathers the
+//   picked cells whenever the batch is small enough. Unset, it gathers once the cache is long enough to pay
+//   for the copies: on a V100 at 6 q heads per kv head the dense read costs ~4.0 us per 1k cells for one
+//   token and ~6.5 us for four, the gathered path ~63 us and ~150 us, so the crossover is ~16k and ~23k cells.
+static bool qwen4exp_qsa_gather_kv(int64_t n_kv, int64_t n_tps) {
+    static const int mode = [] {
+        const char * env = getenv("LLAMA_QSA_GATHER_KV");
+        return env ? atoi(env) : -1;
+    }();
+    if (mode == 0 || n_tps > 8) {
+        return false;
+    }
+    return mode > 0 || n_kv >= 4096*(n_tps + 3);
+}
+
 // QSA attends to a budget of whole blocks of compress_ratio tokens, plus the incomplete tail
 // one mean-pooled indexer key scores each block; set_input resolves the cache layout
 class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
@@ -1072,6 +1087,74 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
+    ggml_tensor * q = q_cur;
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+    // k/v are [head_dim, n_head_kv, n_kv, n_stream], top_k is [n_top_k, n_batch, 1, n_stream]
+    const int64_t n_kv     = k->ne[2];
+    const int64_t n_stream = k->ne[3];
+    const int64_t n_top_k  = top_k->ne[0];
+    const int64_t n_tps    = top_k->ne[1];
+
+    // the CUDA vector kernel takes a multiple of 256 cells (FATTN_KQ_STRIDE)
+    const int64_t n_top_k_pad = GGML_PAD(n_top_k, 256);
+
+    const bool gather = cparams.flash_attn && qwen4exp_qsa_gather_kv(n_kv, n_tps) &&
+        kq_mask->type == GGML_TYPE_F16 && ggml_is_contiguous(kq_mask) &&
+        kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
+        k->nb[1] == ggml_row_size(k->type, k->ne[0]) && v->nb[1] == ggml_row_size(v->type, v->ne[0]) &&
+        v->nb[1] <= v->nb[2];
+
+    if (gather) {
+        // Attend to a copy of the picked cells instead of every cell under a -inf mask. Each token of the
+        //   batch becomes a stream of its own with its own cells. The rows are copied unchanged, so any cache
+        //   type stays exact, and the pad repeats picked cells that the mask then hides.
+        ggml_tensor * idx = top_k;
+        while (idx->ne[0] < n_top_k_pad) {
+            const int64_t n = std::min(idx->ne[0], n_top_k_pad - idx->ne[0]);
+            idx = ggml_concat(ctx0, idx, ggml_view_4d(ctx0, idx, n, idx->ne[1], idx->ne[2], idx->ne[3],
+                    idx->nb[1], idx->nb[2], idx->nb[3], 0), 0);
+        }
+        idx = ggml_reshape_2d(ctx0, idx, n_top_k_pad*n_tps, n_stream);
+
+        // one row of n_head_kv*head_dim per cell
+        auto gather_cells = [&](ggml_tensor * t) {
+            ggml_tensor * rows = ggml_view_3d(ctx0, t, t->ne[0]*t->ne[1], n_kv, n_stream, t->nb[2], t->nb[3], 0);
+            rows = ggml_get_rows_same_type(ctx0, rows, idx);
+            return ggml_reshape_4d(ctx0, rows, t->ne[0], t->ne[1], n_top_k_pad, n_tps*n_stream);
+        };
+        k = gather_cells(k);
+        v = gather_cells(v);
+        cb(k, "k_picked", il);
+        cb(v, "v_picked", il);
+
+        // the mask as rows of one value: [1, n_kv, n_batch, n_stream]
+        ggml_tensor * m_rows = ggml_view_4d(ctx0, kq_mask, 1, n_kv, n_tps, n_stream,
+                kq_mask->nb[0], kq_mask->nb[1], kq_mask->nb[3], 0);
+        ggml_tensor * m_idx  = ggml_view_3d(ctx0, top_k, n_top_k, n_tps, n_stream, top_k->nb[1], top_k->nb[3], 0);
+        ggml_tensor * m_sel  = ggml_get_rows_same_type(ctx0, m_rows, m_idx);
+        m_sel = ggml_reshape_4d(ctx0, m_sel, n_top_k, 1, 1, n_tps*n_stream);
+        if (n_top_k_pad > n_top_k) {
+            if (qsa_mask_pad == nullptr || qsa_mask_pad->ne[0] != n_top_k_pad - n_top_k || qsa_mask_pad->ne[3] != n_tps*n_stream) {
+                qsa_mask_pad = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_top_k_pad - n_top_k, 1, 1, n_tps*n_stream);
+                qsa_mask_pad = ggml_fill(ctx0, qsa_mask_pad, -INFINITY);
+            }
+            m_sel = ggml_concat(ctx0, m_sel, qsa_mask_pad, 0);
+        }
+        cb(m_sel, "kq_mask_picked", il);
+
+        // the cells are the sparse set already, so no n_kv_max
+        ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, m_sel, nullptr, nullptr, 0, kq_scale, il);
+        cb(cur, "kqv_out", il);
+
+        if (inp->self_v_rot) {
+            cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+        }
+
+        return cur;
+    }
+
     // prepare new kq mask - starts filled with -INFINITY
     ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
 
@@ -1097,10 +1180,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     // combine with the original kq mask
     kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
-
-    ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
     cb(cur, "kqv_out", il);
