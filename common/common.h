@@ -294,6 +294,7 @@ struct common_params_sampling {
     bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
 
     bool backend_sampling = false;
+    bool backend_prefilter = true; // let the backend cut each output to the top-k logits the CPU chain can use
 
     // print the parameters into a string
     std::string print() const;

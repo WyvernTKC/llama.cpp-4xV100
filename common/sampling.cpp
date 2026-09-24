@@ -117,6 +117,8 @@ struct common_sampler {
 
     ring_buffer<llama_token> prev;
 
+    int32_t prefilter_k = 0; // see common_sampler_prefilter_k
+
     std::vector<llama_token_data> cur;
 
     llama_token_data_array cur_p;
@@ -182,6 +184,84 @@ std::string common_params_sampling::print() const {
             mirostat, mirostat_eta, mirostat_tau, adaptive_target, adaptive_decay);
 
     return std::string(result);
+}
+
+// Walks the chain as common_sampler_init builds it, up to its first top-k. Ahead of it a sampler may do nothing,
+//   keep the order of the logits (a plain temperature) or only lower the logits of a bounded set of tokens
+//   (penalties, negative biases), each of which widens the cut by that many tokens. Past the top-k every sampler
+//   only sees its k tokens, so they are all in the cut.
+static int32_t common_sampler_compute_prefilter_k(const struct common_params_sampling & params, int32_t n_bias_lower) {
+    constexpr int32_t k_max = 1024;
+
+    if (params.mirostat != 0) {
+        return 0;
+    }
+
+    int32_t n_extra = n_bias_lower;
+
+    for (const auto & cnstr : params.samplers) {
+        switch (cnstr) {
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+                {
+                    const bool active = params.penalty_last_n != 0 &&
+                        (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f);
+                    if (!active) {
+                        break;
+                    }
+                    if (params.penalty_last_n < 0 || params.penalty_repeat < 1.0f || params.penalty_freq < 0.0f || params.penalty_present < 0.0f) {
+                        return 0;
+                    }
+                    n_extra += params.penalty_last_n;
+                } break;
+            case COMMON_SAMPLER_TYPE_DRY:
+                if (params.dry_multiplier != 0.0f) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                if (params.top_n_sigma > 0.0f) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                if (params.dynatemp_range > 0.0f) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_K:
+                {
+                    if (params.top_k <= 0) {
+                        return 0;
+                    }
+                    const int32_t k = params.top_k + n_extra;
+                    return k <= k_max ? k : 0;
+                }
+            case COMMON_SAMPLER_TYPE_TYPICAL_P:
+                if (params.typ_p < 1.0f) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_P:
+                if (params.top_p < 1.0f) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_MIN_P:
+                if (params.min_p > 0.0f) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_XTC:
+                if (params.xtc_probability > 0.0f) {
+                    return 0;
+                }
+                break;
+            default:
+                return 0;
+        }
+    }
+
+    return 0; // no top-k: the chain may pick any token
 }
 
 struct common_sampler * common_sampler_init(
@@ -322,6 +402,8 @@ struct common_sampler * common_sampler_init(
         }
     }
 
+    int32_t n_bias_lower = 0; // tokens whose logits a bias lowers, -1 if one is raised
+
     // logit bias: user biases + model suppress tokens (-INFINITY)
     {
         std::vector<llama_logit_bias> merged = params.logit_bias;
@@ -334,6 +416,16 @@ struct common_sampler * common_sampler_init(
 
         if (!merged.empty()) {
             samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), merged.size(), merged.data()));
+        }
+
+        for (const auto & lb : merged) {
+            if (lb.bias > 0.0f) {
+                n_bias_lower = -1; // can lift a token from anywhere
+                break;
+            }
+            if (lb.bias < 0.0f) {
+                n_bias_lower++;
+            }
         }
     }
 
@@ -425,13 +517,14 @@ struct common_sampler * common_sampler_init(
     }
 
     auto * result = new common_sampler {
-        /* .params  = */ params,
-        /* .grmr    = */ grmr,
-        /* .rbudget = */ rbudget,
-        /* .chain   = */ chain,
-        /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
-        /* .cur     = */ {},
-        /* .cur_p   = */ {},
+        /* .params      = */ params,
+        /* .grmr        = */ grmr,
+        /* .rbudget     = */ rbudget,
+        /* .chain       = */ chain,
+        /* .prev        = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
+        /* .prefilter_k = */ grmr || rbudget || n_bias_lower < 0 ? 0 : common_sampler_compute_prefilter_k(params, n_bias_lower),
+        /* .cur         = */ {},
+        /* .cur_p       = */ {},
     };
 
     return result;
@@ -508,13 +601,14 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     return new common_sampler {
-        /* .params  = */ gsmpl->params,
-        /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
-        /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
-        /* .chain   = */ llama_sampler_clone(gsmpl->chain),
-        /* .prev    = */ gsmpl->prev,
-        /* .cur     = */ gsmpl->cur,
-        /* .cur_p   = */ gsmpl->cur_p,
+        /* .params      = */ gsmpl->params,
+        /* .grmr        = */ llama_sampler_clone(gsmpl->grmr),
+        /* .rbudget     = */ llama_sampler_clone(gsmpl->rbudget),
+        /* .chain       = */ llama_sampler_clone(gsmpl->chain),
+        /* .prev        = */ gsmpl->prev,
+        /* .prefilter_k = */ gsmpl->prefilter_k,
+        /* .cur         = */ gsmpl->cur,
+        /* .cur_p       = */ gsmpl->cur_p,
     };
 }
 
@@ -530,12 +624,13 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     llama_sampler_copy(src->rbudget, dst->rbudget);
     llama_sampler_copy(src->chain,   dst->chain);
 
-    dst->params     = src->params;
-    dst->prev       = src->prev;
-    dst->cur        = src->cur;
-    dst->cur_p      = src->cur_p;
-    dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
-    dst->t_total_us = src->t_total_us;
+    dst->params      = src->params;
+    dst->prev        = src->prev;
+    dst->prefilter_k = src->prefilter_k;
+    dst->cur         = src->cur;
+    dst->cur_p       = src->cur_p;
+    dst->cur_p.data  = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
+    dst->t_total_us  = src->t_total_us;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -589,6 +684,10 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     }
 
     return gsmpl->chain;
+}
+
+int32_t common_sampler_prefilter_k(const struct common_sampler * gsmpl) {
+    return gsmpl ? gsmpl->prefilter_k : 0;
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {

@@ -55,6 +55,11 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
 // get the underlying llama_sampler_chain
 struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 
+// the number of top logits that the chain can ever select from, so a backend top-k of this size in front of it
+//   changes nothing; 0 if the chain needs every logit (grammar, reasoning budget, positive biases, samplers
+//   ahead of top-k that look at the whole distribution, ...)
+int32_t common_sampler_prefilter_k(const struct common_sampler * gsmpl);
+
 // extended sampling implementation:
 //
 // - set logits

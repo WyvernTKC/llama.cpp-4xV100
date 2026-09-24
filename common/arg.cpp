@@ -2324,6 +2324,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_sampling().set_env("LLAMA_ARG_BACKEND_SAMPLING"));
     add_opt(common_arg(
+        {"--backend-prefilter"},
+        {"--no-backend-prefilter"},
+        string_format("without backend sampling, let the backend cut each output to the top logits the sampler chain "
+                      "can select from, when that changes nothing (default: %s)", params.sampling.backend_prefilter ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.sampling.backend_prefilter = value;
+        }
+    ).set_sampling().set_env("LLAMA_ARG_BACKEND_PREFILTER"));
+    add_opt(common_arg(
         {"--pooling"}, "{none,mean,cls,last,rank}",
         "pooling type for embeddings, use model default if unspecified",
         [](common_params & params, const std::string & value) {

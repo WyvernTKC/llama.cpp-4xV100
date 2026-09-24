@@ -401,6 +401,8 @@ struct server_slot {
     json json_schema;
 
     common_sampler_ptr smpl;
+    llama_sampler_ptr  smpl_prefilter;       // backend top-k ahead of smpl, see common_sampler_prefilter_k
+    int32_t            smpl_prefilter_k = 0; // its k
 
     llama_token sampled; // in speculative mode, this is the last accepted token
 
@@ -452,7 +454,11 @@ struct server_slot {
 
         n_predict_max = -1;
 
-        llama_set_sampler(ctx_tgt, id, nullptr);
+        // the slot owns its prefilter chain, so it can stay set for the next task: setting it again would make
+        //   the context reserve its graphs twice per task
+        if (!smpl_prefilter) {
+            llama_set_sampler(ctx_tgt, id, nullptr);
+        }
 
         // clear alora start
         alora_invocation_start = -1;
@@ -1901,11 +1907,40 @@ private:
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
 
+            // without backend sampling the CPU chain may still only ever pick among the top k logits of an output;
+            //   a backend top-k of that size then hands it k candidates instead of the whole vocab, and the logits
+            //   stay on the device
+            int32_t k_prefilter = 0;
+            if (!use_backend_sampling && !need_pre_sample_logits && task.params.sampling.backend_prefilter &&
+                    !(spec && !common_speculative_get_synth_probs(spec.get()).empty())) {
+                k_prefilter = common_sampler_prefilter_k(slot.smpl.get());
+            }
+
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
                 llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+                slot.smpl_prefilter.reset();
+                slot.smpl_prefilter_k = 0;
+            } else if (k_prefilter > 0) {
+                // a new sampler makes the context reserve its graphs again (about a second with -sm tensor), so
+                //   the chain stays set while k does not change
+                if (!slot.smpl_prefilter || slot.smpl_prefilter_k != k_prefilter) {
+                    llama_sampler_ptr prefilter(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+                    llama_sampler_chain_add(prefilter.get(), llama_sampler_init_top_k(k_prefilter));
+
+                    // the context keeps the pointer: swap the owned chain only once the new one is set
+                    if (llama_set_sampler(ctx_tgt, slot.id, prefilter.get())) {
+                        slot.smpl_prefilter   = std::move(prefilter);
+                        slot.smpl_prefilter_k = k_prefilter;
+                    } else {
+                        slot.smpl_prefilter.reset();
+                        slot.smpl_prefilter_k = 0;
+                    }
+                }
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                slot.smpl_prefilter.reset();
+                slot.smpl_prefilter_k = 0;
             }
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
@@ -1918,6 +1953,9 @@ private:
                 slot.spec_synth_rng.seed(seed);
             }
         } else {
+            llama_set_sampler(ctx_tgt, slot.id, nullptr);
+            slot.smpl_prefilter.reset();
+            slot.smpl_prefilter_k = 0;
             slot.smpl.reset();
         }
 
