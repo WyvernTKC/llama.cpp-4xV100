@@ -11008,6 +11008,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_concat(GGML_TYPE_I64, {11, 12, 13, 14}, 7, dim, v));
         }
     }
+    // the conv window of a recurrent layer (d_conv - 1 columns of state and 6 tokens), and rows wide enough for a block each
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 2560, 1, 1}, 6, 0, 2));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {100, 12, 13, 14}, 7, 0, 3));
 
     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
         for (int v : { 0, 4, 8, 12 }) {
