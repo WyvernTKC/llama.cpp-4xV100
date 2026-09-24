@@ -3254,6 +3254,51 @@ struct test_set : public test_case {
 };
 
 // GGML_OP_CPY
+// GGML_OP_CPY x n_copies: windows of n_cols columns into slots, like the conv windows a recurrent layer keeps for
+//   rollback (one per slot, each a column further back). The CUDA backend runs such a run as one launch unless
+//   the slots overlap, which slot_stride < 1 makes them do.
+struct test_cpy_run : public test_case {
+    const int64_t n_cols;
+    const int64_t n_rows;
+    const int64_t n_tok;
+    const int     n_copies;
+    const float   slot_stride; // in slots
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_cols, n_rows, n_tok, n_copies, slot_stride);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CPY_RUN";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_cpy_run(int64_t n_cols = 3, int64_t n_rows = 2560, int64_t n_tok = 6, int n_copies = 6, float slot_stride = 1.0f)
+        : n_cols(n_cols), n_rows(n_rows), n_tok(n_tok), n_copies(n_copies), slot_stride(slot_stride) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_cols + n_tok, n_rows);
+        ggml_set_name(src, "src");
+        const int64_t slot = n_cols*n_rows;
+        const int64_t step = std::max<int64_t>(1, (int64_t) (slot_stride*slot));
+        ggml_tensor * dst = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, step*(n_copies - 1) + slot);
+        ggml_set_name(dst, "dst");
+
+        for (int s = 0; s < n_copies; s++) {
+            ggml_tensor * win = ggml_view_2d(ctx, src, n_cols, n_rows, src->nb[1], (n_tok - s)*sizeof(float));
+            // a flat slot, as the rollback writes it: a copy of the same shape would go to cudaMemcpy2D instead
+            ggml_tensor * out = ggml_view_1d(ctx, dst, slot, s*step*sizeof(float));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, win, out));
+        }
+
+        ggml_tensor * out = ggml_scale(ctx, dst, 1.0f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_cpy : public test_case {
     const ggml_type type_src;
     const ggml_type type_dst;
@@ -9961,6 +10006,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_F32, {256, 2, 3, 4}, {-1,-1,-1,-1}, {1, 0, 2, 3}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {256, 4, 3, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {256, 4, 3, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
+    // the rollback conv windows: 6 slots at 6 tokens, 2 at 1, more than one launch holds, and overlapping slots
+    test_cases.emplace_back(new test_cpy_run(3, 2560, 6, 6));
+    test_cases.emplace_back(new test_cpy_run(3, 2560, 1, 2));
+    test_cases.emplace_back(new test_cpy_run(3, 640, 12, 11));
+    test_cases.emplace_back(new test_cpy_run(3, 2560, 6, 6, 0.5f));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {256, 4, 3, 3}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_BF16, GGML_TYPE_BF16, {256, 4, 3, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {256, 4, 1, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));

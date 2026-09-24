@@ -41,6 +41,40 @@ static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne
     cpy_1(cx + x_offset, cdst + dst_offset);
 }
 
+struct cpy_scalar_batch_ptrs {
+    const char * src[GGML_CUDA_CPY_BATCH_MAX];
+    char       * dst[GGML_CUDA_CPY_BATCH_MAX];
+};
+
+// cpy_scalar for several copies of one shape: blockIdx.y picks the copy
+template <cpy_kernel_t cpy_1>
+static __global__ void cpy_scalar_batch(const cpy_scalar_batch_ptrs ptrs, const int64_t ne,
+                                        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+                                        const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11,
+                                        const int64_t nb12, const int64_t nb13) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= ne) {
+        return;
+    }
+
+    const int64_t i03 = i/(ne00 * ne01 * ne02);
+    const int64_t i02 = (i - i03*ne00*ne01*ne02 )/ (ne00*ne01);
+    const int64_t i01 = (i - i03*ne00*ne01*ne02  -  i02*ne01*ne00) / ne00;
+    const int64_t i00 = i - i03*ne00*ne01*ne02 - i02*ne01*ne00 - i01*ne00;
+    const int64_t x_offset = i00*nb00 + i01*nb01 + i02*nb02 + i03 * nb03;
+
+    const int64_t i13 = i/(ne10 * ne11 * ne12);
+    const int64_t i12 = (i - i13*ne10*ne11*ne12) / (ne10*ne11);
+    const int64_t i11 = (i - i13*ne10*ne11*ne12 - i12*ne10*ne11) / ne10;
+    const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
+    const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13 * nb13;
+
+    ggml_cuda_pdl_sync();
+    cpy_1(ptrs.src[blockIdx.y] + x_offset, ptrs.dst[blockIdx.y] + dst_offset);
+}
+
 template <typename T>
 static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const int64_t ne,
                                const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
@@ -424,6 +458,42 @@ static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tens
     dpitch = src1->nb[d];
 
     return spitch >= width && dpitch >= width;
+}
+
+bool ggml_cuda_cpy_is_scalar_f32(const ggml_tensor * src0, const ggml_tensor * src1) {
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || ggml_nelements(src0) != ggml_nelements(src1)) {
+        return false;
+    }
+    if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+        return false;
+    }
+    size_t mc_width = 0, mc_height = 0, mc_spitch = 0, mc_dpitch = 0;
+    if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
+        return false;
+    }
+    const bool can_be_transposed = src0->nb[1] == ggml_element_size(src0) &&
+        src0->ne[3] == 1 && src0->nb[2] == src0->ne[0] * src0->ne[1] * ggml_element_size(src0);
+    return !can_be_transposed;
+}
+
+void ggml_cuda_cpy_scalar_f32_batch(ggml_backend_cuda_context & ctx, const ggml_tensor * const * src0, ggml_tensor * const * src1, int n) {
+    GGML_ASSERT(n >= 1 && n <= GGML_CUDA_CPY_BATCH_MAX);
+    const ggml_tensor * s0 = src0[0];
+    const ggml_tensor * s1 = src1[0];
+
+    cpy_scalar_batch_ptrs ptrs = {};
+    for (int k = 0; k < n; k++) {
+        ptrs.src[k] = (const char *) src0[k]->data;
+        ptrs.dst[k] = (char *) src1[k]->data;
+    }
+
+    const int64_t ne         = ggml_nelements(s0);
+    const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+    GGML_ASSERT(num_blocks <= INT_MAX);
+    const ggml_cuda_kernel_launch_params launch_params(dim3(num_blocks, n, 1), dim3(CUDA_CPY_BLOCK_SIZE, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(cpy_scalar_batch<cpy_1_scalar<float, float>>, launch_params,
+        ptrs, ne, s0->ne[0], s0->ne[1], s0->ne[2], s0->nb[0], s0->nb[1], s0->nb[2], s0->nb[3],
+        s1->ne[0], s1->ne[1], s1->ne[2], s1->nb[0], s1->nb[1], s1->nb[2], s1->nb[3]);
 }
 
 void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, ggml_tensor * src1) {

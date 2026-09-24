@@ -3900,6 +3900,61 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // A run of scalar f32 copies of one shape and stride, with only views between them, in one launch: a
+    //   recurrent layer keeps its conv window once per rollback slot, 6 copies of 30 KiB per layer at 6 tokens
+    //   (288 launches of ~2.8 us per MTP verify on Qwen3.8-27B). The copies must not touch each other's data.
+    if (node->op == GGML_OP_CPY && cuda_ctx->stream_context().concurrent_events.empty() &&
+            ggml_cuda_cpy_is_scalar_f32(node->src[0], node->src[1])) {
+        const ggml_tensor * s0 = node->src[0];
+        const ggml_tensor * s1 = node->src[1];
+        const auto extent = [](const ggml_tensor * t) {
+            size_t e = ggml_element_size(t);
+            for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                e += (t->ne[d] - 1)*t->nb[d];
+            }
+            return e;
+        };
+        const auto overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
+            const char * a0 = (const char *) a->data;
+            const char * b0 = (const char *) b->data;
+            return a0 < b0 + extent(b) && b0 < a0 + extent(a);
+        };
+        const ggml_tensor * srcs[GGML_CUDA_CPY_BATCH_MAX] = { s0 };
+        ggml_tensor       * dsts[GGML_CUDA_CPY_BATCH_MAX] = { node->src[1] };
+        int n    = 1;
+        int last = i;
+        for (int j = i + 1; j < cgraph->n_nodes && n < GGML_CUDA_CPY_BATCH_MAX; j++) {
+            ggml_tensor * nj = cgraph->nodes[j];
+            if (ggml_cuda_is_view_or_noop(nj) || (nj->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                continue;
+            }
+            if (nj->op != GGML_OP_CPY) {
+                break;
+            }
+            const ggml_tensor * t0 = nj->src[0];
+            ggml_tensor       * t1 = nj->src[1];
+            bool ok = t0->type == s0->type && t1->type == s1->type;
+            for (int d = 0; ok && d < GGML_MAX_DIMS; d++) {
+                ok = t0->ne[d] == s0->ne[d] && t0->nb[d] == s0->nb[d] && t1->ne[d] == s1->ne[d] && t1->nb[d] == s1->nb[d];
+            }
+            // no copy may read or write what another one of the run writes
+            for (int k = 0; ok && k < n; k++) {
+                ok = !overlap(t1, dsts[k]) && !overlap(t1, srcs[k]) && !overlap(t0, dsts[k]);
+            }
+            if (!ok) {
+                break;
+            }
+            srcs[n] = t0;
+            dsts[n] = t1;
+            n++;
+            last = j;
+        }
+        if (n > 1) {
+            ggml_cuda_cpy_scalar_f32_batch(*cuda_ctx, srcs, dsts, n);
+            return last - i;
+        }
+    }
+
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
