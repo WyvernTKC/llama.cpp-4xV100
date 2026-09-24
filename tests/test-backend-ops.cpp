@@ -11395,6 +11395,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 false, 1, 1, false, with_bias, true, false, {1, 1}));
         }
     }
+    // a few tokens: four rows per block on Volta up to 6 tokens with K >= 1024, one row at 8 tokens or K = 512
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int n : {2, 3, 6, 8}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 1280, n, 2048, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 4096, 3, 512, {1, 1}, {1, 1}));
+    }
 
     // Fused row-pair coverage: minimum rows, an even pair, and an odd tail.
     // TODO: the max_nmse_err() for these cases is not estimated correctly causing sporadic false failures.

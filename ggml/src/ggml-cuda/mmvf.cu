@@ -4,10 +4,10 @@
 #include "mmvf.cuh"
 #include "convert.cuh"
 
-// rpb > 1 (one token only) puts that many consecutive rows in a block: they share the y loads, and each row
-// still sums in exactly the order it would with a block of its own.
-// load16 (one token, 2-byte weights) reads 8 weights per 16-byte load instead of 2 per 4-byte load, which
-// changes the order in which a row sums, so its results can differ in the last bits.
+// rpb > 1 puts that many consecutive rows in a block: they share the y loads, and each row still sums in
+// exactly the order it would with a block of its own. With several tokens it needs load16.
+// load16 (2-byte weights) reads 8 weights per 16-byte load instead of 2 per 4-byte load, which changes the
+// order in which a row sums, so its results can differ in the last bits.
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false, int rpb = 1, bool load16 = false>
 static __global__ void mul_mat_vec_f(
         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -19,7 +19,7 @@ static __global__ void mul_mat_vec_f(
     const float   * GGML_CUDA_RESTRICT y   = y_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
     float         * GGML_CUDA_RESTRICT dst = dst_ptr;
-    static_assert(rpb == 1 || (ncols_dst == 1 && !is_multi_token_id), "rows per block need a single token");
+    static_assert(rpb == 1 || ((ncols_dst == 1 || load16) && !is_multi_token_id), "rows per block need a single token or the 16-byte loads");
     const int row         = rpb*blockIdx.x; // the first of the block's rows
     [[maybe_unused]] const int stride_row2 = stride_row/2;
     // for MUL_MAT_ID - blockIdx.y = n_expert_used, blockIdx.z = ncols_dst (tokens)
@@ -133,8 +133,9 @@ static __global__ void mul_mat_vec_f(
     }
 
     if constexpr (load16) {
-        // a 16-byte load brings 8 weights of a row and two more bring their 8 y values, which the rows share
-        static_assert(sizeof(T) == 2 && ncols_dst == 1 && !is_multi_token_id, "16-byte loads need 2-byte weights and one token");
+        // a 16-byte load brings 8 weights of a row and two more bring the 8 matching y values of a column, and the
+        // block uses each weight for every column and each y value for every row
+        static_assert(sizeof(T) == 2 && !is_multi_token_id, "16-byte loads need 2-byte weights");
         const float4 * x4 = (const float4 *) x;
         [[maybe_unused]] const float4 * gate_x4 = nullptr;
         if constexpr (has_fusion) {
@@ -143,36 +144,50 @@ static __global__ void mul_mat_vec_f(
             }
         }
         const float4 * y4 = (const float4 *) y;
-        const int ncols8      = ncols2/4;
-        const int stride_row8 = stride_row/8;
+        const int ncols8        = ncols2/4;
+        const int stride_row8   = stride_row/8;
+        const int stride_col_y4 = stride_col_y2/2;
 
         if constexpr (std::is_same_v<T, half> && std::is_same_v<type_acc, half>) {
 #ifdef FP16_AVAILABLE
-            half2 sumh2[rpb] = {{0.0f, 0.0f}};
-            half2 sumh2_gate[rpb] = {{0.0f, 0.0f}};
+            half2 sumh2[ncols_dst*rpb] = {{0.0f, 0.0f}};
+            half2 sumh2_gate[ncols_dst*rpb] = {{0.0f, 0.0f}};
 
             for (int col8 = tid; col8 < ncols8; col8 += block_size) {
-                const float4 tmpy_lo = y4[2*col8 + 0];
-                const float4 tmpy_hi = y4[2*col8 + 1];
-                const half2 tmpy[4] = {
-                    make_half2(tmpy_lo.x, tmpy_lo.y), make_half2(tmpy_lo.z, tmpy_lo.w),
-                    make_half2(tmpy_hi.x, tmpy_hi.y), make_half2(tmpy_hi.z, tmpy_hi.w)};
+                float4 tmpx[rpb];
+                [[maybe_unused]] float4 tmpx_gate[rpb];
 #pragma unroll
                 for (int i = 0; i < rpb; ++i) {
-                    const float4 tmpx = x4[i*stride_row8 + col8];
-                    const half2 * tmpx_h2 = (const half2 *) &tmpx;
-#pragma unroll
-                    for (int l = 0; l < 4; ++l) {
-                        sumh2[i] += tmpx_h2[l] * tmpy[l];
-                    }
-
+                    tmpx[i] = x4[i*stride_row8 + col8];
                     if constexpr (has_fusion) {
                         if (use_gate) {
-                            const float4 tmpx_gate = gate_x4[i*stride_row8 + col8];
-                            const half2 * tmpx_gate_h2 = (const half2 *) &tmpx_gate;
+                            tmpx_gate[i] = gate_x4[i*stride_row8 + col8];
+                        }
+                    }
+                }
+
 #pragma unroll
-                            for (int l = 0; l < 4; ++l) {
-                                sumh2_gate[i] += tmpx_gate_h2[l] * tmpy[l];
+                for (int j = 0; j < ncols_dst; ++j) {
+                    const float4 tmpy_lo = y4[j*stride_col_y4 + 2*col8 + 0];
+                    const float4 tmpy_hi = y4[j*stride_col_y4 + 2*col8 + 1];
+                    const half2 tmpy[4] = {
+                        make_half2(tmpy_lo.x, tmpy_lo.y), make_half2(tmpy_lo.z, tmpy_lo.w),
+                        make_half2(tmpy_hi.x, tmpy_hi.y), make_half2(tmpy_hi.z, tmpy_hi.w)};
+#pragma unroll
+                    for (int i = 0; i < rpb; ++i) {
+                        const half2 * tmpx_h2 = (const half2 *) &tmpx[i];
+#pragma unroll
+                        for (int l = 0; l < 4; ++l) {
+                            sumh2[i*ncols_dst + j] += tmpx_h2[l] * tmpy[l];
+                        }
+
+                        if constexpr (has_fusion) {
+                            if (use_gate) {
+                                const half2 * tmpx_gate_h2 = (const half2 *) &tmpx_gate[i];
+#pragma unroll
+                                for (int l = 0; l < 4; ++l) {
+                                    sumh2_gate[i*ncols_dst + j] += tmpx_gate_h2[l] * tmpy[l];
+                                }
                             }
                         }
                     }
@@ -180,11 +195,11 @@ static __global__ void mul_mat_vec_f(
             }
 
 #pragma unroll
-            for (int i = 0; i < rpb; ++i) {
-                sumf[i] = __low2float(sumh2[i]) + __high2float(sumh2[i]);
+            for (int j = 0; j < ncols_dst*rpb; ++j) {
+                sumf[j] = __low2float(sumh2[j]) + __high2float(sumh2[j]);
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        sumf_gate[i] = __low2float(sumh2_gate[i]) + __high2float(sumh2_gate[i]);
+                        sumf_gate[j] = __low2float(sumh2_gate[j]) + __high2float(sumh2_gate[j]);
                     }
                 }
             }
@@ -193,25 +208,46 @@ static __global__ void mul_mat_vec_f(
 #endif // FP16_AVAILABLE
         } else {
             for (int col8 = tid; col8 < ncols8; col8 += block_size) {
-                const float4 tmpy_lo = y4[2*col8 + 0];
-                const float4 tmpy_hi = y4[2*col8 + 1];
-                const float tmpy[8] = {tmpy_lo.x, tmpy_lo.y, tmpy_lo.z, tmpy_lo.w, tmpy_hi.x, tmpy_hi.y, tmpy_hi.z, tmpy_hi.w};
+                float tmpx[rpb][8];
+                [[maybe_unused]] float tmpx_gate[rpb][8];
 #pragma unroll
                 for (int i = 0; i < rpb; ++i) {
-                    const float4 tmpx = x4[i*stride_row8 + col8];
-                    const T * tmpx_e = (const T *) &tmpx;
+                    const float4 tmpx4 = x4[i*stride_row8 + col8];
+                    const T * tmpx_e = (const T *) &tmpx4;
 #pragma unroll
                     for (int l = 0; l < 8; ++l) {
-                        ggml_cuda_mad(sumf[i], ggml_cuda_cast<float>(tmpx_e[l]), tmpy[l]);
+                        tmpx[i][l] = ggml_cuda_cast<float>(tmpx_e[l]);
                     }
-
                     if constexpr (has_fusion) {
                         if (use_gate) {
-                            const float4 tmpx_gate = gate_x4[i*stride_row8 + col8];
-                            const T * tmpx_gate_e = (const T *) &tmpx_gate;
+                            const float4 tmpx4_gate = gate_x4[i*stride_row8 + col8];
+                            const T * tmpx_gate_e = (const T *) &tmpx4_gate;
 #pragma unroll
                             for (int l = 0; l < 8; ++l) {
-                                ggml_cuda_mad(sumf_gate[i], ggml_cuda_cast<float>(tmpx_gate_e[l]), tmpy[l]);
+                                tmpx_gate[i][l] = ggml_cuda_cast<float>(tmpx_gate_e[l]);
+                            }
+                        }
+                    }
+                }
+
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    const float4 tmpy_lo = y4[j*stride_col_y4 + 2*col8 + 0];
+                    const float4 tmpy_hi = y4[j*stride_col_y4 + 2*col8 + 1];
+                    const float tmpy[8] = {tmpy_lo.x, tmpy_lo.y, tmpy_lo.z, tmpy_lo.w, tmpy_hi.x, tmpy_hi.y, tmpy_hi.z, tmpy_hi.w};
+#pragma unroll
+                    for (int i = 0; i < rpb; ++i) {
+#pragma unroll
+                        for (int l = 0; l < 8; ++l) {
+                            ggml_cuda_mad(sumf[i*ncols_dst + j], tmpx[i][l], tmpy[l]);
+                        }
+
+                        if constexpr (has_fusion) {
+                            if (use_gate) {
+#pragma unroll
+                                for (int l = 0; l < 8; ++l) {
+                                    ggml_cuda_mad(sumf_gate[i*ncols_dst + j], tmpx_gate[i][l], tmpy[l]);
+                                }
                             }
                         }
                     }
@@ -413,11 +449,12 @@ static __global__ void mul_mat_vec_f(
 
     ggml_cuda_pdl_lc();
     if constexpr (load16) {
-        // the rows reduce together, through a single barrier
+        // all rows and columns reduce together, through a single barrier
         constexpr int nwarps = block_size/warp_size;
-        static_assert(rpb*nwarps <= warp_size, "the partial sums must fit the reduction buffer");
+        constexpr int nsums  = ncols_dst*rpb;
+        static_assert(!has_fusion || nsums*nwarps <= warp_size, "the gate's partial sums start after warp_size floats");
 #pragma unroll
-        for (int i = 0; i < rpb; ++i) {
+        for (int i = 0; i < nsums; ++i) {
             sumf[i] = warp_reduce_sum<warp_size>(sumf[i]);
             if constexpr (has_fusion) {
                 if (use_gate) {
@@ -429,7 +466,7 @@ static __global__ void mul_mat_vec_f(
         if (block_size > warp_size) {
             if (tid % warp_size == 0) {
 #pragma unroll
-                for (int i = 0; i < rpb; ++i) {
+                for (int i = 0; i < nsums; ++i) {
                     buf_iw[i*nwarps + tid/warp_size] = sumf[i];
                     if constexpr (has_fusion) {
                         if (use_gate) {
@@ -439,11 +476,11 @@ static __global__ void mul_mat_vec_f(
                 }
             }
             __syncthreads();
-            if (tid >= rpb) {
+            if (tid >= nsums) {
                 return;
             }
 #pragma unroll
-            for (int i = 0; i < rpb; ++i) {
+            for (int i = 0; i < nsums; ++i) {
                 sumf[i] = 0.0f;
 #pragma unroll
                 for (int w = 0; w < nwarps; ++w) {
@@ -564,6 +601,18 @@ static void mul_mat_vec_f_switch_fusion(
     };
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    if constexpr (ncols_dst > 1 && !is_multi_token_id && sizeof(T) == 2) {
+        if (load16) {
+            GGML_ASSERT(!has_fusion);
+            if (rpb == 4) {
+                launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, 4, true>);
+            } else {
+                GGML_ASSERT(rpb == 1);
+                launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, 1, true>);
+            }
+            return;
+        }
+    }
     if constexpr (ncols_dst == 1 && !is_multi_token_id && sizeof(T) == 2) {
         if (load16) {
             if (rpb == 4) {
@@ -629,11 +678,12 @@ void launch_mul_mat_vec_f_cuda(
     const int device = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
 
-    // On Volta one token over 2-byte weights reads 8 weights per 16-byte load. Measured with a cold cache:
-    // bf16 8192x1024 -14%, 4096x512 -20%, 256x4096 -10%, f16 2560x5120 -4%, 62080x5120 and K = 4096 flat.
+    // On Volta 2-byte weights are read 8 per 16-byte load. Measured with a cold cache, one token: bf16 8192x1024
+    // -14%, 4096x512 -20%, 256x4096 -10%, f16 2560x5120 -4%, 62080x5120 and K = 4096 flat; 2-8 tokens: bf16
+    // 8192x1024 and 1280x17408 1.4-2.6x faster.
     const int  cc        = ggml_cuda_info().devices[device].cc;
     const bool is_volta  = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA && cc < GGML_CUDA_CC_TURING;
-    const bool load16 = sizeof(T) == 2 && ncols_dst == 1 && !is_multi_token_id && is_volta &&
+    const bool load16 = sizeof(T) == 2 && !is_multi_token_id && is_volta && (ncols_dst == 1 || stride_col_y % 4 == 0) &&
         ncols % 8 == 0 && stride_row % 8 == 0 && stride_channel_x % 8 == 0 && stride_sample_x % 8 == 0 &&
         stride_channel_y % 4 == 0 && stride_sample_y % 4 == 0 &&
         (uintptr_t) x % 16 == 0 && (uintptr_t) y % 16 == 0 && (uintptr_t) fusion.gate % 16 == 0;
@@ -655,10 +705,10 @@ void launch_mul_mat_vec_f_cuda(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
 
-    const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
-
     // On Volta four rows per block share the y loads and keep more loads in flight. With the 16-byte loads
-    // that only pays for rows of <= 512 (bf16 4096x512 -10%, 8192x1024 +4%). With the 4-byte loads, where every
+    // that pays for one token only for rows of <= 512 (bf16 4096x512 -10%, 8192x1024 +4%), and for 2-6 tokens for
+    // rows of >= 1024, where each row would otherwise read every y column again (bf16 1280x17408 at 6 tokens
+    // 125 -> 79 us, 4352x5120 118 -> 88 us; rows of 512 and 8 tokens are mixed). With the 4-byte loads, where every
     // row still sums in its own order, short rows gain the most (bf16 8192x1024 -22%, 4096x512 -23%) and so do
     // very tall matrices (f16 62080x5120 -10%), rows of 2k-17k are within +-3%, and below ~8 blocks per SM it
     // loses.
@@ -668,6 +718,13 @@ void launch_mul_mat_vec_f_cuda(
             nrows % 4 == 0 && (nrows/4)*nchannels_dst*nsamples_or_ntokens >= 8*ggml_cuda_info().devices[device].nsm) {
         rpb = 4;
     }
+    if (load16 && ncols_dst > 1 && ncols_dst <= 6 && ncols >= 1024 && nrows % 4 == 0) {
+        rpb = 4;
+    }
+
+    // the 16-byte path keeps one partial sum per warp, row and column
+    const int nsums_red     = load16 ? int(ncols_dst*rpb*(block_size_best/warp_size)) : 0;
+    const int nbytes_shared = (std::max(warp_size, nsums_red) + (has_fusion ? warp_size : 0))*sizeof(float);
 
     const dim3 block_nums(nrows/rpb, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(block_size_best, 1, 1);
@@ -1048,6 +1105,15 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 }
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                     return src0_small && ne11 <= 4;
+                }
+                // On Volta the 16-byte loads beat mmf at 2 tokens, and up to 6 when mmf's 32-row blocks would leave
+                // half of the SMs idle (f16 1280x17408 at 5 tokens 71 vs 83 us); from 3 tokens mmf is otherwise
+                // faster (4352x5120 at 3 tokens 64 vs 68 us, and 65 vs 86 us at 6), and without the 16-byte loads
+                // the old limit stays
+                const bool load16 = src0_ne[0] % 8 == 0 && src0_nb[1] % 16 == 0 && src0_nb[2] % 16 == 0 && src0_nb[3] % 16 == 0;
+                if (cc >= GGML_CUDA_CC_VOLTA && cc < GGML_CUDA_CC_TURING && load16) {
+                    const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+                    return src0_small && (ne11 <= 2 || (ne11 <= 6 && src0_ne[1] <= 16*nsm));
                 }
                 if (fp16_mma_hardware_available(cc)) {
                     return src0_small && ne11 <= 3;
