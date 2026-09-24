@@ -159,6 +159,56 @@ static __global__ void rms_norm_f32(const float * x,
     }
 }
 
+// sum = a + b and dst = rms_norm(sum) * mul in one pass: a residual add and the norm that follows it, which also
+//   leaves the sum for the next residual. It reduces exactly like rms_norm_f32 with the same block size, so both
+//   results are those of the three ops apart. a, b, sum and dst are contiguous.
+template <int block_size>
+static __global__ void rms_norm_pre_add_f32(const float * a, const float * b, float * sum, float * dst, const int ncols,
+                                            const float eps, const float * mul, const int64_t mul_stride_row,
+                                            const int64_t mul_stride_channel, const int64_t mul_stride_sample,
+                                            const uint3 mul_ncols_packed, const uint3 mul_nrows_packed,
+                                            const uint3 mul_nchannels_packed, const uint3 mul_nsamples_packed) {
+    ggml_cuda_pdl_lc();
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+
+    const int row     = blockIdx.x;
+    const int channel = blockIdx.y;
+    const int sample  = blockIdx.z;
+    const int tid     = threadIdx.x;
+
+    const int64_t offset = ((int64_t(sample)*nchannels + channel)*nrows + row)*ncols;
+    a   += offset;
+    b   += offset;
+    sum += offset;
+    dst += offset;
+
+    const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
+    const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
+    const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
+    mul += mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
+
+    float tmp = 0.0f;
+
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = a[col] + b[col];
+        sum[col] = xi;
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const int mul_col = fastmodulo(col, mul_ncols_packed);
+        dst[col] = scale * sum[col] * mul[mul_col];
+    }
+}
+
 template <int block_size>
 static __global__ void rms_norm_back_f32(
         const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
@@ -618,6 +668,66 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
                           /*add_s00*/ 0, 0, 0,
                           0, 0, 0, 0,
                           eps, stream);
+}
+
+bool ggml_cuda_should_fuse_rms_norm_pre_add(const ggml_tensor * add, const ggml_tensor * rms_norm, const ggml_tensor * mul) {
+    if (add->op != GGML_OP_ADD || rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || rms_norm->src[0] != add) {
+        return false;
+    }
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : (mul->src[1] == rms_norm ? mul->src[0] : nullptr);
+    if (w == nullptr || w == rms_norm) {
+        return false;
+    }
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+    for (const ggml_tensor * t : { a, b, add, rms_norm, mul, w }) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    // no broadcast in the add, contiguous rows everywhere, and a weight the norm's mul can broadcast
+    return ggml_are_same_shape(a, add) && ggml_are_same_shape(b, add) && ggml_are_same_shape(mul, add) &&
+        ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(add) && ggml_is_contiguous(mul) &&
+        w->nb[0] == sizeof(float) && ggml_can_repeat(w, add) &&
+        add->ne[1] <= INT_MAX && add->ne[2] <= 65535 && add->ne[3] <= 65535;
+}
+
+void ggml_cuda_op_rms_norm_pre_add(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * rms_norm, ggml_tensor * mul) {
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const int ncols = add->ne[0];
+    const dim3 blocks_num(add->ne[1], add->ne[2], add->ne[3]);
+
+    const size_t ts_w = ggml_type_size(w->type);
+    const uint3 mul_ncols_packed     = init_fastdiv_values(w->ne[0]);
+    const uint3 mul_nrows_packed     = init_fastdiv_values(w->ne[1]);
+    const uint3 mul_nchannels_packed = init_fastdiv_values(w->ne[2]);
+    const uint3 mul_nsamples_packed  = init_fastdiv_values(w->ne[3]);
+
+    const float * a_d   = (const float *) add->src[0]->data;
+    const float * b_d   = (const float *) add->src[1]->data;
+    float       * sum_d = (float *) add->data;
+    float       * dst_d = (float *) mul->data;
+    const float * w_d   = (const float *) w->data;
+
+    // the block size rms_norm_f32 would pick, which fixes the order of the reduction
+    if (ncols < 1024) {
+        const dim3 block_dims(256, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0, ctx.stream()};
+        ggml_cuda_kernel_launch(rms_norm_pre_add_f32<256>, launch_params, a_d, b_d, sum_d, dst_d, ncols, eps, w_d,
+            (int64_t) (w->nb[1]/ts_w), (int64_t) (w->nb[2]/ts_w), (int64_t) (w->nb[3]/ts_w),
+            mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0, ctx.stream()};
+        ggml_cuda_kernel_launch(rms_norm_pre_add_f32<1024>, launch_params, a_d, b_d, sum_d, dst_d, ncols, eps, w_d,
+            (int64_t) (w->nb[1]/ts_w), (int64_t) (w->nb[2]/ts_w), (int64_t) (w->nb[3]/ts_w),
+            mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
+    }
 }
 
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
