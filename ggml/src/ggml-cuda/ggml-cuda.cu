@@ -4749,6 +4749,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // the gate of a gated delta net layer, softplus(alpha + dt) * a
+    if (node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes &&
+            ggml_cuda_should_fuse_add_softplus_mul(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+        const int outputs[1] = { i + 2 };
+        const enum ggml_op ops[3] = { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL };
+        if (ggml_can_fuse_subgraph(cgraph, i, 3, ops, outputs, 1)) {
+            ggml_cuda_op_add_softplus_mul(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+            return 2;
+        }
+    }
+
     // the residual add ahead of a norm: two launches per layer and token, and the sum stays an output
     if (node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes &&
             ggml_cuda_should_fuse_rms_norm_pre_add(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {

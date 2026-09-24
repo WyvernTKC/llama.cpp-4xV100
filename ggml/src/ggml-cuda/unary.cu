@@ -702,6 +702,51 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
     }
 }
 
+/* fused add + softplus + mul, both by a row: the gate of a gated delta net layer, softplus(alpha + dt) * a,
+   three launches per layer and token on a few dozen values. Each op is the one its own kernel runs. */
+
+static __global__ void add_softplus_mul_f32(const float * x, const float * bias, const float * scale, float * dst,
+                                            const int k, const uint3 ne0_packed) {
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+    const uint32_t i0 = fastmodulo((uint32_t) i, ne0_packed);
+    dst[i] = op_softplus(x[i] + bias[i0]) * scale[i0];
+}
+
+static bool ggml_cuda_is_f32_row(const ggml_tensor * t, int64_t ne0) {
+    return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->ne[0] == ne0 && ggml_nelements(t) == ne0;
+}
+
+bool ggml_cuda_should_fuse_add_softplus_mul(const ggml_tensor * add, const ggml_tensor * unary, const ggml_tensor * mul) {
+    if (add->op != GGML_OP_ADD || unary->op != GGML_OP_UNARY || ggml_get_unary_op(unary) != GGML_UNARY_OP_SOFTPLUS ||
+            mul->op != GGML_OP_MUL || unary->src[0] != add || (mul->src[0] != unary && mul->src[1] != unary)) {
+        return false;
+    }
+    const int64_t ne0 = add->ne[0];
+    const ggml_tensor * scale = mul->src[0] == unary ? mul->src[1] : mul->src[0];
+    // the add takes the full tensor and a row, in either order
+    const ggml_tensor * x = ggml_are_same_shape(add->src[0], add) ? add->src[0] : add->src[1];
+    const ggml_tensor * b = x == add->src[0] ? add->src[1] : add->src[0];
+    return add->type == GGML_TYPE_F32 && unary->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 &&
+        x->type == GGML_TYPE_F32 && ggml_are_same_shape(x, add) && ggml_is_contiguous(x) && ggml_is_contiguous(add) &&
+        ggml_are_same_shape(mul, add) && ggml_is_contiguous(mul) &&
+        ggml_cuda_is_f32_row(b, ne0) && ggml_cuda_is_f32_row(scale, ne0) && ggml_nelements(add) <= INT_MAX;
+}
+
+void ggml_cuda_op_add_softplus_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * unary, ggml_tensor * mul) {
+    const ggml_tensor * scale = mul->src[0] == unary ? mul->src[1] : mul->src[0];
+    const ggml_tensor * x     = ggml_are_same_shape(add->src[0], add) ? add->src[0] : add->src[1];
+    const ggml_tensor * b     = x == add->src[0] ? add->src[1] : add->src[0];
+
+    const int k = (int) ggml_nelements(mul);
+    const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    add_softplus_mul_f32<<<num_blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream()>>>(
+        (const float *) x->data, (const float *) b->data, (const float *) scale->data, (float *) mul->data,
+        k, init_fastdiv_values((uint32_t) add->ne[0]));
+}
+
 /* fused relu + sqr */
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node) {

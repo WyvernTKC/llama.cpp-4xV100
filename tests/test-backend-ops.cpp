@@ -3956,6 +3956,47 @@ struct test_rms_norm_back : public test_case {
 };
 
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
+// GGML_OP_ADD + GGML_OP_UNARY(SOFTPLUS) + GGML_OP_MUL with a row each: the gate of a gated delta net layer,
+//   softplus(alpha + dt) * a
+struct test_add_softplus_mul : public test_case {
+    const std::array<int64_t, 4> ne;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_SOFTPLUS_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR1(ne);
+    }
+
+    test_add_softplus_mul(std::array<int64_t, 4> ne = {48, 6, 1, 1})
+        : ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(x, "x");
+        ggml_set_name(b, "b");
+        ggml_set_name(a, "a");
+
+        ggml_tensor * sum = ggml_add(ctx, x, b);
+        ggml_tensor * out = ggml_mul(ctx, ggml_softplus(ctx, sum), a);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // around the softplus threshold of 20 as well as small values
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -25.0f, 25.0f);
+        }
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_RMS_NORM + GGML_OP_MUL, the residual add ahead of the next layer's norm: the sum is used
 //   again later, so a fused kernel has to keep writing it
 struct test_add_rms_norm_mul : public test_case {
@@ -10046,6 +10087,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_F32, {256, 2, 3, 4}, {-1,-1,-1,-1}, {1, 0, 2, 3}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {256, 4, 3, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {256, 4, 3, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
+    for (int64_t n_tokens : {1, 6, 37}) {
+        test_cases.emplace_back(new test_add_softplus_mul({48, n_tokens, 1, 1}));
+        test_cases.emplace_back(new test_add_softplus_mul({12, n_tokens, 2, 1}));
+    }
     // the rollback conv windows: 6 slots at 6 tokens, 2 at 1, more than one launch holds, and overlapping slots
     test_cases.emplace_back(new test_cpy_run(3, 2560, 6, 6));
     test_cases.emplace_back(new test_cpy_run(3, 2560, 1, 2));

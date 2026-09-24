@@ -65,6 +65,10 @@ void ggml_cuda_op_expm1(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+// softplus(x + bias) * scale with bias and scale one row each
+bool ggml_cuda_should_fuse_add_softplus_mul(const ggml_tensor * add, const ggml_tensor * unary, const ggml_tensor * mul);
+void ggml_cuda_op_add_softplus_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * unary, ggml_tensor * mul);
+
 void ggml_cuda_op_elu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_floor(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
