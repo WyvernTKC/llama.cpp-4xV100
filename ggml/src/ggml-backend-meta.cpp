@@ -532,13 +532,53 @@ struct ggml_backend_meta_simple_tensor_container {
     std::vector<ggml_context_ptr> ctxs;
     std::map<const ggml_tensor *, std::vector<ggml_tensor *>> simple_tensors;
 
-    ggml_backend_meta_simple_tensor_container(const ggml_init_params & params, const int n_simple) {
+    // A growable container adds a context of grow_size bytes per device once the current one is full, so the
+    //   mirrors of a compute buffer can start small. The contexts are allocated in full up front, and a fixed
+    //   1M-tensor one per device and container committed ~3 GiB of host memory per compute buffer - 12 GiB
+    //   more for the graph slots of an MTP draft context. The static container stays at one context per
+    //   device: its tensors are what the device buffers get allocated from.
+    size_t grow_size = 0;
+    std::vector<std::vector<ggml_context_ptr>> more; // [device]
+    std::vector<size_t>                        n_more_used;
+
+    ggml_backend_meta_simple_tensor_container(const ggml_init_params & params, const int n_simple, size_t grow_size = 0)
+            : grow_size(grow_size), more(n_simple), n_more_used(n_simple, 0) {
         ctxs.reserve(n_simple);
         for (int i = 0; i < n_simple; i++) {
             ctxs.emplace_back(ggml_init(params));
         }
     }
     ggml_backend_meta_simple_tensor_container() {}
+
+    // a context of device j with room for n more tensors
+    ggml_context * ctx(size_t j, size_t n) {
+        ggml_context * c = n_more_used.empty() || n_more_used[j] == 0 ? ctxs[j].get() : more[j][n_more_used[j] - 1].get();
+        if (grow_size == 0 || ggml_get_mem_size(c) - ggml_used_mem(c) >= n*ggml_tensor_overhead()) {
+            return c;
+        }
+        if (n_more_used[j] == more[j].size()) {
+            const ggml_init_params params = {
+                /*.mem_size   =*/ grow_size,
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            more[j].emplace_back(ggml_init(params));
+        }
+        return more[j][n_more_used[j]++].get();
+    }
+
+    void reset() {
+        for (ggml_context_ptr & c : ctxs) {
+            ggml_reset(c.get());
+        }
+        for (size_t j = 0; j < more.size(); j++) {
+            for (ggml_context_ptr & c : more[j]) {
+                ggml_reset(c.get());
+            }
+            n_more_used[j] = 0;
+        }
+        simple_tensors.clear();
+    }
 };
 
 struct ggml_backend_meta_buffer_context {
@@ -560,6 +600,28 @@ struct ggml_backend_meta_buffer_context {
     int stc_compute_index      = 0;
     int stc_compute_index_next = 0;
     std::vector<ggml_backend_buffer_ptr> bufs;
+
+    // Views of a persistent buffer (a weight, the KV cache) do not rotate: each view tensor keeps one set of
+    //   per-device tensors, rewritten in place when the view is initialized again. The mirrors of the ops that
+    //   read a view point at those, so they stay valid for every graph that is alive at once - llama keeps one
+    //   per small batch size - where the rotating containers only held the views of the last two allocations.
+    bool persistent = false;
+    ggml_backend_meta_simple_tensor_container stc_views;   // the map only, the tensors live in view_pools
+    ggml_backend_meta_simple_tensor_container stc_scratch; // a view mirror is built here, then copied
+    std::vector<std::vector<ggml_context_ptr>> view_pools; // [device]
+
+    ggml_tensor * alloc_view_mirror(size_t j) {
+        auto & pool = view_pools[j];
+        if (pool.empty() || ggml_get_mem_size(pool.back().get()) - ggml_used_mem(pool.back().get()) < ggml_tensor_overhead()) {
+            const ggml_init_params params = {
+                /*.mem_size   =*/ 4096*ggml_tensor_overhead(),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            pool.emplace_back(ggml_init(params));
+        }
+        return ggml_new_tensor_1d(pool.back().get(), GGML_TYPE_F32, 0);
+    }
 
     // FIXME
     // The size of the split state cache is unbounded and can theoretically grow infinitely large.
@@ -586,6 +648,9 @@ struct ggml_backend_meta_buffer_context {
     ggml_backend_meta_simple_tensor_container & get_simple_tensor_container(const ggml_tensor * tensor) {
         if (stc_static.simple_tensors.find(tensor) != stc_static.simple_tensors.end()) {
             return stc_static;
+        }
+        if (persistent && tensor->view_src != nullptr) {
+            return stc_views;
         }
         return stc_compute[stc_compute_index];
     }
@@ -1889,7 +1954,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
     std::vector<ggml_tensor *> simple_tensors;
     simple_tensors.reserve(n_simple_bufs);
     for (size_t j = 0; j < n_simple_bufs; j++) {
-        ggml_context          * simple_ctx = stc.ctxs[j].get();
+        ggml_context          * simple_ctx = stc.ctx(j, 4); // the tensor and up to 3 views of its srcs
         ggml_backend_buffer_t   simple_buf = buf_ctx->bufs[j].get();
 
         if ((simple_buf != nullptr) && ggml_backend_buffer_is_multi_buffer(simple_buf)) {
@@ -2079,6 +2144,43 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
 static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
+    if (buf_ctx->persistent && tensor->view_src != nullptr &&
+            buf_ctx->stc_static.simple_tensors.find(tensor) == buf_ctx->stc_static.simple_tensors.end()) {
+        // the ops that wrap their per-device srcs in views of their own (kv slice, indexer token slice) never
+        //   produce a view of a persistent buffer, so a view mirror is one tensor per device with no helpers
+        GGML_ASSERT(tensor->op != GGML_OP_FLASH_ATTN_EXT && tensor->op != GGML_OP_LIGHTNING_INDEXER);
+        ggml_backend_meta_simple_tensor_container & scratch = buf_ctx->stc_scratch;
+        scratch.reset();
+        const enum ggml_status status = ggml_backend_meta_buffer_init_tensor_impl(scratch, tensor);
+        if (status != GGML_STATUS_SUCCESS) {
+            return status;
+        }
+        const std::vector<ggml_tensor *> & fresh = scratch.simple_tensors.at(tensor);
+        std::vector<ggml_tensor *> & stable = buf_ctx->stc_views.simple_tensors[tensor];
+        // a new view cannot be in any cached decomposition yet, but a new tensor at the address of a dead one
+        //   can meet that one's decomposition again, so both it and a changed view invalidate them
+        bool changed = stable.empty();
+        for (size_t j = 0; j < fresh.size(); j++) {
+            if (stable.size() <= j) {
+                stable.push_back(buf_ctx->alloc_view_mirror(j));
+            }
+            ggml_tensor tmp = *fresh[j];
+            for (int i = 0; i < GGML_MAX_SRC; i++) {
+                if (tmp.src[i] == fresh[j]) {
+                    tmp.src[i] = stable[j];
+                }
+            }
+            if (memcmp(stable[j], &tmp, sizeof(ggml_tensor)) != 0) {
+                changed = true;
+                *stable[j] = tmp;
+            }
+        }
+        scratch.simple_tensors.clear();
+        if (changed) {
+            buf_ctx->mirror_gen++;
+        }
+        return status;
+    }
     buf_ctx->mirror_gen++;
     buf_ctx->stc_compute_index = buf_ctx->stc_compute_index_next;
     return ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), tensor);
@@ -2536,13 +2638,14 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
 
     const ggml_init_params params = {
-        /*.mem_size   =*/ 1024*1024*ggml_tensor_overhead(), // FIXME
+        /*.mem_size   =*/ 16*1024*ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
+    const size_t grow_size = 64*1024*ggml_tensor_overhead();
     ggml_backend_meta_simple_tensor_container stc_static;
-    ggml_backend_meta_simple_tensor_container stc_compute_0(params, n_simple_bufts);
-    ggml_backend_meta_simple_tensor_container stc_compute_1(params, n_simple_bufts);
+    ggml_backend_meta_simple_tensor_container stc_compute_0(params, n_simple_bufts, grow_size);
+    ggml_backend_meta_simple_tensor_container stc_compute_1(params, n_simple_bufts, grow_size);
 
     size_t max_size = 0;
     std::vector<ggml_backend_buffer_t> bufs;
@@ -2588,6 +2691,16 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
 
     std::vector<ggml_backend_buffer_t> bufs(n_simple_bufts, nullptr);
     ggml_backend_meta_buffer_context * meta_buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
+    {
+        const ggml_init_params params_scratch = {
+            /*.mem_size   =*/ 16*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        meta_buf_ctx->persistent  = true;
+        meta_buf_ctx->stc_scratch = ggml_backend_meta_simple_tensor_container(params_scratch, n_simple_bufts);
+        meta_buf_ctx->view_pools.resize(n_simple_bufts);
+    }
 
     ggml_backend_buffer_t meta_buf = ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, meta_buf_ctx, 0);
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
@@ -3920,11 +4033,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
             D->used_bufs.emplace_back(buf_ctx, 0);
             buf_ctx->stc_compute_index_next = buf_ctx->stc_compute_index ^ 1;
-            ggml_backend_meta_simple_tensor_container & stc = buf_ctx->stc_compute[buf_ctx->stc_compute_index_next];
-            for (ggml_context_ptr & ctx : stc.ctxs) {
-                ggml_reset(ctx.get());
-            }
-            stc.simple_tensors.clear();
+            buf_ctx->stc_compute[buf_ctx->stc_compute_index_next].reset();
         }
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
