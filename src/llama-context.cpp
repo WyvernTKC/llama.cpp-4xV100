@@ -827,6 +827,14 @@ void llama_context::synchronize() {
 
     n_queued_tokens = 0;
     t_compute_start_us = 0;
+
+    outputs_synced = true;
+}
+
+void llama_context::synchronize_outputs() {
+    if (!outputs_synced) {
+        synchronize();
+    }
 }
 
 const llama_model & llama_context::get_model() const {
@@ -1486,6 +1494,11 @@ int llama_context::encode(const llama_batch & batch_inp) {
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
 
+    // cleared on the way out too: a synchronize() inside (reserve, output buffer growth) must not count for the
+    //   outputs this call enqueues after it
+    outputs_synced = false;
+    struct outputs_guard { bool & synced; ~outputs_guard() { synced = false; } } outputs_guard_{ outputs_synced };
+
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -1723,6 +1736,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
+
+    // cleared on the way out too: a synchronize() inside (reserve, output buffer growth) must not count for the
+    //   outputs this call enqueues after it
+    outputs_synced = false;
+    struct outputs_guard { bool & synced; ~outputs_guard() { synced = false; } } outputs_guard_{ outputs_synced };
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -4028,13 +4046,13 @@ void llama_synchronize(llama_context * ctx) {
 }
 
 float * llama_get_logits(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_logits();
 }
 
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     float * res = nullptr;
 
@@ -4048,19 +4066,19 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
 }
 
 float * llama_get_embeddings(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_embeddings();
 }
 
 float * llama_get_embeddings_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_embeddings_ith(i);
 }
 
 float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_embeddings_seq(seq_id);
 }
@@ -4086,19 +4104,19 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_embeddings_nextn();
 }
 
 float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_embeddings_nextn_ith(i);
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_embeddings_layer_inp(lid);
 }
@@ -4108,43 +4126,43 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_sampled_token_ith(i);
 }
 
 float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_sampled_probs_ith(i);
 }
 
 float * llama_get_sampled_logits_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_sampled_logits_ith(i);
 }
 
 llama_token * llama_get_sampled_candidates_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return const_cast<llama_token *>(ctx->get_sampled_candidates_ith(i));
 }
 
 uint32_t llama_get_sampled_candidates_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return static_cast<uint32_t>(ctx->get_sampled_candidates_count(i));
 }
 
 uint32_t llama_get_sampled_logits_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return static_cast<uint32_t>(ctx->get_sampled_logits_count(i));
 }
 
 uint32_t llama_get_sampled_probs_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return static_cast<uint32_t>(ctx->get_sampled_probs_count(i));
 }

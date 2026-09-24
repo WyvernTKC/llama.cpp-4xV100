@@ -58,6 +58,10 @@ struct llama_context {
 
     void synchronize();
 
+    // what the output getters call: the last decode's outputs are complete once any synchronize() after it
+    //   returned, so only the first getter after a decode has to wait
+    void synchronize_outputs();
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
@@ -387,6 +391,8 @@ private:
 
 
     bool has_evaluated_once = false;
+
+    bool outputs_synced = true; // no decode/encode since the last synchronize()
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
