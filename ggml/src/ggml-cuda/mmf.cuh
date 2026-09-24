@@ -3,6 +3,7 @@
 #include "mma.cuh"
 #include "common.cuh"
 #include "convert.cuh"
+#include "unary.cuh"
 
 using namespace ggml_cuda_mma;
 
@@ -45,34 +46,52 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 
 bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const int64_t * scr0_ne, const size_t * src0_nb, const int src1_ncols, bool mul_mat_id);
 
-template <typename T, int rows_per_block, int cols_per_block, int nwarps, bool has_ids>
+// gate and up in one mmf launch, with the GLU applied to the result (Volta, f16, 2-8 tokens)
+bool ggml_cuda_should_fuse_mul_mat_f_glu(const ggml_tensor * ffn_up, const ggml_tensor * ffn_gate);
+void ggml_cuda_mul_mat_f_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_cuda_mm_fusion_args_host * fusion, ggml_tensor * dst);
+
+static __device__ __forceinline__ float mmf_apply_glu(const ggml_glu_op op, const float gate, const float x, const float limit) {
+    switch (op) {
+        case GGML_GLU_OP_SWIGLU:       return ggml_cuda_op_silu_single(gate) * x;
+        case GGML_GLU_OP_GEGLU:        return ggml_cuda_op_gelu_single(gate) * x;
+        case GGML_GLU_OP_SWIGLU_OAI:   return ggml_cuda_op_swiglu_oai_single(gate, x);
+        case GGML_GLU_OP_SWIGLU_CLAMP: return ggml_cuda_op_swiglu_clamp_single(gate, x, limit);
+        default:                       return x;
+    }
+}
+
+// has_gate (Volta, no ids, at most 8 columns) also multiplies fusion.gate, whose strides are those of x, and writes
+// glu(gate, x) instead of x
+template <typename T, int rows_per_block, int cols_per_block, int nwarps, bool has_ids, bool has_gate = false>
 __launch_bounds__(ggml_cuda_get_physical_warp_size()*nwarps, 1)
 static __global__ void mul_mat_f(
         const T * __restrict__ x, const float * __restrict__ y, const int32_t * __restrict__ ids, float * __restrict__ dst,
         const int ncols, const int ncols_dst_total, const int nchannels_dst, const int stride_row, const int stride_col_y, const int stride_col_dst,
         const int stride_col_id, const int stride_row_id,
         const int channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
-        const int sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst) {
+        const int sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+        const ggml_cuda_mm_fusion_args_device fusion) {
 // TODO: handle this in a consistent and simpler way after AMD MFMA support has been added
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 #if defined(AMD_WMMA_AVAILABLE)
-    if constexpr (!(std::is_same_v<T, half2> || std::is_same_v<T, nv_bfloat162>) || rows_per_block != MMF_ROWS_PER_BLOCK) {NO_DEVICE_CODE;} else {
+    if constexpr (!(std::is_same_v<T, half2> || std::is_same_v<T, nv_bfloat162>) || rows_per_block != MMF_ROWS_PER_BLOCK || has_gate) {NO_DEVICE_CODE;} else {
     typedef tile<16, 8,  T,     get_input_data_layout()> tile_A;
     typedef tile<16, 8,  T,     get_input_data_layout()> tile_B;
     typedef tile<16, 16, float, DATA_LAYOUT_J_MAJOR>     tile_C;
 #elif defined(AMD_MFMA_AVAILABLE)
-    if constexpr (rows_per_block != MMF_ROWS_PER_BLOCK_CDNA) {NO_DEVICE_CODE;} else {
+    if constexpr (rows_per_block != MMF_ROWS_PER_BLOCK_CDNA || has_gate) {NO_DEVICE_CODE;} else {
     typedef tile<16, 8,  T,     DATA_LAYOUT_I_MAJOR> tile_A;
     typedef tile<16, 8,  T,     DATA_LAYOUT_I_MAJOR> tile_B;
     typedef tile<16, 16, float, DATA_LAYOUT_J_MAJOR> tile_C;
 #else
 #ifdef VOLTA_MMA_AVAILABLE
-    if constexpr (!std::is_same_v<T, half2> || rows_per_block != MMF_ROWS_PER_BLOCK) {NO_DEVICE_CODE;} else {
+    if constexpr (!std::is_same_v<T, half2> || rows_per_block != MMF_ROWS_PER_BLOCK || (has_gate && (has_ids || cols_per_block > 8))) {NO_DEVICE_CODE;} else {
     typedef tile<32, 4, T,     DATA_LAYOUT_I_MAJOR>          tile_A;
     typedef tile< 8, 4, T,     DATA_LAYOUT_I_MAJOR_MIRRORED> tile_B;
     typedef tile<32, 8, float, DATA_LAYOUT_I_MAJOR>          tile_C;
 #else
-    if constexpr (rows_per_block != MMF_ROWS_PER_BLOCK) {NO_DEVICE_CODE;} else {
+    if constexpr (rows_per_block != MMF_ROWS_PER_BLOCK || has_gate) {NO_DEVICE_CODE;} else {
     typedef tile<16, 8, T>     tile_A;
     typedef tile<8,  8, T>     tile_B;
     typedef tile<16, 8, float> tile_C;
@@ -113,6 +132,10 @@ static __global__ void mul_mat_f(
     x   += int64_t(sample_x)  *stride_sample_x   + channel_x  *stride_channel_x  + row0*stride_row ;
     y   += int64_t(sample_y)  *stride_sample_y   + (has_ids ? 0 : channel_y  *stride_channel_y);
     dst += int64_t(sample_dst)*stride_sample_dst + (has_ids ? 0 : channel_dst*stride_channel_dst);
+    [[maybe_unused]] const T * gate_x = nullptr;
+    if constexpr (has_gate) {
+        gate_x = (const T *) fusion.gate + int64_t(sample_x)*stride_sample_x + channel_x*stride_channel_x + row0*stride_row;
+    }
 
     if constexpr (has_ids) {
         constexpr int y_stride_scale = std::is_same_v<T, float> ? 1 : 2;
@@ -131,6 +154,7 @@ static __global__ void mul_mat_f(
     char * compute_base = has_ids ? (shmem_base + GGML_PAD(cols_per_block, 16) * sizeof(int)) : shmem_base;
 
     tile_C C[ntA][ntB];
+    [[maybe_unused]] tile_C C_gate[ntA][ntB];
 
     T * tile_xy = (T *) compute_base + threadIdx.y*(tile_A::I * tile_k_padded);
 
@@ -169,7 +193,81 @@ static __global__ void mul_mat_f(
 
 
 #if defined(VOLTA_MMA_AVAILABLE)
-    if constexpr (!has_ids && ntB == 1) {
+    if constexpr (has_gate) {
+        // x and gate: both tiles of an iteration are loaded at once, and the y tile that both use has shared
+        // memory of its own; each tile goes through the same mma order as it would without the other
+        T * tile_y = (T *) compute_base + nwarps*(tile_A::I*tile_k_padded) + threadIdx.y*(tile_B::I*tile_k_padded);
+
+        for (int col = threadIdx.y*warp_size + threadIdx.x; col < ncols; col += nwarps*warp_size) {
+            T      tmp_x[ntA][tile_A::I];
+            T      tmp_gate[ntA][tile_A::I];
+            float2 tmp_y[tile_B::I];
+#pragma unroll
+            for (int itA = 0; itA < ntA; ++itA) {
+#pragma unroll
+                for (int i = 0; i < tile_A::I; ++i) {
+                    tmp_x[itA][i]    = x[(itA*tile_A::I + i)*stride_row + col];
+                    tmp_gate[itA][i] = gate_x[(itA*tile_A::I + i)*stride_row + col];
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < tile_B::I; ++j) {
+                tmp_y[j] = j < cols_per_block ? y2[j*stride_col_y + col] : make_float2(0.0f, 0.0f);
+            }
+
+            ggml_cuda_syncwarp();
+#pragma unroll
+            for (int j = 0; j < tile_B::I; ++j) {
+                tile_y[j*tile_k_padded + threadIdx.x] = ggml_cuda_cast<T>(tmp_y[j]);
+            }
+
+            tile_A A[ntA][warp_size / tile_A::J];
+#pragma unroll
+            for (int itA = 0; itA < ntA; ++itA) {
+#pragma unroll
+                for (int i = 0; i < tile_A::I; ++i) {
+                    tile_xy[i*tile_k_padded + threadIdx.x] = tmp_x[itA][i];
+                }
+                ggml_cuda_syncwarp();
+#pragma unroll
+                for (int k0 = 0; k0 < warp_size; k0 += tile_A::J) {
+                    load_ldmatrix(A[itA][k0/tile_A::J], tile_xy + k0, tile_k_padded);
+                }
+            }
+#pragma unroll
+            for (int k0 = 0; k0 < warp_size; k0 += tile_B::J) {
+                tile_B B;
+                load_ldmatrix(B, tile_y + k0, tile_k_padded);
+#pragma unroll
+                for (int itA = 0; itA < ntA; ++itA) {
+                    mma(C[itA][0], A[itA][k0/tile_B::J], B);
+                }
+            }
+
+#pragma unroll
+            for (int itA = 0; itA < ntA; ++itA) {
+                ggml_cuda_syncwarp();
+#pragma unroll
+                for (int i = 0; i < tile_A::I; ++i) {
+                    tile_xy[i*tile_k_padded + threadIdx.x] = tmp_gate[itA][i];
+                }
+                ggml_cuda_syncwarp();
+#pragma unroll
+                for (int k0 = 0; k0 < warp_size; k0 += tile_A::J) {
+                    load_ldmatrix(A[itA][k0/tile_A::J], tile_xy + k0, tile_k_padded);
+                }
+            }
+#pragma unroll
+            for (int k0 = 0; k0 < warp_size; k0 += tile_B::J) {
+                tile_B B;
+                load_ldmatrix(B, tile_y + k0, tile_k_padded);
+#pragma unroll
+                for (int itA = 0; itA < ntA; ++itA) {
+                    mma(C_gate[itA][0], A[itA][k0/tile_B::J], B);
+                }
+            }
+        }
+    } else if constexpr (!has_ids && ntB == 1) {
         // Volta: the next iteration's x and y are loaded into registers while this one does its mma, so that each
         // warp keeps loads in flight; the tiles, and so the result, are the same
         constexpr int col_step = nwarps*warp_size;
@@ -306,6 +404,44 @@ static __global__ void mul_mat_f(
     float * buf_iw = (float *) compute_base;
     constexpr int kiw = nwarps*rows_per_block + mmf_get_padding();
 
+    // the gate's sums go through the buffer first and wait in registers for the GLU
+    [[maybe_unused]] float sum_gate[(cols_per_block + nwarps - 1)/nwarps][rows_per_block/warp_size];
+    if constexpr (has_gate) {
+        if (nwarps > 1) {
+            __syncthreads();
+        } else {
+            ggml_cuda_syncwarp();
+        }
+#pragma unroll
+        for (int itA = 0; itA < ntA; ++itA) {
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                const int i = threadIdx.y*rows_per_block + itA*tile_C::I + tile_C::get_i(l);
+                const int j = tile_C::get_j(l);
+                buf_iw[j*kiw + i] = C_gate[itA][0].x[l];
+            }
+        }
+        if (nwarps > 1) {
+            __syncthreads();
+        } else {
+            ggml_cuda_syncwarp();
+        }
+#pragma unroll
+        for (int j0 = 0; j0 < cols_per_block; j0 += nwarps) {
+            const int j = j0 + threadIdx.y;
+#pragma unroll
+            for (int i1 = 0; i1 < rows_per_block/warp_size; ++i1) {
+                sum_gate[j0/nwarps][i1] = 0.0f;
+                if (j < cols_per_block) {
+#pragma unroll
+                    for (int i0 = 0; i0 < nwarps*rows_per_block; i0 += rows_per_block) {
+                        sum_gate[j0/nwarps][i1] += buf_iw[j*kiw + i0 + i1*warp_size + threadIdx.x];
+                    }
+                }
+            }
+        }
+    }
+
     if (nwarps > 1) {
         __syncthreads();
     } else {
@@ -350,7 +486,13 @@ static __global__ void mul_mat_f(
             }
         }
 
-        if constexpr (!has_ids) {
+        if constexpr (has_gate) {
+#pragma unroll
+            for (int i0 = 0; i0 < sizeof(sum)/sizeof(sum[0]); ++i0) {
+                dst[j*stride_col_dst + row0 + i0*warp_size + threadIdx.x] =
+                    mmf_apply_glu(fusion.glu_op, sum_gate[j0/nwarps][i0], sum[i0], fusion.glu_limit);
+            }
+        } else if constexpr (!has_ids) {
 #pragma unroll
             for (int i0 = 0; i0 < sizeof(sum)/sizeof(sum[0]); ++i0) {
                 dst[j*stride_col_dst + row0 + i0*warp_size + threadIdx.x] = sum[i0];
@@ -371,7 +513,7 @@ static __global__ void mul_mat_f(
         ncols, ncols_dst_total, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
         stride_col_id, stride_row_id,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, fusion);
     NO_DEVICE_CODE;
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
@@ -700,12 +842,12 @@ static inline void mul_mat_f_switch_ids(
         mul_mat_f<T, rows_per_block, cols_per_block, nwarps, true><<<block_nums_ids, block_dims, nbytes_shared_total, stream>>>
             (x, y, ids, dst, ncols_x, ncols_dst, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
              stride_col_id, stride_row_id, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-             sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+             sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ggml_cuda_mm_fusion_args_device{});
     } else {
         mul_mat_f<T, rows_per_block, cols_per_block, nwarps, false><<<block_nums, block_dims, nbytes_shared_total, stream>>>
             (x, y, ids, dst, ncols_x, cols_per_block, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
              stride_col_id, stride_row_id, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-             sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+             sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ggml_cuda_mm_fusion_args_device{});
     }
 }
 
@@ -828,7 +970,7 @@ void mul_mat_f_cuda(
             mul_mat_f<T, rows_per_block, cols_per_block, 16, false><<<block_nums, block_dims, nbytes_shared_total, stream>>>
                 (x, y, ids, dst, ncols_x, cols_per_block, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
                  stride_col_id, stride_row_id, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ggml_cuda_mm_fusion_args_device{});
         } break;
         default: {
             GGML_ABORT("fatal error");

@@ -11395,6 +11395,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 false, 1, 1, false, with_bias, true, false, {1, 1}));
         }
     }
+    // gate and up of a few tokens in one mmf launch on Volta
+    for (ggml_glu_op op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI}) {
+        for (int n_tokens : {3, 6, 8}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_F16, op, n_tokens, 4096, 4096,
+                false, 1, 1, false, false, true, false, {1, 1}));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_F16, GGML_GLU_OP_SWIGLU, 5, 2048, 4096,
+        false, 1, 1, false, false, true, false, {1, 1}));
     // a few tokens: four rows per block on Volta up to 6 tokens with K >= 1024, one row at 8 tokens or K = 512
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
         for (int n : {2, 3, 6, 8}) {
