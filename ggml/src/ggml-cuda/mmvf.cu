@@ -718,7 +718,11 @@ void launch_mul_mat_vec_f_cuda(
             nrows % 4 == 0 && (nrows/4)*nchannels_dst*nsamples_or_ntokens >= 8*ggml_cuda_info().devices[device].nsm) {
         rpb = 4;
     }
-    if (load16 && ncols_dst > 1 && ncols_dst <= 6 && ncols >= 1024 && nrows % 4 == 0) {
+    // Only while that leaves a block per SM: with fewer, each block walks the whole K for every column on its own,
+    //   and one row per block spreads that over more SMs (f16 12x5120 at 6 tokens 14.5 -> 9.5 us cold, 24x5120
+    //   14.7 -> 9.9). Each row sums in the same order either way.
+    if (load16 && ncols_dst > 1 && ncols_dst <= 6 && ncols >= 1024 && nrows % 4 == 0 &&
+            (nrows/4)*nchannels_dst*nsamples_or_ntokens >= ggml_cuda_info().devices[device].nsm) {
         rpb = 4;
     }
 
