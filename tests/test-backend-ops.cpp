@@ -11402,6 +11402,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 4096, 3, 512, {1, 1}, {1, 1}));
     }
+    // mmf on Volta: 16 warps for a grid of at most one block per SM, 8 with the prefetch above that, and more
+    // tokens than the prefetch takes
+    for (int n : {4, 6, 8, 12}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 2048, n, 4096, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 4096, 6, 4096, {1, 1}, {1, 1}));
 
     // Fused row-pair coverage: minimum rows, an even pair, and an odd tail.
     // TODO: the max_nmse_err() for these cases is not estimated correctly causing sporadic false failures.
