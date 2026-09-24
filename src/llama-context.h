@@ -264,6 +264,10 @@ public:
 private:
     llm_graph_result * get_gf_res_prev();
 
+    struct graph_slot;
+    graph_slot * get_gf_slot(const llama_ubatch & ubatch);
+    void gf_slots_invalidate(bool free_slots);
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -354,6 +358,9 @@ private:
 
     ggml_backend_sched_ptr sched;
 
+    // the scheduler of the graph being built or last computed: sched, or the one of a graph slot
+    ggml_backend_sched_t sched_cur = nullptr;
+
     bool sched_need_reserve = true;
 
     ggml_backend_t backend_cpu = nullptr;
@@ -380,6 +387,18 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+
+    // An MTP draft context alternates between small graphs of different sizes - the one-token draft step and
+    //   the catch-up over the accepted tokens - and a scheduler holds the split state of one graph, so every
+    //   switch rebuilt and re-split the graph (~2.4 ms against ~0.4 ms reused, twice per step). A slot per
+    //   small token count keeps each of them: its own scheduler, with a compute buffer sized to that graph.
+    struct graph_slot {
+        ggml_backend_sched_ptr sched;
+        llm_graph_result_ptr   res;
+        bool                   active = false;
+    };
+    std::array<graph_slot, 8> gf_slots; // [n_tokens - 1]
+    bool gf_slots_on = false;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
