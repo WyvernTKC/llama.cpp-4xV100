@@ -103,6 +103,15 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
 void ggml_cuda_op_mul_add_sigmoid_scale(ggml_backend_cuda_context & ctx, ggml_tensor * mul_node, ggml_tensor * add_node,
         ggml_tensor * scale_node);
 
+// the op kernels use these too, so a fused kernel gets the values the op's own kernel would
+__device__ __forceinline__ float ggml_cuda_op_sigmoid_single(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+__device__ __forceinline__ float ggml_cuda_op_softplus_single(float x) {
+    return (x > 20.0f) ? x : logf(1.0f + expf(x));
+}
+
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
     return x / (1.0f + expf(-x));
 }

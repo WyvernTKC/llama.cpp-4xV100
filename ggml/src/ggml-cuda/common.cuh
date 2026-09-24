@@ -1605,6 +1605,10 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    // gated delta net gate and beta instead of a GLU: dst = softplus(x*y + gdn_dt) * gdn_a, gdn_beta = sigmoid(gate*y)
+    const ggml_tensor * gdn_dt = nullptr;
+    const ggml_tensor * gdn_a = nullptr;
+    ggml_tensor * gdn_beta = nullptr;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1614,6 +1618,9 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    const float * gdn_dt = nullptr;
+    const float * gdn_a = nullptr;
+    float * gdn_beta = nullptr;
 };
 
 struct ggml_cuda_kernel_launch_params {

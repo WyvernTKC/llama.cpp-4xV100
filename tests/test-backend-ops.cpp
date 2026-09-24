@@ -3956,6 +3956,68 @@ struct test_rms_norm_back : public test_case {
 };
 
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
+// The alpha and beta projections of a gated delta net layer and what follows them, in the node order the qwen35
+//   graph has: MUL_MAT(alpha) RESHAPE ADD(dt) SOFTPLUS MUL(a) RESHAPE, MUL_MAT(beta) RESHAPE SIGMOID. At one token
+//   the CUDA backend runs them as one GEMV.
+struct test_gdn_gate : public test_case {
+    const ggml_type type;
+    const int64_t n_embd;
+    const int64_t n_head;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_GATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, n_embd, n_head, n_tokens);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_gdn_gate(ggml_type type = GGML_TYPE_F16, int64_t n_embd = 5120, int64_t n_head = 12, int64_t n_tokens = 1)
+        : type(type), n_embd(n_embd), n_head(n_head), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * w_alpha = ggml_new_tensor_2d(ctx, type, n_embd, n_head);
+        ggml_tensor * w_beta  = ggml_new_tensor_2d(ctx, type, n_embd, n_head);
+        ggml_tensor * dt      = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_head);
+        ggml_tensor * a       = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_head);
+        ggml_set_name(cur, "cur");
+        ggml_set_name(w_alpha, "w_alpha");
+        ggml_set_name(w_beta, "w_beta");
+        ggml_set_name(dt, "dt");
+        ggml_set_name(a, "a");
+
+        ggml_tensor * alpha = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w_alpha, cur), n_head, n_tokens, 1);
+        ggml_tensor * gate  = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha, dt)), a);
+        gate = ggml_reshape_4d(ctx, gate, 1, n_head, n_tokens, 1);
+        ggml_set_name(gate, "gate");
+
+        ggml_tensor * beta = ggml_reshape_4d(ctx, ggml_mul_mat(ctx, w_beta, cur), 1, n_head, n_tokens, 1);
+        beta = ggml_sigmoid(ctx, beta);
+        ggml_set_name(beta, "beta");
+
+        // the delta net reads the gate ahead of beta
+        ggml_tensor * out = ggml_add(ctx, gate, beta);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            // spread the dot products over the softplus threshold and both tails of the sigmoid
+            init_tensor_uniform(t, -1.0f, 1.0f);
+        }
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_UNARY(SOFTPLUS) + GGML_OP_MUL with a row each: the gate of a gated delta net layer,
 //   softplus(alpha + dt) * a
 struct test_add_softplus_mul : public test_case {
@@ -10087,6 +10149,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_F32, {256, 2, 3, 4}, {-1,-1,-1,-1}, {1, 0, 2, 3}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {256, 4, 3, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {256, 4, 3, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_gdn_gate(type, 5120, 12, 1));
+    }
+    test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_F16, 5120, 48, 1));
+    test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_F16,  256, 16, 1));
+    test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_F16, 5120, 12, 2));
     for (int64_t n_tokens : {1, 6, 37}) {
         test_cases.emplace_back(new test_add_softplus_mul({48, n_tokens, 1, 1}));
         test_cases.emplace_back(new test_add_softplus_mul({12, n_tokens, 2, 1}));

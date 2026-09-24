@@ -3891,6 +3891,51 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// MUL_MAT(alpha) RESHAPE ADD(dt) SOFTPLUS MUL(a) RESHAPE MUL_MAT(beta) RESHAPE SIGMOID, one token, for mul_mat_vec_f
+static bool ggml_cuda_should_fuse_gdn_gate_mmvf(const ggml_cgraph * cgraph, int i) {
+    if (i + 8 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * const * n = cgraph->nodes + i;
+    const ggml_tensor * mm_a = n[0];
+    const ggml_tensor * mm_b = n[6];
+    if (mm_a->op != GGML_OP_MUL_MAT || n[1]->op != GGML_OP_RESHAPE || n[2]->op != GGML_OP_ADD ||
+            n[3]->op != GGML_OP_UNARY || ggml_get_unary_op(n[3]) != GGML_UNARY_OP_SOFTPLUS || n[4]->op != GGML_OP_MUL ||
+            n[5]->op != GGML_OP_RESHAPE || mm_b->op != GGML_OP_MUL_MAT || n[7]->op != GGML_OP_RESHAPE ||
+            n[8]->op != GGML_OP_UNARY || ggml_get_unary_op(n[8]) != GGML_UNARY_OP_SIGMOID) {
+        return false;
+    }
+    if (n[1]->src[0] != mm_a || (n[2]->src[0] != n[1] && n[2]->src[1] != n[1]) || n[3]->src[0] != n[2] ||
+            (n[4]->src[0] != n[3] && n[4]->src[1] != n[3]) || n[5]->src[0] != n[4] ||
+            mm_b->src[1] != mm_a->src[1] || n[7]->src[0] != mm_b || n[8]->src[0] != n[7]) {
+        return false;
+    }
+    // one token, the same weights layout, default precision so that both sum like the GEMV of each alone
+    const ggml_tensor * wa = mm_a->src[0];
+    const ggml_tensor * wb = mm_b->src[0];
+    const int64_t nrows = mm_a->ne[0];
+    if (ggml_nelements(mm_a) != nrows || !ggml_are_same_shape(mm_a, mm_b) || wa->type != wb->type ||
+            !ggml_are_same_shape(wa, wb) || !ggml_are_same_stride(wa, wb) ||
+            ggml_prec(mm_a->op_params[0]) != GGML_PREC_DEFAULT || ggml_prec(mm_b->op_params[0]) != GGML_PREC_DEFAULT ||
+            n[4]->op_params[0] != GGML_PREC_DEFAULT) {
+        return false;
+    }
+    const ggml_tensor * dt = n[2]->src[0] == n[1] ? n[2]->src[1] : n[2]->src[0];
+    const ggml_tensor * a  = n[4]->src[0] == n[3] ? n[4]->src[1] : n[4]->src[0];
+    for (const ggml_tensor * t : { dt, a, n[4], n[8] }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || ggml_nelements(t) != nrows) {
+            return false;
+        }
+    }
+    if (!ggml_cuda_should_fuse_mul_mat_vec_f(mm_a) || !ggml_cuda_should_fuse_mul_mat_vec_f(mm_b)) {
+        return false;
+    }
+    const int outputs[2] = { i + 5, i + 8 };
+    const enum ggml_op ops[9] = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL,
+        GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY };
+    return ggml_can_fuse_subgraph(cgraph, i, 9, ops, outputs, 2);
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4747,6 +4792,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
+    }
+
+    // The alpha and beta projections of a gated delta net layer read the same input, have a few dozen rows and are
+    //   followed by elementwise ops of their own: two GEMV and two elementwise launches per layer and token, in one.
+    //   The GEMV sums x and gate exactly as it sums x alone.
+    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_should_fuse_gdn_gate_mmvf(cgraph, i)) {
+        ggml_tensor * mul_a = cgraph->nodes[i + 4];
+        ggml_tensor * add   = cgraph->nodes[i + 2];
+        ggml_cuda_mm_fusion_args_host fusion_data{};
+        fusion_data.gate     = cgraph->nodes[i + 6]->src[0];
+        fusion_data.gdn_dt   = add->src[0] == cgraph->nodes[i + 1] ? add->src[1] : add->src[0];
+        fusion_data.gdn_a    = mul_a->src[0] == cgraph->nodes[i + 3] ? mul_a->src[1] : mul_a->src[0];
+        fusion_data.gdn_beta = cgraph->nodes[i + 8];
+        ggml_cuda_mul_mat_vec_f(*cuda_ctx, node->src[0], node->src[1], nullptr, mul_a, &fusion_data);
+        return 8;
     }
 
     // the gate of a gated delta net layer, softplus(alpha + dt) * a

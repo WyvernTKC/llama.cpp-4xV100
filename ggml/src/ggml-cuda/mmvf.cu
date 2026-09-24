@@ -66,8 +66,14 @@ static __global__ void mul_mat_vec_f(
     const T * gate_x = nullptr;
     const float * x_bias = nullptr;
     const float * gate_bias = nullptr;
+    const float * gdn_dt = nullptr;
+    const float * gdn_a = nullptr;
+    float * gdn_beta = nullptr;
 
     if constexpr (has_fusion) {
+        gdn_dt   = fusion.gdn_dt;
+        gdn_a    = fusion.gdn_a;
+        gdn_beta = fusion.gdn_beta;
         use_gate = fusion.gate != nullptr;
         use_bias = fusion.x_bias != nullptr;
         use_gate_bias = fusion.gate_bias != nullptr;
@@ -554,6 +560,12 @@ static __global__ void mul_mat_vec_f(
             if (use_gate_bias) {
                 gate_value += gate_bias[dcol*stride_col_dst + drow];
             }
+            if (gdn_beta) {
+                // the gate and beta of a gated delta net layer, x and gate being its alpha and beta projections
+                dst[dcol*stride_col_dst + drow]      = ggml_cuda_op_softplus_single(value + gdn_dt[drow]) * gdn_a[drow];
+                gdn_beta[dcol*stride_col_dst + drow] = ggml_cuda_op_sigmoid_single(gate_value);
+                return;
+            }
             switch (glu_op) {
                 case GGML_GLU_OP_SWIGLU:
                     value *= ggml_cuda_op_silu_single(gate_value);
@@ -577,7 +589,8 @@ static __global__ void mul_mat_vec_f(
     dst[dcol*stride_col_dst + drow] = value;
 
     if constexpr (!has_fusion) {
-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, glu_limit, gate_x, x_bias, gate_bias, sumf_gate);
+        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, glu_limit, gate_x, x_bias, gate_bias, sumf_gate,
+            gdn_dt, gdn_a, gdn_beta);
     }
 }
 
@@ -959,6 +972,15 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;
+        if (fusion->gdn_beta) {
+            GGML_ASSERT(!ids && fusion->gate && !fusion->x_bias && !fusion->gate_bias);
+            for (const ggml_tensor * t : { fusion->gdn_dt, fusion->gdn_a, (const ggml_tensor *) fusion->gdn_beta }) {
+                GGML_ASSERT(t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nelements(t) == dst->ne[0]);
+            }
+            fusion_local.gdn_dt   = (const float *) fusion->gdn_dt->data;
+            fusion_local.gdn_a    = (const float *) fusion->gdn_a->data;
+            fusion_local.gdn_beta = (float *) fusion->gdn_beta->data;
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
