@@ -653,8 +653,14 @@ static __global__ void mul_mat_vec_q(
     const float * gate_scale = nullptr;
     ggml_glu_op active_glu;
     float glu_limit = 0.0f;
+    const float * gdn_dt = nullptr;
+    const float * gdn_a = nullptr;
+    float * gdn_beta = nullptr;
 
     if constexpr (has_fusion) {
+        gdn_dt        = fusion.gdn_dt;
+        gdn_a         = fusion.gdn_a;
+        gdn_beta      = fusion.gdn_beta;
         use_gate      = fusion.gate      != nullptr;
         use_bias      = fusion.x_bias    != nullptr;
         use_gate_bias = fusion.gate_bias != nullptr && use_gate;
@@ -808,7 +814,12 @@ static __global__ void mul_mat_vec_q(
                         result *= x_scales;
                     }
                     result += x_biases[j];
-                    if (use_gate) {
+                    if (gdn_beta) {
+                        // the gate and beta of a gated delta net layer, x and gate being its alpha and beta
+                        //   projections; a single token, so beta is offset by the row alone
+                        result = ggml_cuda_op_softplus_single(result + gdn_dt[row0 + i]) * gdn_a[row0 + i];
+                        gdn_beta[row0 + i] = ggml_cuda_op_sigmoid_single(tmp_gate[j][i]);
+                    } else if (use_gate) {
                         float gate_value = tmp_gate[j][i];
                         if constexpr (type == GGML_TYPE_NVFP4) {
                             gate_value *= gate_scales;
@@ -839,7 +850,8 @@ static __global__ void mul_mat_vec_q(
     }
 
     if constexpr (!has_fusion) {
-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, glu_limit, gate_bias, x_bias, x_scale, gate_scale, tmp_gate);
+        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, glu_limit, gate_bias, x_bias, x_scale, gate_scale, tmp_gate,
+            gdn_dt, gdn_a, gdn_beta);
     }
     if constexpr (type != GGML_TYPE_NVFP4) {
         GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
@@ -1495,6 +1507,15 @@ void ggml_cuda_mul_mat_vec_q(
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;
+        if (fusion->gdn_beta) {
+            GGML_ASSERT(!ids && fusion->gate && !fusion->x_bias && !fusion->gate_bias && !fusion->x_scale && !fusion->gate_scale);
+            for (const ggml_tensor * t : { fusion->gdn_dt, fusion->gdn_a, (const ggml_tensor *) fusion->gdn_beta }) {
+                GGML_ASSERT(t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nelements(t) == dst->ne[0]);
+            }
+            fusion_local.gdn_dt   = (const float *) fusion->gdn_dt->data;
+            fusion_local.gdn_a    = (const float *) fusion->gdn_a->data;
+            fusion_local.gdn_beta = (float *) fusion->gdn_beta->data;
+        }
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.

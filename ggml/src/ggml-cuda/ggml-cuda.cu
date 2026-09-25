@@ -3890,11 +3890,44 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+typedef void (*ggml_cuda_mul_mat_vec_t)(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+    const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion);
+
+// The GEMV that ggml_cuda_mul_mat would run each of the alpha and beta projections of a gated delta net layer on,
+//   if it can also run both at once: then the fused result is the one of each alone.
+static ggml_cuda_mul_mat_vec_t ggml_cuda_gdn_gate_mul_mat_vec(const ggml_tensor * mm_a, const ggml_tensor * mm_b) {
+    if (mm_a->ne[1] == 1) {
+        if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_a) && ggml_cuda_should_fuse_mul_mat_vec_f(mm_b)) {
+            return ggml_cuda_mul_mat_vec_f;
+        }
+        if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_a) && ggml_cuda_should_fuse_mul_mat_vec_q(mm_b)) {
+            return ggml_cuda_mul_mat_vec_q;
+        }
+        return nullptr;
+    }
+
+    const ggml_tensor * w   = mm_a->src[0];
+    const ggml_tensor * y   = mm_a->src[1];
+    const int64_t      ntok = mm_a->ne[1];
+    const int          cc   = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (y->type != GGML_TYPE_F32 || ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
+            ggml_get_op_params_i32(mm_a, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        return nullptr;
+    }
+    // Several tokens only on mul_mat_vec_f: mul_mat_vec_q with a gate unrolls twice the dot products per column, its
+    //   K loop of a few iterations then waits on instruction fetch, and two plain launches win (q8_0 and q4_K with 8
+    //   rows at ubatch 4: 1.4-1.8% faster per ubatch unfused).
+    if (ggml_cuda_should_use_mmvf(w->type, cc, w->ne, w->nb, ntok) && ggml_cuda_mmvf_fuses_tokens(w, y, mm_b->src[0])) {
+        return ggml_cuda_mul_mat_vec_f;
+    }
+    return nullptr;
+}
+
 // try and fuse nodes and return the number of nodes to skip
-// MUL_MAT(alpha) RESHAPE ADD(dt) SOFTPLUS MUL(a) RESHAPE MUL_MAT(beta) RESHAPE SIGMOID, one token, for mul_mat_vec_f
-static bool ggml_cuda_should_fuse_gdn_gate_mmvf(const ggml_cgraph * cgraph, int i) {
+// MUL_MAT(alpha) RESHAPE ADD(dt) SOFTPLUS MUL(a) RESHAPE MUL_MAT(beta) RESHAPE SIGMOID
+static ggml_cuda_mul_mat_vec_t ggml_cuda_should_fuse_gdn_gate(const ggml_cgraph * cgraph, int i) {
     if (i + 8 >= cgraph->n_nodes) {
-        return false;
+        return nullptr;
     }
     const ggml_tensor * const * n = cgraph->nodes + i;
     const ggml_tensor * mm_a = n[0];
@@ -3903,37 +3936,43 @@ static bool ggml_cuda_should_fuse_gdn_gate_mmvf(const ggml_cgraph * cgraph, int 
             n[3]->op != GGML_OP_UNARY || ggml_get_unary_op(n[3]) != GGML_UNARY_OP_SOFTPLUS || n[4]->op != GGML_OP_MUL ||
             n[5]->op != GGML_OP_RESHAPE || mm_b->op != GGML_OP_MUL_MAT || n[7]->op != GGML_OP_RESHAPE ||
             n[8]->op != GGML_OP_UNARY || ggml_get_unary_op(n[8]) != GGML_UNARY_OP_SIGMOID) {
-        return false;
+        return nullptr;
     }
     if (n[1]->src[0] != mm_a || (n[2]->src[0] != n[1] && n[2]->src[1] != n[1]) || n[3]->src[0] != n[2] ||
             (n[4]->src[0] != n[3] && n[4]->src[1] != n[3]) || n[5]->src[0] != n[4] ||
             mm_b->src[1] != mm_a->src[1] || n[7]->src[0] != mm_b || n[8]->src[0] != n[7]) {
-        return false;
+        return nullptr;
     }
-    // one token, the same weights layout, default precision so that both sum like the GEMV of each alone
+    // one matrix of tokens, the same weights layout, default precision so that both sum like the GEMV of each alone
     const ggml_tensor * wa = mm_a->src[0];
     const ggml_tensor * wb = mm_b->src[0];
     const int64_t nrows = mm_a->ne[0];
-    if (ggml_nelements(mm_a) != nrows || !ggml_are_same_shape(mm_a, mm_b) || wa->type != wb->type ||
+    if (mm_a->ne[2] != 1 || mm_a->ne[3] != 1 || !ggml_are_same_shape(mm_a, mm_b) || wa->type != wb->type ||
             !ggml_are_same_shape(wa, wb) || !ggml_are_same_stride(wa, wb) ||
-            ggml_prec(mm_a->op_params[0]) != GGML_PREC_DEFAULT || ggml_prec(mm_b->op_params[0]) != GGML_PREC_DEFAULT ||
-            n[4]->op_params[0] != GGML_PREC_DEFAULT) {
-        return false;
+            ggml_prec(mm_a->op_params[0]) != GGML_PREC_DEFAULT || ggml_prec(mm_b->op_params[0]) != GGML_PREC_DEFAULT) {
+        return nullptr;
     }
+    // dt and a one per row, the gate and beta laid out like the GEMV results
     const ggml_tensor * dt = n[2]->src[0] == n[1] ? n[2]->src[1] : n[2]->src[0];
     const ggml_tensor * a  = n[4]->src[0] == n[3] ? n[4]->src[1] : n[4]->src[0];
     for (const ggml_tensor * t : { dt, a, n[4], n[8] }) {
-        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || ggml_nelements(t) != nrows) {
-            return false;
+        const bool per_row = t == dt || t == a;
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || ggml_nelements(t) != (per_row ? nrows : ggml_nelements(mm_a)) ||
+                (per_row && t->ne[0] != nrows)) {
+            return nullptr;
         }
     }
-    if (!ggml_cuda_should_fuse_mul_mat_vec_f(mm_a) || !ggml_cuda_should_fuse_mul_mat_vec_f(mm_b)) {
-        return false;
+    if (!ggml_are_same_shape(n[2], n[1]) || !ggml_are_same_shape(n[4], n[1])) {
+        return nullptr;
+    }
+    ggml_cuda_mul_mat_vec_t mul_mat_vec = ggml_cuda_gdn_gate_mul_mat_vec(mm_a, mm_b);
+    if (!mul_mat_vec) {
+        return nullptr;
     }
     const int outputs[2] = { i + 5, i + 8 };
     const enum ggml_op ops[9] = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL,
         GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY };
-    return ggml_can_fuse_subgraph(cgraph, i, 9, ops, outputs, 2);
+    return ggml_can_fuse_subgraph(cgraph, i, 9, ops, outputs, 2) ? mul_mat_vec : nullptr;
 }
 
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
@@ -4795,9 +4834,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // The alpha and beta projections of a gated delta net layer read the same input, have a few dozen rows and are
-    //   followed by elementwise ops of their own: two GEMV and two elementwise launches per layer and token, in one.
+    //   followed by elementwise ops of their own: two GEMV and two elementwise launches per layer, in one.
     //   The GEMV sums x and gate exactly as it sums x alone.
-    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_should_fuse_gdn_gate_mmvf(cgraph, i)) {
+    ggml_cuda_mul_mat_vec_t gdn_gate_mul_mat_vec = node->op == GGML_OP_MUL_MAT ? ggml_cuda_should_fuse_gdn_gate(cgraph, i) : nullptr;
+    if (gdn_gate_mul_mat_vec) {
         ggml_tensor * mul_a = cgraph->nodes[i + 4];
         ggml_tensor * add   = cgraph->nodes[i + 2];
         ggml_cuda_mm_fusion_args_host fusion_data{};
@@ -4805,7 +4845,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         fusion_data.gdn_dt   = add->src[0] == cgraph->nodes[i + 1] ? add->src[1] : add->src[0];
         fusion_data.gdn_a    = mul_a->src[0] == cgraph->nodes[i + 3] ? mul_a->src[1] : mul_a->src[0];
         fusion_data.gdn_beta = cgraph->nodes[i + 8];
-        ggml_cuda_mul_mat_vec_f(*cuda_ctx, node->src[0], node->src[1], nullptr, mul_a, &fusion_data);
+        // the shape and precision of alpha, the memory of the gate
+        ggml_tensor gate = *node;
+        gate.data = mul_a->data;
+        gdn_gate_mul_mat_vec(*cuda_ctx, node->src[0], node->src[1], nullptr, &gate, &fusion_data);
         return 8;
     }
 

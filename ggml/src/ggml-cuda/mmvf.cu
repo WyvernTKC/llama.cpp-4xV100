@@ -114,7 +114,9 @@ static __global__ void mul_mat_vec_f(
     float * buf_iw = (float *) data_mmv;
     [[maybe_unused]] float * buf_iw_gate = nullptr;
     if constexpr (has_fusion) {
-        buf_iw_gate = (float *) (data_mmv + warp_size*sizeof(float));
+        // past the partial sums of x: one per warp, or with the 16-byte loads one per warp, row and column
+        constexpr int nsums_red = load16 ? ncols_dst*rpb*(block_size/warp_size) : 0;
+        buf_iw_gate = (float *) (data_mmv + (nsums_red > warp_size ? nsums_red : warp_size)*sizeof(float));
     }
 
     if (!load16 && block_size > warp_size) {
@@ -458,7 +460,6 @@ static __global__ void mul_mat_vec_f(
         // all rows and columns reduce together, through a single barrier
         constexpr int nwarps = block_size/warp_size;
         constexpr int nsums  = ncols_dst*rpb;
-        static_assert(!has_fusion || nsums*nwarps <= warp_size, "the gate's partial sums start after warp_size floats");
 #pragma unroll
         for (int i = 0; i < nsums; ++i) {
             sumf[i] = warp_reduce_sum<warp_size>(sumf[i]);
@@ -616,8 +617,11 @@ static void mul_mat_vec_f_switch_fusion(
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
     if constexpr (ncols_dst > 1 && !is_multi_token_id && sizeof(T) == 2) {
         if (load16) {
-            GGML_ASSERT(!has_fusion);
-            if (rpb == 4) {
+            if (has_fusion) {
+                // with several tokens only the gate of a gated delta net layer, which has no biases, fuses
+                GGML_ASSERT(fusion.gdn_beta && rpb == 1);
+                launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, false, 1, true>);
+            } else if (rpb == 4) {
                 launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, 4, true>);
             } else {
                 GGML_ASSERT(rpb == 1);
@@ -665,9 +669,23 @@ static void mul_mat_vec_f_switch_fusion(
        }
     }
 
-    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+    GGML_ASSERT(!has_fusion && "fusion with several tokens needs the 16-byte loads");
 
     launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, is_multi_token_id>);
+}
+
+// On Volta 2-byte weights are read 8 per 16-byte load. Measured with a cold cache, one token: bf16 8192x1024
+// -14%, 4096x512 -20%, 256x4096 -10%, f16 2560x5120 -4%, 62080x5120 and K = 4096 flat; 2-8 tokens: bf16
+// 8192x1024 and 1280x17408 1.4-2.6x faster.
+static bool mmvf_use_load16(
+        const bool two_byte_weights, const int cc, const int64_t ncols_dst, const int64_t ncols, const int64_t stride_row,
+        const int64_t stride_col_y, const int64_t stride_channel_x, const int64_t stride_sample_x,
+        const int64_t stride_channel_y, const int64_t stride_sample_y, const void * x, const void * y, const void * gate) {
+    const bool is_volta = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA && cc < GGML_CUDA_CC_TURING;
+    return two_byte_weights && is_volta && (ncols_dst == 1 || stride_col_y % 4 == 0) &&
+        ncols % 8 == 0 && stride_row % 8 == 0 && stride_channel_x % 8 == 0 && stride_sample_x % 8 == 0 &&
+        stride_channel_y % 4 == 0 && stride_sample_y % 4 == 0 &&
+        (uintptr_t) x % 16 == 0 && (uintptr_t) y % 16 == 0 && (uintptr_t) gate % 16 == 0;
 }
 
 template <typename T, typename type_acc, int ncols_dst, bool is_multi_token_id = false>
@@ -691,15 +709,10 @@ void launch_mul_mat_vec_f_cuda(
     const int device = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
 
-    // On Volta 2-byte weights are read 8 per 16-byte load. Measured with a cold cache, one token: bf16 8192x1024
-    // -14%, 4096x512 -20%, 256x4096 -10%, f16 2560x5120 -4%, 62080x5120 and K = 4096 flat; 2-8 tokens: bf16
-    // 8192x1024 and 1280x17408 1.4-2.6x faster.
     const int  cc        = ggml_cuda_info().devices[device].cc;
     const bool is_volta  = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA && cc < GGML_CUDA_CC_TURING;
-    const bool load16 = sizeof(T) == 2 && !is_multi_token_id && is_volta && (ncols_dst == 1 || stride_col_y % 4 == 0) &&
-        ncols % 8 == 0 && stride_row % 8 == 0 && stride_channel_x % 8 == 0 && stride_sample_x % 8 == 0 &&
-        stride_channel_y % 4 == 0 && stride_sample_y % 4 == 0 &&
-        (uintptr_t) x % 16 == 0 && (uintptr_t) y % 16 == 0 && (uintptr_t) fusion.gate % 16 == 0;
+    const bool load16 = !is_multi_token_id && mmvf_use_load16(sizeof(T) == 2, cc, ncols_dst, ncols, stride_row, stride_col_y,
+        stride_channel_x, stride_sample_x, stride_channel_y, stride_sample_y, x, y, fusion.gate);
     const int64_t ncols_thread = load16 ? 8 : 2; // columns a thread takes per load
 
     int64_t block_size_best = warp_size;
@@ -733,15 +746,15 @@ void launch_mul_mat_vec_f_cuda(
     }
     // Only while that leaves a block per SM: with fewer, each block walks the whole K for every column on its own,
     //   and one row per block spreads that over more SMs (f16 12x5120 at 6 tokens 14.5 -> 9.5 us cold, 24x5120
-    //   14.7 -> 9.9). Each row sums in the same order either way.
-    if (load16 && ncols_dst > 1 && ncols_dst <= 6 && ncols >= 1024 && nrows % 4 == 0 &&
+    //   14.7 -> 9.9). Each row sums in the same order either way, so a fused gate keeps one row per block.
+    if (load16 && ncols_dst > 1 && ncols_dst <= 6 && !has_fusion && ncols >= 1024 && nrows % 4 == 0 &&
             (nrows/4)*nchannels_dst*nsamples_or_ntokens >= ggml_cuda_info().devices[device].nsm) {
         rpb = 4;
     }
 
     // the 16-byte path keeps one partial sum per warp, row and column
     const int nsums_red     = load16 ? int(ncols_dst*rpb*(block_size_best/warp_size)) : 0;
-    const int nbytes_shared = (std::max(warp_size, nsums_red) + (has_fusion ? warp_size : 0))*sizeof(float);
+    const int nbytes_shared = std::max(warp_size, nsums_red)*(has_fusion ? 2 : 1)*sizeof(float);
 
     const dim3 block_nums(nrows/rpb, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(block_size_best, 1, 1);
@@ -953,7 +966,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        GGML_ASSERT(  ids || dst->ne[1] == 1 || (fusion->gdn_beta && ggml_cuda_mmvf_fuses_tokens(src0, src1, fusion->gate)));
         if (fusion->x_bias) {
             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
@@ -974,9 +987,12 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
         fusion_local.glu_limit = fusion->glu_limit;
         if (fusion->gdn_beta) {
             GGML_ASSERT(!ids && fusion->gate && !fusion->x_bias && !fusion->gate_bias);
-            for (const ggml_tensor * t : { fusion->gdn_dt, fusion->gdn_a, (const ggml_tensor *) fusion->gdn_beta }) {
-                GGML_ASSERT(t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nelements(t) == dst->ne[0]);
+            GGML_ASSERT(ggml_is_contiguous(dst) && dst->ne[2] == 1 && dst->ne[3] == 1);
+            for (const ggml_tensor * t : { fusion->gdn_dt, fusion->gdn_a }) {
+                GGML_ASSERT(t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->ne[0] == dst->ne[0] && ggml_nelements(t) == dst->ne[0]);
             }
+            GGML_ASSERT(fusion->gdn_beta->type == GGML_TYPE_F32 && ggml_is_contiguous(fusion->gdn_beta) &&
+                ggml_nelements(fusion->gdn_beta) == ggml_nelements(dst));
             fusion_local.gdn_dt   = (const float *) fusion->gdn_dt->data;
             fusion_local.gdn_a    = (const float *) fusion->gdn_a->data;
             fusion_local.gdn_beta = (float *) fusion->gdn_beta->data;
@@ -1087,6 +1103,18 @@ void ggml_cuda_op_mul_mat_vec_f(
     }
 
     GGML_UNUSED_VARS(ctx, src1, dst, src1_ddq_i, src1_ncols, src1_padded_row_size);
+}
+
+bool ggml_cuda_mmvf_fuses_tokens(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * gate) {
+    if (src1->ne[1] == 1) {
+        return true;
+    }
+    const int    cc      = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const size_t ts_src0 = ggml_type_size(src0->type);
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    return src1->type == GGML_TYPE_F32 && src1->ne[1] <= MMVF_MAX_BATCH_SIZE && mmvf_use_load16(ts_src0 == 2, cc, src1->ne[1],
+        src0->ne[0], src0->nb[1]/ts_src0, src1->nb[1]/ts_src1, src0->nb[2]/ts_src0, src0->nb[3]/ts_src0,
+        src1->nb[2]/ts_src1, src1->nb[3]/ts_src1, src0->data, src1->data, gate ? gate->data : nullptr);
 }
 
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {

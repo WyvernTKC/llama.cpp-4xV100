@@ -3955,15 +3955,15 @@ struct test_rms_norm_back : public test_case {
     }
 };
 
-// GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
 // The alpha and beta projections of a gated delta net layer and what follows them, in the node order the qwen35
-//   graph has: MUL_MAT(alpha) RESHAPE ADD(dt) SOFTPLUS MUL(a) RESHAPE, MUL_MAT(beta) RESHAPE SIGMOID. At one token
-//   the CUDA backend runs them as one GEMV.
+//   graph has: MUL_MAT(alpha) RESHAPE ADD(dt) SOFTPLUS MUL(a) RESHAPE, MUL_MAT(beta) RESHAPE SIGMOID. At up to 8
+//   tokens the CUDA backend can run them as one GEMV.
 struct test_gdn_gate : public test_case {
     const ggml_type type;
     const int64_t n_embd;
     const int64_t n_head;
-    const int64_t n_tokens;
+    const int64_t n_tokens; // per sequence
+    const int64_t n_seqs;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -3973,18 +3973,19 @@ struct test_gdn_gate : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR4(type, n_embd, n_head, n_tokens);
+        return VARS_TO_STR5(type, n_embd, n_head, n_tokens, n_seqs);
     }
 
     double max_nmse_err() override {
         return 5e-4;
     }
 
-    test_gdn_gate(ggml_type type = GGML_TYPE_F16, int64_t n_embd = 5120, int64_t n_head = 12, int64_t n_tokens = 1)
-        : type(type), n_embd(n_embd), n_head(n_head), n_tokens(n_tokens) {}
+    test_gdn_gate(ggml_type type = GGML_TYPE_F16, int64_t n_embd = 5120, int64_t n_head = 12, int64_t n_tokens = 1,
+            int64_t n_seqs = 1)
+        : type(type), n_embd(n_embd), n_head(n_head), n_tokens(n_tokens), n_seqs(n_seqs) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * cur     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * cur     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens*n_seqs);
         ggml_tensor * w_alpha = ggml_new_tensor_2d(ctx, type, n_embd, n_head);
         ggml_tensor * w_beta  = ggml_new_tensor_2d(ctx, type, n_embd, n_head);
         ggml_tensor * dt      = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_head);
@@ -3995,12 +3996,12 @@ struct test_gdn_gate : public test_case {
         ggml_set_name(dt, "dt");
         ggml_set_name(a, "a");
 
-        ggml_tensor * alpha = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w_alpha, cur), n_head, n_tokens, 1);
+        ggml_tensor * alpha = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w_alpha, cur), n_head, n_tokens, n_seqs);
         ggml_tensor * gate  = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha, dt)), a);
-        gate = ggml_reshape_4d(ctx, gate, 1, n_head, n_tokens, 1);
+        gate = ggml_reshape_4d(ctx, gate, 1, n_head, n_tokens, n_seqs);
         ggml_set_name(gate, "gate");
 
-        ggml_tensor * beta = ggml_reshape_4d(ctx, ggml_mul_mat(ctx, w_beta, cur), 1, n_head, n_tokens, 1);
+        ggml_tensor * beta = ggml_reshape_4d(ctx, ggml_mul_mat(ctx, w_beta, cur), 1, n_head, n_tokens, n_seqs);
         beta = ggml_sigmoid(ctx, beta);
         ggml_set_name(beta, "beta");
 
@@ -4099,6 +4100,7 @@ struct test_add_rms_norm_mul : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
 struct test_rms_norm_mul_add : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -10149,12 +10151,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_F32, {256, 2, 3, 4}, {-1,-1,-1,-1}, {1, 0, 2, 3}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {256, 4, 3, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {256, 4, 3, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
-    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F32}) {
-        test_cases.emplace_back(new test_gdn_gate(type, 5120, 12, 1));
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (int64_t n_tokens : {1, 2, 6, 8}) {
+            test_cases.emplace_back(new test_gdn_gate(type, 5120, 12, n_tokens));
+        }
     }
-    test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_F16, 5120, 48, 1));
-    test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_F16,  256, 16, 1));
-    test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_F16, 5120, 12, 2));
+    test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_F16,  5120, 48, 1));
+    test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_F16,   256, 16, 1));
+    test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_F16,   256, 16, 6));
+    test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_Q8_0, 2048,  8, 1));
+    test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_Q8_0, 2048, 32, 6));
+    test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_Q8_0, 2048,  8, 4));
+    test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_F16,  5120, 12, 4));
+    // one GEMV over the tokens of several sequences, the gate shaped per sequence
+    test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_F16,  5120, 12, 1, 2));
+    test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_F16,  5120, 12, 3, 2));
+    test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_Q8_0, 2048, 32, 1, 4));
     for (int64_t n_tokens : {1, 6, 37}) {
         test_cases.emplace_back(new test_add_softplus_mul({48, n_tokens, 1, 1}));
         test_cases.emplace_back(new test_add_softplus_mul({12, n_tokens, 2, 1}));
