@@ -564,7 +564,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
         const block_q2_K * bxi = (const block_q2_K *) x + kbx0 + i*stride;
 
-        const int x_ql_0 = get_int_b2(bxi->qs, kqsx);
+        const int x_ql_0 = get_int_b4(bxi->qs, kqsx); // the 84-byte blocks keep qs 4-byte aligned
 
 #pragma unroll
         for (int l = 0; l < QR2_K; ++l) {
