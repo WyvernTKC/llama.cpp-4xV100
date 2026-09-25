@@ -4019,6 +4019,15 @@ static ggml_cuda_mul_mat_vec_t ggml_cuda_should_fuse_gdn_gate(const ggml_cgraph 
     if (!ggml_are_same_shape(n[2], n[1]) || !ggml_are_same_shape(n[4], n[1])) {
         return nullptr;
     }
+    // every block reads all of x, and ggml-alloc may give beta the memory of x once the beta GEMV is allocated
+    const ggml_tensor * x = mm_a->src[1];
+    for (const ggml_tensor * out : { n[4], n[8] }) {
+        for (const ggml_tensor * in : { x, dt, a }) {
+            if (ggml_cuda_tensors_overlap(out, in)) {
+                return nullptr;
+            }
+        }
+    }
     ggml_cuda_mul_mat_vec_t mul_mat_vec = ggml_cuda_gdn_gate_mul_mat_vec(mm_a, mm_b);
     if (!mul_mat_vec) {
         return nullptr;

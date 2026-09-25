@@ -729,10 +729,12 @@ bool ggml_cuda_should_fuse_add_softplus_mul(const ggml_tensor * add, const ggml_
     // the add takes the full tensor and a row, in either order
     const ggml_tensor * x = ggml_are_same_shape(add->src[0], add) ? add->src[0] : add->src[1];
     const ggml_tensor * b = x == add->src[0] ? add->src[1] : add->src[0];
+    // dst[i] is written by the thread that reads x[i], and every thread reads the rows b and scale
     return add->type == GGML_TYPE_F32 && unary->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 &&
         x->type == GGML_TYPE_F32 && ggml_are_same_shape(x, add) && ggml_is_contiguous(x) && ggml_is_contiguous(add) &&
         ggml_are_same_shape(mul, add) && ggml_is_contiguous(mul) &&
-        ggml_cuda_is_f32_row(b, ne0) && ggml_cuda_is_f32_row(scale, ne0) && ggml_nelements(add) <= INT_MAX;
+        ggml_cuda_is_f32_row(b, ne0) && ggml_cuda_is_f32_row(scale, ne0) && ggml_nelements(add) <= INT_MAX &&
+        ggml_cuda_same_or_disjoint(mul, x) && !ggml_cuda_tensors_overlap(mul, b) && !ggml_cuda_tensors_overlap(mul, scale);
 }
 
 void ggml_cuda_op_add_softplus_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * unary, ggml_tensor * mul) {

@@ -685,11 +685,17 @@ bool ggml_cuda_should_fuse_rms_norm_pre_add(const ggml_tensor * add, const ggml_
             return false;
         }
     }
-    // no broadcast in the add, contiguous rows everywhere, and a weight the norm's mul can broadcast
+    // no broadcast in the add, contiguous rows everywhere, and a weight the norm's mul can broadcast. A block reads its
+    //   rows of a and b and writes its row of dst only after the reduction, so an output may sit exactly on an input
+    //   but not partly over one: ggml-alloc frees b once the add is allocated, and the elided norm (with the mul in
+    //   place over it) can then start a few rows before b - one block overwrites rows another has not read yet
     return ggml_are_same_shape(a, add) && ggml_are_same_shape(b, add) && ggml_are_same_shape(mul, add) &&
         ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(add) && ggml_is_contiguous(mul) &&
         w->nb[0] == sizeof(float) && ggml_can_repeat(w, add) &&
-        add->ne[1] <= INT_MAX && add->ne[2] <= 65535 && add->ne[3] <= 65535;
+        add->ne[1] <= INT_MAX && add->ne[2] <= 65535 && add->ne[3] <= 65535 &&
+        ggml_cuda_same_or_disjoint(add, a) && ggml_cuda_same_or_disjoint(add, b) && ggml_cuda_same_or_disjoint(mul, a) &&
+        ggml_cuda_same_or_disjoint(mul, b) && ggml_cuda_same_or_disjoint(mul, add) &&
+        !ggml_cuda_tensors_overlap(add, w) && !ggml_cuda_tensors_overlap(mul, w);
 }
 
 void ggml_cuda_op_rms_norm_pre_add(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * rms_norm, ggml_tensor * mul) {

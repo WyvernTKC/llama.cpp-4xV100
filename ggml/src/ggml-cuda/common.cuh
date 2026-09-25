@@ -387,6 +387,19 @@ static bool ggml_cuda_is_aligned(const ggml_tensor * tensor, const size_t alignm
            tensor->nb[3] % alignment == 0;
 }
 
+static bool ggml_cuda_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * a0 = (const char *) a->data;
+    const char * b0 = (const char *) b->data;
+    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+}
+
+// ggml-alloc places the output of a fused chain as if the elided nodes ran on their own, so it can land partly over an
+// input the chain still reads. Sitting exactly on a same-shape input is fine when each element is read before the same
+// thread writes it; a partial overlap lets one block overwrite input rows another block has not read yet.
+static bool ggml_cuda_same_or_disjoint(const ggml_tensor * a, const ggml_tensor * b) {
+    return a->data == b->data || !ggml_cuda_tensors_overlap(a, b);
+}
+
 static constexpr __device__ int ggml_cuda_get_physical_warp_size() {
 #if defined(GGML_USE_HIP) && (defined(__GFX9__) || defined(__GFX8__))
     return 64;
