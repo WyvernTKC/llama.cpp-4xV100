@@ -1089,6 +1089,63 @@ static void mul_mat_vec_q_moe_launch(
     }
 }
 
+// On Volta the rows sharing a block reuse the activations and keep more loads in flight at any K, and
+// each row still sums in the same order. It only loses once the grid drops below ~8 blocks per SM
+// (measured, one token: q4_K 17408x5120 -17%, MoE mxfp4 512x4096 x6 -17%, q8_0 256x4096 +15%).
+static bool mmvq_volta_multi_row(const int cc, const int nwarps, const int64_t nrows_x, const int64_t nchannels_dst,
+        const int64_t nsamples_dst) {
+    const bool is_nvidia_volta = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA && cc < GGML_CUDA_CC_TURING;
+    if (!is_nvidia_volta || nwarps <= 1) {
+        return false;
+    }
+    const int64_t nblocks = int64_t((nrows_x + nwarps - 1) / nwarps) * nchannels_dst * nsamples_dst;
+    return nblocks >= 8*ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+}
+
+// Where several rows in a block are slower, by type and arch.
+static bool mmvq_small_k_is_slow(const ggml_type type, const int cc, const int64_t ncols_dst) {
+    constexpr std::array<ggml_type, 2> iq_slow_turing = {
+        GGML_TYPE_IQ3_XXS,
+        GGML_TYPE_IQ3_S,
+    };
+    constexpr std::array<ggml_type, 8> iq_slow_other = {
+        GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,   GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
+        GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,   GGML_TYPE_IQ4_XS,
+    };
+    constexpr std::array<ggml_type, 3> slow_pascal = {
+        GGML_TYPE_IQ3_S,
+        GGML_TYPE_Q2_K,
+        GGML_TYPE_Q3_K,
+    };
+
+    const bool is_nvidia_turing_plus  = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING;
+    const bool is_nvidia_pascal_older = GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA;
+
+    if (is_nvidia_turing_plus) {
+        return ncols_dst == 1 && std::find(iq_slow_turing.begin(), iq_slow_turing.end(), type) != iq_slow_turing.end();
+    }
+    return (ncols_dst == 1 && std::find(iq_slow_other.begin(), iq_slow_other.end(), type) != iq_slow_other.end()) ||
+        (is_nvidia_pascal_older && std::find(slow_pascal.begin(), slow_pascal.end(), type) != slow_pascal.end()) ||
+        GGML_CUDA_CC_IS_RDNA(cc);
+}
+
+bool ggml_cuda_should_fuse_mmvq_gate(enum ggml_type type, int cc, int64_t nrows_x, int64_t nchannels_dst, int64_t nsamples_dst,
+        bool mul_mat_id) {
+    const int nwarps = calc_nwarps(type, 1, get_device_table_id(cc));
+    if (!mmvq_volta_multi_row(cc, nwarps, nrows_x, nchannels_dst, nsamples_dst) || mmvq_small_k_is_slow(type, cc, 1)) {
+        return true;
+    }
+    // Here the plain kernel keeps 4 rows per block and the fused one 1. A dense GEMV is faster as two launches (one
+    //   token: q4_K 15360x3840 +11% fused). A MUL_MAT_ID wins fused on small grids, where the saved launches weigh the
+    //   most (qwen35moe 512x2048 x8 experts: -1% ms/token end to end), and loses on big ones (q4_K 2048x4096 x6 +9%).
+    //   Q3_K is slower fused at any size.
+    if (!mul_mat_id || type == GGML_TYPE_Q3_K) {
+        return false;
+    }
+    const int64_t nblocks = (nrows_x + nwarps - 1)/nwarps * nchannels_dst * nsamples_dst;
+    return nblocks <= 16*ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+}
+
 template <ggml_type type>
 static void mul_mat_vec_q_switch_ncols_dst(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -1126,44 +1183,19 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int  nwarps = calc_nwarps(type, c_ncols_dst, table_id);
         bool       use    = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
 
-        // On Volta the rows sharing a block reuse the activations and keep more loads in flight at any K, and
-        // each row still sums in the same order. It only loses once the grid drops below ~8 blocks per SM
-        // (measured, one token: q4_K 17408x5120 -17%, MoE mxfp4 512x4096 x6 -17%, q8_0 256x4096 +15%).
+        if (c_ncols_dst == 1 && mmvq_volta_multi_row(cc, nwarps, nrows_x, nchannels_dst, nsamples_dst)) {
+            use = true;
+        }
+
+        // On Volta a fused gate keeps one row per block: it doubles the sums each row keeps live, several rows then cut
+        //   the occupancy (q4_K: 91 registers at 4 rows, 64 at 2, 48 at 1; qwen35moe experts 512x2048 x8, ms/token
+        //   end to end: 1 row -1.1% vs 2 rows, -3.9% vs 4 rows).
         const bool is_nvidia_volta = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA && cc < GGML_CUDA_CC_TURING;
-        if (is_nvidia_volta && c_ncols_dst == 1 && nwarps > 1) {
-            const int64_t nblocks = int64_t((nrows_x + nwarps - 1) / nwarps) * nchannels_dst * nsamples_dst;
-            use = use || nblocks >= 8*ggml_cuda_info().devices[device].nsm;
+        if (is_nvidia_volta && fusion.gate != nullptr) {
+            return false;
         }
 
-        constexpr std::array<ggml_type, 2> iq_slow_turing = {
-            GGML_TYPE_IQ3_XXS,
-            GGML_TYPE_IQ3_S,
-        };
-        constexpr std::array<ggml_type, 8> iq_slow_other = {
-            GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,   GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
-            GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,   GGML_TYPE_IQ4_XS,
-        };
-        constexpr std::array<ggml_type, 3> slow_pascal = {
-            GGML_TYPE_IQ3_S,
-            GGML_TYPE_Q2_K,
-            GGML_TYPE_Q3_K,
-        };
-
-        const bool is_nvidia_turing_plus  = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING;
-        const bool is_nvidia_pascal_older = GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA;
-
-        if (is_nvidia_turing_plus) {
-            if (ncols_dst == 1 &&
-                    std::find(iq_slow_turing.begin(), iq_slow_turing.end(), type) != iq_slow_turing.end()) {
-                use = false;
-            }
-        } else if ((ncols_dst == 1 && std::find(iq_slow_other.begin(), iq_slow_other.end(), type) != iq_slow_other.end()) ||
-                (is_nvidia_pascal_older && std::find(slow_pascal.begin(), slow_pascal.end(), type) != slow_pascal.end()) ||
-                GGML_CUDA_CC_IS_RDNA(cc)) {
-            use = false;
-        }
-
-        return use;
+        return use && !mmvq_small_k_is_slow(type, cc, ncols_dst);
     };
 
     // Whether doubling nwarps pays off on the ncols_dst == 1 path, where K sets the K loop trip count.
