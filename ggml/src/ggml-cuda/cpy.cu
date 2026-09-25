@@ -156,12 +156,13 @@ static __device__ void cpy_blck_q_f32(const char * cxi, char * cdsti) {
     }
 }
 
-template <cpy_kernel_t cpy_blck, int qk>
+// group consecutive threads per block of quants, cpy_blck then takes the thread index within the group
+template <auto cpy_blck, int qk, int group = 1>
 static __global__ void cpy_f32_q(const char * cx, char * cdst, const int64_t ne,
                                  const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
                                  const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11,
                                  const int64_t nb12, const int64_t nb13) {
-    const int64_t i = ((int64_t)blockDim.x*blockIdx.x + threadIdx.x)*qk;
+    const int64_t i = ((int64_t)blockDim.x*blockIdx.x + threadIdx.x)/group*qk;
 
     if (i >= ne) {
         return;
@@ -180,7 +181,11 @@ static __global__ void cpy_f32_q(const char * cx, char * cdst, const int64_t ne,
     const int64_t dst_offset = (i10/qk)*nb10 + i11*nb11 + i12*nb12 + i13*nb13;
 
     ggml_cuda_pdl_sync();
-    cpy_blck(cx + x_offset, cdst + dst_offset);
+    if constexpr (group == 1) {
+        cpy_blck(cx + x_offset, cdst + dst_offset);
+    } else {
+        cpy_blck(cx + x_offset, cdst + dst_offset, threadIdx.x % group);
+    }
 }
 
 template <cpy_kernel_t cpy_blck, int qk>
@@ -287,9 +292,9 @@ static void ggml_cpy_f32_q8_0_cuda(
     const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
 
     GGML_ASSERT(ne % QK8_0 == 0);
-    const int64_t num_blocks = (ne/QK8_0 + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+    const int64_t num_blocks = (ne/QK8_0*QUANTIZE_GROUP_SIZE + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
     GGML_ASSERT(num_blocks <= INT_MAX);
-    cpy_f32_q<cpy_blck_f32_q8_0, QK8_0><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
+    cpy_f32_q<cpy_blck_f32_q8_0_group, QK8_0, QUANTIZE_GROUP_SIZE><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 
@@ -310,9 +315,9 @@ static void ggml_cpy_f32_q4_0_cuda(
     const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
 
     GGML_ASSERT(ne % QK4_0 == 0);
-    const int64_t num_blocks = (ne/QK4_0 + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+    const int64_t num_blocks = (ne/QK4_0*QUANTIZE_GROUP_SIZE + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
     GGML_ASSERT(num_blocks <= INT_MAX);
-    cpy_f32_q<cpy_blck_f32_q4_0, QK4_0><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
+    cpy_f32_q<cpy_blck_f32_q4_0_group, QK4_0, QUANTIZE_GROUP_SIZE><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 

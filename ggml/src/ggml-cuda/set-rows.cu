@@ -3,8 +3,15 @@
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
-// Generic quantized set_rows kernel template
-template <typename idx_t, typename block_type, int qk, void (*quantize_func)(const float *, block_type *)>
+// a quantizer of one block per thread in the form of the group quantizers of cpy-utils.cuh
+template <typename block_type, void (*quantize_block)(const float *, block_type *)>
+static __device__ __forceinline__ void quantize_block_1(const float * __restrict__ x, block_type * __restrict__ y, const int t) {
+    quantize_block(x, y);
+    GGML_UNUSED(t);
+}
+
+// Generic quantized set_rows kernel template, group consecutive threads per block of quants
+template <typename idx_t, typename block_type, int qk, int group, void (*quantize_func)(const float *, block_type *, int)>
 static __global__ void k_set_rows_quant(const float * __restrict__ src0,
                                         const idx_t * __restrict__ src1,
                                         block_type * __restrict__ dst,
@@ -27,10 +34,10 @@ static __global__ void k_set_rows_quant(const float * __restrict__ src0,
                                         const uint3   ne02,
                                         const uint3   ne11_fd,
                                         const uint3   ne12_fd) {
-    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
+    const int64_t i = (int64_t(blockDim.x) * blockIdx.x + threadIdx.x) / group;
 
     if (i >= ne_total) {
-        return;
+        return; // all threads of a group at once
     }
 
     const int64_t i_base = i * qk;
@@ -62,7 +69,7 @@ static __global__ void k_set_rows_quant(const float * __restrict__ src0,
     const float * src_block = src0_row + i00;
     block_type * dst_block = dst_row_ptr + i00 / qk;
 
-    quantize_func(src_block, dst_block);
+    quantize_func(src_block, dst_block, threadIdx.x % group);
 
     GGML_UNUSED(ne10);
     GGML_UNUSED(ne11);
@@ -71,7 +78,7 @@ static __global__ void k_set_rows_quant(const float * __restrict__ src0,
 }
 
 // Template dispatch function for quantized set_rows
-template<typename idx_t, typename block_type, int qk, void (*quantize_func)(const float*, block_type*)>
+template<typename idx_t, typename block_type, int qk, int group, void (*quantize_func)(const float *, block_type *, int)>
 static void set_rows_cuda_quant(
         const float * src0_d, const idx_t * src1_d, block_type * dst_d,
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
@@ -83,7 +90,8 @@ static void set_rows_cuda_quant(
 
     GGML_ASSERT(ne00 % qk == 0);
     const int64_t ne_total = (ne00 * ne01 * ne02 * ne03) / qk;
-    const int num_blocks = (ne_total + CUDA_SET_ROWS_BLOCK_SIZE - 1) / CUDA_SET_ROWS_BLOCK_SIZE;
+    static_assert(CUDA_SET_ROWS_BLOCK_SIZE % group == 0, "bad group");
+    const int num_blocks = (ne_total*group + CUDA_SET_ROWS_BLOCK_SIZE - 1) / CUDA_SET_ROWS_BLOCK_SIZE;
     const dim3 block_size(CUDA_SET_ROWS_BLOCK_SIZE);
     const dim3 grid_size(num_blocks);
 
@@ -104,7 +112,7 @@ static void set_rows_cuda_quant(
         const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
         const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
 
-        k_set_rows_quant<idx_t, block_type, qk, quantize_func><<<grid_size, block_size, 0, stream>>>(
+        k_set_rows_quant<idx_t, block_type, qk, group, quantize_func><<<grid_size, block_size, 0, stream>>>(
             src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01, s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd,
             ne01_fd, ne02_fd, ne11_fd, ne12_fd);
     }
@@ -258,7 +266,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             stream
         );
     } else if (dst->type == GGML_TYPE_Q4_0) {
-        set_rows_cuda_quant<idx_t, block_q4_0, QK4_0, quantize_f32_q4_0_block>(
+        set_rows_cuda_quant<idx_t, block_q4_0, QK4_0, QUANTIZE_GROUP_SIZE, quantize_f32_q4_0_group>(
             src0_d, src1_d, (block_q4_0*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
@@ -268,7 +276,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             stream
         );
     } else if (dst->type == GGML_TYPE_Q4_1) {
-        set_rows_cuda_quant<idx_t, block_q4_1, QK4_1, quantize_f32_q4_1_block>(
+        set_rows_cuda_quant<idx_t, block_q4_1, QK4_1, 1, quantize_block_1<block_q4_1, quantize_f32_q4_1_block>>(
             src0_d, src1_d, (block_q4_1*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
@@ -278,7 +286,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             stream
         );
     } else if (dst->type == GGML_TYPE_Q5_0) {
-        set_rows_cuda_quant<idx_t, block_q5_0, QK5_0, quantize_f32_q5_0_block>(
+        set_rows_cuda_quant<idx_t, block_q5_0, QK5_0, 1, quantize_block_1<block_q5_0, quantize_f32_q5_0_block>>(
             src0_d, src1_d, (block_q5_0*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
@@ -288,7 +296,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             stream
         );
     } else if (dst->type == GGML_TYPE_Q5_1) {
-        set_rows_cuda_quant<idx_t, block_q5_1, QK5_1, quantize_f32_q5_1_block>(
+        set_rows_cuda_quant<idx_t, block_q5_1, QK5_1, 1, quantize_block_1<block_q5_1, quantize_f32_q5_1_block>>(
             src0_d, src1_d, (block_q5_1*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
@@ -298,7 +306,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             stream
         );
     } else if (dst->type == GGML_TYPE_Q8_0) {
-        set_rows_cuda_quant<idx_t, block_q8_0, QK8_0, quantize_f32_q8_0_block>(
+        set_rows_cuda_quant<idx_t, block_q8_0, QK8_0, QUANTIZE_GROUP_SIZE, quantize_f32_q8_0_group>(
             src0_d, src1_d, (block_q8_0*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
@@ -308,7 +316,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             stream
         );
     } else if (dst->type == GGML_TYPE_IQ4_NL) {
-        set_rows_cuda_quant<idx_t, block_iq4_nl, QK4_NL, quantize_f32_iq4_nl_block>(
+        set_rows_cuda_quant<idx_t, block_iq4_nl, QK4_NL, 1, quantize_block_1<block_iq4_nl, quantize_f32_iq4_nl_block>>(
             src0_d, src1_d, (block_iq4_nl*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
