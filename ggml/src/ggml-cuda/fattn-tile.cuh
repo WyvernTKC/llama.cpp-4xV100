@@ -482,7 +482,8 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
 // K/V types the tile kernel reads directly, other quantized types are converted to FP16 before the kernel.
 static constexpr __host__ __device__ bool ggml_cuda_fattn_tile_kv_type_direct(const ggml_type type, const int DKQ, const int DV) {
     return (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0) &&
-        (DKQ == DV ? DKQ == 64 || DKQ == 128 || DKQ == 256 || DKQ == 512 : DKQ == 576 && DV == 512);
+        (DKQ == DV ? DKQ == 64 || DKQ == 96 || DKQ == 128 || DKQ == 256 || DKQ == 512 :
+                     (DKQ == 192 && DV == 128) || (DKQ == 576 && DV == 512));
 }
 
 // Same tile as flash_attn_tile_load_tile, but for q8_0/q4_0 rows: columns k0 .. k0 + J of rows 0 .. I, stride_KV in bytes.
@@ -498,20 +499,15 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_q(
     constexpr int nv       = 8; // values per thread and row, all from one block
     constexpr int nthreads = nwarps*warp_size;
     constexpr int tpr      = J > 0 ? J/nv : 1; // threads per row
-    static_assert(J % nv == 0 && tpr <= nthreads && nthreads % tpr == 0, "bad J");
-    constexpr int rows_per_step = nthreads/tpr;
+    static_assert(J % nv == 0 && tpr <= nthreads, "bad J");
 
     const int tid = threadIdx.y*warp_size + threadIdx.x;
-    const int c   = k0 + (tid % tpr)*nv; // first column of this thread
-    const int ib  = c / 32;
-    const int iqs = c % 32;
 
-#pragma unroll
-    for (int i0 = 0; i0 < I; i0 += rows_per_step) {
-        const int i = i0 + tid/tpr;
-        if (i0 + rows_per_step > I && i >= I) {
-            break;
-        }
+    // the 8 values from column k0 + 8*g of row i
+    auto load = [&](const int i, const int g) {
+        const int c   = k0 + g*nv;
+        const int ib  = c / 32;
+        const int iqs = c % 32;
 
         // the quants as unsigned bytes: q8_0 values + 128, q4_0 values + 8
         __align__(8) uint32_t u[nv/4] = {0};
@@ -558,7 +554,7 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_q(
                 tmp[2*l + 0] = valid ? __hmul2(__hsub2(lo_h2, bias), d2) : make_half2(0.0f, 0.0f);
                 tmp[2*l + 1] = valid ? __hmul2(__hsub2(hi_h2, bias), d2) : make_half2(0.0f, 0.0f);
             }
-            ggml_cuda_memcpy_1<sizeof(tmp)>(tile_KV + i*(J/2 + J_padding) + (tid % tpr)*(nv/2), tmp);
+            ggml_cuda_memcpy_1<sizeof(tmp)>(tile_KV + i*(J/2 + J_padding) + g*(nv/2), tmp);
         } else {
             // round to FP16 like the converted K/V, then widen
             const float df = __half2float(d);
@@ -569,8 +565,32 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_q(
             }
 #pragma unroll
             for (int l = 0; l < nv; l += 4) {
-                ggml_cuda_memcpy_1<4*sizeof(float)>(tile_KV + i*(J + J_padding) + (tid % tpr)*nv + l, tmp + l);
+                ggml_cuda_memcpy_1<4*sizeof(float)>(tile_KV + i*(J + J_padding) + g*nv + l, tmp + l);
             }
+        }
+    };
+
+    if constexpr (nthreads % tpr == 0) {
+        // each thread keeps its column group and steps over the rows
+        constexpr int rows_per_step = nthreads/tpr;
+#pragma unroll
+        for (int i0 = 0; i0 < I; i0 += rows_per_step) {
+            const int i = i0 + tid/tpr;
+            if (i0 + rows_per_step > I && i >= I) {
+                break;
+            }
+            load(i, tid % tpr);
+        }
+    } else {
+        // a row of groups does not divide the threads (head size 96: 12, 6 or 3 groups): the threads take the
+        //   (row, group) pairs of the tile in order
+#pragma unroll
+        for (int w0 = 0; w0 < I*tpr; w0 += nthreads) {
+            const int w = w0 + tid;
+            if (w0 + nthreads > I*tpr && w >= I*tpr) {
+                break;
+            }
+            load(w / tpr, w % tpr);
         }
     }
 }

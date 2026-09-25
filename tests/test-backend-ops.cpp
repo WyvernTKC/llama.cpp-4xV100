@@ -11543,6 +11543,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // decode and small-batch shapes with q8_0/q4_0 K/V, which the tile kernel reads without converting them
+    {
+        struct fa_shape { int64_t hsk, hsv, nh, gqa; };
+        const fa_shape shapes[] = {
+            { 64,  64, 4,  4}, { 96,  96, 4,  1}, { 96,  96, 2,  4}, {128, 128, 4,  4}, {128, 128, 2,  8},
+            {192, 128, 2,  8}, {192, 128, 1, 16}, {256, 256, 2,  2}, {256, 256, 1, 16}, {512, 512, 1, 16},
+            {576, 512, 1, 16},
+        };
+        for (const fa_shape & sh : shapes) {
+            for (int kv : { 113, 1024 }) {
+                for (int nb : { 1, 3, 8 }) {
+                    for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(sh.hsk, sh.hsv, sh.nh, {sh.gqa, 1}, kv, nb, true, false, 0, 0,
+                            GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, sh.hsk == 576));
+                    }
+                }
+            }
+        }
+    }
+
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
             if (hsk != 96 && hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;
