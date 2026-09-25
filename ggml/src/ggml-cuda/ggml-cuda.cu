@@ -1992,13 +1992,18 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
-static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_TENSOR_BINARY_OP_LOCALS
+enum ggml_cuda_mul_mat_path {
+    GGML_CUDA_MUL_MAT_PATH_CUBLAS,
+    GGML_CUDA_MUL_MAT_PATH_MMVF,
+    GGML_CUDA_MUL_MAT_PATH_MMVF_TRANSPOSED,
+    GGML_CUDA_MUL_MAT_PATH_MMF,
+    GGML_CUDA_MUL_MAT_PATH_MMVQ,
+    GGML_CUDA_MUL_MAT_PATH_MMQ,
+};
 
-    const int32_t hint = ggml_get_op_params_i32(dst, 1);
-    if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
-        return;
-    }
+// the kernel ggml_cuda_mul_mat runs a MUL_MAT without the Hadamard hint on
+static ggml_cuda_mul_mat_path ggml_cuda_mul_mat_choose(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    GGML_TENSOR_BINARY_OP_LOCALS
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
@@ -2006,8 +2011,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
-        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
-        return;
+        return GGML_CUDA_MUL_MAT_PATH_CUBLAS;
     }
 
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
@@ -2016,36 +2020,59 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
-        ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
-        return;
+        return GGML_CUDA_MUL_MAT_PATH_MMVF;
     }
     // A transposed vector can still use MMVQ (i.e. ne01 == 1)
     if (ne01 == 1 && ne11 > MMVF_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1
             && src0->type == GGML_TYPE_F32
             && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
             && ggml_cuda_should_use_mmvf(src1->type, cc, src1->ne, src1->nb, /*ne11 =*/ 1)) {
-        ggml_tensor dst_vec = *dst;
-        dst_vec.ne[0] = ne11;
-        dst_vec.ne[1] = 1;
-        dst_vec.nb[1] = dst_vec.nb[0]*ne11;
-        dst_vec.nb[2] = dst_vec.nb[1];
-        dst_vec.nb[3] = dst_vec.nb[1];
-        ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
-        return;
+        return GGML_CUDA_MUL_MAT_PATH_MMVF_TRANSPOSED;
     }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
-        ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
-        return;
+        return GGML_CUDA_MUL_MAT_PATH_MMF;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
-        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
-        return;
+        return GGML_CUDA_MUL_MAT_PATH_MMVQ;
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
-        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        return GGML_CUDA_MUL_MAT_PATH_MMQ;
+    }
+    return GGML_CUDA_MUL_MAT_PATH_CUBLAS;
+}
+
+static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const int32_t hint = ggml_get_op_params_i32(dst, 1);
+    if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return;
     }
-    ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+
+    switch (ggml_cuda_mul_mat_choose(ctx, src0, src1, dst)) {
+        case GGML_CUDA_MUL_MAT_PATH_CUBLAS:
+            ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+            break;
+        case GGML_CUDA_MUL_MAT_PATH_MMVF:
+            ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+            break;
+        case GGML_CUDA_MUL_MAT_PATH_MMVF_TRANSPOSED: {
+            ggml_tensor dst_vec = *dst;
+            dst_vec.ne[0] = src1->ne[1];
+            dst_vec.ne[1] = 1;
+            dst_vec.nb[1] = dst_vec.nb[0]*src1->ne[1];
+            dst_vec.nb[2] = dst_vec.nb[1];
+            dst_vec.nb[3] = dst_vec.nb[1];
+            ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
+        } break;
+        case GGML_CUDA_MUL_MAT_PATH_MMF:
+            ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+            break;
+        case GGML_CUDA_MUL_MAT_PATH_MMVQ:
+            ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+            break;
+        case GGML_CUDA_MUL_MAT_PATH_MMQ:
+            ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+            break;
+    }
 }
 
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
@@ -2879,34 +2906,17 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
     return true;
 }
 
-// mul is null for a norm without weight; reshape, when set, sits between the norm (or its weight) and the rope
-static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm,
-                                                    const ggml_tensor * mul,
-                                                    const ggml_tensor * rope,
-                                                    const ggml_tensor * reshape = nullptr) {
-    if (rms_norm->op != GGML_OP_RMS_NORM || (mul && mul->op != GGML_OP_MUL) || rope->op != GGML_OP_ROPE) {
+// the norm (and its weight, when mul is set) that the fused rms_norm_mul_rope kernel can apply to its rows
+static bool ggml_cuda_rms_norm_mul_fusable_rows(const ggml_tensor * rms_norm, const ggml_tensor * mul) {
+    if (rms_norm->op != GGML_OP_RMS_NORM || (mul && mul->op != GGML_OP_MUL)) {
         return false;
     }
 
-    if (rms_norm->src[0]->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32 || rope->type != GGML_TYPE_F32) {
+    if (rms_norm->src[0]->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32) {
         return false;
     }
 
     if (mul && (mul->src[0]->type != GGML_TYPE_F32 || mul->src[1]->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32)) {
-        return false;
-    }
-
-    const ggml_tensor * normed = mul ? mul : rms_norm;
-    if (reshape) {
-        // a reshape of packed rows keeps every row intact, but a per-row weight would no longer line up
-        const ggml_tensor * x = rms_norm->src[0];
-        const ggml_tensor * w = mul ? (mul->src[0] == rms_norm ? mul->src[1] : mul->src[0]) : nullptr;
-        if (reshape->op != GGML_OP_RESHAPE || reshape->src[0] != normed || rope->src[0] != reshape ||
-            rope->ne[0] != rms_norm->ne[0] || x->nb[2] != x->nb[1]*x->ne[1] || x->nb[3] != x->nb[2]*x->ne[2] ||
-            (w && ggml_nrows(w) != 1)) {
-            return false;
-        }
-    } else if (rope->src[0] != normed) {
         return false;
     }
 
@@ -2925,6 +2935,15 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
         return false;
     }
 
+    return rms_norm->ne[0] % 2 == 0;
+}
+
+// the rope that the fused rms_norm_mul_rope kernel can apply to its rows
+static bool ggml_cuda_rope_fusable_rows(const ggml_tensor * rope) {
+    if (rope->op != GGML_OP_ROPE || rope->type != GGML_TYPE_F32 || rope->src[0]->type != GGML_TYPE_F32) {
+        return false;
+    }
+
     // the fused kernel handles the norm/neox rope modes and multi-section rope, which rotates the neox pairs
     const int mode = ((const int32_t *) rope->op_params)[2];
     const bool is_mrope = (mode & GGML_ROPE_TYPE_MROPE) && mode != GGML_ROPE_TYPE_VISION;
@@ -2940,6 +2959,32 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
     // ggml_rope_set_offset (DeepSeek V4 rotates the tail of each head) is handled for the norm pairing only
     const int n_offs = ((const int32_t *) rope->op_params)[15];
     if (n_offs != 0 && (mode != GGML_ROPE_TYPE_NORMAL || n_offs % 2 != 0 || n_offs + n_dims > rope->ne[0])) {
+        return false;
+    }
+
+    return true;
+}
+
+// mul is null for a norm without weight; reshape, when set, sits between the norm (or its weight) and the rope
+static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm,
+                                                    const ggml_tensor * mul,
+                                                    const ggml_tensor * rope,
+                                                    const ggml_tensor * reshape = nullptr) {
+    if (!ggml_cuda_rms_norm_mul_fusable_rows(rms_norm, mul) || !ggml_cuda_rope_fusable_rows(rope)) {
+        return false;
+    }
+
+    const ggml_tensor * normed = mul ? mul : rms_norm;
+    if (reshape) {
+        // a reshape of packed rows keeps every row intact, but a per-row weight would no longer line up
+        const ggml_tensor * x = rms_norm->src[0];
+        const ggml_tensor * w = mul ? (mul->src[0] == rms_norm ? mul->src[1] : mul->src[0]) : nullptr;
+        if (reshape->op != GGML_OP_RESHAPE || reshape->src[0] != normed || rope->src[0] != reshape ||
+            rope->ne[0] != rms_norm->ne[0] || x->nb[2] != x->nb[1]*x->ne[1] || x->nb[3] != x->nb[2]*x->ne[2] ||
+            (w && ggml_nrows(w) != 1)) {
+            return false;
+        }
+    } else if (rope->src[0] != normed) {
         return false;
     }
 
@@ -3975,6 +4020,195 @@ static ggml_cuda_mul_mat_vec_t ggml_cuda_should_fuse_gdn_gate(const ggml_cgraph 
     return ggml_can_fuse_subgraph(cgraph, i, 9, ops, outputs, 2) ? mul_mat_vec : nullptr;
 }
 
+// The Walsh-Hadamard rotation of a quantized K/V cache (llama_mul_mat_hadamard: RESHAPE, MUL_MAT with the Hadamard
+//   hint, RESHAPE) is one launch of its own four times per layer. It goes into the row kernel of what produces the
+//   rotated rows, together with the SET_ROWS that stores them when that follows:
+//     [RMS_NORM [MUL] [RESHAPE]] [ROPE] RESHAPE MUL_MAT(H) [RESHAPE VIEW SET_ROWS]
+//     MUL_MAT(H) RESHAPE VIEW SET_ROWS (any other producer, e.g. the V projection)
+//   and the rotation of the attention output into the q8_1 quantization of the MUL_MAT that reads it:
+//     MUL_MAT(H) RESHAPE MUL_MAT, when that runs on mul_mat_vec_q.
+// The transform is done as fwht_cuda does it and the rest by the same arithmetic, so the result is bitwise the same.
+// Returns the number of nodes to skip, 0 when nothing was fused.
+static int ggml_cuda_try_fuse_attn_rot(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    const auto node_at = [&](const int k) -> ggml_tensor * {
+        return k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr;
+    };
+    const auto is_rot = [](const ggml_tensor * t) {
+        return t != nullptr && t->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(t, 1) == GGML_HINT_SRC0_IS_HADAMARD;
+    };
+
+    ggml_tensor * rms_norm     = nullptr;
+    ggml_tensor * mul          = nullptr;
+    ggml_tensor * reshape_norm = nullptr;
+    ggml_tensor * rope         = nullptr;
+    ggml_tensor * prev         = nullptr;
+
+    int k = i;
+    if (node_at(k)->op == GGML_OP_RMS_NORM) {
+        rms_norm = prev = node_at(k++);
+        ggml_tensor * t = node_at(k);
+        if (t != nullptr && t->op == GGML_OP_MUL && (t->src[0] == prev || t->src[1] == prev)) {
+            mul = prev = node_at(k++);
+        }
+        // the DeepSeek V4 kv norm, reshaped into one head before its rope
+        t = node_at(k);
+        ggml_tensor * t1 = node_at(k + 1);
+        if (t != nullptr && t1 != nullptr && t->op == GGML_OP_RESHAPE && t->src[0] == prev && t1->op == GGML_OP_ROPE && t1->src[0] == t) {
+            reshape_norm = prev = node_at(k++);
+        }
+    }
+    if (node_at(k) != nullptr && node_at(k)->op == GGML_OP_ROPE && (prev == nullptr || node_at(k)->src[0] == prev)) {
+        rope = prev = node_at(k++);
+    }
+
+    ggml_tensor * rot = nullptr;
+    if (prev != nullptr) {
+        ggml_tensor * reshape = node_at(k);
+        ggml_tensor * mm      = node_at(k + 1);
+        if (reshape == nullptr || reshape->op != GGML_OP_RESHAPE || reshape->src[0] != prev || !is_rot(mm) || mm->src[1] != reshape) {
+            return 0;
+        }
+        rot = mm;
+        k += 2;
+    } else {
+        if (!is_rot(node_at(k))) {
+            return 0;
+        }
+        rot = node_at(k++);
+    }
+
+    // what ggml_cuda_op_fwht does: n from 64 to 512 values of contiguous f32
+    const ggml_tensor * rot_in = rot->src[1];
+    const int64_t n_rot = rot_in->ne[0];
+    if (rot_in->type != GGML_TYPE_F32 || rot->type != GGML_TYPE_F32 || !ggml_is_contiguous(rot_in) || !ggml_is_contiguous(rot) ||
+            !ggml_are_same_shape(rot, rot_in) || n_rot < 64 || n_rot > 512 || (n_rot & (n_rot - 1)) != 0) {
+        return 0;
+    }
+
+    ggml_tensor * set_rows = nullptr;
+    ggml_tensor * rows_out = nullptr;
+    ggml_tensor * view     = nullptr;
+    {
+        ggml_tensor * reshape = node_at(k);
+        ggml_tensor * v       = node_at(k + 1);
+        ggml_tensor * sr      = node_at(k + 2);
+        if (reshape != nullptr && v != nullptr && sr != nullptr && reshape->op == GGML_OP_RESHAPE && reshape->src[0] == rot &&
+                v->op == GGML_OP_VIEW && v->src[0] == reshape && sr->op == GGML_OP_SET_ROWS && sr->src[0] == v) {
+            rows_out = reshape;
+            view     = v;
+            set_rows = sr;
+            k += 3;
+        }
+    }
+
+    if (prev == nullptr && set_rows == nullptr) {
+        // the attention output: MUL_MAT(H) RESHAPE... MUL_MAT
+        ggml_op ops[8] = { GGML_OP_MUL_MAT };
+        int n_ops = 1;
+        const ggml_tensor * y = rot;
+        while (n_ops < 7 && node_at(i + n_ops) != nullptr && node_at(i + n_ops)->op == GGML_OP_RESHAPE && node_at(i + n_ops)->src[0] == y) {
+            y = node_at(i + n_ops);
+            ops[n_ops++] = GGML_OP_RESHAPE;
+        }
+        ggml_tensor * mm = node_at(i + n_ops);
+        if (mm == nullptr || mm->op != GGML_OP_MUL_MAT || mm->src[1] != y || is_rot(mm)) {
+            return 0;
+        }
+        ops[n_ops++] = GGML_OP_MUL_MAT;
+
+        const ggml_tensor * w = mm->src[0];
+        if (!ggml_is_quantized(w->type) || n_rot > CUDA_QUANTIZE_BLOCK_SIZE || y->ne[0] % n_rot != 0 || !ggml_is_contiguous(y) ||
+                ggml_cuda_mul_mat_choose(*cuda_ctx, w, y, mm) != GGML_CUDA_MUL_MAT_PATH_MMVQ) {
+            return 0;
+        }
+        int out_nodes[] = { i + n_ops - 1 };
+        if (!ggml_can_fuse_subgraph(cgraph, i, n_ops, ops, out_nodes, 1) ||
+                !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, out_nodes, 1)) {
+            return 0;
+        }
+        // the unrotated input with the shape of the MUL_MAT's
+        ggml_tensor src1 = *y;
+        src1.data = rot_in->data;
+        ggml_cuda_mul_mat_vec_q_rot(*cuda_ctx, w, &src1, mm, (int) n_rot);
+        return n_ops - 1;
+    }
+
+    // the rows the kernel works on: those of the rope, else of the norm, else of the rotated result
+    const ggml_tensor * rows = rope ? rope : mul ? mul : rms_norm ? rms_norm : rows_out;
+    if (rows == nullptr || rows->ne[0] % n_rot != 0 || rows->ne[0] > 8192) {
+        return 0;
+    }
+    if (rope != nullptr && rms_norm != nullptr) {
+        if (!ggml_cuda_should_fuse_rms_norm_mul_rope(rms_norm, mul, rope, reshape_norm)) {
+            return 0;
+        }
+    } else if (rope != nullptr) {
+        if (!ggml_cuda_rope_fusable_rows(rope) || !ggml_is_contiguous_rows(rope->src[0])) {
+            return 0;
+        }
+    } else if (rms_norm != nullptr) {
+        if (reshape_norm != nullptr || !ggml_cuda_rms_norm_mul_fusable_rows(rms_norm, mul)) {
+            return 0;
+        }
+    }
+
+    if (set_rows != nullptr) {
+        // one cache row per token, the rows of all heads of a token side by side in it
+        const ggml_tensor * idx = set_rows->src[1];
+        if (!ggml_are_same_shape(rows_out, rows) || rows->ne[3] != 1 || !ggml_is_contiguous(view) ||
+                view->ne[0] != rows->ne[0]*rows->ne[1] || view->ne[1] != rows->ne[2] || view->ne[2] != 1 || view->ne[3] != 1 ||
+                !ggml_cuda_rms_norm_mul_rope_fused_dst_supported(set_rows->type) || set_rows->ne[0] != view->ne[0] ||
+                set_rows->ne[2] != 1 || set_rows->ne[3] != 1 || set_rows->nb[0] != ggml_type_size(set_rows->type) ||
+                (ggml_is_quantized(set_rows->type) && rows->ne[0] % ggml_blck_size(set_rows->type) != 0) ||
+                idx->type != GGML_TYPE_I64 || idx->ne[0] != view->ne[1] || ggml_nrows(idx) != 1) {
+            return 0;
+        }
+    }
+
+    ggml_op ops[16];
+    const int n_ops = k - i;
+    GGML_ASSERT(n_ops <= 16);
+    for (int j = 0; j < n_ops; ++j) {
+        ops[j] = cgraph->nodes[i + j]->op;
+    }
+    int out_nodes[] = { k - 1 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, n_ops, ops, out_nodes, 1)) {
+        return 0;
+    }
+    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, out_nodes, 1)) {
+        // the rotated rows may take exactly the memory of the rows they are made from, as they often do: each block
+        //   reads its whole row before it writes the same row of the result. Any other overlap is not allowed.
+        const ggml_tensor * x   = rms_norm ? rms_norm->src[0] : rope ? rope->src[0] : rot_in;
+        const ggml_tensor * dst = cgraph->nodes[k - 1];
+        if (set_rows != nullptr || dst->data != x->data || !ggml_is_contiguous(x) || ggml_nbytes(x) != ggml_nbytes(dst)) {
+            return 0;
+        }
+        const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+            const char * a0 = (const char *) a->data;
+            const char * b0 = (const char *) b->data;
+            return a0 < b0 + ggml_backend_buft_get_alloc_size(b->buffer->buft, b) &&
+                   b0 < a0 + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
+        };
+        for (int j = i; j < k; ++j) {
+            for (const ggml_tensor * src : cgraph->nodes[j]->src) {
+                if (src == nullptr || src->op == GGML_OP_NONE || src->data == x->data) {
+                    continue;
+                }
+                bool intermediate = false;
+                for (int jj = i; jj < j; ++jj) {
+                    intermediate = intermediate || cgraph->nodes[jj] == src;
+                }
+                if (!intermediate && overlap(dst, src)) {
+                    return 0;
+                }
+            }
+        }
+    }
+
+    ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, rms_norm, mul, rope, set_rows, rot, rows);
+    return n_ops - 1;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -3983,6 +4217,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_ROPE || node->op == GGML_OP_MUL_MAT) {
+        const int n_skip = ggml_cuda_try_fuse_attn_rot(cuda_ctx, cgraph, i);
+        if (n_skip != 0) {
+            return n_skip;
+        }
+    }
 
     // A run of scalar f32 copies of one shape and stride, with only views between them, in one launch: a
     //   recurrent layer keeps its conv window once per rollback slot, 6 copies of 30 KiB per layer at 6 tokens

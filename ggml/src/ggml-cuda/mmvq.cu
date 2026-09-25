@@ -1441,9 +1441,9 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
-void ggml_cuda_mul_mat_vec_q(
+static void ggml_cuda_mul_mat_vec_q_impl(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mm_fusion_args_host * fusion) {
+        const ggml_cuda_mm_fusion_args_host * fusion, const int src1_rot) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -1531,30 +1531,45 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
 
-    // quantize_row_q8_1_cuda ignores src0->type, so the result only depends on src1 and the padded
-    // width: reuse it when a later matmul reads the same input, e.g. the q/k/v projections
-    auto & cached = ctx.q8_1_inputs[src1->data];
-    const bool reuse = cached.buf && cached.src1 == src1 && cached.ne_padded == ne10_padded &&
-        cached.stream_no == ctx.curr_stream_no &&
-        std::equal(std::begin(cached.ne), std::end(cached.ne), src1->ne) &&
-        std::equal(std::begin(cached.nb), std::end(cached.nb), src1->nb);
+    const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
 
-    if (!reuse) {
-        cached.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(
-            ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-        cached.src1      = src1;
-        cached.ne_padded = ne10_padded;
-        cached.stream_no = ctx.curr_stream_no;
-        std::copy_n(src1->ne, GGML_MAX_DIMS, cached.ne);
-        std::copy_n(src1->nb, GGML_MAX_DIMS, cached.nb);
+    ggml_cuda_pool_alloc<char> src1_q8_1_rot(ctx.pool());
+    const char * src1_q8_1;
 
+    if (src1_rot != 0) {
+        // src1 is rotated on the way into q8_1, so the copy is not that of src1 and is not kept for reuse
+        GGML_ASSERT(!ids);
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, cached.buf->get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
-    }
+        quantize_row_q8_1_rot_cuda(src1_d, src1_q8_1_rot.alloc(nbytes_src1_q8_1), ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13,
+            src1_rot, stream);
+        src1_q8_1 = src1_q8_1_rot.get();
+    } else {
+        // quantize_row_q8_1_cuda ignores src0->type, so the result only depends on src1 and the padded
+        // width: reuse it when a later matmul reads the same input, e.g. the q/k/v projections
+        auto & cached = ctx.q8_1_inputs[src1->data];
+        const bool reuse = cached.buf && cached.src1 == src1 && cached.ne_padded == ne10_padded &&
+            cached.stream_no == ctx.curr_stream_no &&
+            std::equal(std::begin(cached.ne), std::end(cached.ne), src1->ne) &&
+            std::equal(std::begin(cached.nb), std::end(cached.nb), src1->nb);
 
-    ggml_cuda_pool_alloc<char> & src1_q8_1 = *cached.buf;
+        if (!reuse) {
+            cached.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), nbytes_src1_q8_1);
+            cached.src1      = src1;
+            cached.ne_padded = ne10_padded;
+            cached.stream_no = ctx.curr_stream_no;
+            std::copy_n(src1->ne, GGML_MAX_DIMS, cached.ne);
+            std::copy_n(src1->nb, GGML_MAX_DIMS, cached.nb);
+
+            const int64_t s11 = src1->nb[1] / ts_src1;
+            const int64_t s12 = src1->nb[2] / ts_src1;
+            const int64_t s13 = src1->nb[3] / ts_src1;
+            quantize_row_q8_1_cuda(src1_d, nullptr, cached.buf->get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        }
+
+        src1_q8_1 = cached.buf->get();
+    }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = ne10_padded / QK8_1;
@@ -1579,10 +1594,22 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+}
+
+void ggml_cuda_mul_mat_vec_q(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion) {
+    ggml_cuda_mul_mat_vec_q_impl(ctx, src0, src1, ids, dst, fusion, 0);
+}
+
+void ggml_cuda_mul_mat_vec_q_rot(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const int src1_rot) {
+    GGML_ASSERT(src1_rot > 0);
+    ggml_cuda_mul_mat_vec_q_impl(ctx, src0, src1, nullptr, dst, nullptr, src1_rot);
 }
 
 void ggml_cuda_op_mul_mat_vec_q(

@@ -368,6 +368,36 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    const bool rot_k_used = attn_rot_k && n_embd_head_k_all > 0;
+    if ((rot_k_used || attn_rot_v) && !hparams.no_alloc && !layers.empty()) {
+        ggml_init_params params = {
+            /* .mem_size   = */ 2*ggml_tensor_overhead(),
+            /* .mem_buffer = */ nullptr,
+            /* .no_alloc   = */ true,
+        };
+        attn_rot_ctx.reset(ggml_init(params));
+
+        if (rot_k_used) {
+            attn_rot_k_mat = ggml_new_tensor_2d(attn_rot_ctx.get(), GGML_TYPE_F32, n_rot_k(), n_rot_k());
+            ggml_format_name(attn_rot_k_mat, "attn_%srot_k", name_tag);
+        }
+        if (attn_rot_v) {
+            attn_rot_v_mat = ggml_new_tensor_2d(attn_rot_ctx.get(), GGML_TYPE_F32, 64, 64);
+            ggml_format_name(attn_rot_v_mat, "attn_%srot_v", name_tag);
+        }
+
+        const ggml_tensor * last = layers.back().k ? layers.back().k : layers.back().v;
+        attn_rot_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(attn_rot_ctx.get(), ggml_backend_buffer_get_type(last->buffer)));
+        if (!attn_rot_buf) {
+            throw std::runtime_error("failed to allocate buffer for the kv cache rotation");
+        }
+        for (ggml_tensor * t : { attn_rot_k_mat, attn_rot_v_mat }) {
+            if (t != nullptr) {
+                ggml_backend_tensor_set(t, attn_rot_hadamard.at(t->ne[0]).data(), 0, ggml_nbytes(t));
+            }
+        }
+    }
+
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
@@ -1440,22 +1470,32 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
     return v_idxs;
 }
 
+int64_t llama_kv_cache::n_rot_k() const {
+    // a cache with no layers leaves n_embd_head_k_all at 0, and every nrot divides 0, so the
+    // search below would never end. there is nothing to rotate in that case anyway.
+    GGML_ASSERT(n_embd_head_k_all > 0);
+
+    int64_t nrot = 64;
+
+    // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
+    // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
+    do {
+        nrot *= 2;
+    } while (n_embd_head_k_all % nrot == 0);
+    nrot /= 2;
+
+    return nrot;
+}
+
 ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
-    // a cache with no layers leaves n_embd_head_k_all at 0, and every nrot divides 0, so the
-    // search below would never end. there is nothing to rotate in that case anyway.
     if (attn_rot_k && n_embd_head_k_all > 0) {
-        int nrot = 64;
+        if (attn_rot_k_mat != nullptr) {
+            return attn_rot_k_mat;
+        }
 
-        // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
-        // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
-        do {
-            nrot *= 2;
-        } while (n_embd_head_k_all % nrot == 0);
-        nrot /= 2;
-
-        res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
+        res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rot_k(), n_rot_k());
         ggml_set_input(res);
         ggml_set_name(res, "attn_inp_k_rot");
     }
@@ -1467,6 +1507,10 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
     if (attn_rot_v) {
+        if (attn_rot_v_mat != nullptr) {
+            return attn_rot_v_mat;
+        }
+
         int nrot = 64;
         // using smaller rotation matrices for V seems beneficial
         // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4146397570
@@ -1825,6 +1869,9 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
 }
 
 void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
+    if (dst == attn_rot_k_mat) {
+        return; // written once
+    }
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     const auto n_rot = dst->ne[0];
@@ -1834,6 +1881,9 @@ void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
 }
 
 void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
+    if (dst == attn_rot_v_mat) {
+        return; // written once
+    }
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     const auto n_rot = dst->ne[0];

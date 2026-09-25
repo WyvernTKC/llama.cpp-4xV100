@@ -282,6 +282,16 @@ private:
     // pre-computed hadamard martrices
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
 
+    // the K and V rotation matrices, written once to a buffer of their own on the device of the last layer, so that
+    //   no graph uploads them again (a graph input is copied from the host every step); null without a rotation or
+    //   without allocations, then graphs take them as inputs
+    ggml_context_ptr        attn_rot_ctx;
+    ggml_backend_buffer_ptr attn_rot_buf;
+    ggml_tensor *           attn_rot_k_mat = nullptr;
+    ggml_tensor *           attn_rot_v_mat = nullptr;
+
+    int64_t n_rot_k() const; // the size of the K rotation
+
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
 

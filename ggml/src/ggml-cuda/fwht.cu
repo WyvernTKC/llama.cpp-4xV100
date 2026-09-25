@@ -80,7 +80,7 @@ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
     const ggml_cuda_kernel_launch_params launch_params =
         ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
 
-    const float scale = 1 / sqrtf(n);
+    const float scale = ggml_cuda_fwht_scale(n);
 
     switch (n) {
         case 64:

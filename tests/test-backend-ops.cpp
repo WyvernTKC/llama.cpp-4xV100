@@ -2972,6 +2972,138 @@ struct test_rms_norm_mul_rope : public test_case {
     }
 };
 
+// The attention rotation of a quantized K/V cache as llama_mul_mat_hadamard builds it (RESHAPE, MUL_MAT with the
+// Hadamard hint, RESHAPE) after an optional RMS_NORM (* weight) and ROPE, then optionally stored with VIEW + SET_ROWS
+// into a cache of set_rows_type, or read by a MUL_MAT with a weight of type w_type (the attention output)
+struct test_attn_rot : public test_case {
+    const std::array<int64_t, 3> ne; // head size, heads, tokens
+    const bool norm;
+    const bool mul;
+    const bool rope;
+    const int mode;
+    const int n_rot;
+    const ggml_type set_rows_type; // GGML_TYPE_COUNT: no SET_ROWS
+    const ggml_type w_type;        // GGML_TYPE_COUNT: no MUL_MAT after the rotation
+    const bool view_in;            // the input is a view of a wider tensor, as a projection of a fused QKV
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ATTN_ROT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        const std::string sr = set_rows_type == GGML_TYPE_COUNT ? "none" : ggml_type_name(set_rows_type);
+        const std::string wt = w_type        == GGML_TYPE_COUNT ? "none" : ggml_type_name(w_type);
+        return VARS_TO_STR7(ne, norm, mul, rope, mode, n_rot, view_in) + ",set_rows=" + sr + ",w=" + wt;
+    }
+
+    test_attn_rot(std::array<int64_t, 3> ne, bool norm, bool mul, bool rope, int mode, int n_rot,
+                  ggml_type set_rows_type = GGML_TYPE_COUNT, ggml_type w_type = GGML_TYPE_COUNT, bool view_in = false)
+        : ne(ne), norm(norm), mul(mul), rope(rope), mode(mode), n_rot(n_rot), set_rows_type(set_rows_type),
+          w_type(w_type), view_in(view_in) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a;
+        if (view_in) {
+            ggml_tensor * qkv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0]*(ne[1] + 2), ne[2]);
+            ggml_set_name(qkv, "qkv");
+            a = ggml_view_3d(ctx, qkv, ne[0], ne[1], ne[2], ne[0]*sizeof(float), qkv->nb[1], ne[0]*sizeof(float));
+        } else {
+            a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2]);
+        }
+        ggml_set_name(a, "a");
+
+        if (norm) {
+            a = ggml_rms_norm(ctx, a, 1e-6f);
+            if (mul) {
+                ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+                ggml_set_name(w, "norm_w");
+                a = ggml_mul(ctx, a, w);
+            }
+        }
+
+        if (rope) {
+            const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;
+            ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ne[2] * (is_mrope ? 4 : 1));
+            ggml_set_name(pos, "pos");
+            if (is_mrope) {
+                int sections[4] = { (int) ne[0]/6, (int) ne[0]/6, (int) ne[0]/2 - 2*((int) ne[0]/6), 0 };
+                a = ggml_rope_multi(ctx, a, pos, nullptr, ne[0], sections, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+            } else {
+                a = ggml_rope_ext(ctx, a, pos, nullptr, ne[0], mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+            }
+        }
+
+        ggml_tensor * rot = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rot, n_rot);
+        ggml_set_name(rot, "rot");
+
+        ggml_tensor * r = ggml_is_contiguous(a) ? ggml_reshape_2d(ctx, a, n_rot, ggml_nelements(a)/n_rot)
+                                                : ggml_cont_2d(ctx, a, n_rot, ggml_nelements(a)/n_rot);
+        r = ggml_mul_mat(ctx, rot, r);
+        ggml_mul_mat_set_hint(r, GGML_HINT_SRC0_IS_HADAMARD);
+        a = ggml_reshape_3d(ctx, r, ne[0], ne[1], ne[2]);
+
+        if (set_rows_type != GGML_TYPE_COUNT) {
+            ggml_tensor * view = ggml_view_2d(ctx, a, ne[0]*ne[1], ne[2], a->nb[2], 0);
+
+            ggml_tensor * dst = ggml_new_tensor_2d(ctx, set_rows_type, ne[0]*ne[1], ne[2]*2);
+            ggml_set_name(dst, "dst");
+
+            ggml_tensor * row_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, ne[2]);
+            ggml_set_name(row_idxs, "row_idxs");
+
+            a = ggml_set_rows(ctx, dst, view, row_idxs);
+        } else if (w_type != GGML_TYPE_COUNT) {
+            a = ggml_reshape_2d(ctx, a, ne[0]*ne[1], ne[2]);
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, w_type, ne[0]*ne[1], 256);
+            ggml_set_name(w, "w");
+            a = ggml_mul_mat(ctx, w, a);
+        }
+
+        ggml_set_name(a, "out");
+        return a;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I64) {
+                init_set_rows_row_ids(t, ne[2] * 2);
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int32_t & value : data) {
+                    value = rand() % 512;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "rot") == 0) {
+                std::vector<float> data(ggml_nelements(t));
+                const float scale = 1.0f / sqrtf((float) n_rot);
+                for (int64_t r = 0; r < n_rot; r++) {
+                    for (int64_t i = 0; i < n_rot; i++) {
+                        int pop = 0;
+                        for (int64_t v = r & i; v; v >>= 1) {
+                            pop += v & 1;
+                        }
+                        data[r*n_rot + i] = pop % 2 == 0 ? scale : -scale;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double max_nmse_err() override {
+        // a value of the CPU a rounding away from the backend's can land in the next quant
+        if (w_type != GGML_TYPE_COUNT || (set_rows_type != GGML_TYPE_COUNT && ggml_is_quantized(set_rows_type))) {
+            return 5e-4;
+        }
+        return test_case::max_nmse_err();
+    }
+};
+
 // GGML_OP_ARGMAX
 struct test_argmax : public test_case {
     const ggml_type type;
@@ -10349,6 +10481,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // in-place tests
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
+
+    // the rotation of a quantized K/V cache, fused into its producer and store on CUDA
+    for (ggml_type t : { GGML_TYPE_COUNT, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0,
+                         GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL }) {
+        for (int64_t n_tok : { 1, 3 }) {
+            // gemma3/gemma4: q/k norm with weight and neox rope, v norm without weight
+            test_cases.emplace_back(new test_attn_rot({256, 8, n_tok}, true, true,  true,  GGML_ROPE_TYPE_NEOX,   256, t));
+            test_cases.emplace_back(new test_attn_rot({512, 1, n_tok}, true, true,  true,  GGML_ROPE_TYPE_NEOX,   512, t));
+            test_cases.emplace_back(new test_attn_rot({256, 8, n_tok}, true, false, false, GGML_ROPE_TYPE_NORMAL,  64, t));
+            // qwen3: norm with weight, neox rope, head 128
+            test_cases.emplace_back(new test_attn_rot({128, 4, n_tok}, true, true,  true,  GGML_ROPE_TYPE_NEOX,   128, t));
+            // llama: rope alone, v straight from its projection (only fused with a store)
+            test_cases.emplace_back(new test_attn_rot({128, 8, n_tok}, false, false, true,  GGML_ROPE_TYPE_NORMAL, 128, t));
+            test_cases.emplace_back(new test_attn_rot({128, 8, n_tok}, false, false, true,  GGML_ROPE_TYPE_NEOX,   128, t, GGML_TYPE_COUNT, true));
+            test_cases.emplace_back(new test_attn_rot({128, 8, n_tok}, false, false, false, GGML_ROPE_TYPE_NORMAL,  64, t));
+            // a rotation smaller than the head (the largest power of 2 dividing it), multi-section rope
+            test_cases.emplace_back(new test_attn_rot({192, 2, n_tok}, true, true,  true,  GGML_ROPE_TYPE_NEOX,    64, t));
+            test_cases.emplace_back(new test_attn_rot({128, 4, n_tok}, true, true,  true,  GGML_ROPE_TYPE_IMROPE, 128, t));
+        }
+    }
+    // the rotation of the attention output, fused into the quantization of the output projection's input
+    for (ggml_type w : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
+        for (int64_t n_tok : { 1, 2, 5, 8, 16 }) {
+            test_cases.emplace_back(new test_attn_rot({256, 16, n_tok}, false, false, false, GGML_ROPE_TYPE_NORMAL,  64, GGML_TYPE_COUNT, w));
+            test_cases.emplace_back(new test_attn_rot({128, 8, n_tok},  false, false, false, GGML_ROPE_TYPE_NORMAL, 128, GGML_TYPE_COUNT, w));
+        }
+    }
 
     for (ggml_type set_rows_type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
         test_cases.emplace_back(new test_rms_norm_mul_rope({ 256, 1, 1, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
