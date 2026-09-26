@@ -1308,7 +1308,7 @@ void llama_context::set_causal_attn(bool value) {
 
     cparams.causal_attn = value;
 
-    sched_need_reserve = true;
+    // no reserve: only the mask contents change. can_reuse() still rebuilds the graph and the scheduler grows its buffers if needed
 }
 
 void llama_context::set_warmup(bool value) {
