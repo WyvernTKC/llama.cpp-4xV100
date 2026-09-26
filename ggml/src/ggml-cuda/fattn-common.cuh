@@ -351,12 +351,24 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q5_1(
     return sum;
 }
 
+// With D/QK8_0 threads per row each thread takes one whole block, whose dot product stays in integers, and Q_q8/Q_ds
+//   hold that block's 8 ints and its scale (see flash_attn_ext_vec). Otherwise each thread takes every nthreads-th int.
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
 
     const block_q8_0 * K_q8_0 = (const block_q8_0 *) K_c;
     GGML_UNUSED(Q_v);
+
+    if constexpr (nthreads == D/QK8_0) {
+        const block_q8_0 * b = K_q8_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        int v[QI8_0];
+        ggml_cuda_load_ints_a2<QI8_0>(v, b->qs);
+
+        const float2 * Q_ds = (const float2 *) Q_ds_v;
+        return vec_dot_q8_0_q8_1_impl<float, QI8_0>(v, Q_q8, b->d, Q_ds[0].x);
+    }
 
     float sum = 0.0f;
 
@@ -643,8 +655,12 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     const int     iqs = i0 % QK8_0;
 
     static_assert(ne % 2 == 0, "bad ne");
-    int8_t qs[ne];
-    ggml_cuda_memcpy_1<ne, 2>(qs, x[ib].qs + iqs);
+    __align__(4) int8_t qs[ne];
+    if constexpr (ne % 4 == 0) {
+        ggml_cuda_load_ints_a2<ne/4>((int *) qs, x[ib].qs + iqs);
+    } else {
+        ggml_cuda_memcpy_1<ne, 2>(qs, x[ib].qs + iqs);
+    }
 
 #ifdef FP16_AVAILABLE
     if constexpr (std::is_same<T, half>::value) {

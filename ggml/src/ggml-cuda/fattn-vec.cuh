@@ -79,8 +79,10 @@ static __global__ void flash_attn_ext_vec(
 #endif // RDNA
     constexpr int nthreads_V_q  = (D/4 < 32 ? D/4 : 32);
 #else
-    constexpr int nthreads_KQ_q = (D/4 < 32 ? D/4 : 32);
-    constexpr int nthreads_V_q  = (D/4 < 32 ? D/4 : 32);
+    // q8_0 K: one block per thread, so a row needs D/32 threads and fewer shuffles to reduce its dot product;
+    // q8_0 V: 8 values per thread, one scale load per 8 values
+    constexpr int nthreads_KQ_q = type_K == GGML_TYPE_Q8_0 ? D/QK8_0 : (D/4 < 32 ? D/4 : 32);
+    constexpr int nthreads_V_q  = type_V == GGML_TYPE_Q8_0 ? (D/8 < 32 ? D/8 : 32) : (D/4 < 32 ? D/4 : 32);
 #endif // GGML_USE_HIP
 
     constexpr int nthreads    = ggml_cuda_fattn_vec_get_nthreads_device();
@@ -90,7 +92,10 @@ static __global__ void flash_attn_ext_vec(
     static_assert(WARP_SIZE % nthreads_KQ == 0, "bad nthreads_K");
     static_assert(WARP_SIZE % nthreads_V  == 0, "bad nthreads_V");
 
-    constexpr int V_rows_per_thread = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 2*cpy_ne : 4;
+    constexpr int V_rows_per_thread = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 2*cpy_ne :
+        (type_V == GGML_TYPE_Q8_0 && nthreads_V == D/8 ? 8 : 4);
+    // each thread holds the Q ints of one whole q8_0 block, see vec_dot_fattn_vec_KQ_q8_0
+    constexpr bool Q_q8_1_blocks = type_K == GGML_TYPE_Q8_0 && nthreads_KQ == D/QK8_0;
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
@@ -193,7 +198,8 @@ static __global__ void flash_attn_ext_vec(
 
 #pragma unroll
             for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += nthreads_KQ) {
-                const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
+                const int t = nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ;
+                const int i = Q_q8_1_blocks ? t*QI8_1 + i0/nthreads_KQ : i0 + t;
 
                 Q_i32[j][i0/nthreads_KQ] = tmp_q_i32[i];
                 Q_ds[j][i0/nthreads_KQ]  = tmp_q_ds[i/QI8_1];

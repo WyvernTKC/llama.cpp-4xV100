@@ -11563,6 +11563,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // decode shapes of the vec kernel with a q8_0 K and/or V: one Q head per K/V head or an odd GQA ratio
+    for (int hs : { 64, 128, 256 }) {
+        for (std::array<int64_t, 2> nh_gqa : { std::array<int64_t, 2>{8, 1}, std::array<int64_t, 2>{4, 3} }) {
+            for (int nb : { 1, 2 }) {
+                for (std::array<ggml_type, 2> kv_types : { std::array<ggml_type, 2>{GGML_TYPE_Q8_0, GGML_TYPE_Q8_0},
+                        std::array<ggml_type, 2>{GGML_TYPE_Q8_0, GGML_TYPE_F16}, std::array<ggml_type, 2>{GGML_TYPE_F16, GGML_TYPE_Q8_0},
+                        std::array<ggml_type, 2>{GGML_TYPE_Q8_0, GGML_TYPE_Q4_0} }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, nh_gqa[0], {nh_gqa[1], 1}, 1024, nb, true, nb == 2, 0, 0,
+                        GGML_PREC_F32, kv_types[0], kv_types[1]));
+                }
+            }
+        }
+    }
+
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
             if (hsk != 96 && hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;

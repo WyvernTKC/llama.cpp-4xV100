@@ -848,6 +848,30 @@ static __device__ __forceinline__ void ggml_cuda_memcpy_1(void * __restrict__ ds
     }
 }
 
+// n ints from p, which is only 2-byte aligned (the quants of a q8_0 block): n aligned 32-bit loads and one 16-bit load
+//   rather than 2n 16-bit loads, the ints are then shifted out of the words when p is not 4-byte aligned.
+//   Every load stays within the n ints at p and the 2 bytes before them.
+template <int n>
+static __device__ __forceinline__ void ggml_cuda_load_ints_a2(int * __restrict__ dst, const void * __restrict__ p) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    ggml_cuda_memcpy_1<n*sizeof(int), 2>(dst, p);
+#else
+    const int   shift = 8*(uintptr_t(p) % 4); // 0 or 16
+    const int * w     = (const int *) ((const char *) p - shift/8);
+
+    int words[n + 1];
+#pragma unroll
+    for (int i = 0; i < n; ++i) {
+        words[i] = w[i];
+    }
+    words[n] = shift ? *((const unsigned short *) p + 2*n - 1) : 0;
+#pragma unroll
+    for (int i = 0; i < n; ++i) {
+        dst[i] = __funnelshift_r(words[i], words[i + 1], shift);
+    }
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+}
+
 static __device__ __forceinline__ float ggml_cuda_e8m0_to_fp32(uint8_t x) {
 #if CUDART_VERSION >= 12080
     const nv_bfloat16 e = __nv_cvt_e8m0_to_bf16raw(x);
