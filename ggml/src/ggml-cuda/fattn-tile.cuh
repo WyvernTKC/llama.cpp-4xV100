@@ -506,56 +506,46 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_q(
     // the 8 values from column k0 + 8*g of row i
     auto load = [&](const int i, const int g) {
         const int c   = k0 + g*nv;
-        const int ib  = c / 32;
-        const int iqs = c % 32;
-
-        // the quants as unsigned bytes: q8_0 values + 128, q4_0 values + 8
-        __align__(8) uint32_t u[nv/4] = {0};
-        half d = 0.0f;
         const bool valid = !oob_check || i < i_sup;
-        if (valid) {
-            const char * row = KV + int64_t(i)*stride_KV;
-            if constexpr (type_KV == GGML_TYPE_Q8_0) {
-                const block_q8_0 * b = (const block_q8_0 *) row + ib;
-                d = b->d;
-                ggml_cuda_memcpy_1<nv, 2>(u, b->qs + iqs); // the blocks are only 2-byte aligned
-#pragma unroll
-                for (int l = 0; l < nv/4; ++l) {
-                    u[l] ^= 0x80808080;
-                }
-            } else {
-                // values 0..15 are the low nibbles of qs, values 16..31 the high nibbles
-                const block_q4_0 * b = (const block_q4_0 *) row + ib;
-                d = b->d;
-                ggml_cuda_memcpy_1<nv, 2>(u, b->qs + iqs % 16);
-                const int shift = iqs < 16 ? 0 : 4;
-#pragma unroll
-                for (int l = 0; l < nv/4; ++l) {
-                    u[l] = (u[l] >> shift) & 0x0F0F0F0F;
-                }
-            }
-        }
-        constexpr float offset = type_KV == GGML_TYPE_Q8_0 ? 128.0f : 8.0f;
+        const char * row = KV + int64_t(i)*stride_KV;
 
         if constexpr (std::is_same_v<T, half2>) {
-            // 0x6400 | x is exactly 1024 + x in FP16, so the subtraction is exact
-            // and the product rounds once, like the FP16 conversion of the float product
-            const half2 bias = make_half2(1024.0f + offset, 1024.0f + offset);
-            const half2 d2   = __half2half2(d);
-            __align__(16) half2 tmp[nv/2];
-#pragma unroll
-            for (int l = 0; l < nv/4; ++l) {
-                const uint32_t lo = __byte_perm(u[l], 0x64646464, 0x5140);
-                const uint32_t hi = __byte_perm(u[l], 0x64646464, 0x7362);
-                half2 lo_h2;
-                half2 hi_h2;
-                memcpy(&lo_h2, &lo, sizeof(lo));
-                memcpy(&hi_h2, &hi, sizeof(hi));
-                tmp[2*l + 0] = valid ? __hmul2(__hsub2(lo_h2, bias), d2) : make_half2(0.0f, 0.0f);
-                tmp[2*l + 1] = valid ? __hmul2(__hsub2(hi_h2, bias), d2) : make_half2(0.0f, 0.0f);
+            // rows past the end are +0, not the -0 of the bias arithmetic on zero bytes
+            __align__(16) half2 tmp[nv/2] = {{0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}};
+            if (valid) {
+                ggml_cuda_fattn_dequantize_8_h2<type_KV>(row, c, tmp);
             }
             ggml_cuda_memcpy_1<sizeof(tmp)>(tile_KV + i*(J/2 + J_padding) + g*(nv/2), tmp);
         } else {
+            const int ib  = c / 32;
+            const int iqs = c % 32;
+
+            // the quants as unsigned bytes: q8_0 values + 128, q4_0 values + 8
+            __align__(8) uint32_t u[nv/4] = {0};
+            half d = 0.0f;
+            if (valid) {
+                if constexpr (type_KV == GGML_TYPE_Q8_0) {
+                    const block_q8_0 * b = (const block_q8_0 *) row + ib;
+                    d = b->d;
+                    ggml_cuda_memcpy_1<nv, 2>(u, b->qs + iqs); // the blocks are only 2-byte aligned
+#pragma unroll
+                    for (int l = 0; l < nv/4; ++l) {
+                        u[l] ^= 0x80808080;
+                    }
+                } else {
+                    // values 0..15 are the low nibbles of qs, values 16..31 the high nibbles
+                    const block_q4_0 * b = (const block_q4_0 *) row + ib;
+                    d = b->d;
+                    ggml_cuda_memcpy_1<nv, 2>(u, b->qs + iqs % 16);
+                    const int shift = iqs < 16 ? 0 : 4;
+#pragma unroll
+                    for (int l = 0; l < nv/4; ++l) {
+                        u[l] = (u[l] >> shift) & 0x0F0F0F0F;
+                    }
+                }
+            }
+            constexpr float offset = type_KV == GGML_TYPE_Q8_0 ? 128.0f : 8.0f;
+
             // round to FP16 like the converted K/V, then widen
             const float df = __half2float(d);
             __align__(16) float tmp[nv];

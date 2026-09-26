@@ -84,6 +84,57 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
     return data;
 }
 
+// Whether the MMA kernel reads these K/V directly instead of converting them to FP16: q8_0/q4_0 on Volta, where the K/V
+//   tiles are loaded synchronously and can be dequantized on the way into shared memory.
+static inline bool ggml_cuda_fattn_mma_kv_type_direct(const int cc, const ggml_tensor * K, const ggml_tensor * V) {
+    return volta_mma_available(cc) && K->type == V->type && (K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_Q4_0);
+}
+
+// The 8 values from column c (a multiple of 8) of a q8_0/q4_0 row as FP16, for the kernels that read quantized K/V
+//   directly: each is the product q*d rounded once to FP16, bitwise what the conversion of K/V to FP16 gives.
+//   0x6400 | x is exactly 1024 + x in FP16, so subtracting the bias is exact and the product rounds once.
+template <ggml_type type_KV>
+static __device__ __forceinline__ void ggml_cuda_fattn_dequantize_8_h2(const char * __restrict__ row, const int c, half2 * __restrict__ dst) {
+    static_assert(type_KV == GGML_TYPE_Q8_0 || type_KV == GGML_TYPE_Q4_0, "bad type_KV");
+    static_assert(QK8_0 == 32 && QK4_0 == 32, "bad block size");
+    const int ib  = c / 32;
+    const int iqs = c % 32;
+
+    // the quants as unsigned bytes: q8_0 values + 128, q4_0 values + 8
+    __align__(8) uint32_t u[2];
+    half d;
+    if constexpr (type_KV == GGML_TYPE_Q8_0) {
+        const block_q8_0 * b = (const block_q8_0 *) row + ib;
+        d = b->d;
+        ggml_cuda_memcpy_1<8, 2>(u, b->qs + iqs); // the blocks are only 2-byte aligned
+        u[0] ^= 0x80808080;
+        u[1] ^= 0x80808080;
+    } else {
+        // values 0..15 are the low nibbles of qs, values 16..31 the high nibbles
+        const block_q4_0 * b = (const block_q4_0 *) row + ib;
+        d = b->d;
+        ggml_cuda_memcpy_1<8, 2>(u, b->qs + iqs % 16);
+        const int shift = iqs < 16 ? 0 : 4;
+        u[0] = (u[0] >> shift) & 0x0F0F0F0F;
+        u[1] = (u[1] >> shift) & 0x0F0F0F0F;
+    }
+    constexpr float offset = type_KV == GGML_TYPE_Q8_0 ? 128.0f : 8.0f;
+
+    const half2 bias = make_half2(1024.0f + offset, 1024.0f + offset);
+    const half2 d2   = __half2half2(d);
+#pragma unroll
+    for (int l = 0; l < 2; ++l) {
+        const uint32_t lo = __byte_perm(u[l], 0x64646464, 0x5140);
+        const uint32_t hi = __byte_perm(u[l], 0x64646464, 0x7362);
+        half2 lo_h2;
+        half2 hi_h2;
+        memcpy(&lo_h2, &lo, sizeof(lo));
+        memcpy(&hi_h2, &hi, sizeof(hi));
+        dst[2*l + 0] = __hmul2(__hsub2(lo_h2, bias), d2);
+        dst[2*l + 1] = __hmul2(__hsub2(hi_h2, bias), d2);
+    }
+}
+
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f16(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds_v) {

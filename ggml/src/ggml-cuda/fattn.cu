@@ -765,12 +765,21 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     bool need_f16_K = false;
     bool need_f16_V = false;
 
+    const int cc = ggml_cuda_info().devices[device].cc;
+
     switch (kernel) {
-        case BEST_FATTN_KERNEL_TILE:
-        case BEST_FATTN_KERNEL_MMA_F16:
-            need_f16_K = true;
-            need_f16_V = true;
-            break;
+        case BEST_FATTN_KERNEL_TILE: {
+            // as launch_fattn_tile_switch_type decides it
+            const bool direct = K->type == V->type && GGML_CUDA_CC_IS_NVIDIA(cc) && fast_fp16_available(cc) &&
+                ggml_cuda_fattn_tile_kv_type_direct(K->type, K->ne[0], V->ne[0]);
+            need_f16_K = !direct;
+            need_f16_V = !direct;
+        } break;
+        case BEST_FATTN_KERNEL_MMA_F16: {
+            const bool direct = ggml_cuda_fattn_mma_kv_type_direct(cc, K, V);
+            need_f16_K = !direct;
+            need_f16_V = !direct;
+        } break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
