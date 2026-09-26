@@ -967,12 +967,18 @@ static __global__ void flash_attn_tile(
 
     const int col_Q_0 = blockIdx.x * ncols1; // Index of the first Q column for this CUDA block to work on.
 
-    const int sequence = blockIdx.z / (ne02/ncols2);
-    const int head0 = blockIdx.z*ncols2 - sequence*ne02; // == blockIdx.z % (ne02/ncols2)
-    const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
+    // A block works on ncols2 Q heads of one K/V head. If ncols2 does not divide the GQA ratio, the last block of
+    //     each K/V head has padding heads, which get zero Q and are not written back.
+    const int gqa_ratio    = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
+    const int ntiles_z_gqa = (gqa_ratio + ncols2 - 1) / ncols2;
+    const int sequence     = blockIdx.z / (ne12*ntiles_z_gqa);
+    const int z_KV         = blockIdx.z / ntiles_z_gqa - sequence*ne12;
+    const int zt_gqa       = blockIdx.z % ntiles_z_gqa;
+    const int head0        = z_KV*gqa_ratio + zt_gqa*ncols2;
+    const int ncols2_real  = min(ncols2, gqa_ratio - zt_gqa*ncols2); // Q heads of this block that are not padding.
     const float * Q_f  = (const float *) (Q + nb03*sequence + nb02* head0);
-    const half2 * K_h2 = (const half2 *) (K + nb13*sequence + nb12*(head0 / gqa_ratio));
-    const half2 * V_h2 = (const half2 *) (V + nb23*sequence + nb22*(head0 / gqa_ratio)); // K and V have same shape
+    const half2 * K_h2 = (const half2 *) (K + nb13*sequence + nb12*z_KV);
+    const half2 * V_h2 = (const half2 *) (V + nb23*sequence + nb22*z_KV); // K and V have same shape
 
     const half * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33)) : nullptr;
 
@@ -1034,9 +1040,11 @@ static __global__ void flash_attn_tile(
         for (int i0 = 0; i0 < DKQp; i0 += np*warp_size*cpy_ne_D) {
             if (i0 + np*warp_size*cpy_ne_D <= DKQ || i0 + (threadIdx.y % np)*(warp_size*cpy_ne_D) + threadIdx.x*cpy_ne_D < DKQ) {
                 __align__(16) float tmp_f[cpy_ne_D] = {0.0f};
-                ggml_cuda_memcpy_1<sizeof(tmp_f)>
-                    (tmp_f, &Q_f[c*(nb02/sizeof(float)) + fastmodulo(col_Q_0 + j, ne01)*(nb01/sizeof(float))
-                                 + i0 + (threadIdx.y % np)*(warp_size*cpy_ne_D) + threadIdx.x*cpy_ne_D]);
+                if (ncols2 == 1 || c < ncols2_real) {
+                    ggml_cuda_memcpy_1<sizeof(tmp_f)>
+                        (tmp_f, &Q_f[c*(nb02/sizeof(float)) + fastmodulo(col_Q_0 + j, ne01)*(nb01/sizeof(float))
+                                     + i0 + (threadIdx.y % np)*(warp_size*cpy_ne_D) + threadIdx.x*cpy_ne_D]);
+                }
 
 #pragma unroll
                 for (int i1 = 0; i1 < cpy_ne_D; ++i1) {
@@ -1172,6 +1180,9 @@ static __global__ void flash_attn_tile(
 #pragma unroll
         for (int jc0 = 0; jc0 < cpw; ++jc0) {
             const int jc = jc0 + (threadIdx.y/np)*cpw;
+            if (ncols2 > 1 && jc % ncols2 >= ncols2_real) {
+                continue;
+            }
             const float sink = ((const float *) sinks)[head0 + jc % ncols2];
 
             float KQ_max_new_j = fmaxf(KQ_max[jc0], sink);
@@ -1207,6 +1218,9 @@ static __global__ void flash_attn_tile(
 
         if (ncols1 > 1 && col_Q_0 + j >= int(ne01.z)) {
             return;
+        }
+        if (ncols2 > 1 && c >= ncols2_real) {
+            continue;
         }
 
         const float scale = gridDim.y == 1 ? 1.0f/KQ_sum[jc0] : 1.0f;
@@ -1367,7 +1381,8 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
 
     // On NVIDIA (Pascal and older) the GQA optimizations seem to be detrimental in some cases.
     // However, for DKQ == 576, DV == 512 only the kernel variant with GQA optimizations is implemented.
-    const bool nvidia = GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+    const int  cc     = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool nvidia = GGML_CUDA_CC_IS_NVIDIA(cc);
     const int gqa_limit = nvidia && gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX;
     const bool use_gqa_opt = mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
@@ -1415,7 +1430,9 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
     }
 
     if constexpr (DKQ <= 512 && DKQ != 320 && DKQ != 192) {
-        if (use_gqa_opt && gqa_ratio % 8 == 0) {
+        // on Volta a GQA ratio of 5-7 at one token is padded to 8 heads, see ggml_cuda_get_best_fattn_kernel
+        const bool pad_gqa = cc == GGML_CUDA_CC_VOLTA && gqa_ratio > 4 && gqa_ratio < 8 && Q->ne[1] == 1;
+        if (use_gqa_opt && (gqa_ratio % 8 == 0 || pad_gqa)) {
             launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap, type_KV>(ctx, dst);
             return;
         }

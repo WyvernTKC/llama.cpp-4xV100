@@ -11563,6 +11563,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // a GQA ratio that is not a power of 2 (6 Q heads per K/V head), which the kernels may pad to 8 heads
+    for (int nh : { 1, 4 }) {
+        for (int kv : { 256, 1024 }) {
+            for (int nb : { 1, 2, 3, 6, 8, 17 }) {
+                for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {6, 1}, kv, nb, true, nb == 2, 0, 0,
+                        GGML_PREC_F32, type_KV, type_KV));
+                }
+            }
+        }
+    }
+
     // decode shapes of the vec kernel with a q8_0 K and/or V: one Q head per K/V head or an odd GQA ratio
     for (int hs : { 64, 128, 256 }) {
         for (std::array<int64_t, 2> nh_gqa : { std::array<int64_t, 2>{8, 1}, std::array<int64_t, 2>{4, 3} }) {

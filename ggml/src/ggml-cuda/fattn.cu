@@ -244,7 +244,8 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
-        if (use_gqa_opt && gqa_ratio % 8 == 0) {
+        // a GQA ratio of 5-7 at a few tokens is padded to 8 heads, see ggml_cuda_get_best_fattn_kernel
+        if (use_gqa_opt && (gqa_ratio % 8 == 0 || (gqa_ratio > 4 && gqa_ratio < 8 && Q->ne[1] <= 8))) {
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
             return;
         }
@@ -704,6 +705,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         if (gqa_opt_applies && ggml_cuda_fattn_volta_sparse_tile_ok(dst) && K->ne[1] >= sparse_break_even &&
                 ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, GGML_CUDA_VOLTA_SPARSE_NCOLS1)) {
             return BEST_FATTN_KERNEL_MMA_F16;
+        }
+        // A GQA ratio of 5-7 is padded to 8 Q heads per block, so each K/V head is read once instead of by the vec
+        //     kernel per Q head or by 3 blocks of 2 heads. The MMA kernel has a higher fixed cost and wins only at depth.
+        //     V100, 6 Q heads on 1 K/V head, head size 256: 1 token 1.3x at 1k keys to 2.0x at 131k (tile vs vec),
+        //     6 tokens 1.8x at 32k and 2.7x at 131k (MMA vs tile with 2 heads).
+        if (gqa_opt_applies && gqa_ratio > 4 && gqa_ratio < 8 && (Q->ne[0] == 128 || Q->ne[0] == 256)) {
+            if (Q->ne[1] == 1) {
+                return BEST_FATTN_KERNEL_TILE;
+            }
+            if (Q->ne[1] <= 8 && K->ne[1] >= (Q->ne[1] == 2 ? 32768 : 16384)) {
+                return BEST_FATTN_KERNEL_MMA_F16;
+            }
         }
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
