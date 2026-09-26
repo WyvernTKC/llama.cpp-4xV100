@@ -2849,6 +2849,7 @@ struct ggml_backend_meta_context {
         std::atomic<int>         done{0};
         std::atomic<bool>        stop{false};
         std::atomic<int>         n_parked{0};
+        std::atomic<uint64_t>    nudges{0};
         std::mutex               mtx;
         std::condition_variable  cv;
         // the work of the current round: the workers run it for devices 1.., the caller for device 0
@@ -2872,33 +2873,55 @@ struct ggml_backend_meta_context {
         // must cover the gap between two subgraph launches (~130 us) and the host work between tokens
         static constexpr int64_t spin_budget_us = 5000;
 
+        // returns only for a new round: a nudge sends a parked worker back to spinning
         void wait(uint64_t seen) {
-            for (int spin = 0; spin < 512; ++spin) {
+            while (true) {
+                for (int spin = 0; spin < 512; ++spin) {
+                    if (epoch.load(std::memory_order_acquire) != seen) {
+                        return;
+                    }
+                }
+                const int64_t t_park_us = ggml_time_us() + spin_budget_us;
+                while (ggml_time_us() < t_park_us) {
+                    if (epoch.load(std::memory_order_acquire) != seen) {
+                        return;
+                    }
+                    std::this_thread::yield();
+                }
+                // seq_cst here and on the epoch load below pairs with wake(): if wake() misses this park,
+                // then this thread sees the new epoch and does not wait
+                const uint64_t nudges_seen = nudges.load(std::memory_order_seq_cst);
+                n_parked.fetch_add(1, std::memory_order_seq_cst);
+                {
+                    std::unique_lock<std::mutex> lock(mtx);
+                    cv.wait(lock, [&] {
+                        return epoch.load(std::memory_order_seq_cst) != seen ||
+                            nudges.load(std::memory_order_seq_cst) != nudges_seen;
+                    });
+                }
+                n_parked.fetch_sub(1, std::memory_order_relaxed);
                 if (epoch.load(std::memory_order_acquire) != seen) {
                     return;
                 }
             }
-            const int64_t t_park_us = ggml_time_us() + spin_budget_us;
-            while (ggml_time_us() < t_park_us) {
-                if (epoch.load(std::memory_order_acquire) != seen) {
-                    return;
-                }
-                std::this_thread::yield();
-            }
-            // seq_cst here and on the epoch load below pairs with wake(): if wake() misses this park,
-            // then this thread sees the new epoch and does not wait
-            n_parked.fetch_add(1, std::memory_order_seq_cst);
-            {
-                std::unique_lock<std::mutex> lock(mtx);
-                cv.wait(lock, [&] { return epoch.load(std::memory_order_seq_cst) != seen; });
-            }
-            n_parked.fetch_sub(1, std::memory_order_relaxed);
         }
 
         void wake() {
             if (n_parked.load(std::memory_order_seq_cst) == 0) {
                 return;
             }
+            std::lock_guard<std::mutex> lock(mtx);
+            cv.notify_all();
+        }
+
+        // Get parked workers spinning before the next round is due. A worker parks during the GPU wait of every
+        //   decode token, and unparking it in run() then costs ~150 us with the GPUs idle; after a synchronize
+        //   that wakeup overlaps with the host work for the next graph instead.
+        void nudge() {
+            if (n_parked.load(std::memory_order_seq_cst) == 0) {
+                return;
+            }
+            nudges.fetch_add(1, std::memory_order_seq_cst);
             std::lock_guard<std::mutex> lock(mtx);
             cv.notify_all();
         }
@@ -3245,6 +3268,37 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
             GGML_ABORT("fatal error");
         }
     }
+}
+
+void ggml_backend_meta_set_tensors(ggml_backend_t backend, size_t n, ggml_tensor * const * tensors, const void * const * data) {
+    const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    std::vector<size_t> mirrored;
+    for (size_t i = 0; i < n; i++) {
+        const size_t size = ggml_nbytes(tensors[i]);
+        if (size == 0) {
+            continue;
+        }
+        const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(tensors[i], /*assume_sync =*/ false);
+        const bool plain = ss.n_segments == 1 && ss.nr[0] == 1;
+        if (plain && ss.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            mirrored.push_back(i);
+        } else if ((plain && ss.axis >= GGML_BACKEND_SPLIT_AXIS_0 && ss.axis <= GGML_BACKEND_SPLIT_AXIS_2) ||
+                   (!plain && (ss.axis == GGML_BACKEND_SPLIT_AXIS_0 || ss.axis == GGML_BACKEND_SPLIT_AXIS_1))) {
+            // on the device streams, which the round below waits for
+            ggml_backend_meta_set_tensor_async_impl(backend, tensors[i], data[i], 0, size, /*backends_override =*/ nullptr);
+        } else {
+            ggml_backend_tensor_set(tensors[i], data[i], 0, size); // PARTIAL: only the buffer path divides the value
+        }
+    }
+    ggml_backend_meta_context * ctx = (ggml_backend_meta_context *) backend->context;
+    ctx->for_each_device(n_backends, [&](size_t j) {
+        ggml_backend_t backend_j = ggml_backend_meta_simple_backend(backend, j);
+        for (size_t i : mirrored) {
+            ggml_backend_tensor_set_async(backend_j, ggml_backend_meta_buffer_simple_tensor(tensors[i], j), data[i], 0,
+                ggml_nbytes(tensors[i]));
+        }
+        ggml_backend_synchronize(backend_j);
+    });
 }
 
 static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
@@ -3891,9 +3945,14 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     for (size_t i = 0; i < n_backends; i++) {
         ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, i));
     }
+    ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
     if (ggml_backend_meta_stats::enabled()) {
-        ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
         backend_ctx->stats.t_sync_us += ggml_time_us() - t_start_us;
+    }
+    // the host is about to build the next graph; GGML_META_NO_PREWAKE=1 leaves the workers parked
+    static const bool no_prewake = getenv("GGML_META_NO_PREWAKE") != nullptr;
+    if (backend_ctx->lpool && !no_prewake) {
+        backend_ctx->lpool->nudge();
     }
 }
 

@@ -127,6 +127,10 @@ extern "C" {
     GGML_API int  ggml_backend_expert_cache_generation(void);
     // Wait only for the devices a read of this tensor touched, instead of all of them.
     GGML_API void ggml_backend_meta_synchronize_get(ggml_backend_t backend, const struct ggml_tensor * tensor);
+    // Write n host buffers into meta tensors and return once they have landed. One round of the launch workers
+    // for all of them, each device waiting once, instead of a round and four waits per tensor.
+    GGML_API void ggml_backend_meta_set_tensors(ggml_backend_t backend, size_t n, struct ggml_tensor * const * tensors,
+                                                const void * const * data);
     GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
     GGML_API bool ggml_backend_buft_is_meta  (ggml_backend_buffer_type_t buft);
 

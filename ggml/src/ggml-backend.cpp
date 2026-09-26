@@ -2097,6 +2097,31 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend
         bool user_inputs_waited = false;
+        // A meta split writes every input to each device, and a synchronous copy is one round of the launch
+        //   workers and a wait per device: DS4 decode has 26 inputs of a few bytes, ~0.4 ms per token with the
+        //   GPUs idle. Collect the copies from host memory and write them in one batch, which still returns
+        //   only once they have landed, so the caller may overwrite the host data afterwards.
+        //   GGML_SCHED_SYNC_INPUT_COPY=1 restores the copy per input.
+        static const bool sync_input_copy = getenv("GGML_SCHED_SYNC_INPUT_COPY") != nullptr;
+        const bool batch_host_inputs = !sync_input_copy && ggml_backend_is_meta(split_backend);
+        std::vector<ggml_tensor *> batch_dst;
+        std::vector<const void *>  batch_src;
+        auto copy_input = [&](struct ggml_tensor * src, struct ggml_tensor * dst) {
+            if (batch_host_inputs && src->buffer && ggml_backend_buffer_is_host(src->buffer) &&
+                    ggml_is_contiguous(src) && ggml_is_contiguous(dst) && ggml_nbytes(src) == ggml_nbytes(dst)) {
+                batch_dst.push_back(dst);
+                batch_src.push_back(src->data);
+            } else {
+                ggml_backend_tensor_copy(src, dst);
+            }
+        };
+        auto flush_inputs = [&]() {
+            if (!batch_dst.empty()) {
+                ggml_backend_meta_set_tensors(split_backend, batch_dst.size(), batch_dst.data(), batch_src.data());
+                batch_dst.clear();
+                batch_src.clear();
+            }
+        };
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
@@ -2113,8 +2138,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                     user_inputs_waited = true;
                 }
-                ggml_backend_tensor_copy(input, input_cpy);
+                copy_input(input, input_cpy);
             } else {
+                // the batch waits for the device streams, which a staged weight below makes wait for its copy
+                if (input->buffer && ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                    flush_inputs();
+                }
                 // Opt-in with GGML_META_PARTIAL_COPY=1: let the meta backend take the used-experts-only
                 // path below instead of staging a whole layer. At decode only 6 of 256 experts are live,
                 // so this moves ~1/40 of the bytes. Off by default until the staging path also uses it.
@@ -2195,6 +2224,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
 
+                    flush_inputs(); // the ids below may be one of the inputs copied so far
                     ggml_backend_synchronize(input_backend);
 
                     // get the ids
@@ -2380,11 +2410,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         } else {
                             ggml_backend_synchronize(split_backend);
                         }
-                        ggml_backend_tensor_copy(input, input_cpy);
+                        copy_input(input, input_cpy);
                     }
                 }
             }
         }
+        flush_inputs();
 
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
