@@ -47,6 +47,11 @@ common_reasoning_budget_state common_reasoning_budget_get_state(const struct lla
 // was recorded. Cleared when a new start sequence re-arms the sampler.
 const llama_tokens * common_reasoning_budget_get_end_match(const struct llama_sampler * smpl);
 
+// The token the sampler forces at its next apply(), or LLAMA_TOKEN_NULL when it
+// is not forcing. apply() can only keep a token that is among the candidates,
+// so a caller that passes a subset of the vocab adds this one to it.
+llama_token common_reasoning_budget_get_forced_token(const struct llama_sampler * smpl);
+
 // Manually transition the reasoning budget sampler into the FORCING state.
 // Returns true if the transition occurred.
 bool common_reasoning_budget_force(struct llama_sampler * smpl);

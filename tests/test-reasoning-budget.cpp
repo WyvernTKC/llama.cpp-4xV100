@@ -258,6 +258,44 @@ static void test_reasoning_budget_force_manual() {
     fprintf(stderr, "  Test 'manual force transition' passed\n");
 }
 
+// a caller that hands apply() only some of the vocab (a backend top-k) adds the forced token to it itself
+static void test_reasoning_budget_forced_token() {
+    const std::vector<llama_token> start  = {100};
+    const std::vector<llama_token> end    = {101};
+    const std::vector<llama_token> forced = {102, 101};
+
+    auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, forced, 1, REASONING_BUDGET_IDLE);
+
+    GGML_ASSERT(common_reasoning_budget_get_forced_token(sampler) == LLAMA_TOKEN_NULL && "IDLE forces nothing");
+    llama_sampler_accept(sampler, 100); // COUNTING, remaining=1
+    GGML_ASSERT(common_reasoning_budget_get_forced_token(sampler) == LLAMA_TOKEN_NULL && "COUNTING forces nothing");
+    llama_sampler_accept(sampler, 50);  // budget spent -> FORCING
+
+    for (const llama_token expected : forced) {
+        GGML_ASSERT(common_reasoning_budget_get_forced_token(sampler) == expected);
+        GGML_ASSERT(get_forced_token(sampler, 102) == expected && "apply() keeps the token the getter names");
+
+        // three candidates without the forced one, then with it appended: apply() keeps only that one
+        std::vector<llama_token_data> cur = { {10, 3.0f, 0.0f}, {11, 2.0f, 0.0f}, {12, 1.0f, 0.0f} };
+        cur.push_back({ common_reasoning_budget_get_forced_token(sampler), 0.0f, 0.0f });
+        llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+        llama_sampler_apply(sampler, &cur_p);
+        for (const auto & td : cur) {
+            GGML_ASSERT(std::isfinite(td.logit) == (td.id == expected));
+        }
+
+        llama_sampler_accept(sampler, expected);
+    }
+
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_DONE);
+    GGML_ASSERT(common_reasoning_budget_get_forced_token(sampler) == LLAMA_TOKEN_NULL && "DONE forces nothing");
+    GGML_ASSERT(common_reasoning_budget_get_forced_token(nullptr) == LLAMA_TOKEN_NULL);
+
+    llama_sampler_free(sampler);
+
+    fprintf(stderr, "  Test 'forced token getter' passed\n");
+}
+
 static void test_reasoning_budget_end_match() {
     const std::vector<llama_tokens> start = {{100}};
     const std::vector<llama_tokens> end   = {{101}, {103, 104}};
@@ -493,6 +531,7 @@ int main(void) {
     test_reasoning_budget_clone_mid_counting();
     test_reasoning_budget_clone_mid_forcing();
     test_reasoning_budget_force_manual();
+    test_reasoning_budget_forced_token();
     test_reasoning_budget_end_match();
 
     printf("OK (12 tests passed)\n");

@@ -160,6 +160,15 @@ struct common_sampler {
             }
         }
 
+        // an output cut by a backend top-k (see common_sampler_prefilter_k) holds only its best candidates, which
+        //   need not include the token the reasoning budget is forcing: add it, for the budget to leave it the only one
+        if (cur.size() < (size_t) n_vocab) {
+            const llama_token forced = common_reasoning_budget_get_forced_token(rbudget);
+            if (forced != LLAMA_TOKEN_NULL &&
+                    std::none_of(cur.begin(), cur.end(), [forced](const llama_token_data & td) { return td.id == forced; })) {
+                cur.push_back(llama_token_data{forced, 0.0f, 0.0f});            }
+        }
+
         cur_p = { cur.data(), cur.size(), -1, false };
     }
 
@@ -522,7 +531,7 @@ struct common_sampler * common_sampler_init(
         /* .rbudget     = */ rbudget,
         /* .chain       = */ chain,
         /* .prev        = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
-        /* .prefilter_k = */ grmr || rbudget || n_bias_lower < 0 ? 0 : common_sampler_compute_prefilter_k(params, n_bias_lower),
+        /* .prefilter_k = */ grmr || n_bias_lower < 0 ? 0 : common_sampler_compute_prefilter_k(params, n_bias_lower),
         /* .cur         = */ {},
         /* .cur_p       = */ {},
     };
