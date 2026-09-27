@@ -40,14 +40,24 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
     const int trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
     int mtp_flags = !ml.load_mtp ? TENSOR_SKIP : 0;
 
+    int64_t n_vocab_out = n_vocab;
+    const ggml_tensor * d2t_meta = ml.get_tensor_meta("d2t");
+    if (mtp_only && d2t_meta) {
+        n_vocab_out = d2t_meta->ne[0];
+        d2t = create_tensor(tn(LLM_TENSOR_D2T), { n_vocab_out }, 0);
+        LLAMA_LOG_INFO("%s: QWEN35MOE MTP using d2t draft-vocab trim (n_vocab_out = %lld)\n",
+                __func__, (long long) n_vocab_out);
+    }
+
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
     // output
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
-    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab_out }, TENSOR_NOT_REQUIRED);
 
     // if output is NULL, init from the input tok embed
     if (output == NULL) {
+        GGML_ASSERT(!d2t && "d2t draft-vocab trim requires output.weight");
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
@@ -735,6 +745,10 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     GGML_ASSERT(head_w && "QWEN35MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
     cur = build_lora_mm(head_w, cur, head_s);
     cb(cur, "result_output", -1);
+
+    if (model.d2t) {
+        cur = build_d2t_logits(cur, model.d2t, model.vocab.n_tokens());
+    }
 
     res->t_logits = cur;
     ggml_build_forward_expand(gf, cur);

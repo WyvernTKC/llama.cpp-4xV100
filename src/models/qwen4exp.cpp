@@ -190,7 +190,16 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     hc_head_down = create_tensor(tn(LLM_TENSOR_HC_HEAD_DOWN, "weight"), { hc_dim, hc_lr }, trunk_flags);
     hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, trunk_flags);
 
-    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+    int64_t n_vocab_out = n_vocab;
+    const ggml_tensor * d2t_meta = ml.get_tensor_meta("d2t");
+    if (mtp_only && d2t_meta) {
+        n_vocab_out = d2t_meta->ne[0];
+        d2t = create_tensor(tn(LLM_TENSOR_D2T), { n_vocab_out }, 0);
+        LLAMA_LOG_INFO("%s: QWEN4EXP MTP using d2t draft-vocab trim (n_vocab_out = %lld)\n",
+                __func__, (long long) n_vocab_out);
+    }
+
+    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab_out }, d2t ? 0 : TENSOR_NOT_REQUIRED);
     if (output == NULL && tok_embd != NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
@@ -704,6 +713,11 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     cur = build_lora_mm(head_w, cur, head_s);
     cb(cur, "result_output", -1);
+
+    if (model.d2t) {
+        cur = build_d2t_logits(cur, model.d2t, model.vocab.n_tokens());
+    }
+
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);

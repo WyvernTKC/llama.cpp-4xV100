@@ -1385,6 +1385,13 @@ struct llm_graph_context {
             ggml_tensor * dense_2,
             ggml_tensor * dense_2_b,
             ggml_tensor * dense_3) const;
+
+    //
+    // draft vocab (d2t)
+    //
+
+    // scatter the logits of a draft head over a vocab subset (d2t = their token ids) to the full vocab, -inf elsewhere
+    ggml_tensor * build_d2t_logits(ggml_tensor * cur, ggml_tensor * d2t, int64_t n_vocab) const;
 };
 
 // TODO: better name

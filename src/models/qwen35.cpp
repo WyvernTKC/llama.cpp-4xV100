@@ -650,25 +650,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     cb(cur, "result_output", -1);
 
     if (model.d2t) {
-        const int64_t n_draft_vocab = cur->ne[0];
-        const int64_t n_outputs     = cur->ne[1];
-        const int64_t n_vocab_full  = (int64_t) model.vocab.n_tokens();
-
-        GGML_ASSERT(model.d2t->ne[0] == n_draft_vocab);
-
-        // under -sm tensor the head is split over the vocab dim; the reshape below would move that
-        // split to dim 1, which set_rows cannot scatter. gather the draft logits first.
-        cur = ggml_cont(ctx0, cur);
-        cur->flags |= GGML_TENSOR_FLAG_MIRRORED;
-        ggml_format_name(cur, "mtp_draft_logits_mirrored");
-
-        ggml_tensor * logits = ggml_fill(ctx0,
-                ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab_full, n_outputs), -INFINITY);
-        cur = ggml_set_rows(ctx0, logits,
-                ggml_reshape_3d(ctx0, cur,       1,             n_draft_vocab, n_outputs),
-                ggml_reshape_3d(ctx0, model.d2t, n_draft_vocab, 1,             1));
-        cur = ggml_reshape_2d(ctx0, cur, n_vocab_full, n_outputs);
-        cb(cur, "result_output_d2t", -1);
+        cur = build_d2t_logits(cur, model.d2t, model.vocab.n_tokens());
     }
 
     res->t_logits = cur;
