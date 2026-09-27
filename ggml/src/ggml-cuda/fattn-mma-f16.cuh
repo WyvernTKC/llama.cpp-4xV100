@@ -2038,7 +2038,7 @@ static __global__ void flash_attn_ext_f16(
 #endif // defined(AMD_WMMA_AVAILABLE)
 
 #if defined(AMD_MFMA_AVAILABLE)
-    if (ncols1*ncols2 < 16 || DKQ > 256) {
+    if (ncols1*ncols2 < 16 || (DKQ > 256 && ncols1*ncols2 < 64)) {
         NO_DEVICE_CODE;
         return;
     }
@@ -2175,7 +2175,7 @@ static __global__ void flash_attn_ext_f16(
 #endif // defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
 }
 
-bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1);
+bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2);
 
 // the flash_attn_ext_f16 instance for K/V of this type, see ggml_cuda_fattn_mma_kv_type_direct
 template <int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view, bool use_sparse>
@@ -2248,7 +2248,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         constexpr bool use_logit_softcap = false;
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2)) {
-            if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, ncols1)) {
+            if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, ncols1, ncols2)) {
                 fattn_kernel = ggml_cuda_fattn_mma_get_kernel<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, true>(type_KV);
                 use_sparse = true;
 
@@ -2271,24 +2271,20 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         {
             fattn_kernel = ggml_cuda_fattn_mma_get_kernel<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, false>(type_KV);
 
-#if !defined(GGML_USE_MUSA)
             static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES][3] = {{false}};
             if (!shared_memory_limit_raised[id][i_type]) {
                 CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
                 shared_memory_limit_raised[id][i_type] = true;
             }
-#endif // !defined(GGML_USE_MUSA)
         }
     } else {
         fattn_kernel = ggml_cuda_fattn_mma_get_kernel<DKQ, DV, ncols1, ncols2, true, V_is_K_view, false>(type_KV);
 
-#if !defined(GGML_USE_MUSA)
         static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES][3] = {{false}};
         if (!shared_memory_limit_raised[id][i_type]) {
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
             shared_memory_limit_raised[id][i_type] = true;
         }
-#endif // !defined(GGML_USE_MUSA)
     }
 
     const bool need_f16 = type_KV == GGML_TYPE_F16;
