@@ -3107,6 +3107,86 @@ static int ggml_cuda_try_gdn_cache_fusion(
     return skip;
 }
 
+static int32_t ggml_cuda_graph_use_count(const ggml_cgraph * cgraph, const ggml_tensor * t) {
+    const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+    if (pos == GGML_HASHSET_FULL || !ggml_bitset_get(cgraph->visited_hash_set.used, pos)) {
+        return 0;
+    }
+    return cgraph->use_counts[pos];
+}
+
+// the input of an l2 norm built as rms_norm + scale (build_gdn_l2_norm), if only t's reader uses the norm
+static const ggml_tensor * ggml_cuda_gdn_l2_norm_input(
+        const ggml_cgraph * cgraph, const ggml_tensor * t, float & eps, float & post_scale, float & post_bias) {
+    if (t->op != GGML_OP_SCALE || t->src[0]->op != GGML_OP_RMS_NORM) {
+        return nullptr;
+    }
+    const ggml_tensor * norm = t->src[0];
+    const ggml_tensor * x    = norm->src[0];
+    if (t->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || !ggml_is_contiguous_rows(x) ||
+            ggml_cuda_graph_use_count(cgraph, t) != 1 || ggml_cuda_graph_use_count(cgraph, norm) != 1 ||
+            ((t->flags | norm->flags) & GGML_TENSOR_FLAG_OUTPUT)) {
+        return nullptr;
+    }
+    memcpy(&eps,        norm->op_params,                  sizeof(float));
+    memcpy(&post_scale, (const float *) t->op_params + 0, sizeof(float));
+    memcpy(&post_bias,  (const float *) t->op_params + 1, sizeof(float));
+    return x;
+}
+
+// A gated delta net at a few tokens whose q and k are their l2 norms: the kernel applies the norms and the two norm
+//   launches are skipped. Only with the snapshot cpy fusion, which runs the op in ggml_cuda_try_fuse. At prefill the
+//   norms stay apart, as in the kernel they would lengthen its serial loop over the tokens.
+static bool ggml_cuda_gdn_l2_fusion(const ggml_cgraph * cgraph, const int gdn_idx, ggml_cuda_gated_delta_net_l2 & l2) {
+    const ggml_tensor * gdn = cgraph->nodes[gdn_idx];
+    if (gdn->op != GGML_OP_GATED_DELTA_NET) {
+        return false;
+    }
+    const int64_t S_v       = gdn->src[2]->ne[0];
+    const int     warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    if (warp_size != 32 || (S_v != 16 && S_v != 32 && S_v != 64 && S_v != 128) || gdn->src[2]->ne[2] > 8) {
+        return false;
+    }
+    float eps_k, post_scale_k, post_bias_k;
+    const ggml_tensor * q = ggml_cuda_gdn_l2_norm_input(cgraph, gdn->src[0], l2.eps, l2.post_scale, l2.post_bias);
+    const ggml_tensor * k = ggml_cuda_gdn_l2_norm_input(cgraph, gdn->src[1], eps_k, post_scale_k, post_bias_k);
+    if (!q || !k || q->ne[0] != S_v || !ggml_are_same_shape(q, gdn->src[0]) || !ggml_are_same_shape(k, gdn->src[1]) ||
+            !ggml_are_same_stride(q, k) || eps_k != l2.eps || post_scale_k != l2.post_scale || post_bias_k != l2.post_bias) {
+        return false;
+    }
+    ggml_cuda_gated_delta_net_fused_cache cache;
+    if (ggml_cuda_try_gdn_cache_fusion(cgraph, gdn_idx, cache) == 0) {
+        return false;
+    }
+    // ggml-alloc frees the norm inputs after the norms, their last readers, so a node from there up to the gated delta
+    //   net, the net's own output included, can sit over them. That holds when q and k are separate tensors (kimi-linear
+    //   convolves them apart); as views of one convolution output (qwen35) they live on until v is read.
+    const ggml_tensor * norms[4] = { gdn->src[0], gdn->src[0]->src[0], gdn->src[1], gdn->src[1]->src[0] };
+    int first = gdn_idx;
+    int found = 0;
+    for (int j = gdn_idx - 1; j >= 0 && j >= gdn_idx - 256 && found < 2; j--) {
+        if (cgraph->nodes[j] == norms[1] || cgraph->nodes[j] == norms[3]) {
+            first = j;
+            found++;
+        }
+    }
+    if (found < 2) {
+        return false;
+    }
+    for (int j = first; j <= gdn_idx; j++) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_op_is_empty(n->op) || n == norms[0] || n == norms[1] || n == norms[2] || n == norms[3]) {
+            continue;
+        }
+        if (ggml_cuda_tensors_overlap(n, q) || ggml_cuda_tensors_overlap(n, k)) {
+            return false;
+        }
+    }
+    l2.q = q;
+    l2.k = k;
+    return true;
+}
+
 struct ggml_cuda_rwkv7_output_fusion {
     const ggml_tensor * norm        = nullptr;
     const ggml_tensor * norm_weight = nullptr;
@@ -4377,7 +4457,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             GGML_LOG_INFO("%s: fused gated_delta_net snapshot copies for %s (skipped %d nodes)\n",
                           __func__, node->name, nodes_to_skip);
 #endif
-            ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
+            ggml_cuda_gated_delta_net_l2 l2;
+            const bool fuse_l2 = ggml_cuda_gdn_l2_fusion(cgraph, i, l2);
+            ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy, fuse_l2 ? &l2 : nullptr);
             return nodes_to_skip;
         }
     }
@@ -5140,6 +5222,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // l2 norm built as rms_norm + a scalar scale (build_gdn_l2_norm)
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
+        // not run when the gated delta net that reads it applies the norm itself
+        for (int j = i + 2; j < cgraph->n_nodes && j < i + 256; j++) {
+            const ggml_tensor * gdn = cgraph->nodes[j];
+            if (gdn->op == GGML_OP_GATED_DELTA_NET && (gdn->src[0] == cgraph->nodes[i + 1] || gdn->src[1] == cgraph->nodes[i + 1])) {
+                ggml_cuda_gated_delta_net_l2 l2;
+                if (ggml_cuda_gdn_l2_fusion(cgraph, j, l2)) {
+                    return 1;
+                }
+                break;
+            }
+        }
         ggml_cuda_op_rms_norm_fused_scale(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
     }
