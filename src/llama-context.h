@@ -348,6 +348,10 @@ private:
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;
 
+    // the llama_batch_ext the llama_batch compat wrappers fill, kept so its embd buffer is not faulted in again on
+    //   every call (4096 MTP hook rows are 80 MiB)
+    std::unique_ptr<llama_batch_ext> batch_compat;
+
     uint32_t n_input_tensors = 0; // number of tensors marked as input during the last graph reserve
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
 

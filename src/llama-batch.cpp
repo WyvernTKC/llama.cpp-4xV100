@@ -1264,6 +1264,15 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
         pos_next[s] = llama_memory_seq_pos_max(batch_ext->mem, s) + 1; // assume next pos
     }
 
+    batch_ext->tokens.reserve(batch_ext->tokens.size() + batch_inp.n_tokens);
+
+    // the rows are contiguous: copy them in one go instead of growing the buffer row by row
+    const size_t embd_base = batch_ext->embd.size();
+    if (has_embd && batch_inp.n_tokens > 0) {
+        batch_ext->embd.insert(batch_ext->embd.end(), batch_inp.embd, batch_inp.embd + (size_t) batch_inp.n_tokens * n_embd_row);
+        batch_ext->n_embd = n_embd_row;
+    }
+
     for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
         const int32_t      n_sid = batch_inp.n_seq_id ? batch_inp.n_seq_id[i]    : default_n_seq_id;
         const llama_seq_id * sids = batch_inp.seq_id  ? batch_inp.seq_id[i]      : &default_seq_id;
@@ -1298,10 +1307,7 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
 
         if (has_embd) {
             t.has_embd = true;
-            t.embd_off = batch_ext->embd.size();
-            const float * src = batch_inp.embd + (size_t) i * n_embd_row;
-            batch_ext->embd.insert(batch_ext->embd.end(), src, src + n_embd_row);
-            batch_ext->n_embd = n_embd_row;
+            t.embd_off = embd_base + (size_t) i * n_embd_row;
         }
 
         // output flag
@@ -1310,7 +1316,7 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
             ? (batch_inp.logits[i] != 0)
             : (i == batch_inp.n_tokens - 1);
 
-        batch_ext->tokens.push_back(t);
+        batch_ext->tokens.push_back(std::move(t));
     }
 }
 
