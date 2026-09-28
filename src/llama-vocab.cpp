@@ -8,6 +8,7 @@
 #include "unicode.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cctype>
 #include <cfloat>
@@ -1845,6 +1846,14 @@ struct llama_vocab::impl {
 
     std::vector<llama_token> cache_special_tokens;
     std::vector<std::string> cache_token_to_piece; // llama_token_to_piece(special = true);
+
+    // byte trie over the texts of cache_special_tokens, to find the ones that occur in a text in one pass
+    struct special_trie_node {
+        std::vector<std::pair<uint8_t, uint32_t>> next; // children, sorted by byte
+        std::vector<uint32_t>                     ends; // indices into cache_special_tokens whose text ends here
+    };
+    std::vector<special_trie_node> special_trie;      // [0] is the root
+    std::array<uint32_t, 256>      special_trie_root; // child of the root per first byte, 0 for none
     struct pair_hash {
         size_t operator()(const std::pair<std::string, std::string> & p) const {
             return std::hash<std::string>{}(p.first) ^  //create some hash for pair
@@ -3042,6 +3051,30 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
         );
 
         LLAMA_LOG_INFO("%s: special tokens cache size = %u\n", __func__, (uint32_t) cache_special_tokens.size());
+
+        special_trie.assign(1, {});
+        for (uint32_t i = 0; i < (uint32_t) cache_special_tokens.size(); ++i) {
+            uint32_t node = 0;
+            for (const char c : id_to_token[cache_special_tokens[i]].text) {
+                auto & next = special_trie[node].next;
+                auto it = std::lower_bound(next.begin(), next.end(), (uint8_t) c,
+                    [](const std::pair<uint8_t, uint32_t> & e, const uint8_t b) { return e.first < b; });
+                if (it != next.end() && it->first == (uint8_t) c) {
+                    node = it->second;
+                } else {
+                    const uint32_t child = (uint32_t) special_trie.size();
+                    next.insert(it, { (uint8_t) c, child });
+                    special_trie.emplace_back(); // invalidates next
+                    node = child;
+                }
+            }
+            special_trie[node].ends.push_back(i);
+        }
+
+        special_trie_root.fill(0);
+        for (const auto & [c, child] : special_trie[0].next) {
+            special_trie_root[c] = child;
+        }
     }
 
     // build token to piece cache
@@ -3248,8 +3281,47 @@ void llama_vocab::impl::init_tokenizer(enum llama_vocab_type type) {
 // #define PRETOKENIZERDEBUG
 
 void llama_vocab::impl::tokenizer_st_partition(std::forward_list<fragment_buffer_variant> & buffer, bool parse_special) const {
+    // no special tokens, or a vocab without a tokenizer (load() returned before building the trie)
+    if (cache_special_tokens.empty()) {
+        return;
+    }
+
+    // find the special tokens that occur in the text in one pass over it
+    // the fragments split off below are pieces of this text, so a token that does not occur in it can never match
+    std::vector<uint8_t> present(cache_special_tokens.size(), 0);
+    for (const uint32_t i : special_trie[0].ends) {
+        present[i] = 1; // an empty text
+    }
+    for (const auto & fragment : buffer) {
+        if (fragment.type != FRAGMENT_BUFFER_VARIANT_TYPE_RAW_TEXT) {
+            continue;
+        }
+        const char * s = fragment.raw_text.data() + fragment.offset;
+        const size_t n = fragment.length;
+        for (size_t i = 0; i < n; ++i) {
+            uint32_t node = special_trie_root[(uint8_t) s[i]];
+            for (size_t j = i + 1; node != 0; ++j) {
+                for (const uint32_t e : special_trie[node].ends) {
+                    present[e] = 1;
+                }
+                if (j == n) {
+                    break;
+                }
+                const auto & next = special_trie[node].next;
+                const auto it = std::lower_bound(next.begin(), next.end(), (uint8_t) s[j],
+                    [](const std::pair<uint8_t, uint32_t> & e, const uint8_t b) { return e.first < b; });
+                node = (it != next.end() && it->first == (uint8_t) s[j]) ? it->second : 0;
+            }
+        }
+    }
+
     // for each special token
-    for (const llama_token special_id : cache_special_tokens) {
+    for (size_t i_special = 0; i_special < cache_special_tokens.size(); ++i_special) {
+        if (!present[i_special]) {
+            continue;
+        }
+
+        const llama_token special_id = cache_special_tokens[i_special];
         const auto & data = vocab.get_token_data(special_id);
         const auto & text = data.text;
 
