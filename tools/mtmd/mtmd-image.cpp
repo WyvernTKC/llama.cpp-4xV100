@@ -1250,6 +1250,81 @@ mtmd_image_preproc_out mtmd_image_preprocessor_deepseek4v::preprocess(const clip
     return out;
 }
 
+mtmd_image_preprocessor_deepseek41v::grid_info mtmd_image_preprocessor_deepseek41v::grid_tokens(
+        int best_height, int best_width, int p, int r) {
+    return {
+        ((best_height / p) + r - 1) / r,
+        ((best_width  / p) + r - 1) / r,
+        best_height,
+        best_width,
+    };
+}
+
+void mtmd_image_preprocessor_deepseek41v::solve_resize_ratio(
+        int height, int width, int p, int r, int max_n_token, int & best_height, int & best_width) {
+    const double ratio   = (double) height / width;
+    const double max_w_f = std::sqrt((max_n_token - 2) / ratio + 0.25) - 0.5;
+    const double max_h_f = max_w_f * ratio;
+    const int cell       = p * r;
+    if (max_w_f < 1.0) {
+        best_height = (max_n_token - 2) / 2 * cell;
+        best_width  = cell;
+    } else if (max_h_f < 1.0) {
+        best_height = cell;
+        best_width  = (max_n_token - 3) * cell;
+    } else {
+        const double beta = std::min(
+            std::floor(max_w_f) * cell / width,
+            std::floor(max_h_f) * cell / height);
+        best_height = (int) std::floor(height * beta / p) * p;
+        best_width  = (int) std::floor(width  * beta / p) * p;
+    }
+}
+
+mtmd_image_preprocessor_deepseek41v::grid_info mtmd_image_preprocessor_deepseek41v::plan_image_grid(
+        int width, int height, int p, int r, int max_n_token, int min_pixels, int max_wh_ratio) {
+    if (max_wh_ratio > 0 && (int64_t) width > (int64_t) height * max_wh_ratio) {
+        width = height * max_wh_ratio;
+    }
+    const int64_t pixels = (int64_t) width * height;
+    if (min_pixels > 0 && pixels > 0 && pixels < min_pixels) {
+        const double scale = std::sqrt((double) min_pixels / pixels);
+        width  = (int) (width  * scale);
+        height = (int) (height * scale);
+    }
+
+    int best_width  = CLIP_ALIGN(width,  p);
+    int best_height = CLIP_ALIGN(height, p);
+    grid_info grid = grid_tokens(best_height, best_width, p, r);
+    if (grid.n_tokens() > max_n_token) {
+        solve_resize_ratio(height, width, p, r, max_n_token, best_height, best_width);
+        grid = grid_tokens(best_height, best_width, p, r);
+        GGML_ASSERT(grid.n_tokens() <= max_n_token);
+    }
+    return grid;
+}
+
+mtmd_image_preproc_out mtmd_image_preprocessor_deepseek41v::preprocess(const clip_image_u8 & img) const {
+    mtmd_image_preproc_out out;
+
+    const clip_image_size orig = img.get_size();
+    const grid_info grid = plan_image_grid(
+        orig.width, orig.height,
+        hparams.patch_size, hparams.n_merge,
+        hparams.dsv4_max_n_token, hparams.image_min_pixels, hparams.dsv4_max_wh_ratio);
+
+    clip_image_u8 resized;
+    if (hparams.dsv4_max_wh_ratio > 0 && (int64_t) orig.width >= (int64_t) hparams.dsv4_max_wh_ratio * orig.height) {
+        img_tool::resize(img, resized, {grid.best_width, grid.best_height}, hparams.image_resize_algo, PAD_NONE);
+    } else {
+        img_tool::resize(img, resized, {grid.best_width, grid.best_height}, hparams.image_resize_algo,
+                         PAD_NEAREST, hparams.image_pad_color);
+    }
+
+    out.append(hparams, resized);
+    return out;
+}
+
 mtmd_image_preproc_out mtmd_image_preprocessor_deepseekocr::preprocess(const clip_image_u8 & img) const {
     mtmd_image_preproc_out output;
     int grid_w = 0;

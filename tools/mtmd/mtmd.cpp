@@ -832,6 +832,10 @@ struct mtmd_context {
                     // no vocab tokens are added; the start/end/newline markers are learned embeddings emitted by the encoder
                     image_preproc = std::make_unique<mtmd_image_preprocessor_deepseek4v>(ctx_v);
                 } break;
+            case PROJECTOR_TYPE_DEEPSEEK41V:
+                {
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_deepseek41v>(ctx_v);
+                } break;
             case PROJECTOR_TYPE_DOTS_OCR:
             case PROJECTOR_TYPE_DOTS3NOTE_V:
                 {
@@ -1117,6 +1121,33 @@ std::vector<std::vector<const mtmd_bitmap *>> mtmd_group_mergeable_bitmaps(std::
     return output;
 }
 
+int mtmd_dsv41_separator_padding(const std::string & text, bool leading) {
+    int count = 0;
+    while (count < 2 && (size_t) count < text.size()) {
+        const size_t pos = leading ? count : text.size() - count - 1;
+        if (text[pos] != '\n') {
+            break;
+        }
+        ++count;
+    }
+    return 2 - count;
+}
+
+bool mtmd_dsv41_is_message_boundary(const std::string & text, bool leading) {
+    const std::string bar = "\xef\xbd\x9c";
+    const char * roles[] = { "User", "Assistant", "System", "latest_reminder" };
+    for (const char * role : roles) {
+        const std::string token = "<" + bar + role + bar + ">";
+        if (leading && text.size() >= token.size() && text.compare(0, token.size(), token) == 0) {
+            return true;
+        }
+        if (!leading && text.size() >= token.size() && text.compare(text.size() - token.size(), token.size(), token) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 struct mtmd_tokenizer {
     const mtmd_context * ctx;
 
@@ -1252,6 +1283,10 @@ struct mtmd_tokenizer {
 
         auto merged_bitmaps = mtmd_group_mergeable_bitmaps(parts, n_merge_frames);
 
+        const bool is_dsv41 = ctx->ctx_v && ctx->proj_type_v() == PROJECTOR_TYPE_DEEPSEEK41V;
+        bool has_content = false;
+        bool previous_was_media = false;
+        std::string previous_text;
         size_t i_bm = 0;
         for (const auto & p : parts) {
             if (p.bitmap != nullptr) {
@@ -1260,13 +1295,28 @@ struct mtmd_tokenizer {
                             __func__, merged_bitmaps.size(), parts.size() - 1);
                     return 1;
                 }
+                if (is_dsv41 && has_content && (previous_was_media || !mtmd_dsv41_is_message_boundary(previous_text, false))) {
+                    const int padding = previous_was_media ? 2 : mtmd_dsv41_separator_padding(previous_text, false);
+                    add_text(std::string(padding, '\n'), false);
+                }
                 auto bmps = merged_bitmaps[i_bm++];
                 int32_t res = add_media(bmps);
                 if (res != 0) {
                     return res;
                 }
+                has_content = true;
+                previous_was_media = true;
             } else {
+                if (p.text.empty()) {
+                    continue;
+                }
+                if (is_dsv41 && previous_was_media && !mtmd_dsv41_is_message_boundary(p.text, true)) {
+                    add_text(std::string(mtmd_dsv41_separator_padding(p.text, true), '\n'), false);
+                }
                 add_text(p.text, p.parse_special);
+                has_content = true;
+                previous_was_media = false;
+                previous_text = p.text;
             }
         }
 

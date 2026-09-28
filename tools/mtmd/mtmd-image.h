@@ -145,6 +145,28 @@ private:
     static void safe_resize(int height, int width, int & best_height, int & best_width, int p, int r, int max_n_token);
 };
 
+struct mtmd_image_preprocessor_deepseek41v : mtmd_image_preprocessor {
+    mtmd_image_preprocessor_deepseek41v(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
+
+    struct grid_info {
+        int n_llm_h;
+        int n_llm_w;
+        int best_height;
+        int best_width;
+
+        int n_tokens() const {
+            return dsv41_n_output_tokens(n_llm_w, n_llm_h);
+        }
+    };
+
+    static grid_info plan_image_grid(int width, int height, int p, int r, int max_n_token, int min_pixels, int max_wh_ratio);
+
+private:
+    static grid_info grid_tokens(int best_height, int best_width, int p, int r);
+    static void solve_resize_ratio(int height, int width, int p, int r, int max_n_token, int & best_height, int & best_width);
+};
+
 // custom llava-uhd slicing logic for MiniCPM-V
 struct mtmd_image_preprocessor_minicpmv : mtmd_image_preprocessor_llava_uhd {
     using mtmd_image_preprocessor_llava_uhd::mtmd_image_preprocessor_llava_uhd;

@@ -19,3 +19,6 @@ struct mtmd_internal_part {
 
 // [QWEN_VIDEO] merged parts are erased from `parts`, so one group always maps to one part
 std::vector<std::vector<const mtmd_bitmap *>> mtmd_group_mergeable_bitmaps(std::vector<mtmd_internal_part> & parts, int n_merge);
+
+int mtmd_dsv41_separator_padding(const std::string & text, bool leading);
+bool mtmd_dsv41_is_message_boundary(const std::string & text, bool leading);

@@ -72,6 +72,62 @@ MAKE_TEST(test_image_preprocessor_lfm2) {
     }
 }
 
+MAKE_TEST(test_image_preprocessor_deepseek41v) {
+    struct test_case {
+        int width;
+        int height;
+        int n_llm_h;
+        int n_llm_w;
+        int best_height;
+        int best_width;
+    };
+
+    const std::vector<test_case> cases = {
+        {  1024,  1024,  25,   25,  1036,  1036 },
+        {  4000,   500,  11,   88,   462,  3696 },
+        {   500,  4000,  80,   10,  3360,   420 },
+        {   320,   200,  11,   17,   434,   700 },
+        {  1920,  1080,  23,   41,   966,  1708 },
+        {     1, 10000, 511,    1, 21462,    42 },
+        { 10000,     1,   1, 1021,    42, 42882 },
+    };
+
+    for (const auto & expected : cases) {
+        const auto actual = mtmd_image_preprocessor_deepseek41v::plan_image_grid(
+            expected.width, expected.height, 14, 3, 1024, 295936, 0);
+        const std::string size = std::to_string(expected.width) + "x" + std::to_string(expected.height);
+        t.assert_equal(size + " n_llm_h", expected.n_llm_h, actual.n_llm_h);
+        t.assert_equal(size + " n_llm_w", expected.n_llm_w, actual.n_llm_w);
+        t.assert_equal(size + " height", expected.best_height, actual.best_height);
+        t.assert_equal(size + " width", expected.best_width, actual.best_width);
+        t.assert_true(size + " token budget", actual.n_tokens() <= 1024);
+    }
+}
+
+MAKE_TEST(test_deepseek41v_layout) {
+    const std::vector<int32_t> expected = { 6, 0, 1, 2, 8, 3, 4, 5, 8, 7 };
+    const auto actual = dsv41_build_layout_indices(3, 2);
+    t.assert_true("row-major layout", expected == actual);
+    t.assert_equal("V4.1 output tokens", 10, dsv41_n_output_tokens(3, 2));
+    t.assert_equal("V4 layout unchanged", 12, dsv4_get_block_layout(3, 2, 2).n_out);
+}
+
+MAKE_TEST(test_deepseek41v_media_separator) {
+    t.assert_equal("missing trailing separator", 2, mtmd_dsv41_separator_padding("text", false));
+    t.assert_equal("one trailing newline",       1, mtmd_dsv41_separator_padding("text\n", false));
+    t.assert_equal("complete trailing separator", 0, mtmd_dsv41_separator_padding("text\n\n", false));
+    t.assert_equal("missing leading separator",  2, mtmd_dsv41_separator_padding("text", true));
+    t.assert_equal("one leading newline",        1, mtmd_dsv41_separator_padding("\ntext", true));
+    t.assert_equal("complete leading separator", 0, mtmd_dsv41_separator_padding("\n\ntext", true));
+
+    const std::string bar = "\xef\xbd\x9c";
+    const std::string user = "<" + bar + "User" + bar + ">";
+    const std::string assistant = "<" + bar + "Assistant" + bar + ">";
+    t.assert_true("image-only user prefix", mtmd_dsv41_is_message_boundary(user, false));
+    t.assert_true("assistant suffix", mtmd_dsv41_is_message_boundary(assistant + "</think>", true));
+    t.assert_true("plain user text", !mtmd_dsv41_is_message_boundary("inspect", false));
+}
+
 //
 // mtmd temporal merge
 //

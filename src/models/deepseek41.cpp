@@ -1080,6 +1080,9 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
             ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc - 1, n_tokens), 0.0f), 0);
     cb(pre_mix, "hc_pre_init", -1);
 
+    // an image batch from mtmd has no token ids to key the engram n-grams on
+    const bool is_media = ubatch.embd != nullptr;
+
     for (int il = 0; il < n_layer; ++il) {
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = dsv41_hc_mean(ctx0, inpL);
@@ -1088,7 +1091,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         }
 
         // the engram sits before the block and writes straight into the stream
-        if (pmodel.engram_index(il) >= 0) {
+        if (!is_media && pmodel.engram_index(il) >= 0) {
             inpL = build_engram(model, inpL, build_inp_engram(model, il), il);
             cb(inpL, "engram_out", il);
         }
@@ -1139,7 +1142,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
 
         // may apply exp_probs_b_vl if the input is from mtmd
-        if (ubatch.embd != nullptr && layer.ffn_exp_probs_b_vl) {
+        if (is_media && layer.ffn_exp_probs_b_vl) {
             exp_probs_b = layer.ffn_exp_probs_b_vl;
         }
 
