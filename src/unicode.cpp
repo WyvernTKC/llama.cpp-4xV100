@@ -735,6 +735,287 @@ static std::vector<size_t> unicode_regex_split_custom_qwen35(const std::string &
     return bpe_offsets;
 }
 
+// The custom splitters below reproduce the std::regex fallback of unicode_regex_split exactly. Expressions with \p{}
+// classes are matched there on a "collapsed" text that keeps ASCII as is and turns every other codepoint into 0x0B if
+// it is whitespace, else into the byte of its category (N/L/P/M/S), else into 0xD0. So \s is ASCII \t\n\v\f\r and space
+// plus every non-ASCII whitespace, ASCII ranges such as [A-Za-z] match ASCII only, and ASCII takes its \p{} category
+// from the k_ucat_map ranges. As in unicode_regex_split_stl, a run of unmatched codepoints is one piece.
+enum : uint8_t {
+    COLLAPSED_N      = 1 << 0, // \p{N}
+    COLLAPSED_L      = 1 << 1, // \p{L}
+    COLLAPSED_M      = 1 << 2, // \p{M}
+    COLLAPSED_P      = 1 << 3, // \p{P}
+    COLLAPSED_S      = 1 << 4, // \p{S}
+    COLLAPSED_SPACE  = 1 << 5, // \s
+    COLLAPSED_ALPHA  = 1 << 6, // [A-Za-z]
+    COLLAPSED_APUNCT = 1 << 7, // [!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~]
+};
+
+static uint8_t unicode_collapsed_class(const uint32_t cpt) {
+    if (cpt < 128) {
+        if ((cpt >= 'A' && cpt <= 'Z') || (cpt >= 'a' && cpt <= 'z')) {
+            return COLLAPSED_L | COLLAPSED_ALPHA;
+        }
+        if (cpt >= '0' && cpt <= '9') {
+            return COLLAPSED_N;
+        }
+        if (cpt == ' ' || (cpt >= '\t' && cpt <= '\r')) {
+            return COLLAPSED_SPACE;
+        }
+        switch (cpt) {
+            case '$': case '+': case '<': case '=': case '>': case '^': case '`': case '|': case '~':
+                return COLLAPSED_S | COLLAPSED_APUNCT;
+        }
+        // the rest of printable ASCII is punctuation, the control characters are in no class
+        return (cpt > ' ' && cpt < 0x7F) ? (COLLAPSED_P | COLLAPSED_APUNCT) : 0;
+    }
+
+    const auto flags = unicode_cpt_flags_from_cpt(cpt);
+    if (flags.is_whitespace) {
+        return COLLAPSED_SPACE;
+    }
+    switch (flags.category_flag()) {
+        case unicode_cpt_flags::NUMBER:      return COLLAPSED_N;
+        case unicode_cpt_flags::LETTER:      return COLLAPSED_L;
+        case unicode_cpt_flags::ACCENT_MARK: return COLLAPSED_M;
+        case unicode_cpt_flags::PUNCTUATION: return COLLAPSED_P;
+        case unicode_cpt_flags::SYMBOL:      return COLLAPSED_S;
+        default:                             return 0;
+    }
+}
+
+// split each offset into the matches of match_at(pos, end) -> length (0 = no match at pos) and the runs between them
+template <typename F>
+static std::vector<size_t> unicode_regex_split_custom_matches(const std::vector<size_t> & offsets, F && match_at) {
+    std::vector<size_t> bpe_offsets;
+    bpe_offsets.reserve(offsets.size());
+
+    size_t start = 0;
+    for (auto offset : offsets) {
+        const size_t offset_end = start + offset;
+
+        size_t prev_end = start;
+        for (size_t pos = start; pos < offset_end; ) {
+            const size_t len = match_at(pos, offset_end);
+            if (len == 0) {
+                pos++;
+                continue;
+            }
+            if (pos > prev_end) {
+                bpe_offsets.push_back(pos - prev_end);
+            }
+            bpe_offsets.push_back(len);
+            pos += len;
+            prev_end = pos;
+        }
+        if (offset_end > prev_end) {
+            bpe_offsets.push_back(offset_end - prev_end);
+        }
+
+        start = offset_end;
+    }
+
+    return bpe_offsets;
+}
+
+// regex: \s*[\r\n]+|\s+(?!\S)|\s+ at pos, 0 when pos is no space
+static size_t unicode_collapsed_match_spaces(const std::vector<uint8_t> & cls, const std::vector<uint32_t> & cpts, const size_t pos, const size_t end) {
+    size_t n_space = 0;
+    size_t last_end_r_or_n = 0;
+    while (pos + n_space < end && (cls[pos + n_space] & COLLAPSED_SPACE)) {
+        const uint32_t cpt = cpts[pos + n_space];
+        if (cpt == '\r' || cpt == '\n') {
+            last_end_r_or_n = pos + n_space + 1;
+        }
+        n_space++;
+    }
+
+    // \s*[\r\n]+
+    if (last_end_r_or_n > 0) {
+        return last_end_r_or_n - pos;
+    }
+
+    // \s+(?!\S), which backs off one space unless the run reaches the end of the offset
+    if (n_space > 1 && pos + n_space < end) {
+        return n_space - 1;
+    }
+
+    // \s+
+    return n_space;
+}
+
+// DeepSeek V3/V4 pre-tokenizer (deepseek3-llm, joyai-llm, hy-v4, hunyuan-dense), one function per expression
+
+// regex: \p{N}{1,3}
+static std::vector<size_t> unicode_regex_split_custom_joyai_digits(const std::string & text, const std::vector<size_t> & offsets) {
+    const auto cpts = unicode_cpts_from_utf8(text);
+
+    return unicode_regex_split_custom_matches(offsets, [&](const size_t pos, const size_t end) -> size_t {
+        size_t n = 0;
+        while (n < 3 && pos + n < end && (unicode_collapsed_class(cpts[pos + n]) & COLLAPSED_N)) {
+            n++;
+        }
+        return n;
+    });
+}
+
+// regex: [一-龥぀-ゟ゠-ヿ]+
+// the fallback matches this one with std::wregex on the raw codepoints, which on Windows are truncated to the 16 bits
+// of wchar_t; here they are compared in full, as with the 32-bit wchar_t of other platforms
+static std::vector<size_t> unicode_regex_split_custom_joyai_cjk(const std::string & text, const std::vector<size_t> & offsets) {
+    const auto cpts = unicode_cpts_from_utf8(text);
+
+    auto is_cjk = [](const uint32_t cpt) {
+        return (0x4E00 <= cpt && cpt <= 0x9FA5) || (0x3040 <= cpt && cpt <= 0x30FF);
+    };
+
+    return unicode_regex_split_custom_matches(offsets, [&](const size_t pos, const size_t end) -> size_t {
+        size_t p = pos;
+        while (p < end && is_cjk(cpts[p])) {
+            p++;
+        }
+        return p - pos;
+    });
+}
+
+// regex: [!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+static std::vector<size_t> unicode_regex_split_custom_joyai_words(const std::string & text, const std::vector<size_t> & offsets) {
+    const auto cpts = unicode_cpts_from_utf8(text);
+
+    std::vector<uint8_t> cls(cpts.size());
+    for (size_t i = 0; i < cpts.size(); ++i) {
+        cls[i] = unicode_collapsed_class(cpts[i]);
+    }
+
+    return unicode_regex_split_custom_matches(offsets, [&](const size_t pos, const size_t end) -> size_t {
+        auto cls_at = [&](const size_t p) -> uint8_t {
+            return p < end ? cls[p] : 0;
+        };
+        auto is_cr_or_lf = [&](const size_t p) {
+            return p < end && (cpts[p] == '\r' || cpts[p] == '\n');
+        };
+
+        const uint8_t c0 = cls[pos];
+        const uint8_t c1 = cls_at(pos + 1);
+
+        // [!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+
+        if ((c0 & COLLAPSED_APUNCT) && (c1 & COLLAPSED_ALPHA)) {
+            size_t p = pos + 2;
+            while (cls_at(p) & COLLAPSED_ALPHA) {
+                p++;
+            }
+            return p - pos;
+        }
+
+        // [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+
+        {
+            size_t p = pos;
+            if (!(c0 & (COLLAPSED_L | COLLAPSED_P | COLLAPSED_S)) && !is_cr_or_lf(pos) && (c1 & (COLLAPSED_L | COLLAPSED_M))) {
+                p++;
+            }
+            if (cls_at(p) & (COLLAPSED_L | COLLAPSED_M)) {
+                while (cls_at(p) & (COLLAPSED_L | COLLAPSED_M)) {
+                    p++;
+                }
+                return p - pos;
+            }
+        }
+
+        // ?[\p{P}\p{S}]+[\r\n]*
+        {
+            size_t p = pos;
+            if (cpts[pos] == ' ' && (c1 & (COLLAPSED_P | COLLAPSED_S))) {
+                p++;
+            }
+            if (cls_at(p) & (COLLAPSED_P | COLLAPSED_S)) {
+                while (cls_at(p) & (COLLAPSED_P | COLLAPSED_S)) {
+                    p++;
+                }
+                while (is_cr_or_lf(p)) {
+                    p++;
+                }
+                return p - pos;
+            }
+        }
+
+        return unicode_collapsed_match_spaces(cls, cpts, pos, end);
+    });
+}
+
+// Mistral tekken pre-tokenizer
+// regex: [^\r\n\p{L}\p{N}]?((?=[\p{L}])([^a-z]))*((?=[\p{L}])([^A-Z]))+|[^\r\n\p{L}\p{N}]?((?=[\p{L}])([^a-z]))+((?=[\p{L}])([^A-Z]))*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+
+// a letter that is not a-z counts as upper and one that is not A-Z as lower, so a non-ASCII letter is both
+static std::vector<size_t> unicode_regex_split_custom_tekken(const std::string & text, const std::vector<size_t> & offsets) {
+    const auto cpts = unicode_cpts_from_utf8(text);
+
+    std::vector<uint8_t> cls(cpts.size());
+    for (size_t i = 0; i < cpts.size(); ++i) {
+        cls[i] = unicode_collapsed_class(cpts[i]);
+    }
+
+    return unicode_regex_split_custom_matches(offsets, [&](const size_t pos, const size_t end) -> size_t {
+        auto is_upper = [&](const size_t p) {
+            return p < end && (cls[p] & COLLAPSED_L) && !(cpts[p] >= 'a' && cpts[p] <= 'z');
+        };
+        auto is_lower = [&](const size_t p) {
+            return p < end && (cls[p] & COLLAPSED_L) && !(cpts[p] >= 'A' && cpts[p] <= 'Z');
+        };
+        auto is_other = [&](const size_t p) {
+            return p < end && !(cls[p] & (COLLAPSED_SPACE | COLLAPSED_L | COLLAPSED_N));
+        };
+
+        const uint8_t  c0  = cls[pos];
+        const uint32_t cpt = cpts[pos];
+
+        // [^\r\n\p{L}\p{N}]? - when it can take pos, pos is no letter, so leaving it out cannot match either
+        const size_t q = (!(c0 & (COLLAPSED_L | COLLAPSED_N)) && cpt != '\r' && cpt != '\n') ? pos + 1 : pos;
+
+        size_t u = q;
+        while (is_upper(u)) {
+            u++;
+        }
+
+        // (upper)*(lower)+: the upper run backs off until a lower one follows it
+        if (is_lower(u)) {
+            while (is_lower(u)) {
+                u++;
+            }
+            return u - pos;
+        }
+        for (size_t k = u; k > q; --k) {
+            if (is_lower(k - 1)) {
+                return k - pos;
+            }
+        }
+
+        // (upper)+(lower)*, where the lower run is empty because none followed the upper run above
+        if (u > q) {
+            return u - pos;
+        }
+
+        // \p{N}
+        if (c0 & COLLAPSED_N) {
+            return 1;
+        }
+
+        // ?[^\s\p{L}\p{N}]+[\r\n/]*
+        {
+            size_t p = (cpt == ' ' && is_other(pos + 1)) ? pos + 1 : pos;
+            if (is_other(p)) {
+                while (is_other(p)) {
+                    p++;
+                }
+                while (p < end && (cpts[p] == '\r' || cpts[p] == '\n' || cpts[p] == '/')) {
+                    p++;
+                }
+                return p - pos;
+            }
+        }
+
+        return unicode_collapsed_match_spaces(cls, cpts, pos, end);
+    });
+}
+
 template <typename CharT>
 static std::vector<size_t> unicode_regex_split_stl(const std::basic_string<CharT> & text, const std::basic_string<CharT> & regex, const std::vector<size_t> & offsets) {
     using BidirIt = typename std::basic_string<CharT>::const_iterator;
@@ -1062,6 +1343,14 @@ static std::vector<size_t> unicode_regex_split_custom(const std::string & text, 
     } else if (
            regex_expr == "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
         bpe_offsets = unicode_regex_split_custom_qwen35(text, offsets);
+    } else if (regex_expr == "\\p{N}{1,3}") {
+        bpe_offsets = unicode_regex_split_custom_joyai_digits(text, offsets);
+    } else if (regex_expr == "[一-龥぀-ゟ゠-ヿ]+") {
+        bpe_offsets = unicode_regex_split_custom_joyai_cjk(text, offsets);
+    } else if (regex_expr == "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+") {
+        bpe_offsets = unicode_regex_split_custom_joyai_words(text, offsets);
+    } else if (regex_expr == "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))*((?=[\\p{L}])([^A-Z]))+|[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))+((?=[\\p{L}])([^A-Z]))*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
+        bpe_offsets = unicode_regex_split_custom_tekken(text, offsets);
     } else if (regex_expr == "\\p{Han}+") {
         // K2's first pattern - handle all K2 patterns together
         bpe_offsets = unicode_regex_split_custom_kimi_k2(text, offsets);
