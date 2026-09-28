@@ -3262,7 +3262,9 @@ void llama_vocab::impl::tokenizer_st_partition(std::forward_list<fragment_buffer
         }
 
         // for each text fragment
-        std::forward_list<fragment_buffer_variant>::iterator it = buffer.begin();
+        //  it_prev is kept as the predecessor of it, so a split fragment is erased without walking the list
+        std::forward_list<fragment_buffer_variant>::iterator it_prev = buffer.before_begin();
+        std::forward_list<fragment_buffer_variant>::iterator it      = buffer.begin();
         while (it != buffer.end()) {
             auto & fragment = (*it);
 
@@ -3287,7 +3289,9 @@ void llama_vocab::impl::tokenizer_st_partition(std::forward_list<fragment_buffer
 #ifdef PRETOKENIZERDEBUG
                     LLAMA_LOG_WARN("FF: (%ld %ld %ld) '%s'\n", raw_text->length(), raw_text_base_offset, raw_text_base_length, raw_text->substr(raw_text_base_offset, raw_text_base_length).c_str());
 #endif
-                    auto source = std::distance(buffer.begin(), it);
+                    // the fragment being split: the pieces are inserted after it, then it is erased
+                    const auto it_src      = it;
+                    const auto it_src_prev = it_prev;
 
                     // if match is further than base offset
                     //  then we have some text to the left of it
@@ -3304,7 +3308,7 @@ void llama_vocab::impl::tokenizer_st_partition(std::forward_list<fragment_buffer
 
                         if (left_reminder_length > 0) {
                             buffer.emplace_after(it, raw_text, left_reminder_offset, left_reminder_length);
-                            it++;
+                            it_prev = it++;
                         }
 
 #ifdef PRETOKENIZERDEBUG
@@ -3314,7 +3318,7 @@ void llama_vocab::impl::tokenizer_st_partition(std::forward_list<fragment_buffer
 
                     // special token
                     buffer.emplace_after(it, special_id);
-                    it++;
+                    it_prev = it++;
 
                     // right
                     if (match + text.length() < raw_text_base_offset + raw_text_base_length) {
@@ -3330,18 +3334,17 @@ void llama_vocab::impl::tokenizer_st_partition(std::forward_list<fragment_buffer
 
                         if (right_reminder_length > 0) {
                             buffer.emplace_after(it, raw_text, right_reminder_offset, right_reminder_length);
-                            it++;
+                            it_prev = it++;
                         }
 
 #ifdef PRETOKENIZERDEBUG
                         LLAMA_LOG_WARN("FR: (%ld %ld) '%s'\n", right_reminder_offset, right_reminder_length, raw_text->substr(right_reminder_offset, right_reminder_length).c_str());
 #endif
 
-                        if (source == 0) {
-                            buffer.erase_after(buffer.before_begin());
-                        } else {
-                            buffer.erase_after(std::next(buffer.begin(), (source - 1)));
+                        if (it_prev == it_src) {
+                            it_prev = it_src_prev;
                         }
+                        buffer.erase_after(it_src_prev);
 
                         // repeat for the right side
                         raw_text_base_offset = right_reminder_offset;
@@ -3351,16 +3354,15 @@ void llama_vocab::impl::tokenizer_st_partition(std::forward_list<fragment_buffer
                         LLAMA_LOG_WARN("RR: (%ld %ld) '%s'\n", raw_text_base_offset, raw_text_base_length, raw_text->substr(raw_text_base_offset, raw_text_base_length).c_str());
 #endif
                     } else {
-                        if (source == 0) {
-                            buffer.erase_after(buffer.before_begin());
-                        } else {
-                            buffer.erase_after(std::next(buffer.begin(), (source - 1)));
+                        if (it_prev == it_src) {
+                            it_prev = it_src_prev;
                         }
+                        buffer.erase_after(it_src_prev);
                         break;
                     }
                 }
             }
-            it++;
+            it_prev = it++;
         }
     }
 }
