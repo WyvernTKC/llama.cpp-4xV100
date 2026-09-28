@@ -84,10 +84,6 @@ bool llama_batch_allocr::init(
         }
     }
 
-    if (has_embd) {
-        embd_vec = batch_inp.embd;
-    }
-
     //
     // build flat pos array
     // token batch:     pos[i]            = tokens[i].pos[0]
@@ -174,7 +170,8 @@ bool llama_batch_allocr::init(
 
     batch.n_tokens = n_tok;
     batch.token    = has_token ? token_vec.data() : nullptr;
-    batch.embd     = has_embd  ? embd_vec.data()  : nullptr;
+    // embd is not copied: batch_inp outlives every use of it, which is inside the encode/decode call
+    batch.embd     = has_embd  ? const_cast<float *>(batch_inp.embd.data()) : nullptr;
     batch.pos      = pos.data();
     batch.n_seq_id = n_seq_id.data();
     batch.seq_id   = seq_id.data();
@@ -758,7 +755,6 @@ void llama_batch_allocr::clear() {
     batch = {};
 
     token_vec   .clear();
-    embd_vec    .clear();
     seq_id_data .clear();
     pos         .clear();
     n_seq_id    .clear();

@@ -3739,12 +3739,15 @@ void llama_context::opt_epoch_iter(
         }
 
         // TODO: use llama_batch_ext here
-        {
-            llama_batch_compat compat(this, batch);
-            if (!balloc->init(*compat.batch_ext, model.vocab, true)) {
-                LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
-                return;
-            }
+        // balloc points into the llama_batch_ext, so it has to outlive the splits below
+        if (!batch_compat) {
+            batch_compat = std::make_unique<llama_batch_ext>(this);
+        }
+        batch_compat->clear();
+        llama_batch_compat::init(*batch_compat, batch);
+        if (!balloc->init(*batch_compat, model.vocab, true)) {
+            LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+            return;
         }
 
         const uint32_t n_tokens_all = balloc->get_n_tokens();
