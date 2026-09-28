@@ -1,5 +1,6 @@
 #include "allreduce-p2p.cuh"
 
+#include <algorithm>
 #include <cstdlib>
 
 // One block index is the unit of cross-device synchronisation: block b on every rank exchanges
@@ -14,14 +15,19 @@
 // from overwriting payload a slow rank has not consumed yet.
 #define GGML_CUDA_P2P_AR_NSLOTS 2
 
+// LL path for the smallest messages: one float4 per thread, no inter-block coupling.
+#define GGML_CUDA_P2P_AR_LL_NTHREADS 128
+
 struct ggml_cuda_p2p_ar_args {
     float4 *             stage[GGML_CUDA_MAX_DEVICES];
     unsigned long long * flag [GGML_CUDA_MAX_DEVICES];
+    uint4 *              ll   [GGML_CUDA_MAX_DEVICES];
 
     const float4 *     src;
     float4 *           dst;
     int64_t            nvec;
     int64_t            stage_stride;
+    int64_t            ll_stride;
     int                n_devs;
     int                rank;
     int                slot;
@@ -35,11 +41,15 @@ struct ggml_cuda_p2p_ar {
 
     // Peer-mapped. stage[j] is device j's staging area, laid out [slot][rank][stage_stride].
     // flag[j] is device j's flag array, laid out [slot][rank][nblocks].
+    // ll[j] is device j's LL staging, laid out [slot][rank][ll_stride] 16 B lines.
     float4 *             stage[GGML_CUDA_MAX_DEVICES] = {};
     unsigned long long * flag [GGML_CUDA_MAX_DEVICES] = {};
+    uint4 *              ll   [GGML_CUDA_MAX_DEVICES] = {};
 
     size_t             max_bytes    = 0; // per-rank payload cap, above which the caller uses NCCL
+    size_t             ll_max_bytes = 0; // per-rank payload cap for the LL kernel, 0 = LL off
     int64_t            stage_stride = 0; // float4 elements per (slot, rank) region
+    int64_t            ll_stride    = 0; // LL lines per (slot, rank) region, two per float4
     int                nblocks      = 0; // grid size, also the flag array's last dimension
     unsigned long long seq          = 0; // monotonic, identical across ranks for a given call
 
@@ -113,6 +123,65 @@ static __global__ void ggml_cuda_p2p_ar_kernel(const ggml_cuda_p2p_ar_args a) {
     }
 }
 
+static __device__ __forceinline__ void ggml_cuda_p2p_ar_st_ll(uint4 * p, const uint4 v) {
+    asm volatile("st.volatile.global.v4.u32 [%0], {%1, %2, %3, %4};" :: "l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
+}
+
+static __device__ __forceinline__ uint4 ggml_cuda_p2p_ar_ld_ll(const uint4 * p) {
+    uint4 v;
+    asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p) : "memory");
+    return v;
+}
+
+// Same exchange for small messages with NCCL's LL scheme: each 16 B line is {d0, flag, d1, flag} and
+// one store, so the flag arrives with its data. The receiver polls the data itself: no fence, no
+// barrier, no flag array. It doubles the bytes, which only pays below a few tens of KB.
+static __global__ void ggml_cuda_p2p_ar_ll_kernel(const ggml_cuda_p2p_ar_args a) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= a.nvec) {
+        return;
+    }
+
+    // Never 0, so zeroed staging cannot match. A slot only sees one parity of seq, so seq | 1 stays
+    // unique per slot.
+    const uint32_t flag = (uint32_t) a.seq | 1u;
+
+    const int64_t slot_base = (int64_t) a.slot * a.n_devs * a.ll_stride;
+
+    // A rank that does not contribute still pushes zeros: the lines are also the barrier.
+    const float4 v = ((a.contrib_mask >> a.rank) & 1u) ? a.src[i] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const uint4 l0 = make_uint4(__float_as_uint(v.x), flag, __float_as_uint(v.y), flag);
+    const uint4 l1 = make_uint4(__float_as_uint(v.z), flag, __float_as_uint(v.w), flag);
+    for (int j = 0; j < a.n_devs; ++j) {
+        uint4 * dst = a.ll[j] + slot_base + (int64_t) a.rank * a.ll_stride + 2*i;
+        ggml_cuda_p2p_ar_st_ll(dst + 0, l0);
+        ggml_cuda_p2p_ar_st_ll(dst + 1, l1);
+    }
+
+    // Sum in rank order, like the kernel above, so every rank gets the same bits.
+    const uint4 * src = a.ll[a.rank] + slot_base + 2*i;
+    float4 sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int j = 0; j < a.n_devs; ++j) {
+        const uint4 * p = src + (int64_t) j * a.ll_stride;
+        uint4 r0;
+        uint4 r1;
+        do {
+            r0 = ggml_cuda_p2p_ar_ld_ll(p + 0);
+        } while (r0.y != flag || r0.w != flag);
+        do {
+            r1 = ggml_cuda_p2p_ar_ld_ll(p + 1);
+        } while (r1.y != flag || r1.w != flag);
+        if (((a.contrib_mask >> j) & 1u) == 0) {
+            continue;
+        }
+        sum.x += __uint_as_float(r0.x);
+        sum.y += __uint_as_float(r0.z);
+        sum.z += __uint_as_float(r1.x);
+        sum.w += __uint_as_float(r1.z);
+    }
+    a.dst[i] = sum;
+}
+
 void ggml_cuda_p2p_ar_free(ggml_cuda_p2p_ar * ar) {
     if (ar == nullptr) {
         return;
@@ -123,6 +192,7 @@ void ggml_cuda_p2p_ar_free(ggml_cuda_p2p_ar * ar) {
         }
         cudaFree(ar->stage[i]);
         cudaFree(ar->flag [i]);
+        cudaFree(ar->ll   [i]);
     }
     (void) cudaGetLastError();
     delete ar;
@@ -142,6 +212,13 @@ ggml_cuda_p2p_ar * ggml_cuda_p2p_ar_init(const int * devices, size_t n_devices) 
         return nullptr;
     }
     max_bytes = GGML_PAD(max_bytes, sizeof(float4));
+
+    // Batch-1 decode sizes (n_embd x 4 B). The LL kernel wins below ~32 KB and loses above ~48 KB.
+    size_t ll_max_bytes = 32*1024;
+    if (const char * env = getenv("GGML_CUDA_P2P_AR_LL_MAX_BYTES")) {
+        ll_max_bytes = (size_t) atoll(env);
+    }
+    ll_max_bytes = std::min(GGML_PAD(ll_max_bytes, sizeof(float4)), max_bytes);
 
     int nblocks = GGML_CUDA_P2P_AR_NBLOCKS_DEFAULT;
     if (const char * env = getenv("GGML_CUDA_P2P_AR_NBLOCKS")) {
@@ -181,12 +258,15 @@ ggml_cuda_p2p_ar * ggml_cuda_p2p_ar_init(const int * devices, size_t n_devices) 
     ggml_cuda_p2p_ar * ar = new ggml_cuda_p2p_ar;
     ar->n_devices    = n_devices;
     ar->max_bytes    = max_bytes;
+    ar->ll_max_bytes = ll_max_bytes;
     ar->stage_stride = (int64_t) (max_bytes / sizeof(float4));
+    ar->ll_stride    = (int64_t) (2 * ll_max_bytes / sizeof(uint4));
     ar->nblocks      = nblocks;
 
     const size_t stage_bytes = (size_t) GGML_CUDA_P2P_AR_NSLOTS * n_devices * max_bytes;
     const size_t flag_bytes  = (size_t) GGML_CUDA_P2P_AR_NSLOTS * n_devices *
                                ar->nblocks * sizeof(unsigned long long);
+    const size_t ll_bytes    = (size_t) GGML_CUDA_P2P_AR_NSLOTS * n_devices * 2 * ll_max_bytes;
 
     for (size_t i = 0; i < n_devices; ++i) {
         ar->devices[i] = devices[i];
@@ -214,7 +294,9 @@ ggml_cuda_p2p_ar * ggml_cuda_p2p_ar_init(const int * devices, size_t n_devices) 
 
         if (cudaMalloc((void **) &ar->stage[i], stage_bytes) != cudaSuccess ||
             cudaMalloc((void **) &ar->flag [i], flag_bytes)  != cudaSuccess ||
-            cudaMemset(ar->flag[i], 0, flag_bytes)           != cudaSuccess) {
+            cudaMemset(ar->flag[i], 0, flag_bytes)           != cudaSuccess ||
+            (ll_bytes > 0 && cudaMalloc((void **) &ar->ll[i], ll_bytes) != cudaSuccess) ||
+            (ll_bytes > 0 && cudaMemset(ar->ll[i], 0, ll_bytes)         != cudaSuccess)) {
             (void) cudaGetLastError();
             GGML_LOG_INFO("%s: staging allocation failed, keeping NCCL for AllReduce\n", __func__);
             ggml_cuda_p2p_ar_free(ar);
@@ -223,8 +305,8 @@ ggml_cuda_p2p_ar * ggml_cuda_p2p_ar_init(const int * devices, size_t n_devices) 
     }
 
     GGML_LOG_INFO("%s: one-shot P2P AllReduce enabled for %zu devices, up to %zu KiB per rank "
-                  "(%zu MiB staging per device), %d blocks\n",
-        __func__, n_devices, max_bytes >> 10, (stage_bytes + flag_bytes) >> 20, ar->nblocks);
+                  "(LL up to %zu KiB, %zu MiB staging per device), %d blocks\n",
+        __func__, n_devices, max_bytes >> 10, ll_max_bytes >> 10, (stage_bytes + flag_bytes + ll_bytes) >> 20, ar->nblocks);
 
     return ar;
 }
@@ -249,7 +331,12 @@ void ggml_cuda_p2p_ar_launch(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, g
 
     ggml_cuda_set_device(cuda_ctx->device);
 
-    ggml_cuda_p2p_ar_kernel<<<ar->nblocks, GGML_CUDA_P2P_AR_NTHREADS, 0, cuda_ctx->stream()>>>(args);
+    if ((size_t) args.nvec * sizeof(float4) <= ar->ll_max_bytes) {
+        const int nblocks_ll = (int) ((args.nvec + GGML_CUDA_P2P_AR_LL_NTHREADS - 1) / GGML_CUDA_P2P_AR_LL_NTHREADS);
+        ggml_cuda_p2p_ar_ll_kernel<<<nblocks_ll, GGML_CUDA_P2P_AR_LL_NTHREADS, 0, cuda_ctx->stream()>>>(args);
+    } else {
+        ggml_cuda_p2p_ar_kernel<<<ar->nblocks, GGML_CUDA_P2P_AR_NTHREADS, 0, cuda_ctx->stream()>>>(args);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -297,9 +384,11 @@ bool ggml_cuda_p2p_ar_prepare(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, 
     for (size_t j = 0; j < n_devices; ++j) {
         args.stage[j] = ar->stage[j];
         args.flag [j] = ar->flag [j];
+        args.ll   [j] = ar->ll   [j];
     }
     args.nvec         = ne / 4;
     args.stage_stride = ar->stage_stride;
+    args.ll_stride    = ar->ll_stride;
     args.n_devs       = (int) n_devices;
     args.slot         = (int) (ar->seq % GGML_CUDA_P2P_AR_NSLOTS);
     args.contrib_mask = contrib_mask;
