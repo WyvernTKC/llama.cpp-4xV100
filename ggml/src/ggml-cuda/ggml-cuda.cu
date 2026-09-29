@@ -6865,6 +6865,13 @@ static void ggml_backend_cuda_expert_cache_free(void * cache) {
     ggml_cuda_expert_cache_free(cache);
 }
 
+static bool ggml_backend_cuda_expert_cache_fill(ggml_backend_t backend, void * cache, const void * pool_data, void * dst) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    return ggml_cuda_expert_cache_fill(*(ggml_backend_cuda_context *) backend->context, cache, pool_data, dst);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -6887,6 +6894,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_expert_cache_free") == 0) {
         return (void *)ggml_backend_cuda_expert_cache_free;
+    }
+    if (strcmp(name, "ggml_backend_expert_cache_fill") == 0) {
+        return (void *)ggml_backend_cuda_expert_cache_fill;
+    }
+    if (strcmp(name, "ggml_backend_expert_cache_read_slots") == 0) {
+        return (void *)ggml_cuda_expert_cache_read_slots;
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_launch") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_launch;

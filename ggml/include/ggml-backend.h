@@ -223,6 +223,11 @@ extern "C" {
         const void * host_ptr, int64_t n_expert, int cap, size_t expert_bytes, size_t chunk_full, size_t chunk_dev,
         size_t offset_dev, int64_t n_chunks, int max_ids);
     typedef void   (*ggml_backend_expert_cache_free_t)(void * cache);
+    // For a ubatch too wide for the pool: copies the experts the pool holds from pool_data into dst, a whole copy of
+    //   this device's slice with one pool-sized slot per expert, on the stream of backend. read_slots gives the pool
+    //   slot of every expert (-1 when absent), so the caller can copy the others from host memory.
+    typedef bool   (*ggml_backend_expert_cache_fill_t)(ggml_backend_t backend, void * cache, const void * pool_data, void * dst);
+    typedef bool   (*ggml_backend_expert_cache_read_slots_t)(void * cache, int32_t * slot_of);
 
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);

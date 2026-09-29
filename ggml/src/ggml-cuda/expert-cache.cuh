@@ -27,3 +27,12 @@ bool ggml_cuda_expert_cache_is(const ggml_tensor * pool);
 // Gathers the experts routed by ids into pool (src0 of the MUL_MAT_ID) and fills ids_remap with a tensor
 // like ids whose values are pool slots.
 void ggml_cuda_expert_cache_gather(ggml_backend_cuda_context & ctx, const ggml_tensor * pool, const ggml_tensor * ids, ggml_tensor * ids_remap);
+
+// Copies the experts the pool holds from pool_data into dst, a whole staged copy of this device's slice of the
+// weight laid out with one slot-sized stride per expert, on the stream of ctx. The caller copies the others.
+// Returns false when the cache does not belong to ctx's device or an address is not aligned for the copy.
+bool ggml_cuda_expert_cache_fill(ggml_backend_cuda_context & ctx, void * cache, const void * pool_data, void * dst);
+
+// Reads the pool slot of every expert (-1 when absent) into slot_of[n_expert]. Synchronous; the caller makes
+// sure no gather that could change it is still queued.
+bool ggml_cuda_expert_cache_read_slots(void * cache, int32_t * slot_of);

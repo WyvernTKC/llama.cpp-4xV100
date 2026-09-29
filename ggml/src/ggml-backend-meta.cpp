@@ -720,6 +720,11 @@ struct ggml_backend_meta_gathered_weight {
     std::vector<ggml_tensor *>           pool_tensors; // one per device, nullptr where the slice is empty
     std::vector<void *>                  caches;
     ggml_backend_expert_cache_free_t     cache_free = nullptr;
+    // optional, for a ubatch too wide for the pools: see ggml_backend_meta_stage_weight
+    ggml_backend_expert_cache_fill_t       cache_fill       = nullptr;
+    ggml_backend_expert_cache_read_slots_t cache_read_slots = nullptr;
+    std::vector<int32_t>                   slots;         // pool slot of every expert, the same on every device
+    uint64_t                               slots_gen = 0; // g_meta_gather_gen when slots was read
     ggml_context_ptr                     pool_ctx;
     bool                                 failed = false;
     // what the entry was built for: a tuner can change the cap between graphs, and a reloaded model can
@@ -741,6 +746,11 @@ struct ggml_backend_meta_gather_registry {
     std::unordered_map<const ggml_tensor *, ggml_backend_meta_gathered_weight>  weights;
     int                                                                         n_backends = 0; // live meta backends
 };
+
+// Counts the graphs that gathered into the device expert pools, and which meta backend queued the last one. A
+//   whole-weight fill reads the pools, so it must follow those gathers on the device; see ggml_backend_meta_stage_weight.
+static std::atomic<uint64_t>     g_meta_gather_gen{0};
+static std::atomic<const void *> g_meta_gather_ctx{nullptr};
 
 // Heap allocated and never destroyed: the pools are freed when the last meta backend goes, while the
 //   CUDA runtime is still there. A static destructor would free device memory after it has gone.
@@ -852,6 +862,8 @@ static ggml_backend_meta_gathered_weight * ggml_backend_meta_gathered_weight_get
     ggml_backend_reg_t breg = ggml_backend_dev_backend_reg(ggml_backend_meta_dev_simple_dev(meta_dev, 0));
     auto cache_create = (ggml_backend_expert_cache_create_t) ggml_backend_reg_get_proc_address(breg, "ggml_backend_expert_cache_create");
     gw.cache_free     = (ggml_backend_expert_cache_free_t)   ggml_backend_reg_get_proc_address(breg, "ggml_backend_expert_cache_free");
+    gw.cache_fill     = (ggml_backend_expert_cache_fill_t)   ggml_backend_reg_get_proc_address(breg, "ggml_backend_expert_cache_fill");
+    gw.cache_read_slots = (ggml_backend_expert_cache_read_slots_t) ggml_backend_reg_get_proc_address(breg, "ggml_backend_expert_cache_read_slots");
     if (cache_create == nullptr || gw.cache_free == nullptr) {
         return give_up("the backend has no device expert cache");
     }
@@ -943,6 +955,58 @@ bool ggml_backend_meta_device_cache_owns(ggml_backend_t backend, const ggml_tens
     std::lock_guard<std::mutex> lock(reg.mutex);
     auto it = reg.weights.find(w);
     return it != reg.weights.end() && it->second.matches(w, ggml_backend_expert_cache_cap());
+}
+
+// A pooled weight staged whole for a ubatch too wide for its pool copies the experts the pool holds on the device
+//   and only the rest from host memory. GGML_META_EXPERT_CACHE_FILL=0 copies the whole weight from host.
+static bool ggml_backend_meta_expert_cache_fill_on() {
+    static const bool on = [] {
+        const char * env = getenv("GGML_META_EXPERT_CACHE_FILL");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return on && ggml_backend_meta_gather_device_mode();
+}
+
+// The pools a whole-weight staging of w into dst can fill from. nullptr means copy all of w from host: the fill is
+//   off, no graph has gathered into the pools yet (so they hold nothing), another meta backend queued the last
+//   gather (its streams are not ordered against this one's), w has no live pools, or dst is not laid out one pool
+//   slot per expert.
+static ggml_backend_meta_gathered_weight * ggml_backend_meta_fill_source(ggml_backend_t backend, const ggml_tensor * w,
+        const ggml_tensor * dst) {
+    if (w == nullptr || w->ne[3] != 1 || !ggml_backend_meta_expert_cache_fill_on() ||
+            g_meta_gather_gen.load() == 0 || g_meta_gather_ctx.load() != backend->context) {
+        return nullptr;
+    }
+    ggml_backend_meta_gathered_weight * gw = nullptr;
+    {
+        ggml_backend_meta_gather_registry & reg = ggml_backend_meta_gather_reg();
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        auto it = reg.weights.find(w);
+        if (it == reg.weights.end() || !it->second.matches(w, ggml_backend_expert_cache_cap()) ||
+                it->second.cache_fill == nullptr || it->second.cache_read_slots == nullptr) {
+            return nullptr;
+        }
+        gw = &it->second;
+    }
+    const size_t n_dev = ggml_backend_meta_n_backends(backend);
+    if (gw->pool_tensors.size() != n_dev || gw->caches.size() != n_dev) {
+        return nullptr;
+    }
+    for (size_t j = 0; j < n_dev; j++) {
+        const ggml_tensor * t = ggml_backend_meta_buffer_simple_tensor(dst, j);
+        if (t == nullptr) {
+            return nullptr;
+        }
+        if (ggml_nbytes(t) == 0) {
+            continue; // this device holds none of the weight
+        }
+        const ggml_tensor * p = gw->pool_tensors[j];
+        if (p == nullptr || gw->caches[j] == nullptr || !ggml_is_contiguous(t) || t->ne[2] != w->ne[2] ||
+                t->nb[2] != p->nb[2] || ggml_nbytes(t) != (size_t) w->ne[2]*p->nb[2]) {
+            return nullptr;
+        }
+    }
+    return gw;
 }
 
 // Flash attention with q split by head over mirrored k/v: the kv heads that the q heads of device j belong to.
@@ -2996,6 +3060,9 @@ struct ggml_backend_meta_context {
     size_t                      stage_slot_size = 0;
     int                         stage_next      = 0;
     bool                        stage_failed    = false;
+    // recorded on the compute streams after the gathers queued up to g_meta_gather_gen == fill_after_gen
+    std::vector<ggml_backend_event_t> fill_after;
+    uint64_t                          fill_after_gen = 0;
 
     std::string                 name;
     std::vector<backend_config> backend_configs;
@@ -3018,6 +3085,7 @@ struct ggml_backend_meta_context {
         // what this entry was sized for, so a recycled one knows to grow
         int      sized_nnodes    = 0;
         size_t   sized_subgraphs = 0;
+        bool     gathers         = false; // a MUL_MAT_ID reads a host weight through the device expert cache
     };
     // unique_ptr so growing the pool never invalidates a decomposition pointer
     std::vector<std::unique_ptr<decomposition>> decs;
@@ -3102,6 +3170,9 @@ struct ggml_backend_meta_context {
         }
         stage_slots.clear();
         for (ggml_backend_event_t ev : gather_events) {
+            ggml_backend_event_free(ev);
+        }
+        for (ggml_backend_event_t ev : fill_after) {
             ggml_backend_event_free(ev);
         }
         for (ggml_backend_t b : stage_backends) {
@@ -3852,11 +3923,69 @@ bool ggml_backend_meta_stage_weight_ranges(ggml_backend_t backend, ggml_tensor *
     return true;
 }
 
-// Move an offloaded weight into a rotating staging slot on the staging stream, so that the transfer runs
-// while the compute stream works through what is already queued.
-static bool ggml_backend_meta_stage_weight(ggml_backend_t backend, ggml_tensor * dst, const void * data, size_t size) {
+// Order the staging streams after every gather queued so far, before a fill reads the pools. Only the first fill
+//   after new gathers records the event, on compute streams that then also hold whatever part of the current
+//   ubatch is queued; decode pays nothing and a prefill waits once. False when the devices have no events.
+static bool ggml_backend_meta_fill_after_gathers(ggml_backend_t backend) {
     ggml_backend_meta_context * ctx = (ggml_backend_meta_context *) backend->context;
     const size_t n_dev = ggml_backend_meta_n_backends(backend);
+    if (ctx->fill_after.empty()) {
+        for (size_t j = 0; j < n_dev; j++) {
+            ggml_backend_event_t ev = ggml_backend_event_new(ggml_backend_get_device(ggml_backend_meta_simple_backend(backend, j)));
+            if (ev == nullptr) {
+                for (ggml_backend_event_t e : ctx->fill_after) {
+                    ggml_backend_event_free(e);
+                }
+                ctx->fill_after.clear();
+                return false;
+            }
+            ctx->fill_after.push_back(ev);
+        }
+    }
+    const uint64_t gen = g_meta_gather_gen.load();
+    if (ctx->fill_after_gen != gen) {
+        for (size_t j = 0; j < n_dev; j++) {
+            ggml_backend_event_record(ctx->fill_after[j], ggml_backend_meta_simple_backend(backend, j));
+        }
+        ctx->fill_after_gen = gen;
+    }
+    for (size_t j = 0; j < n_dev; j++) {
+        ggml_backend_event_wait(ctx->stage_backends[j], ctx->fill_after[j]);
+    }
+    return true;
+}
+
+// The residency a fill copies by: which experts the pools hold, read once after new gathers, when the host has
+//   waited for them to run. No gather runs during a wide ubatch, so it holds for every fill until the next decode.
+//   Every device assigns the same slots, so one device's copy is enough. Call after fill_after_gathers.
+static bool ggml_backend_meta_fill_slots(ggml_backend_t backend, ggml_backend_meta_gathered_weight * gw, int64_t n_expert) {
+    ggml_backend_meta_context * ctx = (ggml_backend_meta_context *) backend->context;
+    if (gw->slots_gen == ctx->fill_after_gen && (int64_t) gw->slots.size() == n_expert) {
+        return true;
+    }
+    size_t j0 = 0;
+    while (j0 < gw->caches.size() && gw->caches[j0] == nullptr) {
+        j0++;
+    }
+    if (j0 == gw->caches.size() || j0 >= ctx->fill_after.size()) {
+        return false;
+    }
+    ggml_backend_event_synchronize(ctx->fill_after[j0]);
+    gw->slots.resize(n_expert);
+    if (!gw->cache_read_slots(gw->caches[j0], gw->slots.data())) {
+        return false;
+    }
+    gw->slots_gen = ctx->fill_after_gen;
+    return true;
+}
+
+// Move an offloaded weight into a rotating staging slot on the staging stream, so that the transfer runs
+// while the compute stream works through what is already queued.
+static bool ggml_backend_meta_stage_weight(ggml_backend_t backend, ggml_tensor * dst, const ggml_tensor * src) {
+    ggml_backend_meta_context * ctx = (ggml_backend_meta_context *) backend->context;
+    const size_t n_dev = ggml_backend_meta_n_backends(backend);
+    const void * data = src->data;
+    const size_t size = ggml_nbytes(src);
 
     // the buffer type decides the real size: CUDA pads quantized rows and MMQ reads into that padding
     size_t need = 0;
@@ -3897,7 +4026,44 @@ static bool ggml_backend_meta_stage_weight(ggml_backend_t backend, ggml_tensor *
         ggml_backend_meta_buffer_simple_tensor(dst, j)->data = ggml_backend_buffer_get_base(slot.bufs[j].get());
     }
 
-    ggml_backend_meta_set_tensor_async_impl(backend, dst, data, 0, size, &ctx->stage_backends);
+    ggml_backend_meta_gathered_weight * gw = ggml_backend_meta_fill_source(backend, src, dst);
+    if (gw != nullptr && ggml_backend_meta_fill_after_gathers(backend) && ggml_backend_meta_fill_slots(backend, gw, src->ne[2])) {
+        // the experts the pools do not hold come from host memory, in runs of consecutive ids
+        const size_t  expert_size  = src->nb[2];
+        const int64_t n_expert     = src->ne[2];
+        int64_t       n_resident   = 0;
+        for (int64_t e0 = 0; e0 < n_expert; ) {
+            if (gw->slots[e0] >= 0) {
+                n_resident++;
+                e0++;
+                continue;
+            }
+            int64_t e1 = e0 + 1;
+            while (e1 < n_expert && gw->slots[e1] < 0) {
+                e1++;
+            }
+            ggml_backend_meta_set_tensor_async_impl(backend, dst, (const char *) data + e0*expert_size, e0*expert_size,
+                (e1 - e0)*expert_size, &ctx->stage_backends);
+            e0 = e1;
+        }
+        // and the others from the pools
+        for (size_t j = 0; n_resident > 0 && j < n_dev; j++) {
+            ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(dst, j);
+            if (ggml_nbytes(simple_tensor) == 0) {
+                continue;
+            }
+            const bool ok = gw->cache_fill(ctx->stage_backends[j], gw->caches[j], gw->pool_tensors[j]->data, simple_tensor->data);
+            GGML_ASSERT(ok && "the staging slot is not aligned for the expert cache fill");
+        }
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            GGML_LOG_INFO("%s: wide ubatch: %s staged with %lld of %lld experts from its pools\n", __func__, src->name,
+                (long long) n_resident, (long long) n_expert);
+        }
+    } else {
+        ggml_backend_meta_set_tensor_async_impl(backend, dst, data, 0, size, &ctx->stage_backends);
+    }
 
     for (size_t j = 0; j < n_dev; j++) {
         ggml_backend_event_record(slot.ready[j], ctx->stage_backends[j]);
@@ -3939,7 +4105,7 @@ static bool ggml_backend_meta_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         default:
             return false;
     }
-    if (!ggml_backend_meta_stage_weight(backend_dst, dst, src->data, ggml_nbytes(src))) {
+    if (!ggml_backend_meta_stage_weight(backend_dst, dst, src)) {
         ggml_backend_meta_set_tensor_async(backend_dst, dst, src->data, 0, ggml_nbytes(src));
     }
     return true;
@@ -4022,6 +4188,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
         D->uid = 0; // invalid until the rebuild below completes
+
+        // the scheduler copies every other host weight into the split, so one read in place is gathered
+        D->gathers = false;
+        for (int i = 0; i < cgraph->n_nodes && !D->gathers; i++) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            D->gathers = node->op == GGML_OP_MUL_MAT_ID && node->src[0] != nullptr && node->src[0]->buffer != nullptr &&
+                !ggml_backend_buffer_is_meta(node->src[0]->buffer);
+        }
     }
     D->used = ++backend_ctx->dec_clock;
     backend_ctx->cur = D;
@@ -4817,6 +4991,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 ggml_backend_event_record(pool->release[j], simple_backend);
             }
         });
+    }
+    if (D->gathers) {
+        g_meta_gather_ctx.store(backend_ctx);
+        g_meta_gather_gen.fetch_add(1);
     }
     backend_ctx->stage_pending.clear();
     backend_ctx->expert_pools_pending.clear();

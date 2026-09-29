@@ -158,6 +158,24 @@ static __global__ void expert_cache_copy(const ggml_cuda_expert_cache_dev d, cha
     }
 }
 
+// The experts the pool holds, copied from their slots into a whole staged copy of this device's slice of the
+// weight (one slot-sized stride per expert). The caller copies the other experts from host memory.
+template <typename T>
+static __global__ void expert_cache_fill(const ggml_cuda_expert_cache_dev d, const char * pool, char * dst) {
+    const size_t n = d.slot_bytes / sizeof(T);
+    for (int e = blockIdx.x; e < d.n_expert; e += gridDim.x) {
+        const int s = d.slot_of[e];
+        if (s < 0) {
+            continue;
+        }
+        const T * src_s = (const T *) (pool + (size_t) s*d.slot_bytes);
+        T *       dst_e = (T *) (dst + (size_t) e*d.slot_bytes);
+        for (size_t i = threadIdx.x; i < n; i += blockDim.x) {
+            dst_e[i] = src_s[i];
+        }
+    }
+}
+
 // Registered host ranges, so several weights in one buffer register it once.
 struct expert_cache_host_reg {
     const char * base;
@@ -333,4 +351,42 @@ void ggml_cuda_expert_cache_gather(ggml_backend_cuda_context & ctx, const ggml_t
     ids_remap->nb[3] = ids_remap->nb[2]*ids->ne[2];
     ids_remap->view_src = nullptr;
     ids_remap->extra    = nullptr;
+}
+
+bool ggml_cuda_expert_cache_read_slots(void * cache, int32_t * slot_of) {
+    const ggml_cuda_expert_cache * c = (const ggml_cuda_expert_cache *) cache;
+    if (c == nullptr || c->magic != GGML_CUDA_EXPERT_CACHE_MAGIC || slot_of == nullptr) {
+        return false;
+    }
+    ggml_cuda_set_device(c->device);
+    CUDA_CHECK(cudaMemcpy(slot_of, c->d.slot_of, (size_t) c->d.n_expert*sizeof(int32_t), cudaMemcpyDeviceToHost));
+    return true;
+}
+
+bool ggml_cuda_expert_cache_fill(ggml_backend_cuda_context & ctx, void * cache, const void * pool_data, void * dst) {
+    const ggml_cuda_expert_cache * c = (const ggml_cuda_expert_cache *) cache;
+    if (c == nullptr || c->magic != GGML_CUDA_EXPERT_CACHE_MAGIC || c->device != ctx.device ||
+            pool_data == nullptr || dst == nullptr || (uintptr_t) pool_data % c->align != 0 || (uintptr_t) dst % c->align != 0) {
+        return false;
+    }
+    const ggml_cuda_expert_cache_dev & d = c->d;
+    ggml_cuda_set_device(ctx.device);
+    cudaStream_t stream = ctx.stream();
+
+    // the copy runs beside the prefill matmuls: qwen4exp prefill is best at 64 blocks (16: -6%, 256: -4%);
+    //   GGML_META_EXPERT_CACHE_FILL_BLOCKS overrides
+    static const int n_blocks = getenv("GGML_META_EXPERT_CACHE_FILL_BLOCKS") ? atoi(getenv("GGML_META_EXPERT_CACHE_FILL_BLOCKS")) : 64;
+    const int  nthreads = 256;
+    const dim3 grid(std::max(1, std::min(n_blocks, d.n_expert)));
+    const char * pool = (const char *) pool_data;
+    char       * out  = (char *) dst;
+    switch (c->align) {
+        case 16: expert_cache_fill<int4>   <<<grid, nthreads, 0, stream>>>(d, pool, out); break;
+        case  8: expert_cache_fill<int2>   <<<grid, nthreads, 0, stream>>>(d, pool, out); break;
+        case  4: expert_cache_fill<int32_t><<<grid, nthreads, 0, stream>>>(d, pool, out); break;
+        case  2: expert_cache_fill<int16_t><<<grid, nthreads, 0, stream>>>(d, pool, out); break;
+        default: expert_cache_fill<int8_t> <<<grid, nthreads, 0, stream>>>(d, pool, out); break;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
 }
