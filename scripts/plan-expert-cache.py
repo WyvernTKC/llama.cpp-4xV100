@@ -250,23 +250,25 @@ class Plan:
     def vram(self, caps):
         return sum(min(caps[il], self.n_expert) * self.bytes_of[il] for il in self.layers)
 
-    def pick(self, budget):
+    def pick(self, budget, max_host=None):
         """best resident set + one cap for the rest within budget bytes: deployable with -ot and the cache env"""
         best = None
+        n_force = 0 if max_host is None else max(0, len(self.layers) - max_host)
         for cap in self.grid:
             if cap >= self.n_expert:
                 continue
             caps = {il: cap for il in self.layers}
             used = self.vram(caps)
-            if used > budget:
-                continue
             # a resident layer saves its copies at this cap and costs (n_expert - cap) more slots
             order = sorted(self.layers, key=lambda il: -self.cost(il, cap) / (self.n_expert - cap))
-            for il in order:
+            for k, il in enumerate(order):
                 extra = (self.n_expert - cap) * self.bytes_of[il]
-                if used + extra <= budget and self.cost(il, cap) > 0:
+                # host RAM may force the first n_force resident whatever they cost in VRAM
+                if k < n_force or (used + extra <= budget and self.cost(il, cap) > 0):
                     caps[il] = self.n_expert
                     used += extra
+            if used > budget:
+                continue
             v = self.mib_per_token(caps)
             if best is None or v < best[0]:
                 best = (v, cap, caps)
@@ -385,7 +387,10 @@ def cmd_plan(args):
 
     print(f"expert VRAM budget: {gib_dev(budget):.2f} GiB per GPU over {args.gpus} GPUs\n")
 
-    v, cap, caps = full.pick(budget)
+    picked = full.pick(budget, args.max_host)
+    if picked is None:
+        sys.exit(f"no config keeps at most {args.max_host} layers on the host within this VRAM budget")
+    v, cap, caps = picked
     resident = sorted(il for il in layers if caps[il] >= n_expert)
     host_new = sorted(il for il in layers if caps[il] < n_expert)
     pl = full.per_layer(budget)
@@ -401,7 +406,7 @@ def cmd_plan(args):
         print("\nheld-out (chosen on one half of the requests, scored on the other):")
         for fit, ev in ((0, 1), (1, 0)):
             pf, pe = plan_for(halves[fit]), plan_for(halves[ev])
-            _, cf, capsf = pf.pick(budget)
+            _, cf, capsf = pf.pick(budget, args.max_host)
             line = f"  fit {fit} -> score {ev}: plan {pe.mib_per_token(capsf):8.1f} MiB"
             if cur_caps is not None:
                 c0 = pe.mib_per_token(cur_caps)
@@ -453,6 +458,7 @@ def main():
     g.add_argument("--current-resident", help="current resident layers; all others are on the host")
     p.add_argument("--current-cap", type=int, help="current GGML_META_EXPERT_CACHE")
     p.add_argument("--budget-gib", type=float, help="expert VRAM per GPU to plan for, instead of the current config")
+    p.add_argument("--max-host", type=int, help="at most this many layers' experts on the host (pinned host RAM limit)")
     p.add_argument("--gpus", type=int, default=4, help="GPUs the experts are split over (for the per-GPU figures)")
     p.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) // 2))
 
