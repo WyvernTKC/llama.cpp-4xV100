@@ -1,48 +1,49 @@
 #include "moe-weighted-reduction.cuh"
 
-static __global__ void moe_weighted_reduction_f32(const float * __restrict__ experts,
-                                                  const float * __restrict__ expert_scale,
-                                                  const float * __restrict__ weights,
-                                                  float * __restrict__ dst,
+#define MOE_WEIGHTED_REDUCTION_SMEM_EXPERTS 16
+
+// blockIdx.x is the token and blockIdx.y a slice of its columns. A block reads the token's router weights (and expert
+//   scales) before any of its threads writes, so with a single block per token dst may sit on them; each thread reads
+//   the experts of its columns before it writes them, so dst may sit on the token's own expert rows. The products and
+//   the sum are rounded like the MULs and the chain of ADDs apart.
+static __global__ void moe_weighted_reduction_f32(const float * experts,
+                                                  const float * expert_scale,
+                                                  const float * weights,
+                                                  float *       dst,
                                                   const int64_t n_embd,
                                                   const int     n_expert_used) {
-    const int64_t token = blockIdx.x;
-    const int64_t col   = (int64_t) blockIdx.y * blockDim.x + threadIdx.x;
-    if (col >= n_embd) {
-        return;
+    const int64_t  token     = blockIdx.x;
+    const uint64_t first_row = (uint64_t) token * n_expert_used;
+
+    __shared__ float s_weights[MOE_WEIGHTED_REDUCTION_SMEM_EXPERTS];
+    __shared__ float s_scale[MOE_WEIGHTED_REDUCTION_SMEM_EXPERTS];
+    if (threadIdx.x < n_expert_used) {
+        s_weights[threadIdx.x] = weights[first_row + threadIdx.x];
+        s_scale[threadIdx.x]   = expert_scale != nullptr ? expert_scale[first_row + threadIdx.x] : 1.0f;
     }
+    __syncthreads();
 
-    const uint64_t first_row   = (uint64_t) token * n_expert_used;
-    const float    first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
-    float          sum         = (experts[first_row * n_embd + col] * first_scale) * weights[first_row];
-
-    for (int expert = 1; expert < n_expert_used; ++expert) {
-        const uint64_t row   = first_row + expert;
-        const float   scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
-        sum += (experts[row * n_embd + col] * scale) * weights[row];
+    for (int64_t col = (int64_t) blockIdx.y*blockDim.x + threadIdx.x; col < n_embd; col += (int64_t) gridDim.y*blockDim.x) {
+        float sum = 0.0f;
+#pragma unroll 8
+        for (int expert = 0; expert < n_expert_used; ++expert) {
+            float v = experts[(first_row + expert) * n_embd + col];
+            if (expert_scale != nullptr) {
+                v = __fmul_rn(v, s_scale[expert]);
+            }
+            v   = __fmul_rn(v, s_weights[expert]);
+            sum = expert == 0 ? v : __fadd_rn(sum, v);
+        }
+        dst[token * n_embd + col] = sum;
     }
-    dst[token * n_embd + col] = sum;
-}
-
-static void launch_moe_weighted_reduction(const float * experts,
-                                          const float * expert_scale,
-                                          const float * weights,
-                                          float *       dst,
-                                          int64_t       n_embd,
-                                          int64_t       n_tokens,
-                                          int           n_expert_used,
-                                          cudaStream_t  stream) {
-    constexpr int threads = 256;
-    const dim3 blocks(n_tokens, (n_embd + threads - 1) / threads, 1);
-    moe_weighted_reduction_f32
-        <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
 }
 
 void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
                                          const ggml_tensor *         experts,
                                          const ggml_tensor *         expert_scale,
                                          const ggml_tensor *         weights,
-                                         ggml_tensor *               dst) {
+                                         ggml_tensor *               dst,
+                                         const bool                  copy_weights) {
     GGML_ASSERT(experts->type == GGML_TYPE_F32);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
     GGML_ASSERT(expert_scale == nullptr || expert_scale->type == GGML_TYPE_F32);
@@ -56,10 +57,32 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
     const int64_t n_expert_used = experts->ne[1];
     const int64_t n_tokens      = experts->ne[2] * experts->ne[3];
     cudaStream_t  stream        = ctx.stream();
+    GGML_ASSERT(n_expert_used <= MOE_WEIGHTED_REDUCTION_SMEM_EXPERTS);
 
-    launch_moe_weighted_reduction((const float *) experts->data,
-                                  expert_scale ? (const float *) expert_scale->data : nullptr,
-                                  (const float *) weights->data,
-                                  (float *) dst->data, n_embd, n_tokens, (int) n_expert_used, stream);
+    const float * weights_d = (const float *) weights->data;
+    const float * scale_d   = expert_scale ? (const float *) expert_scale->data : nullptr;
+
+    // dst sits on the weights of other tokens, which other blocks read: a copy of them
+    ggml_cuda_pool_alloc<float> weights_copy(ctx.pool());
+    ggml_cuda_pool_alloc<float> scale_copy(ctx.pool());
+    if (copy_weights) {
+        weights_copy.alloc(ggml_nelements(weights));
+        CUDA_CHECK(cudaMemcpyAsync(weights_copy.get(), weights_d, ggml_nbytes(weights), cudaMemcpyDeviceToDevice, stream));
+        weights_d = weights_copy.get();
+        if (scale_d != nullptr) {
+            scale_copy.alloc(ggml_nelements(expert_scale));
+            CUDA_CHECK(cudaMemcpyAsync(scale_copy.get(), scale_d, ggml_nbytes(expert_scale), cudaMemcpyDeviceToDevice, stream));
+            scale_d = scale_copy.get();
+        }
+    }
+
+    // a single block per token when dst sits on the weights it still has to read, else a block per 256 columns
+    const bool one_block = !copy_weights && (ggml_cuda_tensors_overlap(dst, weights) ||
+        (expert_scale != nullptr && ggml_cuda_tensors_overlap(dst, expert_scale)));
+    GGML_ASSERT(!one_block || n_tokens == 1);
+    const int  threads = one_block ? 1024 : 256;
+    const dim3 blocks(n_tokens, one_block ? 1 : (n_embd + threads - 1) / threads, 1);
+    moe_weighted_reduction_f32<<<blocks, threads, 0, stream>>>(
+        (const float *) experts->data, scale_d, weights_d, (float *) dst->data, n_embd, (int) n_expert_used);
     CUDA_CHECK(cudaGetLastError());
 }

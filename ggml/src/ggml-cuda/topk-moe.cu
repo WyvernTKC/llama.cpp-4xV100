@@ -214,8 +214,10 @@ __global__ void topk_moe_cuda(const float *         logits,
                 }
             }
 
-            if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
-                selection_wt[max_expert / WARP_SIZE] = -INFINITY;
+            const bool owner = (max_expert & (WARP_SIZE - 1)) == threadIdx.x;
+#pragma unroll
+            for (int i = 0; i < experts_per_thread; i++) {
+                selection_wt[i] = owner && i == max_expert / WARP_SIZE ? -INFINITY : selection_wt[i];
             }
         } else {
 #pragma unroll
@@ -237,13 +239,20 @@ __global__ void topk_moe_cuda(const float *         logits,
                 }
             }
 
-            if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
-                wt[max_expert / WARP_SIZE] = -INFINITY;
+            const bool owner = (max_expert & (WARP_SIZE - 1)) == threadIdx.x;
+#pragma unroll
+            for (int i = 0; i < experts_per_thread; i++) {
+                wt[i] = owner && i == max_expert / WARP_SIZE ? -INFINITY : wt[i];
             }
         }
 
-        if ((k & (WARP_SIZE - 1)) == threadIdx.x) {
-            output_weights[k / WARP_SIZE] = max_val;
+        // every slot is written through a select: indexing wt, selection_wt or output_weights with max_expert / WARP_SIZE
+        //   or k / WARP_SIZE, or a guarded write to the one slot (which the compiler turns back into that), puts the arrays
+        //   in local memory, read again in every round
+        const bool k_owner = (k & (WARP_SIZE - 1)) == threadIdx.x;
+#pragma unroll
+        for (int i = 0; i < experts_per_thread; i++) {
+            output_weights[i] = k_owner && i == k / WARP_SIZE ? max_val : output_weights[i];
         }
 
         if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {

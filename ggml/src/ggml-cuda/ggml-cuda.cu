@@ -4678,10 +4678,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
-            const int output_idx = i + match.node_count - 1;
-            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
+            // The kernel reads only the experts, the expert scales and the router weights. Under -sm tensor the meta
+            //   backend has no graph_optimize, so the alloc deps of ggml_backend_cuda_graph_optimize are not made and
+            //   ggml-alloc can put dst over the weights, which the elided MUL read last: a block reads its token's
+            //   weights before it writes, and with several tokens the kernel reads a copy. Over the experts, dst can
+            //   only sit on the rows of a lone token, which the threads read before they write the same columns.
+            const int64_t n_tokens  = match.experts->ne[2] * match.experts->ne[3];
+            const bool    over_w    = ggml_cuda_tensors_overlap(match.dst, match.weights) ||
+                (match.expert_scale != nullptr && ggml_cuda_tensors_overlap(match.dst, match.expert_scale));
+            bool          safe      = true;
+            if (ggml_cuda_tensors_overlap(match.dst, match.experts)) {
+                const int64_t off = (const char *) match.dst->data - (const char *) match.experts->data;
+                safe = n_tokens == 1 && off >= 0 && off % (int64_t) match.experts->nb[1] == 0 &&
+                    off / (int64_t) match.experts->nb[1] < match.experts->ne[1];
+            }
+            if (safe) {
                 ggml_cuda_op_moe_weighted_reduction(
-                    *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
+                    *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst, over_w && n_tokens > 1);
                 return match.node_count - 1;
             }
         }
