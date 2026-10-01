@@ -10718,8 +10718,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 5, 4, 3 }, 4, eps, true));
             test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 5, 4, 3 }, 4, eps, false));
         }
-        // row lengths that are not a multiple of 32, for the scalar (33) and float4 (132, 260) paths
-        for (uint32_t n : { 33, 132, 260 }) {
+        // row lengths that are not a multiple of 32, for the scalar (33) and float4 (132, 260) paths, and rows of
+        //   3 and 5 columns per thread for the CUDA rms_norm that holds a row in registers
+        for (uint32_t n : { 33, 132, 260, 700, 5120 }) {
             for (bool v : { false, true }) {
                 test_cases.emplace_back(new test_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, v, eps));
                 test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, v, eps));
@@ -10773,7 +10774,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
         }
     }
-    for (uint32_t n : {1, 511, 1025, 8192, 33*512}) {
+    for (uint32_t n : {1, 511, 700, 1000, 1025, 3000, 5120, 7000, 8192, 33*512}) {
         for (bool multi_add : {false, true}) {
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false, multi_add));
             test_cases.emplace_back(new test_add_rms_norm_mul({n, 6, 1, 1}, 1e-6f));
