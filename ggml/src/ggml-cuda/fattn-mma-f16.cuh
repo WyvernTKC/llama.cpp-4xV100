@@ -402,6 +402,13 @@ static constexpr __device__ int get_cols_per_thread() {
 #endif // defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
 
+// Volta: x[(threadIdx.x/2) % 2], the value for the Q column of this thread's row of a VKQ tile, without a runtime index.
+//     A runtime index puts x in local memory. Where that frees registers it is the cheaper choice, so use this only
+//     where it measured better (split_d).
+static __device__ __forceinline__ float ggml_cuda_fattn_mma_volta_col(const float * x) {
+    return threadIdx.x & 2 ? x[1] : x[0];
+}
+
 static __host__ int get_cols_per_warp(const int cc) {
     if (turing_mma_available(cc) || amd_wmma_available(cc) || amd_mfma_available(cc)) {
         return 16;
@@ -511,7 +518,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
         // 6: max  1*16= 16 bytes,   8 half
         ggml_cuda_unroll<6>{}(load);
     } else {
-        const half2 zero[4] = {{0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}};
         auto load = [&] __device__ (const int n) {
             const int stride_k = 32 >> n;
             const int k0_start = stride_k == 32 ? 0 : chunks_per_row - chunks_per_row % (2*stride_k);
@@ -534,14 +540,23 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                 for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
                     const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
 
-                    const half2 * src;
+                    // rows past the end or not gathered are +0: a predicated load, a pointer to zeros in local memory
+                    //     would put them on the stack and make every load a generic one
+                    int64_t i_KV;
+                    bool    valid;
                     if constexpr (use_sparse) {
                         const int32_t index = i < i_sup ? indices[k_VKQ_0 + i] : -1;
-                        src = index >= 0 ? KV + int64_t(index)*stride_KV + k*h2_per_chunk : zero;
+                        i_KV  = index;
+                        valid = index >= 0;
                     } else {
-                        src = !oob_check || i < i_sup ? KV + int64_t(k_VKQ_0 + i)*stride_KV + k*h2_per_chunk : zero;
+                        i_KV  = k_VKQ_0 + i;
+                        valid = !oob_check || i < i_sup;
                     }
-                    ggml_cuda_memcpy_1<16>((char *) tile_KV + swizzle_bytes<swz, half2>(i, k*h2_per_chunk, stride_tile), src);
+                    int4 tmp = make_int4(0, 0, 0, 0);
+                    if (valid) {
+                        ggml_cuda_memcpy_1<16>(&tmp, KV + i_KV*stride_KV + k*h2_per_chunk);
+                    }
+                    ggml_cuda_memcpy_1<16>((char *) tile_KV + swizzle_bytes<swz, half2>(i, k*h2_per_chunk, stride_tile), &tmp);
                 }
             }
         };
@@ -1150,16 +1165,18 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
     if constexpr (split_d) {
         static_assert(nstages <= 1 && !V_is_K_view, "split_d loads V synchronously and does not reuse the K tile");
-        static_assert(nbatch_V2 % (np*T_C_VKQ::J) == 0, "bad nbatch_V2");
-        constexpr int nrt = nbatch_fa/T_A_VKQ::I; // tiles of 8 KV rows per batch, each warp has P for nrt/np of them
-        constexpr int nvw = nbatch_V2/np;         // half2 columns of each V batch accumulated by one warp
+        static_assert(std::is_same_v<T_C_VKQ, tile<32, 8, float>>, "split_d accumulates VKQ in f32");
+        constexpr int nrt    = nbatch_fa/T_A_VKQ::I; // tiles of 8 KV rows per batch, each warp has P for nrt/np of them
+        constexpr int nvw    = nbatch_V2/np;         // half2 columns of each V batch accumulated by one warp
+        constexpr int vkq_h2 = T_C_VKQ::J/2;         // half2 columns of one VKQ tile
+        static_assert(nvw % vkq_h2 == 0, "bad nbatch_V2");
 
         const int ip = threadIdx.y % np;
         half2 * tile_P_g   = tile_P + (threadIdx.y / np)*(nrt*warp_size*T_B_VKQ::ne);
         float * tile_max_g = (float *) (tile_P + (nwarps/np)*(nrt*warp_size*T_B_VKQ::ne)) + (threadIdx.y / np)*(np*warp_size);
 
         // thread i has the max of Q column i in KQ_max_new[(i/2) % 2], see T_C_KQ
-        tile_max_g[ip*warp_size + threadIdx.x] = KQ_max_new[(threadIdx.x / 2) % 2];
+        tile_max_g[ip*warp_size + threadIdx.x] = ggml_cuda_fattn_mma_volta_col(KQ_max_new);
 #pragma unroll
         for (int k = 0; k < nrt/np; ++k) {
             ggml_cuda_memcpy_1<sizeof(B[k].x)>(tile_P_g + ((k*np + ip)*warp_size + threadIdx.x)*T_B_VKQ::ne, B[k].x);
@@ -1188,12 +1205,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             KQ_rowsum[col] = KQ_max_scale[col]*KQ_rowsum[col] + KQ_own_scale*KQ_rowsum_add[col];
         }
 
-        const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[(threadIdx.x / 2) % 2], KQ_max_scale[(threadIdx.x / 2) % 2]);
+        // the VKQ tiles have the layout of T_C_KQ: value l is in Q column (l/2) % 2 of this thread.
+        //     At long context the max rarely changes, so skip the f32 rescale when it is 1 for the whole warp.
+        if (__any_sync(0xFFFFFFFF, KQ_max_scale[0] != 1.0f || KQ_max_scale[1] != 1.0f)) {
 #pragma unroll
-        for (int i = 0; i < DV/(2*T_C_VKQ::J*np); ++i) {
+            for (int i = 0; i < (DV/2)/(vkq_h2*np); ++i) {
 #pragma unroll
-            for (int l = 0; l < T_C_VKQ::ne; ++l) {
-                VKQ_C[i].x[l] *= KQ_max_scale_h2;
+                for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                    VKQ_C[i].x[l] *= KQ_max_scale[(l/2) % 2];
+                }
             }
         }
 
@@ -1201,18 +1221,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         half2 P_scale[np];
 #pragma unroll
         for (int p = 0; p < np; ++p) {
-            const float diff = tile_max_g[p*warp_size + threadIdx.x] - KQ_max_common[(threadIdx.x / 2) % 2];
+            const float diff = tile_max_g[p*warp_size + threadIdx.x] - ggml_cuda_fattn_mma_volta_col(KQ_max_common);
             const float s = diff >= SOFTMAX_FTZ_THRESHOLD ? expf(diff) : 0.0f;
             P_scale[p] = make_half2(s, s);
-        }
-        T_B_VKQ B_all[nrt];
-#pragma unroll
-        for (int r = 0; r < nrt; ++r) {
-            ggml_cuda_memcpy_1<sizeof(B_all[r].x)>(B_all[r].x, tile_P_g + (r*warp_size + threadIdx.x)*T_B_VKQ::ne);
-#pragma unroll
-            for (int l = 0; l < T_B_VKQ::ne; ++l) {
-                B_all[r].x[l] *= P_scale[r % np];
-            }
         }
 
 #pragma unroll
@@ -1227,14 +1238,21 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             }
             __syncthreads();
 
-            // this warp accumulates the half2 columns [ip*nvw, (ip + 1)*nvw) of each V batch
+            // this warp accumulates the half2 columns [ip*nvw, (ip + 1)*nvw) of each V batch.
+            //     P is read again from SRAM for each V batch: keeping all of it in registers makes the f32 VKQ spill.
 #pragma unroll
-            for (int i1 = 0; i1 < nvw; i1 += T_C_VKQ::J) {
+            for (int r = 0; r < nrt; ++r) {
+                T_B_VKQ P;
+                ggml_cuda_memcpy_1<sizeof(P.x)>(P.x, tile_P_g + (r*warp_size + threadIdx.x)*T_B_VKQ::ne);
 #pragma unroll
-                for (int r = 0; r < nrt; ++r) {
+                for (int l = 0; l < T_B_VKQ::ne; ++l) {
+                    P.x[l] *= P_scale[r % np];
+                }
+#pragma unroll
+                for (int i1 = 0; i1 < nvw; i1 += vkq_h2) {
                     T_A_VKQ A;
                     load_ldmatrix(A, tile_V + r*T_A_VKQ::I*stride_tile_V + ip*nvw + i1, stride_tile_V);
-                    mma(VKQ_C[(i0_start/(2*nbatch_V2))*(nvw/T_C_VKQ::J) + i1/T_C_VKQ::J], B_all[r], A);
+                    mma(VKQ_C[(i0_start/(2*nbatch_V2))*(nvw/vkq_h2) + i1/vkq_h2], P, A);
                 }
             }
             __syncthreads();
@@ -1489,6 +1507,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages       (DKQ, DV, ncols1, ncols2, use_sparse);
     constexpr bool split_d         = ggml_cuda_fattn_mma_get_split_d        (DKQ, DV, ncols);
 
+    // split_d: each VKQ accumulator sums over all KV rows, too many for f16 at long context, so it is f32.
+    //     A tile<32, 8, float> holds the same 8 values per Q column as the f16 tile<32, 4, half2>.
+#if defined(VOLTA_MMA_AVAILABLE)
+    using T_C_VKQ_acc = std::conditional_t<split_d, tile<32, 8, float>, T_C_VKQ>;
+#else
+    using T_C_VKQ_acc = T_C_VKQ;
+#endif // defined(VOLTA_MMA_AVAILABLE)
+
     if (cols_per_warp > ncols) {
         NO_DEVICE_CODE;
         return;
@@ -1518,7 +1544,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 #elif defined(AMD_WMMA_AVAILABLE)
     T_C_VKQ VKQ_C[                                     DV/(2*T_C_VKQ::J)];
 #else // Volta
-    T_C_VKQ VKQ_C[                                     DV/(2*T_C_VKQ::J*(split_d ? np : 1))];
+    T_C_VKQ_acc VKQ_C[                                 DV/(2*T_C_VKQ::J*(split_d ? np : 1))];
 #endif // defined(TURING_MMA_AVAILABLE)
 
     float KQ_rowsum[cols_per_thread] = {0.0f};
@@ -1610,7 +1636,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             constexpr int  k_VKQ_sup = nbatch_fa;
             flash_attn_ext_f16_iter
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
-                 type_KV, T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+                 type_KV, T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ_acc>
                 (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, tile_P, Q_B, VKQ_C,
                  KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
@@ -1619,7 +1645,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
         flash_attn_ext_f16_iter
             <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
-              type_KV, T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+              type_KV, T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ_acc>
             (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, tile_P, Q_B, VKQ_C,
              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
@@ -1630,7 +1656,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             constexpr int  k_VKQ_sup = nbatch_fa;
             flash_attn_ext_f16_iter
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
-                 type_KV, T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+                 type_KV, T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ_acc>
                 (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, tile_P, Q_B, VKQ_C,
                  KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
@@ -1639,7 +1665,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         constexpr int  k_VKQ_sup = nbatch_fa;
         flash_attn_ext_f16_iter
             <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
-             type_KV, T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+             type_KV, T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ_acc>
             (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, tile_P, Q_B, VKQ_C,
              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
@@ -1746,13 +1772,24 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             }
         }
 #else // Volta
-        const int col = (threadIdx.x / 2) % 2;
-        const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[col], KQ_max_scale[col]);
+        if constexpr (split_d) {
+            // f32 VKQ tiles with the layout of T_C_KQ: value l is in Q column (l/2) % 2 of this thread
 #pragma unroll
-        for (int i = 0; i < (DV/2)/(T_C_VKQ::J*(split_d ? np : 1)); ++i) {
+            for (int i = 0; i < (DV/2)/(T_C_VKQ::J*np); ++i) {
 #pragma unroll
-            for (int l = 0; l < T_C_VKQ::ne; ++l) {
-                VKQ_C[i].x[l] *= KQ_max_scale_h2;
+                for (int l = 0; l < T_C_VKQ_acc::ne; ++l) {
+                    VKQ_C[i].x[l] *= KQ_max_scale[(l/2) % 2];
+                }
+            }
+        } else {
+            const int col = (threadIdx.x / 2) % 2;
+            const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[col], KQ_max_scale[col]);
+#pragma unroll
+            for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
+#pragma unroll
+                for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                    VKQ_C[i].x[l] *= KQ_max_scale_h2;
+                }
             }
         }
 #endif // defined(TURING_MMA_AVAILABLE)
@@ -1924,31 +1961,34 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             }
         } else {
             const int j0 = threadIdx.y*cols_per_warp;
-            if constexpr (std::is_same_v<decltype(T_C_VKQ::x), half2[T_C_VKQ::ne]>) {
-                if constexpr (split_d) {
-                    // each warp has the columns [ip*nvw, (ip + 1)*nvw) of each V batch, all go to the rows of the first warp of the group
-                    constexpr int nvw = nbatch_V2/np;
-                    const int ip   = threadIdx.y % np;
-                    const int j0_g = j0 - ip*cols_per_warp;
+            if constexpr (split_d) {
+                // each warp has the columns [ip*nvw, (ip + 1)*nvw) of each V batch, all go to the rows of the first warp of the group.
+                //     The f32 values l and l + 1 (l even) are 2 adjacent columns of one Q column.
+                constexpr int nvw    = nbatch_V2/np;
+                constexpr int vkq_h2 = T_C_VKQ_acc::J/2;
+                const int ip   = threadIdx.y % np;
+                const int j0_g = j0 - ip*cols_per_warp;
 #pragma unroll
-                    for (int iv = 0; iv < (DV/2)/nbatch_V2; ++iv) {
-                        if (iv*nbatch_V2 >= k00 + nbatch_combine || (iv + 1)*nbatch_V2 <= k00) {
+                for (int iv = 0; iv < (DV/2)/nbatch_V2; ++iv) {
+                    if (iv*nbatch_V2 >= k00 + nbatch_combine || (iv + 1)*nbatch_V2 <= k00) {
+                        continue;
+                    }
+#pragma unroll
+                    for (int k1 = 0; k1 < nvw; k1 += vkq_h2) {
+                        const int k = iv*nbatch_V2 + ip*nvw + k1 - k00;
+                        if (k < 0 || k >= nbatch_combine) {
                             continue;
                         }
+                        const T_C_VKQ_acc & VKQ_t = VKQ_C[iv*(nvw/vkq_h2) + k1/vkq_h2];
 #pragma unroll
-                        for (int k1 = 0; k1 < nvw; k1 += T_C_VKQ::J) {
-                            const int k = iv*nbatch_V2 + ip*nvw + k1 - k00;
-                            if (k < 0 || k >= nbatch_combine) {
-                                continue;
-                            }
-#pragma unroll
-                            for (int l = 0; l < T_C_VKQ::ne; ++l) {
-                                tile_Q[(j0_g + T_C_VKQ::get_i(l))*tile_stride + k + T_C_VKQ::get_j(l)] =
-                                    VKQ_C[iv*(nvw/T_C_VKQ::J) + k1/T_C_VKQ::J].x[l];
-                            }
+                        for (int l = 0; l < T_C_VKQ_acc::ne; l += 2) {
+                            tile_Q[(j0_g + T_C_VKQ_acc::get_i(l))*tile_stride + k + T_C_VKQ_acc::get_j(l)/2] =
+                                make_half2(VKQ_t.x[l], VKQ_t.x[l + 1]);
                         }
                     }
-                } else if constexpr (T_C_VKQ::dl == DATA_LAYOUT_I_MAJOR) {
+                }
+            } else if constexpr (std::is_same_v<decltype(T_C_VKQ::x), half2[T_C_VKQ::ne]>) {
+                if constexpr (T_C_VKQ::dl == DATA_LAYOUT_I_MAJOR) {
 #pragma unroll
                     for (int k1 = 0; k1 < nbatch_combine; k1 += T_C_VKQ::J) {
 #pragma unroll
