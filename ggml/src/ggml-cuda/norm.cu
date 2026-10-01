@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "unary.cuh"
 #include <cstdint>
 
 template <int block_size>
@@ -205,6 +206,58 @@ static __global__ void rms_norm_pre_add_f32(const float * a, const float * b, fl
     for (int col = tid; col < ncols; col += block_size) {
         const int mul_col = fastmodulo(col, mul_ncols_packed);
         dst[col] = scale * sum[col] * mul[mul_col];
+    }
+}
+
+// dst = op(gate) * (rms_norm(x) * mul): the gated output norm of a gated delta net layer (build_norm_gated) in one launch
+//   instead of two. The norm reduces exactly like rms_norm_f32 with the same block size and the gate is applied like in
+//   unary_gated_op_kernel, so the values are those of the separate kernels. x and gate have contiguous rows, dst is
+//   contiguous.
+template <int block_size, float (*op)(float)>
+static __global__ void rms_norm_gated_f32(const float * x, const float * gate, float * dst, const int ncols,
+                                          const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
+                                          const int64_t gate_stride_row, const int64_t gate_stride_channel,
+                                          const int64_t gate_stride_sample, const float eps, const float * mul,
+                                          const int64_t mul_stride_row, const int64_t mul_stride_channel,
+                                          const int64_t mul_stride_sample, const uint3 mul_ncols_packed,
+                                          const uint3 mul_nrows_packed, const uint3 mul_nchannels_packed,
+                                          const uint3 mul_nsamples_packed) {
+    ggml_cuda_pdl_lc();
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+
+    const int row     = blockIdx.x;
+    const int channel = blockIdx.y;
+    const int sample  = blockIdx.z;
+    const int tid     = threadIdx.x;
+
+    x    += sample*stride_sample + channel*stride_channel + row*stride_row;
+    gate += sample*gate_stride_sample + channel*gate_stride_channel + row*gate_stride_row;
+    dst  += ((int64_t(sample)*nchannels + channel)*nrows + row)*ncols;
+
+    const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
+    const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
+    const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
+    mul += mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
+
+    float tmp = 0.0f;
+
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const int   mul_col = fastmodulo(col, mul_ncols_packed);
+        const float normed  = scale * x[col] * mul[mul_col];
+        dst[col] = op(gate[col]) * normed;
     }
 }
 
@@ -705,6 +758,91 @@ void ggml_cuda_op_rms_norm_pre_add(ggml_backend_cuda_context & ctx, ggml_tensor 
         ggml_cuda_kernel_launch(rms_norm_pre_add_f32<1024>, launch_params, a_d, b_d, sum_d, dst_d, ncols, eps, w_d,
             (int64_t) (w->nb[1]/ts_w), (int64_t) (w->nb[2]/ts_w), (int64_t) (w->nb[3]/ts_w),
             mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
+    }
+}
+
+// the same functions as op_silu and op_sigmoid of unary_gated_op_kernel
+static __device__ __forceinline__ float rms_norm_gate_silu(float x) {
+    return ggml_cuda_op_silu_single(x);
+}
+
+static __device__ __forceinline__ float rms_norm_gate_sigmoid(float x) {
+    return ggml_cuda_op_sigmoid_single(x);
+}
+
+bool ggml_cuda_should_fuse_rms_norm_gated(const ggml_tensor * rms_norm, const ggml_tensor * mul, const ggml_tensor * unary,
+                                          const ggml_tensor * mul_gate) {
+    if (rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || unary->op != GGML_OP_UNARY || mul_gate->op != GGML_OP_MUL) {
+        return false;
+    }
+    const ggml_unary_op uop = ggml_get_unary_op(unary);
+    if (uop != GGML_UNARY_OP_SILU && uop != GGML_UNARY_OP_SIGMOID) {
+        return false;
+    }
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : (mul->src[1] == rms_norm ? mul->src[0] : nullptr);
+    if (w == nullptr || w == rms_norm ||
+            !((mul_gate->src[0] == mul && mul_gate->src[1] == unary) || (mul_gate->src[0] == unary && mul_gate->src[1] == mul))) {
+        return false;
+    }
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * z = unary->src[0];
+    for (const ggml_tensor * t : { x, z, w, rms_norm, mul, unary, mul_gate }) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    // a block reads its rows of x twice and writes its row of dst after the reduction, so dst may sit exactly on a
+    //   contiguous x or z (ggml-alloc can reuse them once the elided nodes are done) but not partly over one
+    return ggml_are_same_shape(mul, rms_norm) && ggml_are_same_shape(z, rms_norm) && ggml_are_same_shape(mul_gate, rms_norm) &&
+        x->nb[0] == sizeof(float) && z->nb[0] == sizeof(float) && w->nb[0] == sizeof(float) && ggml_can_repeat(w, rms_norm) &&
+        ggml_is_contiguous(mul_gate) && rms_norm->ne[1] <= INT_MAX && rms_norm->ne[2] <= 65535 && rms_norm->ne[3] <= 65535 &&
+        ggml_cuda_same_or_disjoint(mul_gate, x) && (mul_gate->data != x->data || ggml_is_contiguous(x)) &&
+        ggml_cuda_same_or_disjoint(mul_gate, z) && (mul_gate->data != z->data || ggml_is_contiguous(z)) &&
+        !ggml_cuda_tensors_overlap(mul_gate, w);
+}
+
+void ggml_cuda_op_rms_norm_gated(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul, ggml_tensor * unary,
+                                 ggml_tensor * mul_gate) {
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * z = unary->src[0];
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const int ncols = x->ne[0];
+    const dim3 blocks_num(x->ne[1], x->ne[2], x->ne[3]);
+
+    const size_t ts = sizeof(float);
+    const uint3 mul_ncols_packed     = init_fastdiv_values(w->ne[0]);
+    const uint3 mul_nrows_packed     = init_fastdiv_values(w->ne[1]);
+    const uint3 mul_nchannels_packed = init_fastdiv_values(w->ne[2]);
+    const uint3 mul_nsamples_packed  = init_fastdiv_values(w->ne[3]);
+
+    const auto launch = [&](auto kernel, const int block_size) {
+        const dim3 block_dims(block_size, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0, ctx.stream()};
+        ggml_cuda_kernel_launch(kernel, launch_params, (const float *) x->data, (const float *) z->data, (float *) mul_gate->data,
+            ncols, (int64_t) (x->nb[1]/ts), (int64_t) (x->nb[2]/ts), (int64_t) (x->nb[3]/ts),
+            (int64_t) (z->nb[1]/ts), (int64_t) (z->nb[2]/ts), (int64_t) (z->nb[3]/ts), eps, (const float *) w->data,
+            (int64_t) (w->nb[1]/ts), (int64_t) (w->nb[2]/ts), (int64_t) (w->nb[3]/ts),
+            mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
+    };
+    // the block size rms_norm_f32 would pick, which fixes the order of the reduction
+    const bool silu = ggml_get_unary_op(unary) == GGML_UNARY_OP_SILU;
+    if (ncols < 1024) {
+        if (silu) {
+            launch(rms_norm_gated_f32<256, rms_norm_gate_silu>, 256);
+        } else {
+            launch(rms_norm_gated_f32<256, rms_norm_gate_sigmoid>, 256);
+        }
+    } else {
+        if (silu) {
+            launch(rms_norm_gated_f32<1024, rms_norm_gate_silu>, 1024);
+        } else {
+            launch(rms_norm_gated_f32<1024, rms_norm_gate_sigmoid>, 1024);
+        }
     }
 }
 

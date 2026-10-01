@@ -255,6 +255,10 @@ ggml_tensor * llama_model_qwen35::graph::build_norm_gated(
         ggml_tensor * weights,
         ggml_tensor * gate,
         int           layer) {
+    // the gate goes in before the norm: otherwise its projection lands between the norm and the gate op,
+    //   and the CUDA backend cannot fuse the four ops into one kernel
+    ggml_build_forward_expand(gf, input);
+    ggml_build_forward_expand(gf, gate);
     ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
     ggml_tensor * gated_silu = ggml_silu(ctx0, gate);
 

@@ -747,6 +747,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
         ggml_tensor * weights,
         ggml_tensor * gate,
         int           layer) {
+    // the gate goes in before the norm: otherwise its projection lands between the norm and the gate op,
+    //   and the CUDA backend cannot fuse the four ops into one kernel
+    ggml_build_forward_expand(gf, input);
+    ggml_build_forward_expand(gf, gate);
+
     // the one numerical difference from Qwen3.5's GDN: sigmoid output gate, not silu
     ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
     ggml_tensor * gated = ggml_sigmoid(ctx0, gate);

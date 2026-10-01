@@ -4362,6 +4362,50 @@ struct test_rms_norm_scale : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_UNARY + GGML_OP_MUL (rms_norm(x) * w * op(z), build_norm_gated)
+struct test_rms_norm_gated : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const ggml_unary_op op;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_GATED";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(type, ne) + ",op=" + ggml_unary_op_name(op);
+    }
+
+    test_rms_norm_gated(ggml_type type = GGML_TYPE_F32, std::array<int64_t, 4> ne = {128, 12, 1, 1},
+            ggml_unary_op op = GGML_UNARY_OP_SILU)
+        : type(type), ne(ne), op(op) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, type, ne[0]);
+        ggml_tensor * z = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(x, "x");
+        ggml_set_name(w, "w");
+        ggml_set_name(z, "z");
+
+        ggml_tensor * normed = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        ggml_tensor * gate   = op == GGML_UNARY_OP_SILU ? ggml_silu(ctx, z) : ggml_sigmoid(ctx, z);
+        ggml_tensor * out    = ggml_mul(ctx, normed, gate);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_ADD (fused residual chain)
 struct test_add_add : public test_case {
     const ggml_type type;
@@ -10755,6 +10799,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_scale(GGML_TYPE_F32, { 128, 4, 3, 2 }, 1e-6f, 0.0883883476f));
     test_cases.emplace_back(new test_rms_norm_scale(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, 0.125f));
     test_cases.emplace_back(new test_rms_norm_scale(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, 2.0f, 0.5f));
+    for (ggml_unary_op op : { GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID }) {
+        test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 128, 12, 1, 1 }, op));
+        test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 128, 12, 6, 1 }, op));
+        test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 128, 48, 4, 2 }, op));
+        test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 64, 5, 4, 3 }, op));
+        test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 1536, 2, 1, 1 }, op));
+    }
 
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));
