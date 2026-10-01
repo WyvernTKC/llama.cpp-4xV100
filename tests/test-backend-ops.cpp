@@ -5076,6 +5076,84 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// build_conv_state + GGML_OP_SSM_CONV + silu of one sequence, in the node order of the model: the conv state is
+//   GET_ROWS of a cache, concatenated with the transposed new tokens, a CPY stores a window of the concat to each
+//   rollback slot, and the convolution reads the concat. Checks the silu output and the whole cache.
+struct test_ssm_conv_state : public test_case {
+    const int64_t nr;       // channels
+    const int64_t n_t;      // tokens
+    const int64_t K;        // rollback slots, n_rs_seq + 1
+    const int32_t src_row;  // the cache row of the start state
+    const int64_t kv_head;  // the cell the slots store to
+
+    static constexpr int64_t d_conv  = 4;
+    static constexpr int64_t n_cells = 3;
+
+    ggml_tensor * silu      = nullptr;
+    ggml_tensor * cache_out = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_STATE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(nr, n_t, K, src_row, kv_head);
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { silu, cache_out }; }
+
+    test_ssm_conv_state(int64_t nr = 256, int64_t n_t = 1, int64_t K = 1, int32_t src_row = 1, int64_t kv_head = 1)
+        : nr(nr), n_t(n_t), K(K), src_row(src_row), kv_head(kv_head) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t row = (d_conv - 1)*nr;
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row, n_cells*K);
+        ggml_tensor * ids   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_tensor * x     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nr, n_t, 1);
+        ggml_tensor * w     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, nr);
+        ggml_set_name(cache, "cache");
+        ggml_set_name(ids,   "ids");
+        ggml_set_name(x,     "x");
+        ggml_set_name(w,     "w");
+
+        ggml_tensor * states     = ggml_reshape_3d(ctx, ggml_get_rows(ctx, cache, ids), d_conv - 1, nr, 1);
+        ggml_tensor * conv_input = ggml_concat(ctx, states, ggml_transpose(ctx, x), 0);
+
+        // slot s holds the window that ends s tokens before the last
+        const int64_t n_slots = std::min<int64_t>(n_t, K - 1);
+        for (int64_t s = 0; s <= n_slots; ++s) {
+            ggml_tensor * win = ggml_view_3d(ctx, conv_input, d_conv - 1, nr, 1, conv_input->nb[1], conv_input->nb[2],
+                    ggml_row_size(conv_input->type, n_t - s));
+            ggml_tensor * dst = ggml_view_2d(ctx, cache, row, 1, cache->nb[1], (s*n_cells + kv_head)*cache->nb[1]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, win, dst));
+        }
+
+        silu = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, w));
+        ggml_set_name(silu, "silu");
+        ggml_build_forward_expand(gf, silu);
+
+        // the cache after the slot copies
+        cache_out = ggml_scale(ctx, cache, 1.0f);
+        ggml_set_name(cache_out, "cache_out");
+        return cache_out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (strcmp(t->name, "ids") == 0) {
+                ggml_backend_tensor_set(t, &src_row, 0, sizeof(src_row));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -10874,6 +10952,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // build_conv_state, which CUDA runs as one kernel up to 8 tokens: decode without and with rollback slots, a draft
+    //   step and an MTP verify, a channel count the block does not divide, a start state read from a row the slots
+    //   write (cell 1 is slot 0's row, row 4 is slot 1's), and 12 tokens, which stay apart
+    test_cases.emplace_back(new test_ssm_conv_state(256,  1, 1, 1, 1));
+    test_cases.emplace_back(new test_ssm_conv_state(256,  1, 1, 2, 0));
+    test_cases.emplace_back(new test_ssm_conv_state(2560, 1, 6, 1, 1));
+    test_cases.emplace_back(new test_ssm_conv_state(2560, 6, 6, 1, 1));
+    test_cases.emplace_back(new test_ssm_conv_state(1000, 3, 2, 0, 2));
+    test_cases.emplace_back(new test_ssm_conv_state(512,  8, 4, 1, 1));
+    test_cases.emplace_back(new test_ssm_conv_state(512,  2, 4, 4, 1));
+    test_cases.emplace_back(new test_ssm_conv_state(512, 12, 4, 1, 1));
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 96, 64, 128, 8, 1, 1)); // Nemotron-3-Puzzle decode (scan path, unused warp in last block)
