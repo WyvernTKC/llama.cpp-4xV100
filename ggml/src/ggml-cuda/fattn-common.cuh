@@ -1216,6 +1216,11 @@ void launch_fattn(
             if (amd_wmma_available(cc) && DKQ == 64) {
                 return true; // TODO better configuration
             }
+            // Volta: with few waves the idle SMs of the last one cost more than stream-k, even above 75%.
+            //     With many waves stream-k is slower: the blocks no longer read K/V in step, so L2 hits drop.
+            if (volta_mma_available(cc) && tiles_nwaves <= 4 && tiles_efficiency_percent < 90) {
+                return true;
+            }
             return tiles_efficiency_percent < 75;
         };
 
