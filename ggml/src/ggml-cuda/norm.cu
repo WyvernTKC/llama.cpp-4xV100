@@ -316,6 +316,88 @@ static __global__ void __launch_bounds__(block_size) rms_norm_pre_add_f32(const 
     }
 }
 
+// y = rms_norm(x) * w1 + r, with has_scale y *= s (one value or one per column), and dst = rms_norm(y) * w2: the
+//   post-norm of a gemma attention or FFN block, its residual add (and the layer output scale) and the pre-norm of the
+//   next block on the same row in one launch. Both norms reduce like rms_norm_f32 with the same block size and the y
+//   of the separate kernels is written, so both outputs are those of the ops apart. Every input is read before the
+//   first reduction, so an output may sit exactly on an input; the second reduction has its own shared slots.
+template <int block_size, int cols_per_thread, bool has_scale>
+static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
+        const float * x, const float * w1, const float * r, const float * s, const float * w2, float * y_out, float * dst,
+        const int ncols, const float eps1, const float eps2, const bool s_per_col) {
+    ggml_cuda_pdl_lc();
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+    const int tid       = threadIdx.x;
+
+    const int64_t offset = ((int64_t(blockIdx.z)*nchannels + blockIdx.y)*nrows + blockIdx.x)*ncols;
+    x     += offset;
+    r     += offset;
+    y_out += offset;
+    dst   += offset;
+
+    float xv[cols_per_thread];
+    float w1v[cols_per_thread];
+    float rv[cols_per_thread];
+    float w2v[cols_per_thread];
+    [[maybe_unused]] float sv[cols_per_thread];
+
+    ggml_cuda_pdl_sync();
+#pragma unroll
+    for (int i = 0; i < cols_per_thread; ++i) {
+        const int col = tid + i*block_size;
+        xv[i] = col < ncols ? x[col] : 0.0f;
+    }
+#pragma unroll
+    for (int i = 0; i < cols_per_thread; ++i) {
+        const int col = tid + i*block_size;
+        w1v[i] = col < ncols ? w1[col] : 0.0f;
+        rv[i]  = col < ncols ? r[col]  : 0.0f;
+        w2v[i] = col < ncols ? w2[col] : 0.0f;
+        if constexpr (has_scale) {
+            sv[i] = col < ncols ? s[s_per_col ? col : 0] : 0.0f;
+        }
+    }
+
+    extern __shared__ float s_sum[];
+
+    float tmp = 0.0f;
+#pragma unroll
+    for (int i = 0; i < cols_per_thread; ++i) {
+        if (tid + i*block_size < ncols) {
+            tmp += xv[i] * xv[i];
+        }
+    }
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float scale1 = rsqrtf(tmp / ncols + eps1);
+
+    float tmp2 = 0.0f;
+#pragma unroll
+    for (int i = 0; i < cols_per_thread; ++i) {
+        const int col = tid + i*block_size;
+        if (col >= ncols) {
+            continue;
+        }
+        float y = scale1 * xv[i] * w1v[i] + rv[i];
+        if constexpr (has_scale) {
+            y = __fmul_rn(y, sv[i]);
+        }
+        y_out[col] = y;
+        xv[i]      = y;
+        tmp2 += y * y;
+    }
+    tmp2 = block_reduce<block_reduce_method::SUM, block_size>(tmp2, s_sum + 32);
+    const float scale2 = rsqrtf(tmp2 / ncols + eps2);
+
+#pragma unroll
+    for (int i = 0; i < cols_per_thread; ++i) {
+        const int col = tid + i*block_size;
+        if (col < ncols) {
+            dst[col] = scale2 * xv[i] * w2v[i];
+        }
+    }
+}
+
 // dst = op(gate) * (rms_norm(x) * mul): the gated output norm of a gated delta net layer (build_norm_gated) in one launch
 //   instead of two. The norm reduces exactly like rms_norm_f32 with the same block size and the gate is applied like in
 //   unary_gated_op_kernel, so the values are those of the separate kernels. x and gate have contiguous rows, dst is
@@ -963,6 +1045,97 @@ void ggml_cuda_op_rms_norm_pre_add_gated(ggml_backend_cuda_context & ctx, ggml_t
     GGML_ASSERT(ggml_cuda_rms_norm_pre_add_gated_srcs(sigmoid, mul_gate, add_shexp, add, a, b, c, g));
     rms_norm_pre_add_cuda<true>(ctx, (const float *) a->data, (const float *) b->data, (const float *) c->data,
                                 (const float *) g->data, add, rms_norm, mul);
+}
+
+// the other operand of a binary op whose one operand is t, or nullptr
+static const ggml_tensor * ggml_cuda_other_src(const ggml_tensor * op, const ggml_tensor * t) {
+    return op->src[0] == t ? op->src[1] : (op->src[1] == t ? op->src[0] : nullptr);
+}
+
+bool ggml_cuda_should_fuse_rms_norm_add_rms_norm(const ggml_tensor * norm1, const ggml_tensor * mul1, const ggml_tensor * add,
+                                                 const ggml_tensor * scale, const ggml_tensor * norm2, const ggml_tensor * mul2) {
+    if (norm1->op != GGML_OP_RMS_NORM || mul1->op != GGML_OP_MUL || add->op != GGML_OP_ADD ||
+            (scale != nullptr && scale->op != GGML_OP_MUL) || norm2->op != GGML_OP_RMS_NORM || mul2->op != GGML_OP_MUL) {
+        return false;
+    }
+    const ggml_tensor * y  = scale != nullptr ? scale : add;
+    const ggml_tensor * x  = norm1->src[0];
+    const ggml_tensor * w1 = ggml_cuda_other_src(mul1, norm1);
+    const ggml_tensor * r  = ggml_cuda_other_src(add, mul1);
+    const ggml_tensor * s  = scale != nullptr ? ggml_cuda_other_src(scale, add) : nullptr;
+    const ggml_tensor * w2 = ggml_cuda_other_src(mul2, norm2);
+    if (w1 == nullptr || w1 == norm1 || r == nullptr || r == mul1 || (scale != nullptr && (s == nullptr || s == add)) ||
+            norm2->src[0] != y || w2 == nullptr || w2 == norm2) {
+        return false;
+    }
+    for (const ggml_tensor * t : { x, w1, r, w2, norm1, mul1, add, norm2, mul2 }) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    const int64_t ncols = x->ne[0];
+    if (scale != nullptr && (s->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(s) ||
+            !(ggml_nelements(s) == 1 || (s->ne[0] == ncols && ggml_nelements(s) == ncols)) || !ggml_are_same_shape(scale, x))) {
+        return false;
+    }
+    // rows held in registers (at most 8 columns per thread), weights of one row, and outputs that sit exactly on an
+    //   input or apart from it: blocks of other rows still read their rows when this one writes
+    return ncols <= 8*1024 && ggml_is_contiguous(x) && ggml_is_contiguous(r) && ggml_are_same_shape(r, x) &&
+        ggml_are_same_shape(add, x) && ggml_are_same_shape(mul2, x) && ggml_is_contiguous(y) && ggml_is_contiguous(mul2) &&
+        ggml_is_contiguous(w1) && ggml_nelements(w1) == ncols && ggml_is_contiguous(w2) && ggml_nelements(w2) == ncols &&
+        x->ne[1] <= INT_MAX && x->ne[2] <= 65535 && x->ne[3] <= 65535 &&
+        ggml_cuda_same_or_disjoint(y, x) && ggml_cuda_same_or_disjoint(y, r) && ggml_cuda_same_or_disjoint(mul2, x) &&
+        ggml_cuda_same_or_disjoint(mul2, r) && !ggml_cuda_tensors_overlap(y, mul2) &&
+        !ggml_cuda_tensors_overlap(y, w1) && !ggml_cuda_tensors_overlap(y, w2) &&
+        !ggml_cuda_tensors_overlap(mul2, w1) && !ggml_cuda_tensors_overlap(mul2, w2) &&
+        (s == nullptr || (!ggml_cuda_tensors_overlap(y, s) && !ggml_cuda_tensors_overlap(mul2, s)));
+}
+
+void ggml_cuda_op_rms_norm_add_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * norm1, ggml_tensor * mul1, ggml_tensor * add,
+                                        ggml_tensor * scale, ggml_tensor * norm2, ggml_tensor * mul2) {
+    const ggml_tensor * x  = norm1->src[0];
+    const ggml_tensor * w1 = ggml_cuda_other_src(mul1, norm1);
+    const ggml_tensor * r  = ggml_cuda_other_src(add, mul1);
+    const ggml_tensor * s  = scale != nullptr ? ggml_cuda_other_src(scale, add) : nullptr;
+    const ggml_tensor * w2 = ggml_cuda_other_src(mul2, norm2);
+    ggml_tensor       * y  = scale != nullptr ? scale : add;
+
+    float eps1 = 0.0f;
+    float eps2 = 0.0f;
+    memcpy(&eps1, norm1->op_params, sizeof(float));
+    memcpy(&eps2, norm2->op_params, sizeof(float));
+    GGML_ASSERT(eps1 >= 0.0f && eps2 >= 0.0f);
+
+    const int  ncols     = x->ne[0];
+    const bool s_per_col = s != nullptr && ggml_nelements(s) > 1;
+    const dim3 blocks_num(x->ne[1], x->ne[2], x->ne[3]);
+
+    const auto launch = [&](auto has_scale, auto block_size, auto cols) {
+        constexpr int nc = decltype(cols)::value;
+        if constexpr (nc > 0) {
+            constexpr int bs = decltype(block_size)::value;
+            const ggml_cuda_kernel_launch_params launch_params{blocks_num, dim3(bs, 1, 1), 64 * sizeof(float), ctx.stream()};
+            ggml_cuda_kernel_launch(rms_norm_add_rms_norm_f32<bs, nc, decltype(has_scale)::value>, launch_params,
+                (const float *) x->data, (const float *) w1->data, (const float *) r->data,
+                s != nullptr ? (const float *) s->data : nullptr, (const float *) w2->data, (float *) y->data,
+                (float *) mul2->data, ncols, eps1, eps2, s_per_col);
+        } else {
+            GGML_ABORT("fatal error");
+        }
+    };
+    // the block size rms_norm_f32 would pick, which fixes the order of the reductions
+    const auto with_scale = [&](auto has_scale) {
+        if (ncols < 1024) {
+            rms_norm_launch_cols<256, 4>(ncols, [&](auto cols) { launch(has_scale, std::integral_constant<int, 256>(), cols); });
+        } else {
+            rms_norm_launch_cols<1024, 8>(ncols, [&](auto cols) { launch(has_scale, std::integral_constant<int, 1024>(), cols); });
+        }
+    };
+    if (s != nullptr) {
+        with_scale(std::true_type());
+    } else {
+        with_scale(std::false_type());
+    }
 }
 
 // the same functions as op_silu and op_sigmoid of unary_gated_op_kernel

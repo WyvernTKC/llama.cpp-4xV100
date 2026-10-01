@@ -4252,6 +4252,61 @@ struct test_add_rms_norm_mul : public test_case {
     }
 };
 
+// gemma's sandwich norms: y = rms_norm(x) * w1 + r (* s, the layer output scale: 1 = one value, 2 = one per column)
+//   and rms_norm(y) * w2, the next block's pre-norm; y is read again by the next residual add
+struct test_rms_norm_add_rms_norm : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int scale;
+    const float eps1;
+    const float eps2;
+
+    ggml_tensor * y  = nullptr;
+    ggml_tensor * n2 = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_ADD_RMS_NORM";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { y, n2 }; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(ne, scale, eps1, eps2);
+    }
+
+    test_rms_norm_add_rms_norm(std::array<int64_t, 4> ne = {64, 5, 4, 3}, int scale = 0, float eps1 = 1e-6f, float eps2 = 1e-6f)
+        : ne(ne), scale(scale), eps1(eps1), eps2(eps2) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x  = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * r  = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * w1 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_tensor * w2 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(x,  "x");
+        ggml_set_name(r,  "r");
+        ggml_set_name(w1, "w1");
+        ggml_set_name(w2, "w2");
+
+        y = ggml_add(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, x, eps1), w1), r);
+        if (scale != 0) {
+            ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, scale == 1 ? 1 : ne[0]);
+            ggml_set_name(s, "s");
+            y = ggml_mul(ctx, y, s);
+        }
+        ggml_set_name(y, "y");
+        n2 = ggml_mul(ctx, ggml_rms_norm(ctx, y, eps2), w2);
+        ggml_set_name(n2, "n2");
+        // both are compared, so no other fusion may elide them
+        ggml_set_output(y);
+        ggml_set_output(n2);
+
+        ggml_tensor * out = ggml_add(ctx, n2, y);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
 struct test_rms_norm_mul_add : public test_case {
     const ggml_type type;
@@ -10864,6 +10919,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
         }
+    }
+    // every columns-per-thread count of both block sizes, gemma-4-31B (5376) and its MoE sibling (2816), and a row past
+    //   the register path, which stays apart
+    for (int scale : {0, 1, 2}) {
+        for (int64_t n : {64, 700, 1000, 1025, 2816, 5376, 8192, 9000}) {
+            test_cases.emplace_back(new test_rms_norm_add_rms_norm({n, 1, 1, 1}, scale));
+            test_cases.emplace_back(new test_rms_norm_add_rms_norm({n, 6, 1, 1}, scale, 1e-6f, 1e-5f));
+        }
+        test_cases.emplace_back(new test_rms_norm_add_rms_norm({1025, 5, 4, 3}, scale, 1e-1f, 0.0f));
     }
     for (uint32_t n : {1, 511, 700, 1000, 1025, 3000, 5120, 7000, 8192, 33*512}) {
         for (bool multi_add : {false, true}) {

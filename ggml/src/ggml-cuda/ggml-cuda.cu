@@ -5472,6 +5472,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // the sandwich norms of gemma: a block's post-norm, the residual add (and the layer output scale) and the next block's
+    //   pre-norm of the same row, two or three launches per block
+    if (node->op == GGML_OP_RMS_NORM && i + 4 < cgraph->n_nodes) {
+        const bool has_scale = cgraph->nodes[i + 3]->op == GGML_OP_MUL;
+        const int  n_ops     = has_scale ? 6 : 5;
+        if (i + n_ops <= cgraph->n_nodes &&
+                ggml_cuda_should_fuse_rms_norm_add_rms_norm(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2],
+                    has_scale ? cgraph->nodes[i + 3] : nullptr, cgraph->nodes[i + n_ops - 2], cgraph->nodes[i + n_ops - 1])) {
+            const int outputs[2] = { i + n_ops - 3, i + n_ops - 1 };
+            const enum ggml_op ops_scale[6] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL, GGML_OP_RMS_NORM, GGML_OP_MUL };
+            const enum ggml_op ops[5]       = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
+            if (ggml_can_fuse_subgraph(cgraph, i, n_ops, has_scale ? ops_scale : ops, outputs, 2)) {
+                ggml_cuda_op_rms_norm_add_rms_norm(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2],
+                    has_scale ? cgraph->nodes[i + 3] : nullptr, cgraph->nodes[i + n_ops - 2], cgraph->nodes[i + n_ops - 1]);
+                return n_ops - 1;
+            }
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
