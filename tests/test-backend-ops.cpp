@@ -5338,17 +5338,22 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     const int64_t n_seq_tokens;
     const int64_t n_seqs;
     const int64_t K; // snapshot slot count (>1)
+    const bool gather; // the state is GET_ROWS of a cache, as build_rs makes it
 
     ggml_tensor * cpy_node = nullptr;
+    ggml_tensor * pre_node = nullptr;
+
+    static constexpr int64_t n_cells = 3;
 
     std::string vars() override {
-        return VARS_TO_STR6(type, head_count, head_size, n_seq_tokens, n_seqs, K);
+        return VARS_TO_STR7(type, head_count, head_size, n_seq_tokens, n_seqs, K, gather);
     }
 
     test_gated_delta_net_cache_fusion(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 2, int64_t n_seqs = 1,
-            int64_t K = 2)
-        : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K) {}
+            int64_t K = 2, bool gather = false)
+        : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K),
+          gather(gather) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t S_v = head_size;
@@ -5365,10 +5370,19 @@ struct test_gated_delta_net_cache_fusion : public test_case {
         ggml_set_name(v, "v");
         ggml_tensor * g     = ggml_new_tensor_4d(ctx, type, 1, H_v, n_seq_tokens, n_seqs);
         ggml_tensor * beta  = ggml_new_tensor_4d(ctx, type, 1, H_v, n_seq_tokens, n_seqs);
-        ggml_tensor * state = ggml_new_tensor_4d(ctx, type, head_size, head_size, H_v, n_seqs);
         ggml_set_name(g,     "g");
         ggml_set_name(beta,  "beta");
-        ggml_set_name(state, "state");
+        ggml_tensor * state;
+        if (gather) {
+            ggml_tensor * states = ggml_new_tensor_2d(ctx, type, D, n_cells);
+            ggml_tensor * ids    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+            ggml_set_name(states, "states");
+            ggml_set_name(ids,    "ids");
+            state = ggml_reshape_4d(ctx, ggml_get_rows(ctx, states, ids), head_size, head_size, H_v, n_seqs);
+        } else {
+            state = ggml_new_tensor_4d(ctx, type, head_size, head_size, H_v, n_seqs);
+            ggml_set_name(state, "state");
+        }
 
         q = ggml_l2_norm(ctx, q, 1e-6f);
         k = ggml_l2_norm(ctx, k, 1e-6f);
@@ -5406,6 +5420,16 @@ struct test_gated_delta_net_cache_fusion : public test_case {
 
         // read the cpy output (not the plain dst view, which would not pull the cpy into the graph)
         // so that neither the gdn nor the cpy is the graph output
+        if (gather && n_seq_tokens < K) {
+            // a batch shorter than K also stores its start state to the slot that rolls back past its first token,
+            //     in a cpy right after the snapshot cpy (build_recurrent_attn)
+            ggml_tensor * pre_cache = ggml_new_tensor_2d(ctx, type, D, n_seqs);
+            ggml_set_name(pre_cache, "pre_cache");
+            ggml_tensor * pre = ggml_cpy(ctx, state, ggml_view_2d(ctx, pre_cache, D, n_seqs, pre_cache->nb[1], 0));
+            ggml_set_name(pre, "gdn_pre_cpy");
+            pre_node = pre;
+            return ggml_sum(ctx, ggml_add(ctx, cpy, pre));
+        }
         ggml_tensor * out = ggml_sum(ctx, cpy);
         return out;
     }
@@ -5416,7 +5440,12 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     }
 
     bool run_whole_graph() override { return true; }
-    std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node }; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (pre_node) {
+            return { cpy_node, pre_node };
+        }
+        return { cpy_node };
+    }
 
     uint64_t op_flops(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5430,7 +5459,16 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
-            if (strcmp(t->name, "g") == 0) {
+            if (strcmp(t->name, "ids") == 0) {
+                // a cell other than 0, distinct per sequence
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = (int32_t) ((i + 1) % n_cells);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "pre_cache") == 0) {
+                init_tensor_uniform(t, 0.0f, 0.0f);
+            } else if (strcmp(t->name, "g") == 0) {
                 init_tensor_uniform(t, -20.0f, -1e-4f);
             } else if (strcmp(t->name, "beta") == 0) {
                 init_tensor_uniform(t, 0.0f, 1.0f);
@@ -12163,6 +12201,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+    // the start state gathered from a cache (build_rs): read by the kernel with one sequence, plus the rollback slot
+    //     of the start state when n_seq_tokens < K
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   1, 1, 4, true));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 4, true));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 128,  2, 1, 4, true));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 64,   4, 1, 4, true));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   2, 2, 4, true));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

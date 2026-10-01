@@ -56,7 +56,10 @@ gated_delta_net_cuda(const float * q,
                                      int           l2_ncols, // S_v, as a runtime value: rms_norm divides by one
                                      float         l2_eps,
                                      float         l2_post_scale,
-                                     float         l2_post_bias) {
+                                     float         l2_post_bias,
+                                     const int32_t * s_ids,         // gathered: cache row of each sequence, else nullptr
+                                     int64_t       s_row_stride,
+                                     float *       s_pre) {         // nullptr, or where the start state goes
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
     // each warp owns one column, using warp-level primitives to reduce across rows
@@ -73,7 +76,6 @@ gated_delta_net_cuda(const float * q,
     const int64_t state_in_offset      = sequence * H * S_v * S_v + h_idx * S_v * S_v;
     const int64_t state_out_offset     = (sequence * H + h_idx) * S_v * S_v;
     state += state_out_offset;
-    curr_state += state_in_offset + col * S_v;
     attn_data += (sequence * n_tokens * H + h_idx) * S_v;
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
@@ -83,10 +85,19 @@ gated_delta_net_cuda(const float * q,
     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
 
     ggml_cuda_pdl_sync();
+    // gathered, the start state is the cache row of this sequence
+    curr_state += (s_ids ? int64_t(s_ids[sequence]) * s_row_stride + h_idx * S_v * S_v : state_in_offset) + col * S_v;
 #pragma unroll
     for (int r = 0; r < rows_per_lane; r++) {
         const int i = r * warp_size + lane;
         s_shard[r]  = curr_state[i];
+    }
+    if (s_pre) {
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            const int i = r * warp_size + lane;
+            s_pre[state_out_offset + col * S_v + i] = s_shard[r];
+        }
     }
 
     for (int t = 0; t < n_tokens; t++) {
@@ -210,7 +221,8 @@ static void launch_gated_delta_net(
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
-        float scale, int64_t state_slot_stride, int K, const ggml_cuda_gated_delta_net_l2 & l2, cudaStream_t stream) {
+        float scale, int64_t state_slot_stride, int K, const ggml_cuda_gated_delta_net_l2 & l2,
+        const ggml_cuda_gated_delta_net_gather & gather, cudaStream_t stream) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = 4;
@@ -226,7 +238,7 @@ static void launch_gated_delta_net(
             q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
             n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
             sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
-            (int) S_v, l2.eps, l2.post_scale, l2.post_bias);
+            (int) S_v, l2.eps, l2.post_scale, l2.post_bias, gather.ids, gather.row_stride, gather.pre);
     };
     switch (S_v) {
         case 16:
@@ -249,7 +261,7 @@ static void launch_gated_delta_net(
 
 static void ggml_cuda_op_gated_delta_net_impl(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gated_delta_net_fused_cache * cache,
-        const ggml_cuda_gated_delta_net_l2 * l2) {
+        const ggml_cuda_gated_delta_net_l2 * l2, const ggml_cuda_gated_delta_net_gather * gather) {
     // with l2, q and k are the inputs of their norms, which the kernel applies
     const ggml_tensor * src_q     = l2 ? l2->q : dst->src[0];
     const ggml_tensor * src_k     = l2 ? l2->k : dst->src[1];
@@ -284,7 +296,8 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const float * g_d = (const float *) src_g->data;
     const float * b_d = (const float *) src_beta->data;
 
-    const float * s_d   = (const float *) src_state->data;
+    // gathered, src_state is not computed: the kernel reads the cache rows itself
+    const float * s_d   = gather ? gather->states : (const float *) src_state->data;
     float *       dst_d = (float *) dst->data;
 
     GGML_ASSERT(ggml_is_contiguous_rows(src_q));
@@ -323,13 +336,14 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_slot_stride = cache->slot_stride;
     }
 
-    const ggml_cuda_gated_delta_net_l2 l2_args = l2 ? *l2 : ggml_cuda_gated_delta_net_l2{};
+    const ggml_cuda_gated_delta_net_l2     l2_args     = l2     ? *l2     : ggml_cuda_gated_delta_net_l2{};
+    const ggml_cuda_gated_delta_net_gather gather_args = gather ? *gather : ggml_cuda_gated_delta_net_gather{};
 
     const auto launch = [&](auto kda_c, auto keep_rs_c, auto l2_c) {
         launch_gated_delta_net<decltype(kda_c)::value, decltype(keep_rs_c)::value, decltype(l2_c)::value>(
             q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
             S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, l2_args, stream);
+            sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, l2_args, gather_args, stream);
     };
     const auto launch_l2 = [&](auto kda_c, auto keep_rs_c) {
         if (l2) {
@@ -353,11 +367,11 @@ static void ggml_cuda_op_gated_delta_net_impl(
 }
 
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    ggml_cuda_op_gated_delta_net_impl(ctx, dst, nullptr, nullptr);
+    ggml_cuda_op_gated_delta_net_impl(ctx, dst, nullptr, nullptr, nullptr);
 }
 
 void ggml_cuda_op_gated_delta_net_fused_cache(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_gated_delta_net_fused_cache cache,
-        const ggml_cuda_gated_delta_net_l2 * l2) {
-    ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache, l2);
+        const ggml_cuda_gated_delta_net_l2 * l2, const ggml_cuda_gated_delta_net_gather * gather) {
+    ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache, l2, gather);
 }
