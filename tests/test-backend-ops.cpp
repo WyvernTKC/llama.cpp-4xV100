@@ -4202,9 +4202,12 @@ struct test_add_softplus_mul : public test_case {
 
 // GGML_OP_ADD + GGML_OP_RMS_NORM + GGML_OP_MUL, the residual add ahead of the next layer's norm: the sum is used
 //   again later, so a fused kernel has to keep writing it
+//   With gated, the sum is (a + c * sigmoid(g)) + b: the sigmoid-gated shared expert of a qwen35moe layer added to the
+//   routed experts, then the residual, in the node order of the model
 struct test_add_rms_norm_mul : public test_case {
     const std::array<int64_t, 4> ne;
     const float eps;
+    const bool gated;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4214,11 +4217,11 @@ struct test_add_rms_norm_mul : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR2(ne, eps);
+        return VARS_TO_STR3(ne, eps, gated);
     }
 
-    test_add_rms_norm_mul(std::array<int64_t, 4> ne = {64, 5, 4, 3}, float eps = 1e-6f)
-        : ne(ne), eps(eps) {}
+    test_add_rms_norm_mul(std::array<int64_t, 4> ne = {64, 5, 4, 3}, float eps = 1e-6f, bool gated = false)
+        : ne(ne), eps(eps), gated(gated) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
@@ -4228,7 +4231,16 @@ struct test_add_rms_norm_mul : public test_case {
         ggml_set_name(b, "b");
         ggml_set_name(w, "w");
 
-        ggml_tensor * sum = ggml_add(ctx, a, b);
+        ggml_tensor * x = a;
+        if (gated) {
+            ggml_tensor * c = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, ne[1], ne[2], ne[3]);
+            ggml_set_name(c, "c");
+            ggml_set_name(g, "g");
+            x = ggml_add(ctx, a, ggml_mul(ctx, c, ggml_sigmoid(ctx, g)));
+        }
+
+        ggml_tensor * sum = ggml_add(ctx, x, b);
         ggml_set_name(sum, "sum");
         ggml_tensor * n = ggml_mul(ctx, ggml_rms_norm(ctx, sum, eps), w);
         ggml_set_name(n, "norm");
@@ -10845,6 +10857,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (uint32_t n : { 64, 1025 }) {
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
             test_cases.emplace_back(new test_add_rms_norm_mul({ n, 5, 4, 3 }, eps));
+            test_cases.emplace_back(new test_add_rms_norm_mul({ n, 5, 4, 3 }, eps, true));
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
             test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
             test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
@@ -10858,6 +10871,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_add_rms_norm_mul({n, 6, 1, 1}, 1e-6f));
         }
         test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false));
+        test_cases.emplace_back(new test_add_rms_norm_mul({n, 1, 1, 1}, 1e-6f, true));
+        test_cases.emplace_back(new test_add_rms_norm_mul({n, 6, 1, 1}, 1e-6f, true));
     }
     for (uint32_t n : {64, 1025}) {
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F32, GGML_TYPE_F32, { n, 5, 4, 3 }, false, false));

@@ -14,6 +14,13 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
 bool ggml_cuda_should_fuse_rms_norm_pre_add(const ggml_tensor * add, const ggml_tensor * rms_norm, const ggml_tensor * mul);
 void ggml_cuda_op_rms_norm_pre_add(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * rms_norm, ggml_tensor * mul);
 
+// the same with the sigmoid-gated shared expert of a MoE layer added first:
+//   add = (moe + shexp * sigmoid(g)) + residual, mul = rms_norm(add) * w
+bool ggml_cuda_should_fuse_rms_norm_pre_add_gated(const ggml_tensor * sigmoid, const ggml_tensor * mul_gate, const ggml_tensor * add_shexp,
+                                                  const ggml_tensor * add, const ggml_tensor * rms_norm, const ggml_tensor * mul);
+void ggml_cuda_op_rms_norm_pre_add_gated(ggml_backend_cuda_context & ctx, ggml_tensor * sigmoid, ggml_tensor * mul_gate,
+                                         ggml_tensor * add_shexp, ggml_tensor * add, ggml_tensor * rms_norm, ggml_tensor * mul);
+
 // rms_norm(x) * w * op(z) with op silu or sigmoid, the gated output norm of a gated delta net layer
 bool ggml_cuda_should_fuse_rms_norm_gated(const ggml_tensor * rms_norm, const ggml_tensor * mul, const ggml_tensor * unary,
                                           const ggml_tensor * mul_gate);

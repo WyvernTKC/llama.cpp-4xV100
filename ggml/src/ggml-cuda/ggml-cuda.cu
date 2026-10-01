@@ -5518,6 +5518,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // the same after the sigmoid-gated shared expert of a MoE layer (qwen35moe, qwen3next): its SIGMOID, MUL and the ADD
+    //   onto the routed experts would be three more launches per layer, the two ADDs ahead of the norm fit neither fusion
+    if (node->op == GGML_OP_UNARY && i + 5 < cgraph->n_nodes &&
+            ggml_cuda_should_fuse_rms_norm_pre_add_gated(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3],
+                                                         cgraph->nodes[i + 4], cgraph->nodes[i + 5])) {
+        const int outputs[2] = { i + 3, i + 5 };
+        const enum ggml_op ops[6] = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
+        if (ggml_can_fuse_subgraph(cgraph, i, 6, ops, outputs, 2)) {
+            ggml_cuda_op_rms_norm_pre_add_gated(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3],
+                                                cgraph->nodes[i + 4], cgraph->nodes[i + 5]);
+            return 5;
+        }
+    }
+
     // the gated output norm of a gated delta net layer, rms_norm(x) * w * op(z): the unary reads z, not the norm
     if (node->op == GGML_OP_RMS_NORM && i + 3 < cgraph->n_nodes &&
             ggml_cuda_should_fuse_rms_norm_gated(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3])) {

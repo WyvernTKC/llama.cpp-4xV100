@@ -214,12 +214,15 @@ static __global__ void __launch_bounds__(block_size) rms_norm_f32(const float * 
 // sum = a + b and dst = rms_norm(sum) * mul in one pass: a residual add and the norm that follows it, which also
 //   leaves the sum for the next residual. It reduces exactly like rms_norm_f32 with the same block size, so both
 //   results are those of the three ops apart. a, b, sum and dst are contiguous. cols_per_thread as in rms_norm_f32.
-template <int block_size, int cols_per_thread = 0>
+//   With gated, sum = (a + c * sigmoid(g[row])) + b: the sigmoid-gated shared expert c of a MoE layer is added to its
+//   routed output a before the residual b, rounded like the SIGMOID, MUL and ADDs apart.
+template <int block_size, int cols_per_thread = 0, bool gated = false>
 static __global__ void __launch_bounds__(block_size) rms_norm_pre_add_f32(const float * a, const float * b, float * sum, float * dst, const int ncols,
                                             const float eps, const float * mul, const int64_t mul_stride_row,
                                             const int64_t mul_stride_channel, const int64_t mul_stride_sample,
                                             const uint3 mul_ncols_packed, const uint3 mul_nrows_packed,
-                                            const uint3 mul_nchannels_packed, const uint3 mul_nsamples_packed) {
+                                            const uint3 mul_nchannels_packed, const uint3 mul_nsamples_packed,
+                                            const float * c = nullptr, const float * g = nullptr) {
     ggml_cuda_pdl_lc();
     const int nrows     = gridDim.x;
     const int nchannels = gridDim.y;
@@ -229,11 +232,15 @@ static __global__ void __launch_bounds__(block_size) rms_norm_pre_add_f32(const 
     const int sample  = blockIdx.z;
     const int tid     = threadIdx.x;
 
-    const int64_t offset = ((int64_t(sample)*nchannels + channel)*nrows + row)*ncols;
+    const int64_t row_flat = (int64_t(sample)*nchannels + channel)*nrows + row;
+    const int64_t offset   = row_flat*ncols;
     a   += offset;
     b   += offset;
     sum += offset;
     dst += offset;
+    if constexpr (gated) {
+        c += offset;
+    }
 
     const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
     const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
@@ -244,13 +251,25 @@ static __global__ void __launch_bounds__(block_size) rms_norm_pre_add_f32(const 
     extern __shared__ float s_sum[];
 
     ggml_cuda_pdl_sync();
+    [[maybe_unused]] float gate = 0.0f;
+    if constexpr (gated) {
+        gate = ggml_cuda_op_sigmoid_single(g[row_flat]);
+    }
+    const auto x_at = [&](const int col) {
+        if constexpr (gated) {
+            return (a[col] + __fmul_rn(c[col], gate)) + b[col];
+        } else {
+            return a[col] + b[col];
+        }
+    };
+
     if constexpr (cols_per_thread > 0) {
         float xv[cols_per_thread];
         float mv[cols_per_thread];
 #pragma unroll
         for (int i = 0; i < cols_per_thread; ++i) {
             const int col = tid + i*block_size;
-            xv[i] = col < ncols ? a[col] + b[col] : 0.0f;
+            xv[i] = col < ncols ? x_at(col) : 0.0f;
         }
 #pragma unroll
         for (int i = 0; i < cols_per_thread; ++i) {
@@ -280,7 +299,7 @@ static __global__ void __launch_bounds__(block_size) rms_norm_pre_add_f32(const 
         }
     } else {
         for (int col = tid; col < ncols; col += block_size) {
-            const float xi = a[col] + b[col];
+            const float xi = x_at(col);
             sum[col] = xi;
             tmp += xi * xi;
         }
@@ -840,7 +859,9 @@ bool ggml_cuda_should_fuse_rms_norm_pre_add(const ggml_tensor * add, const ggml_
         !ggml_cuda_tensors_overlap(add, w) && !ggml_cuda_tensors_overlap(mul, w);
 }
 
-void ggml_cuda_op_rms_norm_pre_add(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * rms_norm, ggml_tensor * mul) {
+template <bool gated>
+static void rms_norm_pre_add_cuda(ggml_backend_cuda_context & ctx, const float * a_d, const float * b_d, const float * c_d,
+                                  const float * g_d, ggml_tensor * add, ggml_tensor * rms_norm, ggml_tensor * mul) {
     const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
 
     float eps = 0.0f;
@@ -856,8 +877,6 @@ void ggml_cuda_op_rms_norm_pre_add(ggml_backend_cuda_context & ctx, ggml_tensor 
     const uint3 mul_nchannels_packed = init_fastdiv_values(w->ne[2]);
     const uint3 mul_nsamples_packed  = init_fastdiv_values(w->ne[3]);
 
-    const float * a_d   = (const float *) add->src[0]->data;
-    const float * b_d   = (const float *) add->src[1]->data;
     float       * sum_d = (float *) add->data;
     float       * dst_d = (float *) mul->data;
     const float * w_d   = (const float *) w->data;
@@ -867,19 +886,83 @@ void ggml_cuda_op_rms_norm_pre_add(ggml_backend_cuda_context & ctx, ggml_tensor 
         const dim3 block_dims(256, 1, 1);
         const ggml_cuda_kernel_launch_params launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0, ctx.stream()};
         rms_norm_launch_cols<256, 4>(ncols, [&](auto cols) {
-            ggml_cuda_kernel_launch(rms_norm_pre_add_f32<256, decltype(cols)::value>, launch_params, a_d, b_d, sum_d, dst_d, ncols, eps, w_d,
+            ggml_cuda_kernel_launch(rms_norm_pre_add_f32<256, decltype(cols)::value, gated>, launch_params, a_d, b_d, sum_d, dst_d, ncols, eps, w_d,
                 (int64_t) (w->nb[1]/ts_w), (int64_t) (w->nb[2]/ts_w), (int64_t) (w->nb[3]/ts_w),
-                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
+                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, c_d, g_d);
         });
     } else {
         const dim3 block_dims(1024, 1, 1);
         const ggml_cuda_kernel_launch_params launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0, ctx.stream()};
         rms_norm_launch_cols<1024, 8>(ncols, [&](auto cols) {
-            ggml_cuda_kernel_launch(rms_norm_pre_add_f32<1024, decltype(cols)::value>, launch_params, a_d, b_d, sum_d, dst_d, ncols, eps, w_d,
+            ggml_cuda_kernel_launch(rms_norm_pre_add_f32<1024, decltype(cols)::value, gated>, launch_params, a_d, b_d, sum_d, dst_d, ncols, eps, w_d,
                 (int64_t) (w->nb[1]/ts_w), (int64_t) (w->nb[2]/ts_w), (int64_t) (w->nb[3]/ts_w),
-                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
+                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, c_d, g_d);
         });
     }
+}
+
+void ggml_cuda_op_rms_norm_pre_add(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * rms_norm, ggml_tensor * mul) {
+    rms_norm_pre_add_cuda<false>(ctx, (const float *) add->src[0]->data, (const float *) add->src[1]->data, nullptr, nullptr,
+                                 add, rms_norm, mul);
+}
+
+// the inputs of the gated chain: a the routed experts, c the shared expert, g its gate, b the residual
+static bool ggml_cuda_rms_norm_pre_add_gated_srcs(const ggml_tensor * sigmoid, const ggml_tensor * mul_gate,
+                                                  const ggml_tensor * add_shexp, const ggml_tensor * add,
+                                                  const ggml_tensor *& a, const ggml_tensor *& b, const ggml_tensor *& c,
+                                                  const ggml_tensor *& g) {
+    if (sigmoid->op != GGML_OP_UNARY || ggml_get_unary_op(sigmoid) != GGML_UNARY_OP_SIGMOID || mul_gate->op != GGML_OP_MUL ||
+            add_shexp->op != GGML_OP_ADD || add->op != GGML_OP_ADD) {
+        return false;
+    }
+    c = mul_gate->src[0] == sigmoid ? mul_gate->src[1] : (mul_gate->src[1] == sigmoid ? mul_gate->src[0] : nullptr);
+    a = add_shexp->src[0] == mul_gate ? add_shexp->src[1] : (add_shexp->src[1] == mul_gate ? add_shexp->src[0] : nullptr);
+    b = add->src[0] == add_shexp ? add->src[1] : (add->src[1] == add_shexp ? add->src[0] : nullptr);
+    g = sigmoid->src[0];
+    return c != nullptr && c != sigmoid && a != nullptr && a != mul_gate && b != nullptr && b != add_shexp;
+}
+
+bool ggml_cuda_should_fuse_rms_norm_pre_add_gated(const ggml_tensor * sigmoid, const ggml_tensor * mul_gate, const ggml_tensor * add_shexp,
+                                                  const ggml_tensor * add, const ggml_tensor * rms_norm, const ggml_tensor * mul) {
+    const ggml_tensor * a;
+    const ggml_tensor * b;
+    const ggml_tensor * c;
+    const ggml_tensor * g;
+    if (!ggml_cuda_rms_norm_pre_add_gated_srcs(sigmoid, mul_gate, add_shexp, add, a, b, c, g) ||
+            rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || rms_norm->src[0] != add) {
+        return false;
+    }
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : (mul->src[1] == rms_norm ? mul->src[0] : nullptr);
+    if (w == nullptr || w == rms_norm) {
+        return false;
+    }
+    for (const ggml_tensor * t : { a, b, c, g, w, sigmoid, mul_gate, add_shexp, add, rms_norm, mul }) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    // one gate value per row; the outputs as in ggml_cuda_should_fuse_rms_norm_pre_add, and neither may touch g or w,
+    //   which every thread of the row reads
+    return ggml_are_same_shape(a, add) && ggml_are_same_shape(b, add) && ggml_are_same_shape(c, add) &&
+        ggml_are_same_shape(mul, add) && g->ne[0] == 1 && ggml_nelements(g) == ggml_nrows(add) && ggml_is_contiguous(g) &&
+        ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(c) && ggml_is_contiguous(add) &&
+        ggml_is_contiguous(mul) && w->nb[0] == sizeof(float) && ggml_can_repeat(w, add) &&
+        add->ne[1] <= INT_MAX && add->ne[2] <= 65535 && add->ne[3] <= 65535 &&
+        ggml_cuda_same_or_disjoint(add, a) && ggml_cuda_same_or_disjoint(add, b) && ggml_cuda_same_or_disjoint(add, c) &&
+        ggml_cuda_same_or_disjoint(mul, a) && ggml_cuda_same_or_disjoint(mul, b) && ggml_cuda_same_or_disjoint(mul, c) &&
+        ggml_cuda_same_or_disjoint(mul, add) && !ggml_cuda_tensors_overlap(add, g) && !ggml_cuda_tensors_overlap(mul, g) &&
+        !ggml_cuda_tensors_overlap(add, w) && !ggml_cuda_tensors_overlap(mul, w);
+}
+
+void ggml_cuda_op_rms_norm_pre_add_gated(ggml_backend_cuda_context & ctx, ggml_tensor * sigmoid, ggml_tensor * mul_gate,
+                                         ggml_tensor * add_shexp, ggml_tensor * add, ggml_tensor * rms_norm, ggml_tensor * mul) {
+    const ggml_tensor * a;
+    const ggml_tensor * b;
+    const ggml_tensor * c;
+    const ggml_tensor * g;
+    GGML_ASSERT(ggml_cuda_rms_norm_pre_add_gated_srcs(sigmoid, mul_gate, add_shexp, add, a, b, c, g));
+    rms_norm_pre_add_cuda<true>(ctx, (const float *) a->data, (const float *) b->data, (const float *) c->data,
+                                (const float *) g->data, add, rms_norm, mul);
 }
 
 // the same functions as op_silu and op_sigmoid of unary_gated_op_kernel
