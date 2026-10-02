@@ -11136,9 +11136,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // build_conv_state, which CUDA runs as one kernel up to 8 tokens: decode without and with rollback slots, a draft
-    //   step and an MTP verify, a channel count the block does not divide, a start state read from a row the slots
-    //   write (cell 1 is slot 0's row, row 4 is slot 1's), and 12 tokens, which stay apart
+    // build_conv_state, which CUDA runs as one kernel: decode without and with rollback slots, a draft step and an MTP
+    //   verify, a channel count the block does not divide, a start state read from a row the slots write (cell 1 is
+    //   slot 0's row, row 4 is slot 1's); past 8 tokens the prefill kernel, with a last block of 1 token, whole blocks
+    //   of 32, and a prefill batch of Qwen3.8-27B split four ways
     test_cases.emplace_back(new test_ssm_conv_state(256,  1, 1, 1, 1));
     test_cases.emplace_back(new test_ssm_conv_state(256,  1, 1, 2, 0));
     test_cases.emplace_back(new test_ssm_conv_state(2560, 1, 6, 1, 1));
@@ -11147,6 +11148,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_conv_state(512,  8, 4, 1, 1));
     test_cases.emplace_back(new test_ssm_conv_state(512,  2, 4, 4, 1));
     test_cases.emplace_back(new test_ssm_conv_state(512, 12, 4, 1, 1));
+    test_cases.emplace_back(new test_ssm_conv_state(1000,  33, 1, 1, 1));
+    test_cases.emplace_back(new test_ssm_conv_state(512,   64, 4, 4, 1));
+    test_cases.emplace_back(new test_ssm_conv_state(256,  100, 6, 0, 2));
+    test_cases.emplace_back(new test_ssm_conv_state(2560, 2048, 1, 1, 1));
+    test_cases.emplace_back(new test_ssm_conv_state(2560, 2048, 4, 1, 1));
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 96, 64, 128, 8, 1, 1)); // Nemotron-3-Puzzle decode (scan path, unused warp in last block)

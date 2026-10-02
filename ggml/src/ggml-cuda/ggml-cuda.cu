@@ -3359,11 +3359,12 @@ static bool ggml_cuda_gdn_gather_is_folded(ggml_backend_cuda_context * cuda_ctx,
     return false;
 }
 
-// build_conv_state of one sequence at a few tokens: GET_ROWS(states, ids) -> RESHAPE -> CONCAT with the transposed new
-//   tokens -> a CPY of a window of the concat to each rollback slot -> ... -> SSM_CONV -> SILU. One kernel at the CONCAT
-//   reads the cache row itself and writes the slots and the SILU output, so the GET_ROWS, the CONCAT, the CPYs and the
-//   SSM_CONV do not run. The SILU output is written before the nodes between the CPYs and the SSM_CONV run, so none of
-//   them may read or write its memory.
+// build_conv_state of one sequence: GET_ROWS(states, ids) -> RESHAPE -> CONCAT with the transposed new tokens -> a CPY of
+//   a window of the concat to each rollback slot -> ... -> SSM_CONV -> SILU. One kernel at the CONCAT reads the cache row
+//   itself and writes the slots and the SILU output, so the GET_ROWS, the CONCAT, the CPYs and the SSM_CONV do not run;
+//   past GGML_CUDA_SSM_CONV_STATE_MAX_TOKENS (a prefill batch) the concat, ~0.16 ms a layer at 2048 tokens, is not made
+//   either. The SILU output is written before the nodes between the CPYs and the SSM_CONV run, so none of them may read
+//   or write its memory.
 struct ggml_cuda_ssm_conv_state_fusion {
     const ggml_tensor * states   = nullptr;
     const ggml_tensor * ids      = nullptr;
@@ -3373,7 +3374,9 @@ struct ggml_cuda_ssm_conv_state_fusion {
     int                 gr_idx   = -1;
     int                 last_cpy = -1;
     int                 conv_idx = -1;
-    ggml_cuda_ssm_conv_state_slots slots = {};
+    bool                long_path = false; // more than GGML_CUDA_SSM_CONV_STATE_MAX_TOKENS tokens
+    ggml_cuda_ssm_conv_state_slots      slots      = {};
+    ggml_cuda_ssm_conv_state_long_slots long_slots = {};
 };
 
 static bool ggml_cuda_ssm_conv_state_fusion_match(
@@ -3386,10 +3389,11 @@ static bool ggml_cuda_ssm_conv_state_fusion_match(
     const int     d_conv = 4;
     const int64_t nr     = concat->ne[1];
     const int64_t n_t    = concat->ne[0] - (d_conv - 1);
-    if (n_t < 1 || n_t > GGML_CUDA_SSM_CONV_STATE_MAX_TOKENS) {
+    if (n_t < 1 || n_t > INT32_MAX) {
         return false;
     }
     f = {};
+    f.long_path = n_t > GGML_CUDA_SSM_CONV_STATE_MAX_TOKENS;
 
     // the state columns: the GET_ROWS of one cache row through reshapes, read by nothing else
     const ggml_tensor * st = concat->src[0];
@@ -3431,13 +3435,31 @@ static bool ggml_cuda_ssm_conv_state_fusion_match(
             const ggml_tensor * dst = n->src[1];
             const int64_t       i0  = (int64_t) (win->view_offs / sizeof(float));
             if (win->ne[0] != d_conv - 1 || win->ne[1] != nr || win->ne[2] != 1 || win->nb[1] != concat->nb[1] ||
-                    win->view_offs % sizeof(float) != 0 || i0 > n_t || f.slots.dst[i0] != nullptr ||
+                    win->view_offs % sizeof(float) != 0 || i0 > n_t ||
                     ggml_cuda_graph_use_count(cgraph, win) != 1 || ggml_cuda_graph_use_count(cgraph, n) != 0 ||
                     (n->flags & GGML_TENSOR_FLAG_OUTPUT) || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
                     ggml_nelements(dst) != (d_conv - 1)*nr || dst->data == nullptr || n->data != dst->data) {
                 return false;
             }
-            f.slots.dst[i0] = (float *) dst->data;
+            if (f.long_path) {
+                ggml_cuda_ssm_conv_state_long_slots & ls = f.long_slots;
+                for (int k = 0; k < ls.n; ++k) {
+                    if (ls.start[k] == (int) i0) {
+                        return false;
+                    }
+                }
+                if (ls.n == GGML_CUDA_SSM_CONV_STATE_MAX_TOKENS + 1) {
+                    return false;
+                }
+                ls.start[ls.n] = (int) i0;
+                ls.dst  [ls.n] = (float *) dst->data;
+                ls.n++;
+            } else {
+                if (f.slots.dst[i0] != nullptr) {
+                    return false;
+                }
+                f.slots.dst[i0] = (float *) dst->data;
+            }
             f.last_cpy      = j;
             n_cpy++;
             continue;
@@ -5713,7 +5735,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (ggml_cuda_ssm_conv_state_fusion_match(cuda_ctx, cgraph, i, f)) {
             cuda_ctx->q8_1_input_invalidate(f.silu->data);
             cuda_ctx->cublas_input_invalidate(f.silu);
-            ggml_cuda_op_ssm_conv_state(*cuda_ctx, f.states, f.ids, f.x, f.ssm_conv, f.silu, f.slots);
+            if (f.long_path) {
+                ggml_cuda_op_ssm_conv_state_long(*cuda_ctx, f.states, f.ids, f.x, f.ssm_conv, f.silu, f.long_slots);
+            } else {
+                ggml_cuda_op_ssm_conv_state(*cuda_ctx, f.states, f.ids, f.x, f.ssm_conv, f.silu, f.slots);
+            }
             return f.last_cpy - i;
         }
     }

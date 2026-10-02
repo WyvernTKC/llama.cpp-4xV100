@@ -272,6 +272,141 @@ void ggml_cuda_op_ssm_conv_state(ggml_backend_cuda_context & ctx, const ggml_ten
     }
 }
 
+// The same for a longer batch, convolved as ssm_conv_long_token_f32 does: a thread takes one channel of split_n_t tokens
+//   and loads its window of the concat, the columns before the first token from the cache row and the tokens of x after
+//   them; the threads of the first tokens also store the windows of the rollback slots. A window reaches into the tokens
+//   of the block before, which with dst on x may already be overwritten: the first d_conv - 1 columns of every block
+//   then come from ssm_conv_state_halo_f32, run before, which also stores the slot windows, after it has read the start
+//   state (a slot is usually the cache row the state comes from), and a thread writes only tokens it has read.
+template <int d_conv, int split_n_t>
+static __global__ void ssm_conv_state_halo_f32(const float * states, const int32_t * ids, const int64_t row_stride,
+                                               const float * x, const int64_t x_stride_t, const int64_t x_stride_c,
+                                               float * halo, const ggml_cuda_ssm_conv_state_long_slots slots,
+                                               const int nr, const int n_blocks_t) {
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= nr) {
+        return;
+    }
+    const float * s = states + ids[0]*row_stride + (int64_t) c*(d_conv - 1);
+
+    // the first columns of block b: the start state for the first, the last tokens of the block before for the others
+    for (int b = blockIdx.y; b < n_blocks_t; b += gridDim.y) {
+#pragma unroll
+        for (int k = 0; k < d_conv - 1; ++k) {
+            const int t = b*split_n_t - (d_conv - 1) + k;
+            halo[((int64_t) b*(d_conv - 1) + k)*nr + c] = b == 0 ? s[k] : x[(int64_t) t*x_stride_t + (int64_t) c*x_stride_c];
+        }
+    }
+
+    if (blockIdx.y == 0) {
+        for (int k = 0; k < slots.n; ++k) {
+#pragma unroll
+            for (int kk = 0; kk < d_conv - 1; ++kk) {
+                const int p = slots.start[k] + kk;
+                slots.dst[k][(int64_t) c*(d_conv - 1) + kk] =
+                    p < d_conv - 1 ? s[p] : x[(int64_t) (p - (d_conv - 1))*x_stride_t + (int64_t) c*x_stride_c];
+            }
+        }
+    }
+}
+
+template <int d_conv, int split_n_t>
+static __global__ void ssm_conv_state_long_f32(const float * states, const int32_t * ids, const int64_t row_stride,
+                                               const float * x, const int64_t x_stride_t, const int64_t x_stride_c,
+                                               const float * w, const int64_t w_stride, const float * bias,
+                                               float * dst, const int64_t dst_stride_t, const float * halo,
+                                               const ggml_cuda_ssm_conv_state_long_slots slots, const int nr, const int n_t) {
+    ggml_cuda_pdl_lc();
+    const int c  = blockIdx.x*blockDim.x + threadIdx.x;
+    const int t0 = blockIdx.y*split_n_t;
+
+    ggml_cuda_pdl_sync();
+    if (c >= nr) {
+        return;
+    }
+
+    const float * s = states + ids[0]*row_stride + (int64_t) c*(d_conv - 1);
+
+    // column j of the window is column t0 + j of the concat
+    constexpr int n_cols = d_conv - 1 + split_n_t;
+    float win[n_cols];
+#pragma unroll
+    for (int j = 0; j < n_cols; ++j) {
+        const int p = t0 + j;
+        if (halo != nullptr && j < d_conv - 1) {
+            win[j] = halo[((int64_t) blockIdx.y*(d_conv - 1) + j)*nr + c];
+        } else {
+            win[j] = p < d_conv - 1 ? s[p] : p - (d_conv - 1) < n_t ? x[(int64_t) (p - (d_conv - 1))*x_stride_t + (int64_t) c*x_stride_c] : 0.0f;
+        }
+    }
+
+    if (blockIdx.y == 0) {
+        for (int k = 0; k < slots.n; ++k) {
+#pragma unroll
+            for (int kk = 0; kk < d_conv - 1; ++kk) {
+                const int p = slots.start[k] + kk;
+                slots.dst[k][(int64_t) c*(d_conv - 1) + kk] =
+                    p < d_conv - 1 ? s[p] : x[(int64_t) (p - (d_conv - 1))*x_stride_t + (int64_t) c*x_stride_c];
+            }
+        }
+    }
+
+    float wv[d_conv];
+#pragma unroll
+    for (int j = 0; j < d_conv; ++j) {
+        wv[j] = w[c*w_stride + j];
+    }
+    const float b = bias != nullptr ? bias[c] : 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < split_n_t; ++i) {
+        if (t0 + i >= n_t) {
+            break;
+        }
+        float sumf = 0.0f;
+#pragma unroll
+        for (int j = 0; j < d_conv; ++j) {
+            sumf += win[i + j] * wv[j];
+        }
+        sumf += b;
+        dst[(int64_t) (t0 + i)*dst_stride_t + c] = ggml_cuda_op_silu_single(sumf);
+    }
+}
+
+void ggml_cuda_op_ssm_conv_state_long(ggml_backend_cuda_context & ctx, const ggml_tensor * states, const ggml_tensor * ids,
+                                      const ggml_tensor * x, const ggml_tensor * ssm_conv, ggml_tensor * silu,
+                                      const ggml_cuda_ssm_conv_state_long_slots & slots) {
+    const ggml_tensor * w = ssm_conv->src[1];
+
+    const int nr  = (int) w->ne[1];
+    const int n_t = (int) silu->ne[1];
+    GGML_ASSERT(w->ne[0] == 4 && silu->ne[2] == 1);
+
+    constexpr int threads   = 128;
+    constexpr int split_n_t = 32;
+    const int     n_blocks_t = (n_t + split_n_t - 1) / split_n_t;
+    const size_t  ts         = sizeof(float);
+
+    // silu on x: the columns each block reads from the block before, and the slot windows, go first
+    ggml_cuda_pool_alloc<float> halo(ctx.pool());
+    ggml_cuda_ssm_conv_state_long_slots slots_long = slots;
+    if (silu->data == x->data) {
+        halo.alloc((size_t) n_blocks_t*3*nr);
+        const dim3 blocks_halo((nr + threads - 1) / threads, std::min(n_blocks_t, 16), 1);
+        ssm_conv_state_halo_f32<4, split_n_t><<<blocks_halo, threads, 0, ctx.stream()>>>(
+            (const float *) states->data, (const int32_t *) ids->data, (int64_t) (states->nb[1]/ts),
+            (const float *) x->data, (int64_t) (x->nb[0]/ts), (int64_t) (x->nb[1]/ts), halo.get(), slots, nr, n_blocks_t);
+        slots_long.n = 0;
+    }
+
+    const ggml_cuda_kernel_launch_params launch_params(dim3((nr + threads - 1) / threads, n_blocks_t, 1), threads, 0, ctx.stream());
+    ggml_cuda_kernel_launch(ssm_conv_state_long_f32<4, split_n_t>, launch_params,
+        (const float *) states->data, (const int32_t *) ids->data, (int64_t) (states->nb[1]/ts),
+        (const float *) x->data, (int64_t) (x->nb[0]/ts), (int64_t) (x->nb[1]/ts),
+        (const float *) w->data, (int64_t) (w->nb[1]/ts), (const float *) nullptr,
+        (float *) silu->data, (int64_t) (silu->nb[1]/ts), (const float *) halo.ptr, slots_long, nr, n_t);
+}
+
 void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst) {
     const struct ggml_tensor * src0 = dst->src[0];  // conv_x
     const struct ggml_tensor * src1 = dst->src[1];  // conv1d.weight

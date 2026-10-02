@@ -15,3 +15,15 @@ struct ggml_cuda_ssm_conv_state_slots {
 void ggml_cuda_op_ssm_conv_state(ggml_backend_cuda_context & ctx, const ggml_tensor * states, const ggml_tensor * ids,
                                  const ggml_tensor * x, const ggml_tensor * ssm_conv, ggml_tensor * silu,
                                  const ggml_cuda_ssm_conv_state_slots & slots);
+
+// the rollback slots of a longer batch, at the first column of the window each holds in the concat
+struct ggml_cuda_ssm_conv_state_long_slots {
+    int     n;
+    int     start[GGML_CUDA_SSM_CONV_STATE_MAX_TOKENS + 1];
+    float * dst  [GGML_CUDA_SSM_CONV_STATE_MAX_TOKENS + 1];
+};
+
+// the same for one sequence of more tokens, without the concat in memory; silu may sit on x only with its layout
+void ggml_cuda_op_ssm_conv_state_long(ggml_backend_cuda_context & ctx, const ggml_tensor * states, const ggml_tensor * ids,
+                                      const ggml_tensor * x, const ggml_tensor * ssm_conv, ggml_tensor * silu,
+                                      const ggml_cuda_ssm_conv_state_long_slots & slots);
