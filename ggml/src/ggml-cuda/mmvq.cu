@@ -644,8 +644,11 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool wide = false>
-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
+// paired: a fused gate on twice the warps, the first half summing x and the second half the gate over the same rows and
+//   K slices as the plain kernel, so a thread keeps the sums of one matrix as there and each sum is the plain one
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool wide = false,
+          bool paired = false>
+__launch_bounds__((paired ? 2 : 1)*calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -668,7 +671,10 @@ static __global__ void mul_mat_vec_q(
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = wide ? get_vec_dot_q_cuda_wide(type) : get_vec_dot_q_cuda(type);
 
-    const     int tid = warp_size*threadIdx.y + threadIdx.x;
+    static_assert(!paired || (has_fusion && ncols_dst == 1), "paired needs a fused gate and one column");
+    const     int half = paired ? threadIdx.y / nwarps : 0; // 1: the warps of the gate
+    const     int wy   = paired ? threadIdx.y % nwarps : threadIdx.y;
+    const     int tid = warp_size*wy + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
     const     int blocks_per_row_x = ncols_x / qk;
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
@@ -766,6 +772,8 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
+    [[maybe_unused]] const void * vsum = paired && half ? vgate : vx;
+
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
@@ -796,6 +804,11 @@ static __global__ void mul_mat_vec_q(
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
+                if constexpr (paired) {
+                    tmp[j][i] += vec_dot_q_cuda(
+                        vsum, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    continue;
+                }
                 tmp[j][i] += vec_dot_q_cuda(
                     vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                 if constexpr (has_fusion) {
@@ -809,9 +822,21 @@ static __global__ void mul_mat_vec_q(
     }
 
     __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
-    [[maybe_unused]] __shared__ float tmp_shared_gate[(has_fusion && (nwarps-1 > 0)) ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
+    // paired: the partial sums of all gate warps, the first of them taking the place of the plain kernel's own
+    [[maybe_unused]] __shared__ float tmp_shared_gate[paired ? nwarps : (has_fusion && (nwarps-1 > 0)) ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
 
-    if (threadIdx.y > 0) {
+    if constexpr (paired) {
+        if (half || wy > 0) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                if (half) {
+                    tmp_shared_gate[wy][0][i][threadIdx.x] = tmp[0][i];
+                } else {
+                    tmp_shared[wy-1][0][i][threadIdx.x] = tmp[0][i];
+                }
+            }
+        }
+    } else if (threadIdx.y > 0) {
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
@@ -840,10 +865,17 @@ static __global__ void mul_mat_vec_q(
     for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
         for (int i = 0; i < rows_per_cuda_block; ++i) {
+            if constexpr (paired) {
+                tmp_gate[j][i] = tmp_shared_gate[0][j][i][threadIdx.x];
+#pragma unroll
+                for (int l = 1; l < nwarps; ++l) {
+                    tmp_gate[j][i] += tmp_shared_gate[l][j][i][threadIdx.x];
+                }
+            }
 #pragma unroll
             for (int l = 0; l < nwarps-1; ++l) {
                 tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
-                if constexpr (has_fusion) {
+                if constexpr (has_fusion && !paired) {
                     if (use_gate) {
                         tmp_gate[j][i] += tmp_shared_gate[l][j][i][threadIdx.x];
                     }
@@ -1070,7 +1102,7 @@ static std::pair<dim3, dim3> calc_launch_params(
     return {block_nums, block_dims};
 }
 
-template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, bool wide = false>
+template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, bool wide = false, bool paired = false>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -1085,7 +1117,7 @@ static void mul_mat_vec_q_switch_fusion(
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, wide>, launch_params,
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, wide, paired>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -1094,6 +1126,9 @@ static void mul_mat_vec_q_switch_fusion(
     }
 
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+    if constexpr (paired) {
+        GGML_ABORT("the paired layout needs a fused gate");
+    }
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, wide>, launch_params,
@@ -1103,16 +1138,16 @@ static void mul_mat_vec_q_switch_fusion(
 }
 
 // The wide kernel is compiled only where mmvq_wide can pick it.
-template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, typename... Args>
+template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, bool paired = false, typename... Args>
 static void mul_mat_vec_q_switch_wide(const bool wide, Args &&... args) {
     if constexpr (mmvq_wide(type, MMVQ_PARAMETERS_VOLTA, c_ncols_dst)) {
         if (wide) {
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, small_k, halve_iters, true>(std::forward<Args>(args)...);
+            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, small_k, halve_iters, true, paired>(std::forward<Args>(args)...);
             return;
         }
     }
     GGML_UNUSED(wide);
-    mul_mat_vec_q_switch_fusion<type, c_ncols_dst, small_k, halve_iters, false>(std::forward<Args>(args)...);
+    mul_mat_vec_q_switch_fusion<type, c_ncols_dst, small_k, halve_iters, false, paired>(std::forward<Args>(args)...);
 }
 
 template <ggml_type type>
@@ -1194,11 +1229,14 @@ bool ggml_cuda_should_fuse_mmvq_gate(enum ggml_type type, int cc, int64_t nrows_
     if (!mmvq_volta_multi_row(cc, nwarps, nrows_x, nchannels_dst, nsamples_dst) || mmvq_small_k_is_slow(type, cc, 1)) {
         return true;
     }
-    // Here the plain kernel keeps 4 rows per block and the fused one 1. A dense GEMV is faster as two launches (one
-    //   token: q4_K 15360x3840 +11% fused). A MUL_MAT_ID wins fused on small grids, where the saved launches weigh the
-    //   most (qwen35moe 512x2048 x8 experts: -1% ms/token end to end), and loses on big ones (q4_K 2048x4096 x6 +9%).
-    //   Q3_K is slower fused at any size.
-    if (!mul_mat_id || type == GGML_TYPE_Q3_K) {
+    // Here the plain kernel keeps 4 rows per block. A dense GEMV then fuses in the paired layout, which keeps them (with
+    //   one row per block it was slower than two launches: one token, q4_K 15360x3840 +11%). A MUL_MAT_ID fuses with one
+    //   row per block, which wins on small grids, where the saved launches weigh the most (qwen35moe 512x2048 x8 experts:
+    //   -1% ms/token end to end), and loses on big ones (q4_K 2048x4096 x6 +9%). Q3_K is slower so at any size.
+    if (!mul_mat_id) {
+        return true;
+    }
+    if (type == GGML_TYPE_Q3_K) {
         return false;
     }
     const int64_t nblocks = (nrows_x + nwarps - 1)/nwarps * nchannels_dst * nsamples_dst;
@@ -1242,7 +1280,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return mmvq_wide(type, table_id, c_ncols_dst) && blocks_per_row_x > calc_nwarps(type, c_ncols_dst, table_id) * blocks_per_iter_1warp;
     };
 
-    const auto should_use_small_k = [&](int c_ncols_dst) {
+    // Whether the plain kernel puts several rows in a block.
+    const auto multi_row = [&](int c_ncols_dst) {
         // When K is small, increase rows_per_block to match nwarps so each warp has more work to do
         // Trigger when the full thread block covers all K blocks in a single loop iteration and few threads remain idle.
         const int  nwarps = calc_nwarps(type, c_ncols_dst, table_id);
@@ -1253,16 +1292,20 @@ static void mul_mat_vec_q_switch_ncols_dst(
             use = true;
         }
 
-        // On Volta a fused gate keeps one row per block: it doubles the sums each row keeps live, several rows then cut
-        //   the occupancy (q4_K: 91 registers at 4 rows, 64 at 2, 48 at 1; qwen35moe experts 512x2048 x8, ms/token
-        //   end to end: 1 row -1.1% vs 2 rows, -3.9% vs 4 rows).
-        const bool is_nvidia_volta = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA && cc < GGML_CUDA_CC_TURING;
-        if (is_nvidia_volta && fusion.gate != nullptr) {
-            return false;
-        }
-
         return use && !mmvq_small_k_is_slow(type, cc, ncols_dst);
     };
+
+    // On Volta a fused gate never keeps several rows per block in one thread: it doubles the sums each row keeps live,
+    //   several rows then cut the occupancy (q4_K: 91 registers at 4 rows, 64 at 2, 48 at 1; qwen35moe experts 512x2048
+    //   x8, ms/token end to end: 1 row -1.1% vs 2 rows, -3.9% vs 4 rows). A dense one takes the paired layout instead,
+    //   with the rows of the plain kernel; the experts of a MUL_MAT_ID keep one row per block.
+    const bool is_nvidia_volta = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA && cc < GGML_CUDA_CC_TURING;
+    const bool volta_gate      = is_nvidia_volta && fusion.gate != nullptr;
+
+    const auto should_use_small_k = [&](int c_ncols_dst) {
+        return multi_row(c_ncols_dst) && !volta_gate;
+    };
+    const bool use_paired = volta_gate && !has_ids && ncols_dst == 1 && multi_row(1);
 
     // Whether doubling nwarps pays off on the ncols_dst == 1 path, where K sets the K loop trip count.
     const auto should_halve_iters = [&] {
@@ -1302,8 +1345,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
             static constexpr int c_ncols_dst = 1;
 
             // Tag types keep the flags compile-time, so __launch_bounds__ matches what is launched.
-            const auto launch = [&](auto small_k_tag, auto halve_iters_tag) {
+            const auto launch = [&](auto small_k_tag, auto halve_iters_tag, auto paired_tag) {
                 constexpr bool c_small_k = decltype(small_k_tag)::value;
+                constexpr bool c_paired  = decltype(paired_tag)::value;
                 // Types the table does not promote would compile a second, identical kernel.
                 constexpr bool c_promoted =
                     calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_GB10, false, true) !=
@@ -1311,21 +1355,26 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
                 constexpr bool c_halve_iters = decltype(halve_iters_tag)::value && c_promoted;
 
-                const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
-                                                                              nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters);
-                mul_mat_vec_q_switch_wide<type, c_ncols_dst, c_small_k, c_halve_iters>(use_wide(c_ncols_dst),
+                std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
+                                                                        nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters);
+                if constexpr (c_paired) {
+                    dims.second.y *= 2;
+                }
+                mul_mat_vec_q_switch_wide<type, c_ncols_dst, c_small_k, c_halve_iters, c_paired>(use_wide(c_ncols_dst),
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
                     stream);
             };
 
-            if (should_use_small_k(c_ncols_dst)) {
-                launch(std::true_type{},  std::false_type{});
+            if (use_paired) {
+                launch(std::true_type{},  std::false_type{}, std::true_type{});
+            } else if (should_use_small_k(c_ncols_dst)) {
+                launch(std::true_type{},  std::false_type{}, std::false_type{});
             } else if (should_halve_iters()) {
-                launch(std::false_type{}, std::true_type{});
+                launch(std::false_type{}, std::true_type{},  std::false_type{});
             } else {
-                launch(std::false_type{}, std::false_type{});
+                launch(std::false_type{}, std::false_type{}, std::false_type{});
             }
         } break;
         case 2: {
