@@ -1648,16 +1648,19 @@ static void ggml_cuda_mul_mat_vec_q_impl(
         src1_q8_1 = src1_q8_1_rot.get();
     } else {
         // quantize_row_q8_1_cuda ignores src0->type, so the result only depends on src1 and the padded
-        // width: reuse it when a later matmul reads the same input, e.g. the q/k/v projections
+        // width: reuse it when a later matmul reads the same input, e.g. the q/k/v projections. A view of
+        // the same rows of the same tensor reads the same bytes, e.g. the MUL_MAT_ID reshape of a norm
+        // that the shared expert reads as it is.
+        const ggml_tensor * src1_owner = src1->view_src ? src1->view_src : src1;
         auto & cached = ctx.q8_1_inputs[src1->data];
-        const bool reuse = cached.buf && cached.src1 == src1 && cached.ne_padded == ne10_padded &&
+        const bool reuse = cached.buf && cached.src1 == src1_owner && cached.ne_padded == ne10_padded &&
             cached.stream_no == ctx.curr_stream_no &&
             std::equal(std::begin(cached.ne), std::end(cached.ne), src1->ne) &&
             std::equal(std::begin(cached.nb), std::end(cached.nb), src1->nb);
 
         if (!reuse) {
             cached.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), nbytes_src1_q8_1);
-            cached.src1      = src1;
+            cached.src1      = src1_owner;
             cached.ne_padded = ne10_padded;
             cached.stream_no = ctx.curr_stream_no;
             std::copy_n(src1->ne, GGML_MAX_DIMS, cached.ne);

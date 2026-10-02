@@ -3000,6 +3000,23 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
     return true;
 }
 
+// a norm without weight whose rows go straight into a cache row per token, the V of gemma 4: the rows of the norm
+//   kernel, stored by it as set_rows does
+static bool ggml_cuda_should_fuse_rms_norm_set_rows(const ggml_tensor * rms_norm, const ggml_tensor * view,
+                                                    const ggml_tensor * set_rows) {
+    if (!ggml_cuda_rms_norm_mul_fusable_rows(rms_norm, nullptr) || view->op != GGML_OP_VIEW || set_rows->op != GGML_OP_SET_ROWS) {
+        return false;
+    }
+
+    const ggml_tensor * idx = set_rows->src[1];
+    return rms_norm->ne[3] == 1 && view->view_offs == 0 && ggml_is_contiguous(view) &&
+           view->ne[0] == rms_norm->ne[0]*rms_norm->ne[1] && view->ne[1] == rms_norm->ne[2] && view->ne[2] == 1 && view->ne[3] == 1 &&
+           ggml_cuda_rms_norm_mul_rope_fused_dst_supported(set_rows->type) && set_rows->ne[0] == view->ne[0] &&
+           set_rows->ne[2] == 1 && set_rows->ne[3] == 1 && set_rows->nb[0] == ggml_type_size(set_rows->type) &&
+           (!ggml_is_quantized(set_rows->type) || rms_norm->ne[0] % ggml_blck_size(set_rows->type) == 0) &&
+           idx->type == GGML_TYPE_I64 && idx->ne[0] == view->ne[1] && ggml_nrows(idx) == 1;
+}
+
 // the qwen4exp QSA key pooling: get_rows_mean -> reshape -> rms_norm * weight -> reshape -> multi-section rope,
 // one token per pooled row; the caller checked the edges
 static bool ggml_cuda_should_fuse_get_rows_mean_norm_rope(const ggml_tensor * get_rows_mean, const ggml_tensor * rms_norm,
@@ -4131,6 +4148,18 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         if (ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 1 }) &&
             ggml_cuda_should_fuse_rms_norm_mul_rope(cgraph->nodes[node_idx], nullptr, cgraph->nodes[node_idx + 1])) {
             int out_nodes[] = { node_idx + 1 };
+            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
+        }
+        return false;
+    }
+
+    std::initializer_list<enum ggml_op> rms_norm_set_rows_ops = { GGML_OP_RMS_NORM, GGML_OP_VIEW, GGML_OP_SET_ROWS };
+
+    if (is_equal(rms_norm_set_rows_ops, ops)) {
+        if (ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 }) &&
+            ggml_check_edges(cgraph, node_idx, {{1, 0, 0}, {2, 0, 1}}) &&
+            ggml_cuda_should_fuse_rms_norm_set_rows(cgraph->nodes[node_idx], cgraph->nodes[node_idx + 1], cgraph->nodes[node_idx + 2])) {
+            int out_nodes[] = { node_idx + 2 };
             return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
         }
         return false;
@@ -5486,6 +5515,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_ROPE }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, nullptr, cgraph->nodes[i + 1], nullptr);
         return 1;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
+        ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, nullptr, nullptr, cgraph->nodes[i + 2]);
+        return 2;
     }
 
     // the sandwich norms of gemma: a block's post-norm, the residual add (and the layer output scale) and the next block's
