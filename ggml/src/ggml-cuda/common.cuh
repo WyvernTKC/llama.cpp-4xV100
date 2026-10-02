@@ -1644,19 +1644,55 @@ struct ggml_backend_cuda_context {
 
     cublas_input cublas_src1;
 
+    // The expert lists and the quantized activations of an MMQ MUL_MAT_ID, kept for the next one that reads the same
+    // activations with the same ids: the up projection of an expert FFN after its gate. One entry, replaced by the next,
+    // on a pool that frees in any order, as above.
+    struct mmq_ids_input {
+        const ggml_tensor * src1_owner = nullptr;
+        const void * src1_data   = nullptr;
+        size_t       src1_nbytes = 0;
+        int64_t      src1_ne[GGML_MAX_DIMS] = {0};
+        size_t       src1_nb[GGML_MAX_DIMS] = {0};
+        const void * ids_data    = nullptr;
+        size_t       ids_nbytes  = 0;
+        int64_t      ids_ne[GGML_MAX_DIMS] = {0};
+        size_t       ids_nb[GGML_MAX_DIMS] = {0};
+        ggml_type    type      = GGML_TYPE_COUNT;
+        int          prec      = -1;
+        int64_t      n_experts = 0;
+        size_t       nbytes    = 0; // of the quantized activations, with the tile padding of the type
+        int          stream_no = -1;
+        std::unique_ptr<ggml_cuda_pool_alloc<char>> ids_src1, ids_dst, expert_bounds, q8_1, scale;
+
+        void reset() {
+            ids_src1.reset();
+            ids_dst.reset();
+            expert_bounds.reset();
+            q8_1.reset();
+            scale.reset();
+        }
+    };
+
+    mmq_ids_input mmq_ids;
+
     // a node is about to write its memory
     void cublas_input_invalidate(const ggml_tensor * node) {
-        if (cublas_src1.buf) {
+        const auto overlaps = [node](const void * data, const size_t nbytes) {
             const char * a = (const char *) node->data;
-            const char * b = (const char *) cublas_src1.data;
-            if (a < b + cublas_src1.nbytes && b < a + ggml_nbytes(node)) {
-                cublas_src1.buf.reset();
-            }
+            const char * b = (const char *) data;
+            return a < b + nbytes && b < a + ggml_nbytes(node);
+        };
+        if (cublas_src1.buf && overlaps(cublas_src1.data, cublas_src1.nbytes)) {
+            cublas_src1.buf.reset();
+        }
+        if (mmq_ids.q8_1 && (overlaps(mmq_ids.src1_data, mmq_ids.src1_nbytes) || overlaps(mmq_ids.ids_data, mmq_ids.ids_nbytes))) {
+            mmq_ids.reset();
         }
     }
 
     void cublas_input_reset() {
         cublas_src1.buf.reset();
+        mmq_ids.reset();
     }
 };
 

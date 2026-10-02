@@ -6138,6 +6138,63 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, float amax =
     init_mul_mat_id_ids(ctx, n_mats);
 }
 
+// The gate and up projections of an expert FFN, two MUL_MAT_ID of the same activations and ids, then the activations
+// written in place and read by a third: a backend that keeps the expert lists and the quantized activations of the
+// first for the second must not keep them past the write
+struct test_mul_mat_id_shared : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_used;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_SHARED";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, n_mats, n_used, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_id_shared(ggml_type type_a = GGML_TYPE_Q8_0, int n_mats = 16, int n_used = 4, int64_t m = 64,
+                           int64_t n = 256, int64_t k = 256)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as[3];
+        for (ggml_tensor *& a : as) {
+            a = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        }
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+
+        ggml_tensor * b0 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
+        ggml_tensor * b  = ggml_scale(ctx, b0, 1.0f);
+
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, as[0], b, ids);
+        ggml_tensor * up   = ggml_mul_mat_id(ctx, as[1], b, ids);
+        ggml_tensor * bs   = ggml_scale_inplace(ctx, b, 0.5f);
+        ggml_tensor * last = ggml_mul_mat_id(ctx, as[2], bs, ids);
+
+        ggml_tensor * out = ggml_add(ctx, ggml_add(ctx, gate, up), last);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
 // GGML_OP_MUL_MAT_ID
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
@@ -11542,6 +11599,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0,   GGML_TYPE_F32, 1024, 10, false, 256, n, 128));
     }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
+
+    // gate and up of a batch on MMQ, then the activations scaled in place: a small batch, and a large one over more
+    //   than 64 experts, the two cases where MMQ is chosen with fp16 tensor cores
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        test_cases.emplace_back(new test_mul_mat_id_shared(type_a, 16, 4, 64, 64, 256));
+        test_cases.emplace_back(new test_mul_mat_id_shared(type_a, 128, 8, 32, 512, 512));
+    }
 
     // prefill batches, whose expert lists several warps of mm_ids_helper build: a specialised and the generic number of
     //   experts used, broadcast activations (gate/up) and 256 experts as in Qwen3.5-35B-A3B
