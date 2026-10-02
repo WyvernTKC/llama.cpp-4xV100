@@ -1626,15 +1626,40 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         src0_ptr = src0_alloc.get();
     }
 
+    // the matmul before may have converted the same input, e.g. q, k and v of one norm. Only the memory of graph
+    //   tensors is followed by the invalidation, not a pool copy that a caller passes in (the experts of MUL_MAT_ID)
+    auto & cached = ctx.cublas_src1;
+    const ggml_tensor * src1_owner = src1->view_src ? src1->view_src : src1;
+    const char *        src1_base  = src1->buffer ? (const char *) ggml_backend_buffer_get_base(src1->buffer) : nullptr;
+    const bool keep_src1 = !ggml_cuda_info().devices[ctx.device].vmm && src1_base != nullptr &&
+        (const char *) src1->data >= src1_base &&
+        (const char *) src1->data + ggml_nbytes(src1) <= src1_base + ggml_backend_buffer_get_size(src1->buffer);
+
     if (src1->type == compute_type) {
         src1_ptr = (const cuda_t *) src1->data;
+    } else if (keep_src1 && cached.buf && cached.owner == src1_owner && cached.data == src1->data &&
+            cached.type == compute_type && cached.stream_no == ctx.curr_stream_no &&
+            std::equal(std::begin(cached.ne), std::end(cached.ne), src1->ne) &&
+            std::equal(std::begin(cached.nb), std::end(cached.nb), src1->nb)) {
+        src1_ptr       = (const cuda_t *) cached.buf->get();
+        s11            = cached.s11;
+        s12            = cached.s12;
+        s13            = cached.s13;
+        is_src1_cont_2 = cached.cont_2;
     } else {
-        src1_alloc.alloc(ggml_nelements(src1));
+        cuda_t * src1_conv = nullptr;
+        if (keep_src1) {
+            cached.buf.reset();
+            cached.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), ggml_nelements(src1)*sizeof(cuda_t));
+            src1_conv  = (cuda_t *) cached.buf->get();
+        } else {
+            src1_conv  = src1_alloc.alloc(ggml_nelements(src1));
+        }
 
         if (ggml_is_contiguously_allocated(src1)) {
             const auto convert_func = traits::convert(src1->type);
             GGML_ASSERT(convert_func != nullptr);
-            convert_func(src1->data, src1_alloc.get(), ggml_nelements(src1), main_stream);
+            convert_func(src1->data, src1_conv, ggml_nelements(src1), main_stream);
             const size_t src1_bs = ggml_blck_size(src1->type);
             s11 *= src1_bs;
             s12 *= src1_bs;
@@ -1642,13 +1667,27 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         } else {
             const auto convert_func = traits::convert_nc(src1->type);
             GGML_ASSERT(convert_func != nullptr);
-            convert_func(src1->data, src1_alloc.get(), ne10, ne11, ne12, ne13, s11, s12, s13, main_stream);
+            convert_func(src1->data, src1_conv, ne10, ne11, ne12, ne13, s11, s12, s13, main_stream);
             s11 = ne10;
             s12 = ne11*s11;
             s13 = ne12*s12;
             is_src1_cont_2 = true;
         }
-        src1_ptr = src1_alloc.get();
+        src1_ptr = src1_conv;
+
+        if (keep_src1) {
+            cached.owner     = src1_owner;
+            cached.data      = src1->data;
+            cached.nbytes    = ggml_nbytes(src1);
+            cached.type      = compute_type;
+            cached.stream_no = ctx.curr_stream_no;
+            std::copy_n(src1->ne, GGML_MAX_DIMS, cached.ne);
+            std::copy_n(src1->nb, GGML_MAX_DIMS, cached.nb);
+            cached.s11       = s11;
+            cached.s12       = s12;
+            cached.s13       = s13;
+            cached.cont_2    = is_src1_cont_2;
+        }
     }
 
     ggml_cuda_pool_alloc<cuda_t> dst_temp(ctx.pool());
@@ -5650,6 +5689,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_ssm_conv_state_fusion f;
         if (ggml_cuda_ssm_conv_state_fusion_match(cuda_ctx, cgraph, i, f)) {
             cuda_ctx->q8_1_input_invalidate(f.silu->data);
+            cuda_ctx->cublas_input_invalidate(f.silu);
             ggml_cuda_op_ssm_conv_state(*cuda_ctx, f.states, f.ids, f.x, f.ssm_conv, f.silu, f.slots);
             return f.last_cpy - i;
         }
@@ -5841,6 +5881,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 cuda_ctx->q8_1_input_invalidate(node->data);
+                cuda_ctx->cublas_input_invalidate(node);
 
                 // the state gather of a gated delta net or a convolution that reads the cache itself
                 if (node->op == GGML_OP_GET_ROWS && (ggml_cuda_gdn_gather_is_folded(cuda_ctx, cgraph, i) ||
@@ -5853,6 +5894,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (nodes_to_skip != 0) {
                     for (int j = i; j <= i + nodes_to_skip; j++) {
                         cuda_ctx->q8_1_input_invalidate(cgraph->nodes[j]->data);
+                        cuda_ctx->cublas_input_invalidate(cgraph->nodes[j]);
                     }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
@@ -5951,8 +5993,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
-    // every tensor is written again this pass, so no quantized copy from the last one survives
+    // every tensor is written again this pass, so no quantized or converted copy from the last one survives
     cuda_ctx->q8_1_input_reset();
+    cuda_ctx->cublas_input_reset();
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

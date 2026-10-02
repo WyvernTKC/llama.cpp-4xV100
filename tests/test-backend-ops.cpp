@@ -8019,6 +8019,54 @@ struct test_moe_reduce : public test_case {
     }
 };
 
+// Matmuls of a batch that read one input, as the q/k/v projections of a norm do, then the same input written in place
+// and read again: the converted input a backend keeps for the second matmul must not survive the write
+struct test_mul_mat_shared_src1 : public test_case {
+    const ggml_type type;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SHARED_SRC1";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, m, n, k);
+    }
+
+    test_mul_mat_shared_src1(ggml_type type = GGML_TYPE_F16, int64_t m = 256, int64_t n = 512, int64_t k = 256)
+        : type(type), m(m), n(n), k(k) {}
+
+    // as test_mul_mat; a stale input for the last two matmuls doubles half of the sum
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * w[4];
+        for (ggml_tensor *& wi : w) {
+            wi = ggml_new_tensor_2d(ctx, type, k, m);
+        }
+
+        ggml_tensor * x  = ggml_add(ctx, a, b);
+        ggml_tensor * y0 = ggml_mul_mat(ctx, w[0], x);
+        ggml_tensor * y1 = ggml_mul_mat(ctx, w[1], x);
+        ggml_tensor * xs = ggml_scale_inplace(ctx, x, 0.5f);
+        ggml_tensor * y2 = ggml_mul_mat(ctx, w[2], xs);
+        ggml_tensor * y3 = ggml_mul_mat(ctx, w[3], ggml_reshape_2d(ctx, xs, k, n));
+
+        ggml_tensor * out = ggml_add(ctx, ggml_add(ctx, y0, y1), ggml_add(ctx, y2, y3));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -12356,6 +12404,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 4096, 512,
                 false, 1, 1, false, with_bias, true, false, {1, 1}));
         }
+    }
+    // a batch of matmuls sharing an input, which is then scaled in place
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        test_cases.emplace_back(new test_mul_mat_shared_src1(type, 256, 512, 256));
+        test_cases.emplace_back(new test_mul_mat_shared_src1(type, 512, 64, 1024));
     }
     // one token of a quantized gate and up over enough rows that Volta puts four of them in a block, which fuses them in
     //   the paired layout: gemma-4-31B split four ways, and an odd tail row

@@ -1623,6 +1623,41 @@ struct ggml_backend_cuda_context {
     void q8_1_input_reset() {
         q8_1_inputs.clear();
     }
+
+    // The f16 (or bf16) copy of an f32 matmul input that cuBLAS reads, kept for the next matmul of the same input: the
+    // q/k/v projections of one norm convert it once instead of three times. One entry, replaced by the next conversion.
+    // Its pool allocation outlives the matmul, so it is only kept where the pool frees in any order (not vmm).
+    struct cublas_input {
+        const ggml_tensor * owner = nullptr; // the tensor that owns the memory, the source of a view
+        const void * data = nullptr;
+        size_t nbytes = 0; // of the f32 input
+        ggml_type type = GGML_TYPE_COUNT;
+        int64_t ne[GGML_MAX_DIMS] = {0};
+        size_t  nb[GGML_MAX_DIMS] = {0};
+        int stream_no = -1;
+        int64_t s11 = 0; // the strides of the copy, in elements
+        int64_t s12 = 0;
+        int64_t s13 = 0;
+        bool cont_2 = false;
+        std::unique_ptr<ggml_cuda_pool_alloc<char>> buf;
+    };
+
+    cublas_input cublas_src1;
+
+    // a node is about to write its memory
+    void cublas_input_invalidate(const ggml_tensor * node) {
+        if (cublas_src1.buf) {
+            const char * a = (const char *) node->data;
+            const char * b = (const char *) cublas_src1.data;
+            if (a < b + cublas_src1.nbytes && b < a + ggml_nbytes(node)) {
+                cublas_src1.buf.reset();
+            }
+        }
+    }
+
+    void cublas_input_reset() {
+        cublas_src1.buf.reset();
+    }
 };
 
 struct ggml_cuda_mm_fusion_args_host {
