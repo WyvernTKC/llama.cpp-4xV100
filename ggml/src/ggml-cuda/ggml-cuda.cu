@@ -4686,6 +4686,29 @@ static int ggml_cuda_try_fuse_attn_rot(ggml_backend_cuda_context * cuda_ctx, ggm
     return n_ops - 1;
 }
 
+// The outputs of the fused topk_moe may lie over the logits: ggml-alloc puts them there once nothing else reads the
+// logits, as the alloc deps of graph_optimize are not made under the meta backend. Up to TOPK_MOE_ROWS_PER_BLOCK rows
+// one block reads all logits before it writes; with more, the other blocks would read logits already overwritten, so
+// they read a copy (a prefill batch otherwise took the unfused argsort path, ~0.1 ms per layer at 2048 tokens).
+static bool ggml_cuda_topk_moe_launch(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i,
+        const int n_ops, const int * out_nodes, const ggml_tensor * logits, ggml_tensor * weights, ggml_tensor * ids,
+        const ggml_tensor * clamp, const ggml_tensor * scale, const ggml_tensor * bias, const ggml_cuda_topk_moe_args & args) {
+    if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, out_nodes, 2, /*is_topk_moe=*/true)) {
+        ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+        return true;
+    }
+    if (!ggml_is_contiguous(logits) ||
+            !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, out_nodes, 2, /*is_topk_moe=*/true, logits)) {
+        return false;
+    }
+    ggml_cuda_pool_alloc<char> logits_copy(cuda_ctx->pool(), ggml_nbytes(logits));
+    CUDA_CHECK(cudaMemcpyAsync(logits_copy.get(), logits->data, ggml_nbytes(logits), cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+    ggml_tensor logits_c = *logits;
+    logits_c.data = logits_copy.get();
+    ggml_cuda_op_topk_moe(*cuda_ctx, &logits_c, weights, ids, clamp, scale, bias, args);
+    return true;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4915,8 +4938,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
-                        ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
-                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                        ggml_cuda_topk_moe_launch(cuda_ctx, cgraph, i, ops.size(), out_nodes, logits, weights, ids, clamp, scale,
+                            bias, args)) {
                     return ops.size() - 1;
                 }
             } else if (!args.norm && !args.prob_bias) {
@@ -4930,8 +4953,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 int out_nodes[2] = { i + 1, i + 5 };
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids) &&
-                        ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
-                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                        ggml_cuda_topk_moe_launch(cuda_ctx, cgraph, i, ops.size(), out_nodes, logits, weights, ids, clamp, scale,
+                            bias, args)) {
                     return ops.size() - 1;
                 }
             }
