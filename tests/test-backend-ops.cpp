@@ -4429,6 +4429,52 @@ struct test_rms_norm_scale : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM + GGML_OP_SCALE + GGML_OP_MUL (rms_norm(x) * s * w, the gemma4 router input)
+struct test_rms_norm_scale_mul : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const float eps;
+    const float scale;
+    const bool weight_first; // a full weight as the first operand of the mul instead of a broadcast row
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_SCALE_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, ne, eps, scale, weight_first);
+    }
+
+    test_rms_norm_scale_mul(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {64, 5, 4, 3},
+            float eps = 1e-6f, float scale = 0.125f, bool weight_first = false)
+        : type(type), ne(ne), eps(eps), scale(scale), weight_first(weight_first) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+        // a leaf, as a model weight: a param would add an OP_NONE node between the scale and the mul
+        ggml_tensor * w = weight_first ? ggml_new_tensor(ctx, type, 4, ne.data()) : ggml_new_tensor_1d(ctx, type, ne[0]);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * n   = ggml_scale(ctx, ggml_rms_norm(ctx, a, eps), scale);
+        ggml_tensor * out = weight_first ? ggml_mul(ctx, w, n) : ggml_mul(ctx, n, w);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+};
+
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_UNARY + GGML_OP_MUL (rms_norm(x) * w * op(z), build_norm_gated)
 struct test_rms_norm_gated : public test_case {
     const ggml_type type;
@@ -11163,6 +11209,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_scale(GGML_TYPE_F32, { 128, 4, 3, 2 }, 1e-6f, 0.0883883476f));
     test_cases.emplace_back(new test_rms_norm_scale(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, 0.125f));
     test_cases.emplace_back(new test_rms_norm_scale(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, 2.0f, 0.5f));
+    // the gemma4 router row, both block sizes, a row past the register columns, and a full weight first
+    test_cases.emplace_back(new test_rms_norm_scale_mul(GGML_TYPE_F32, { 2816, 64, 1, 1 }, 1e-6f, 0.0188445951f));
+    test_cases.emplace_back(new test_rms_norm_scale_mul(GGML_TYPE_F32, { 128, 4, 3, 2 }, 1e-6f, 0.125f));
+    test_cases.emplace_back(new test_rms_norm_scale_mul(GGML_TYPE_F32, { 9000, 2, 1, 1 }, 1e-6f, 0.5f));
+    test_cases.emplace_back(new test_rms_norm_scale_mul(GGML_TYPE_F32, { 1536, 3, 1, 1 }, 1e-6f, 2.0f, true));
     for (ggml_unary_op op : { GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SILU }) {
         for (int64_t n_tokens : { 1, 6, 32 }) {
             test_cases.emplace_back(new test_cont_unary_mul(256, 4,  n_tokens, op));
