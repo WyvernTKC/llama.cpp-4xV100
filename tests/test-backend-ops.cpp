@@ -11537,6 +11537,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
 
+    // prefill batches, whose expert lists several warps of mm_ids_helper build: a specialised and the generic number of
+    //   experts used, broadcast activations (gate/up) and 256 experts as in Qwen3.5-35B-A3B
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        for (bool b : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32,  64, 8, b, 64,  512, 256));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32,  64, 8, b, 64, 2048, 256));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32,  32, 5, b, 64, 1000, 256));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, b, 32, 2048, 256));
+        }
+    }
+
     // multiple blocks per row: exercises the block-stride loop and the
     // per-expert base offset, which k == 256 alone leaves untested
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
