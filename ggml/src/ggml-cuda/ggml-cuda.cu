@@ -2878,9 +2878,11 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
 }
 #endif // USE_CUDA_GRAPH
 
+// multi: the rows go through rms_norm_mul_rope_f32, which also does the multi-section ropes (mrope, imrope)
 static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
                                                 const ggml_tensor * view,
-                                                const ggml_tensor * set_rows) {
+                                                const ggml_tensor * set_rows,
+                                                const bool          multi = false) {
 
     if (rope->op != GGML_OP_ROPE || view->op != GGML_OP_VIEW || set_rows->op != GGML_OP_SET_ROWS) {
         return false;
@@ -2903,9 +2905,10 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
         return false;
     }
 
-    // Only norm/neox shaders have the fusion code
+    // Only norm/neox shaders have the fusion code, and the fused norm kernel for the multi-section ropes
     const int mode = ((const int32_t *) rope->op_params)[2];
-    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
+    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX &&
+            !(multi && (mode == GGML_ROPE_TYPE_MROPE || mode == GGML_ROPE_TYPE_IMROPE))) {
         return false;
     }
 
@@ -4091,7 +4094,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
         if (ggml_check_edges(cgraph, node_idx, {{1, 0, 0}, {2, 0, 1}, {3, 0, 2}, {4, 0, 3}}) &&
             ggml_cuda_should_fuse_rms_norm_mul_rope(rms_norm, mul, rope) &&
-            ggml_cuda_should_fuse_rope_set_rows(rope, view, set_rows)) {
+            ggml_cuda_should_fuse_rope_set_rows(rope, view, set_rows, /*multi =*/ true)) {
             int out_nodes[] = { node_idx + 4 };
             return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
         }
@@ -5618,6 +5621,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
         ggml_cuda_op_ssm_conv(*cuda_ctx, node, /*bias_add_node=*/ nullptr, cgraph->nodes[i + 1]);
         return 1;
+    }
+
+    // the attention output gate of qwen35: the gate is the second half of each head of the q projection, made contiguous
+    //   only for its sigmoid and the mul onto the attention output
+    if (node->op == GGML_OP_CONT && i + 2 < cgraph->n_nodes &&
+            ggml_cuda_should_fuse_cont_unary_mul(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+        const int outputs[1] = { i + 2 };
+        const enum ggml_op ops[3] = { GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL };
+        if (ggml_can_fuse_subgraph(cgraph, i, 3, ops, outputs, 1)) {
+            ggml_cuda_op_cont_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+            return 2;
+        }
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||

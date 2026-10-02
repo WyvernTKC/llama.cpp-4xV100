@@ -97,6 +97,10 @@ void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
 
+// CONT of a strided view, unary, mul: the gated kernel reads the view (the attention output gate of qwen35)
+bool ggml_cuda_should_fuse_cont_unary_mul(const ggml_tensor * cont, const ggml_tensor * unary, const ggml_tensor * mul);
+void ggml_cuda_op_cont_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * cont, ggml_tensor * unary, ggml_tensor * mul);
+
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
 // scale(sigmoid(x * m + a)) with m and a broadcast along the rows, the DeepSeek V4 hyper-connection coefficients

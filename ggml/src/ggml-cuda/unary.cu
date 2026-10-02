@@ -686,6 +686,59 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
     }
 }
 
+// CONT of a view with rows at one stride, then unary and mul: the gated kernel reads the strided rows of the view
+//   itself, so the copy is not made. The values are those of the three ops apart.
+bool ggml_cuda_should_fuse_cont_unary_mul(const ggml_tensor * cont, const ggml_tensor * unary, const ggml_tensor * mul) {
+    if (cont->op != GGML_OP_CONT || unary->op != GGML_OP_UNARY || mul->op != GGML_OP_MUL || unary->src[0] != cont) {
+        return false;
+    }
+    const ggml_unary_op uop = ggml_get_unary_op(unary);
+    if (uop != GGML_UNARY_OP_SILU && uop != GGML_UNARY_OP_SIGMOID && uop != GGML_UNARY_OP_SOFTPLUS) {
+        return false;
+    }
+    const ggml_tensor * v     = cont->src[0];
+    const ggml_tensor * other = mul->src[0] == unary ? mul->src[1] : (mul->src[1] == unary ? mul->src[0] : nullptr);
+    if (other == nullptr || other == unary) {
+        return false;
+    }
+    for (const ggml_tensor * t : { v, cont, unary, mul, other }) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    // the rows of v follow each other at nb1 across all of its dims, so row r of the copy is at r*nb1; the output may
+    //   sit on other, which each thread reads at its own element, but not on v, read at a stride
+    return v->nb[0] == sizeof(float) && v->nb[1] % sizeof(float) == 0 && v->nb[2] == v->ne[1]*v->nb[1] &&
+        v->nb[3] == v->ne[2]*v->nb[2] && ggml_is_contiguous(cont) && ggml_is_contiguous(mul) && ggml_is_contiguous(other) &&
+        ggml_are_same_shape(other, cont) && ggml_are_same_shape(mul, cont) &&
+        !ggml_cuda_tensors_overlap(mul, v) && ggml_cuda_same_or_disjoint(mul, other);
+}
+
+void ggml_cuda_op_cont_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * cont, ggml_tensor * unary, ggml_tensor * mul) {
+    const ggml_tensor * v     = cont->src[0];
+    const ggml_tensor * other = mul->src[0] == unary ? mul->src[1] : mul->src[0];
+
+    const int64_t k  = ggml_nelements(mul);
+    const int64_t nc = v->ne[0];
+    const int64_t o0 = v->nb[1] / sizeof(float);
+    const float * x  = (const float *) v->data;
+    const float * g  = (const float *) other->data;
+    float *       d  = (float *) mul->data;
+    switch (ggml_get_unary_op(unary)) {
+        case GGML_UNARY_OP_SILU:
+            unary_gated_cuda<op_silu>(x, g, d, k, nc, o0, nc, ctx.stream());
+            break;
+        case GGML_UNARY_OP_SIGMOID:
+            unary_gated_cuda<op_sigmoid>(x, g, d, k, nc, o0, nc, ctx.stream());
+            break;
+        case GGML_UNARY_OP_SOFTPLUS:
+            unary_gated_cuda<op_softplus>(x, g, d, k, nc, o0, nc, ctx.stream());
+            break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+}
+
 void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
     switch (ggml_get_unary_op(unary_node)) {
         case GGML_UNARY_OP_SILU:

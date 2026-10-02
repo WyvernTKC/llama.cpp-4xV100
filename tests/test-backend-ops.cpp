@@ -4473,6 +4473,48 @@ struct test_rms_norm_gated : public test_case {
     }
 };
 
+// the attention output gate of qwen35: the gate is the second half of each head of the q projection [2*D*H, T], made
+//   contiguous, then op(gate) * attn. pad adds columns to each token of the projection, so the gate rows no longer
+//   follow each other at one stride
+struct test_cont_unary_mul : public test_case {
+    const int64_t head_dim;
+    const int64_t n_head;
+    const int64_t n_tokens;
+    const ggml_unary_op op;
+    const int64_t pad;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONT_UNARY_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(head_dim, n_head, n_tokens, pad) + ",op=" + ggml_unary_op_name(op);
+    }
+
+    test_cont_unary_mul(int64_t head_dim = 256, int64_t n_head = 4, int64_t n_tokens = 1,
+            ggml_unary_op op = GGML_UNARY_OP_SIGMOID, int64_t pad = 0)
+        : head_dim(head_dim), n_head(n_head), n_tokens(n_tokens), op(op), pad(pad) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q_full = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*head_dim*n_head + pad, n_tokens);
+        ggml_tensor * attn   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim*n_head, n_tokens);
+        ggml_set_name(q_full, "q_full");
+        ggml_set_name(attn,   "attn");
+
+        ggml_tensor * gate = ggml_view_3d(ctx, q_full, head_dim, n_head, n_tokens,
+            ggml_element_size(q_full)*head_dim*2, q_full->nb[1], ggml_element_size(q_full)*head_dim);
+        gate = ggml_cont_2d(ctx, gate, head_dim*n_head, n_tokens);
+        gate = op == GGML_UNARY_OP_SIGMOID ? ggml_sigmoid(ctx, gate) : ggml_silu(ctx, gate);
+
+        ggml_tensor * out = ggml_mul(ctx, attn, gate);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_ADD (fused residual chain)
 struct test_add_add : public test_case {
     const ggml_type type;
@@ -10957,6 +10999,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_scale(GGML_TYPE_F32, { 128, 4, 3, 2 }, 1e-6f, 0.0883883476f));
     test_cases.emplace_back(new test_rms_norm_scale(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, 0.125f));
     test_cases.emplace_back(new test_rms_norm_scale(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, 2.0f, 0.5f));
+    for (ggml_unary_op op : { GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SILU }) {
+        for (int64_t n_tokens : { 1, 6, 32 }) {
+            test_cases.emplace_back(new test_cont_unary_mul(256, 4,  n_tokens, op));
+            test_cases.emplace_back(new test_cont_unary_mul(256, 6,  n_tokens, op));
+            test_cases.emplace_back(new test_cont_unary_mul(128, 24, n_tokens, op));
+        }
+        test_cases.emplace_back(new test_cont_unary_mul(256, 4, 3, op, 64));
+    }
     for (ggml_unary_op op : { GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID }) {
         test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 128, 12, 1, 1 }, op));
         test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 128, 12, 6, 1 }, op));
