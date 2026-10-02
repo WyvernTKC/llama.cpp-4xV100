@@ -8124,6 +8124,59 @@ struct test_mul_mat_shared_src1 : public test_case {
     }
 };
 
+// The GLU of an FFN and its down projection, then the GLU output written in place and read by a second matmul: a
+// backend that writes the converted input of the down projection with the GLU must not keep it past the write
+struct test_glu_mul_mat : public test_case {
+    const ggml_type type;
+    const ggml_glu_op glu_op;
+    const bool split;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GLU_MUL_MAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, glu_op, split, m, n, k);
+    }
+
+    test_glu_mul_mat(ggml_type type = GGML_TYPE_F16, ggml_glu_op glu_op = GGML_GLU_OP_SWIGLU, bool split = true,
+                     int64_t m = 256, int64_t n = 512, int64_t k = 256)
+        : type(type), glu_op(glu_op), split(split), m(m), n(n), k(k) {}
+
+    // as test_mul_mat; a stale input for the second matmul doubles half of the sum
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * g;
+        if (split) {
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            g = ggml_glu_split(ctx, a, b, glu_op);
+        } else {
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*k, n);
+            g = ggml_glu(ctx, a, glu_op, false);
+        }
+        ggml_tensor * w0 = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_tensor * w1 = ggml_new_tensor_2d(ctx, type, k, m);
+
+        ggml_tensor * y0 = ggml_mul_mat(ctx, w0, g);
+        ggml_tensor * gs = ggml_scale_inplace(ctx, g, 0.5f);
+        ggml_tensor * y1 = ggml_mul_mat(ctx, w1, gs);
+
+        ggml_tensor * out = ggml_add(ctx, y0, y1);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -12490,6 +12543,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
         test_cases.emplace_back(new test_mul_mat_shared_src1(type, 256, 512, 256));
         test_cases.emplace_back(new test_mul_mat_shared_src1(type, 512, 64, 1024));
+    }
+    // the GLU of a batch and its down projection, then the GLU output scaled in place
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0}) {
+        for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_REGLU}) {
+            test_cases.emplace_back(new test_glu_mul_mat(type, glu_op, true, 256, 512, 256));
+        }
+        test_cases.emplace_back(new test_glu_mul_mat(type, GGML_GLU_OP_GEGLU_QUICK, false, 256, 512, 256));
+        test_cases.emplace_back(new test_glu_mul_mat(type, GGML_GLU_OP_GEGLU_ERF, true, 512, 64, 1024));
     }
     // one token of a quantized gate and up over enough rows that Volta puts four of them in a block, which fuses them in
     //   the paired layout: gemma-4-31B split four ways, and an odd tail row

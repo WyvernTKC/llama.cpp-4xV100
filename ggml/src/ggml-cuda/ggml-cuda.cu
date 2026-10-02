@@ -1562,6 +1562,31 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
 };
 
+// whether the converted src1 of a cuBLAS matmul is kept in ctx.cublas_src1. Only the memory of graph tensors is followed
+//   by the invalidation, not a pool copy that a caller passes in (the experts of MUL_MAT_ID)
+static bool ggml_cuda_cublas_keep_src1(const ggml_backend_cuda_context & ctx, const ggml_tensor * src1) {
+    const char * src1_base = src1->buffer ? (const char *) ggml_backend_buffer_get_base(src1->buffer) : nullptr;
+    return !ggml_cuda_info().devices[ctx.device].vmm && src1_base != nullptr && (const char *) src1->data >= src1_base &&
+        (const char *) src1->data + ggml_nbytes(src1) <= src1_base + ggml_backend_buffer_get_size(src1->buffer);
+}
+
+// the key of the converted src1 in ctx.cublas_src1, and the strides of the copy in elements
+static void ggml_cuda_cublas_store_src1(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const ggml_type compute_type,
+        const int64_t s11, const int64_t s12, const int64_t s13, const bool cont_2) {
+    auto & cached = ctx.cublas_src1;
+    cached.owner     = src1->view_src ? src1->view_src : src1;
+    cached.data      = src1->data;
+    cached.nbytes    = ggml_nbytes(src1);
+    cached.type      = compute_type;
+    cached.stream_no = ctx.curr_stream_no;
+    std::copy_n(src1->ne, GGML_MAX_DIMS, cached.ne);
+    std::copy_n(src1->nb, GGML_MAX_DIMS, cached.nb);
+    cached.s11       = s11;
+    cached.s12       = s12;
+    cached.s13       = s13;
+    cached.cont_2    = cont_2;
+}
+
 template<ggml_type compute_type>
 static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     using traits = batched_mul_mat_traits<compute_type>;
@@ -1626,14 +1651,10 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         src0_ptr = src0_alloc.get();
     }
 
-    // the matmul before may have converted the same input, e.g. q, k and v of one norm. Only the memory of graph
-    //   tensors is followed by the invalidation, not a pool copy that a caller passes in (the experts of MUL_MAT_ID)
+    // the matmul before may have converted the same input, e.g. q, k and v of one norm, or a GLU written it
     auto & cached = ctx.cublas_src1;
     const ggml_tensor * src1_owner = src1->view_src ? src1->view_src : src1;
-    const char *        src1_base  = src1->buffer ? (const char *) ggml_backend_buffer_get_base(src1->buffer) : nullptr;
-    const bool keep_src1 = !ggml_cuda_info().devices[ctx.device].vmm && src1_base != nullptr &&
-        (const char *) src1->data >= src1_base &&
-        (const char *) src1->data + ggml_nbytes(src1) <= src1_base + ggml_backend_buffer_get_size(src1->buffer);
+    const bool keep_src1 = ggml_cuda_cublas_keep_src1(ctx, src1);
 
     if (src1->type == compute_type) {
         src1_ptr = (const cuda_t *) src1->data;
@@ -1676,17 +1697,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         src1_ptr = src1_conv;
 
         if (keep_src1) {
-            cached.owner     = src1_owner;
-            cached.data      = src1->data;
-            cached.nbytes    = ggml_nbytes(src1);
-            cached.type      = compute_type;
-            cached.stream_no = ctx.curr_stream_no;
-            std::copy_n(src1->ne, GGML_MAX_DIMS, cached.ne);
-            std::copy_n(src1->nb, GGML_MAX_DIMS, cached.nb);
-            cached.s11       = s11;
-            cached.s12       = s12;
-            cached.s13       = s13;
-            cached.cont_2    = is_src1_cont_2;
+            ggml_cuda_cublas_store_src1(ctx, src1, compute_type, s11, s12, s13, is_src1_cont_2);
         }
     }
 
@@ -1815,8 +1826,8 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     }
 }
 
-static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+// the type cuBLAS runs a MUL_MAT in, which src1 is converted to unless it has it
+static ggml_type ggml_cuda_mul_mat_cublas_compute_type(const int cc, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     ggml_type compute_type = src0->type;
     if (ggml_is_quantized(compute_type)) {
         compute_type = fast_fp16_hardware_available(cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
@@ -1850,8 +1861,13 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
             GGML_LOG_WARN("%s: unknown value for GGML_CUDA_CUBLAS_COMPUTE_TYPE: %s", __func__, env_cpp.c_str());
         }
     }
+    return compute_type;
+}
 
-    switch (compute_type) {
+static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+
+    switch (ggml_cuda_mul_mat_cublas_compute_type(cc, src0, src1, dst)) {
         case GGML_TYPE_F32:
             ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F32>(ctx, src0, src1, dst);
             break;
@@ -2122,6 +2138,34 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
             break;
     }
+}
+
+// The GLU of an FFN whose down projection follows on cuBLAS in f16 also writes the f16 copy of its output that the
+//   matmul would convert, as the entry of ctx.cublas_src1 the matmul looks up
+static bool ggml_cuda_glu_with_f16_copy(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    ggml_tensor * glu = cgraph->nodes[i];
+    if (glu->op != GGML_OP_GLU || i + 1 >= cgraph->n_nodes || !ggml_cuda_op_glu_f16_copy_supported(glu)) {
+        return false;
+    }
+    const ggml_tensor * mm = cgraph->nodes[i + 1];
+    if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != glu || (mm->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            ggml_cuda_op_mul_mat_use_fwht(mm) || !ggml_cuda_cublas_keep_src1(ctx, glu)) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (ggml_cuda_mul_mat_choose(ctx, mm->src[0], glu, mm) != GGML_CUDA_MUL_MAT_PATH_CUBLAS ||
+            ggml_cuda_mul_mat_cublas_compute_type(cc, mm->src[0], glu, mm) != GGML_TYPE_F16) {
+        return false;
+    }
+
+    auto & cached = ctx.cublas_src1;
+    cached.buf.reset();
+    cached.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), ggml_nelements(glu)*sizeof(half));
+    ggml_cuda_op_glu_f16_copy(ctx, glu, (half *) cached.buf->get());
+    // a contiguous input keeps its strides through the conversion
+    ggml_cuda_cublas_store_src1(ctx, glu, GGML_TYPE_F16, glu->nb[1]/sizeof(float), glu->nb[2]/sizeof(float),
+        glu->nb[3]/sizeof(float), ggml_is_contiguous_2(glu));
+    return true;
 }
 
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
@@ -5971,7 +6015,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
-                bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                bool ok = ggml_cuda_glu_with_f16_copy(*cuda_ctx, cgraph, i) || ggml_cuda_compute_forward(*cuda_ctx, node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
