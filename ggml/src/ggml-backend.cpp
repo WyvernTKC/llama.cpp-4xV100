@@ -1704,6 +1704,27 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 }
 
+// A split of a meta backend fed a non-weight host input of at least 1 MiB, the embeddings or the KQ mask of a
+//   prefill batch. Before the allocation a graph input has no buffer yet, so go by the backend it was assigned to.
+static bool ggml_backend_sched_meta_prefill(ggml_backend_sched_t sched) {
+    for (int i = 0; i < sched->n_splits; i++) {
+        const struct ggml_backend_sched_split * split = &sched->splits[i];
+        if (!ggml_backend_is_meta(sched->backends[split->backend_id])) {
+            continue;
+        }
+        for (int j = 0; j < split->n_inputs; j++) {
+            struct ggml_tensor * input = split->inputs[j];
+            const int input_backend_id = tensor_backend_id(input);
+            const bool weight = input->buffer && ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+            if (!weight && input_backend_id >= 0 && ggml_backend_buft_is_host(sched->bufts[input_backend_id]) &&
+                    ggml_nbytes(input) >= (1u << 20)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
@@ -1742,7 +1763,20 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
         // the re-allocation may cause the split inputs to be moved to a different address
         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
+        //
+        // Except a meta backend at prefill. Nothing it has queued reads a buffer the re-allocation can move: its
+        //   non-weight inputs from host memory are copied after a wait for the devices (it has no events), its
+        //   async copies are weights only, and a device buffer that has to grow is freed with cudaFree, which
+        //   waits for the device. The wait only held the host while it could have built the next ubatch, with
+        //   the GPUs idle afterwards: at the second ubatch of every long prompt, whose KQ mask outgrows the layout
+        //   of the first, it was ~450 ms on Ornith at ubatch 4096. Decode keeps the wait. GGML_SCHED_REALLOC_SYNC=1
+        //   waits always.
+        static const bool realloc_sync = getenv("GGML_SCHED_REALLOC_SYNC") != nullptr;
+        const bool skip_meta = !realloc_sync && ggml_backend_sched_meta_prefill(sched);
         for (int i = 0; i < sched->n_backends; i++) {
+            if (skip_meta && ggml_backend_is_meta(sched->backends[i])) {
+                continue;
+            }
             ggml_backend_synchronize(sched->backends[i]);
         }
 
