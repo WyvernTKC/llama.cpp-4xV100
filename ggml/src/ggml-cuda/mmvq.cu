@@ -681,12 +681,19 @@ static __global__ void mul_mat_vec_q(
 
     const uint32_t channel_dst = blockIdx.y;
 
+    // with ids, a gate and sib_x: the channel past the used experts is the sibling pair sib_x/sib_gate, see
+    //   ggml_cuda_mm_fusion_args_host
+    bool sib = false;
+    if constexpr (has_fusion && ncols_dst == 1) {
+        sib = ids && fusion.sib_x != nullptr && channel_dst == gridDim.y - 1;
+    }
+
     uint32_t channel_x;
     uint32_t channel_y;
     uint32_t sample_dst;
 
     ggml_cuda_pdl_sync();
-    channel_x  = ncols_dst == 1 && ids ? ids[channel_dst]                     : fastdiv(channel_dst, channel_ratio);
+    channel_x  = ncols_dst == 1 && ids ? (sib ? 0 : ids[channel_dst])         : fastdiv(channel_dst, channel_ratio);
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
 
@@ -726,6 +733,10 @@ static __global__ void mul_mat_vec_q(
             use_gate_scale = fusion.gate_scale != nullptr && use_gate;
             x_scale        = (const float *) fusion.x_scale;
             gate_scale     = (const float *) fusion.gate_scale;
+        }
+        if (sib) {
+            vx    = fusion.sib_x;
+            vgate = fusion.sib_gate;
         }
     }
 
@@ -859,7 +870,7 @@ static __global__ void mul_mat_vec_q(
         return;
     }
 
-    dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
+    dst = sib ? fusion.sib_dst + row0 : dst + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
 
     // bound for the rows of a block past the last one; with ids the channels are the used experts, a row stride apart
     const uint32_t nrows_dst = ncols_dst == 1 && ids ? stride_channel_dst : stride_col_dst;
@@ -977,8 +988,17 @@ static __global__ void mul_mat_vec_q_short(
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     const uint32_t channel_dst = blockIdx.y;
-    const uint32_t channel_x   = ids ? ids[channel_dst]                          : fastdiv(channel_dst, channel_ratio);
-    const uint32_t channel_y   = ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
+
+    // quant_y with ids and sib_x: the channel past the used experts is the sibling sib_x with its own input sib_y
+    const bool sib = quant_y && ids && fusion.sib_x != nullptr && channel_dst == gridDim.y - 1;
+    if (sib) {
+        vx  = fusion.sib_x;
+        vy  = fusion.sib_y;
+        dst = fusion.sib_dst;
+    }
+
+    const uint32_t channel_x   = ids ? (sib ? 0 : ids[channel_dst])                         : fastdiv(channel_dst, channel_ratio);
+    const uint32_t channel_y   = ids ? (sib ? 0 : fastmodulo(channel_dst, nchannels_y)) : channel_dst;
 
     const int lane = threadIdx.x % MMVQ_SHORT_LANES;
     const int row0 = rows_per_thread*rows_per_slice*blockIdx.x + rows_per_warp*threadIdx.y + threadIdx.x / MMVQ_SHORT_LANES;
@@ -986,7 +1006,9 @@ static __global__ void mul_mat_vec_q_short(
     const int kqs  = vdr * (lane % (qi/vdr));
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y;
-    dst += channel_dst*stride_channel_dst;
+    if (!sib) {
+        dst += channel_dst*stride_channel_dst;
+    }
 
     [[maybe_unused]] float x_biases[rows_per_thread] = { 0.0f };
     [[maybe_unused]] float x_sig = 1.0f;
@@ -1101,7 +1123,7 @@ static bool mmvq_use_short(const mmvq_parameter_table_id table_id, const int nco
         return false;
     } else {
         const bool short_fusion = fusion.gate == nullptr && fusion.gate_bias == nullptr && fusion.x_scale == nullptr &&
-            fusion.gate_scale == nullptr && fusion.gdn_beta == nullptr && fusion.sib_x == nullptr &&
+            fusion.gate_scale == nullptr && fusion.gdn_beta == nullptr && (fusion.sib_x == nullptr || fusion.sib_y != nullptr) &&
             (fusion.x_bias == nullptr || !has_ids);
         // measured on Volta only
         return table_id == MMVQ_PARAMETERS_VOLTA && ncols_dst == 1 && nsamples_dst == 1 && short_fusion &&
@@ -1299,7 +1321,11 @@ static void mul_mat_vec_q_switch_fusion(
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
-            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+            dim3 grid = block_nums;
+            if (ids && fusion.sib_x) {
+                grid.y += 1; // the sibling pair, see mul_mat_vec_q
+            }
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, block_dims, nbytes_shared, stream);
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, wide, paired>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -1340,7 +1366,8 @@ static void mul_mat_vec_q_short_launch_rpt(
         const uint3 channel_ratio, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
         const uint32_t stride_channel_dst, const int nchannels_dst, cudaStream_t stream) {
     constexpr int rows_per_block = rows_per_thread*MMVQ_SHORT_NWARPS*(WARP_SIZE/MMVQ_SHORT_LANES);
-    const dim3 block_nums((nrows_x + rows_per_block - 1) / rows_per_block, nchannels_dst, 1);
+    // and the sibling, see mul_mat_vec_q_short
+    const dim3 block_nums((nrows_x + rows_per_block - 1) / rows_per_block, nchannels_dst + (ids && fusion.sib_x ? 1 : 0), 1);
     const dim3 block_dims(WARP_SIZE, MMVQ_SHORT_NWARPS, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
     if (fusion.x_bias != nullptr || fusion.x_sigmoid != nullptr) {
@@ -1896,6 +1923,25 @@ static void ggml_cuda_mul_mat_vec_q_impl(
             GGML_ASSERT(fusion->x_sigmoid->type == GGML_TYPE_F32 && ggml_nelements(fusion->x_sigmoid) == 1);
             fusion_local.x_sigmoid = (const float *) fusion->x_sigmoid->data;
         }
+        if (fusion->sib_gate) {
+            // one token with one input row for all experts, a GLU and nothing else
+            GGML_ASSERT(ids && fusion->sib && fusion->sib_dst && fusion->gate && dst->ne[2] == 1 && src1->ne[1] == 1);
+            GGML_ASSERT(!fusion->x_bias && !fusion->gate_bias && !fusion->x_scale && !fusion->gate_scale && !fusion->x_sigmoid);
+            for (const ggml_tensor * t : { fusion->sib, fusion->sib_gate }) {
+                GGML_ASSERT(t->type == src0->type && t->ne[0] == ne00 && t->ne[1] == ne01 && t->nb[1] == nb01);
+            }
+            GGML_ASSERT(fusion->sib_dst->type == GGML_TYPE_F32 && ggml_is_contiguous(fusion->sib_dst) && fusion->sib_dst->ne[0] == ne0);
+            fusion_local.sib_x    = fusion->sib->data;
+            fusion_local.sib_gate = fusion->sib_gate->data;
+            fusion_local.sib_dst  = (float *) fusion->sib_dst->data;
+        }
+        if (fusion->sib_y) {
+            GGML_ASSERT(ggml_cuda_mul_mat_vec_q_short_sibling(src0, src1, ids, fusion->sib, fusion->sib_y) && fusion->sib_out);
+            GGML_ASSERT(!fusion->gate && !fusion->x_bias && !fusion->x_scale && !fusion->x_sigmoid && !fusion->sib_gate);
+            fusion_local.sib_x   = fusion->sib->data;
+            fusion_local.sib_y   = (const float *) fusion->sib_y->data;
+            fusion_local.sib_dst = fusion->sib_out;
+        }
         if (fusion->gdn_beta) {
             GGML_ASSERT(!ids && fusion->gate && !fusion->x_bias && !fusion->gate_bias && !fusion->x_scale && !fusion->gate_scale);
             for (const ggml_tensor * t : { fusion->gdn_dt, fusion->gdn_a, (const ggml_tensor *) fusion->gdn_beta }) {
@@ -1935,6 +1981,7 @@ static void ggml_cuda_mul_mat_vec_q_impl(
             return;
         }
     }
+    GGML_ASSERT(fusion_local.sib_y == nullptr);
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
 
@@ -2008,6 +2055,20 @@ static void ggml_cuda_mul_mat_vec_q_impl(
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+}
+
+bool ggml_cuda_mul_mat_vec_q_short_sibling(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        const ggml_tensor * sib, const ggml_tensor * sib_y) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    ggml_cuda_mm_fusion_args_device fusion{};
+    fusion.sib_x = sib->data;
+    fusion.sib_y = (const float *) sib_y->data;
+    return ids && src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F32 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        mmvq_use_short<GGML_TYPE_Q8_0>(get_device_table_id(cc), src0->ne[0], 1, 1, true, fusion) &&
+        (uintptr_t) src1->data % 16 == 0 && src1->nb[1] % 16 == 0 && src1->nb[2] % 16 == 0 &&
+        sib->type == src0->type && sib->ne[0] == src0->ne[0] && sib->ne[1] == src0->ne[1] && sib->nb[1] == src0->nb[1] &&
+        sib_y->type == GGML_TYPE_F32 && ggml_is_contiguous(sib_y) && ggml_nelements(sib_y) == src0->ne[0] &&
+        (uintptr_t) sib_y->data % 16 == 0;
 }
 
 void ggml_cuda_mul_mat_vec_q(

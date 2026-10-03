@@ -1646,6 +1646,15 @@ struct ggml_backend_cuda_context {
         q8_1_emit_as = nullptr;
     }
 
+    // A one-token gate/up GLU deferred to the MUL_MAT_ID gate/up GLU of the same input that follows it (node target),
+    //   which runs it as one more channel; see ggml_cuda_try_defer_glu. Launched on its own if that does not happen.
+    struct deferred_glu {
+        const ggml_tensor * up     = nullptr;
+        const ggml_tensor * gate   = nullptr;
+        ggml_tensor *       glu    = nullptr;
+        int                 target = -1;
+    } glu_deferred;
+
     // A kernel can write the q8_1 copy of its output (one row) for the MMVQ matmul that reads it next, which then
     //   skips its quantize launch. ggml_cuda_q8_1_request names the output and the tensor the matmul reads it as (the
     //   output or a view of all of it); the launcher takes the buffer with q8_1_emit_alloc. The copy waits in
@@ -1769,8 +1778,15 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gdn_a = nullptr;
     ggml_tensor * gdn_beta = nullptr;
     // a sibling matrix of one row with the same input, computed as one more row: sib_dst = sib*y (f32, one token)
+    // mmvq with ids and a gate: a sibling pair of the same shape as one expert, computed as one more channel past the
+    //   used experts: sib_dst = glu(sib_gate*y, sib*y) (one token)
+    // mmvq with ids, short q8_0 rows: a sibling of the same shape as one expert with its own f32 input, computed as one
+    //   more channel past the used experts: sib_out = sib*sib_y (one token)
     const ggml_tensor * sib = nullptr;
+    const ggml_tensor * sib_gate = nullptr;
     ggml_tensor * sib_dst = nullptr;
+    const ggml_tensor * sib_y = nullptr;
+    float * sib_out = nullptr;
     // one value per token gating the product before the bias: dst = x_bias + sigmoid(x_sigmoid)*(x*y), one token
     const ggml_tensor * x_sigmoid = nullptr;
 };
@@ -1786,7 +1802,9 @@ struct ggml_cuda_mm_fusion_args_device {
     const float * gdn_a = nullptr;
     float * gdn_beta = nullptr;
     const void * sib_x = nullptr;
+    const void * sib_gate = nullptr;
     float * sib_dst = nullptr;
+    const float * sib_y = nullptr;
     const float * x_sigmoid = nullptr;
 };
 

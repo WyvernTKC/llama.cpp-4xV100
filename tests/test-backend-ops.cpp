@@ -4596,6 +4596,90 @@ struct test_mul_mat_sigmoid_add : public test_case {
     }
 };
 
+static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, float amax);
+
+// The FFN of a Qwen3.5-MoE layer in the order the model builds it: the shared expert's gate/up GLU, the routed experts'
+// gate/up GLU, down projection and weighted sum, then the shared expert's down projection gated by sigmoid(g) and added
+struct test_moe_shexp : public test_case {
+    const ggml_type type;
+    const int n_mats;
+    const int n_used;
+    const int64_t n_embd;
+    const int64_t n_ff;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_SHEXP";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, n_mats, n_used, n_embd, n_ff, n_tokens);
+    }
+
+    test_moe_shexp(ggml_type type = GGML_TYPE_Q8_0, int n_mats = 16, int n_used = 8, int64_t n_embd = 2048,
+            int64_t n_ff = 128, int64_t n_tokens = 1)
+        : type(type), n_mats(n_mats), n_used(n_used), n_embd(n_embd), n_ff(n_ff), n_tokens(n_tokens) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats, 1.0f);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x         = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * ids       = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+        ggml_tensor * weights   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n_tokens);
+        ggml_tensor * g         = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_tokens);
+        ggml_tensor * up_exps   = ggml_new_tensor_3d(ctx, type, n_embd, n_ff, n_mats);
+        ggml_tensor * gate_exps = ggml_new_tensor_3d(ctx, type, n_embd, n_ff, n_mats);
+        ggml_tensor * down_exps = ggml_new_tensor_3d(ctx, type, n_ff, n_embd, n_mats);
+        ggml_tensor * up_sh     = ggml_new_tensor_2d(ctx, type, n_embd, n_ff);
+        ggml_tensor * gate_sh   = ggml_new_tensor_2d(ctx, type, n_embd, n_ff);
+        ggml_tensor * down_sh   = ggml_new_tensor_2d(ctx, type, n_ff, n_embd);
+        ggml_set_name(x, "x");
+        ggml_set_name(ids, "ids");
+        ggml_set_name(weights, "weights");
+        ggml_set_name(g, "g");
+
+        ggml_tensor * act_sh = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, gate_sh, x), ggml_mul_mat(ctx, up_sh, x));
+        ggml_set_name(act_sh, "act_sh");
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, act_sh);
+        }
+
+        ggml_tensor * xr  = ggml_reshape_3d(ctx, x, n_embd, 1, n_tokens);
+        ggml_tensor * act = ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, gate_exps, xr, ids), ggml_mul_mat_id(ctx, up_exps, xr, ids));
+        ggml_tensor * weighted = ggml_mul(ctx, ggml_mul_mat_id(ctx, down_exps, act, ids), weights);
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, weighted);
+        }
+        std::vector<ggml_tensor *> views(n_used);
+        for (int e = 0; e < n_used; ++e) {
+            views[e] = ggml_view_2d(ctx, weighted, n_embd, n_tokens, weighted->nb[2], e*weighted->nb[1]);
+            if (mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, views[e]);
+            }
+        }
+        ggml_tensor * moe_out = views[0];
+        for (int e = 1; e < n_used; ++e) {
+            moe_out = ggml_add(ctx, moe_out, views[e]);
+        }
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, moe_out);
+        }
+
+        ggml_tensor * out = ggml_add(ctx, moe_out, ggml_mul(ctx, ggml_mul_mat(ctx, down_sh, act_sh), ggml_sigmoid(ctx, g)));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_UNARY + GGML_OP_MUL (rms_norm(x) * w * op(z), build_norm_gated)
 struct test_rms_norm_gated : public test_case {
     const ggml_type type;
@@ -11373,6 +11457,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_mul_mat_sigmoid_add(GGML_TYPE_Q8_0, 128, 2048, 1));
+    // one token runs the shared expert in the experts' launches (the down projection only for q8_0 rows of K 128),
+    //   two tokens do not
+    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K }) {
+        for (int64_t n_ff : { 256, 512 }) {
+            for (int64_t n_tokens : { 1, 2 }) {
+                test_cases.emplace_back(new test_moe_shexp(type, 16, 8, 2048, n_ff, n_tokens));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_moe_shexp(GGML_TYPE_Q8_0, 16, 8, 2048, 128, 1));
+    test_cases.emplace_back(new test_moe_shexp(GGML_TYPE_Q8_0, 16, 8, 2048, 128, 2));
     for (ggml_unary_op op : { GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SILU }) {
         for (int64_t n_tokens : { 1, 6, 32 }) {
             test_cases.emplace_back(new test_cont_unary_mul(256, 4,  n_tokens, op));

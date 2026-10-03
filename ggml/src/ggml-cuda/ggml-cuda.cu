@@ -4834,6 +4834,158 @@ static void ggml_cuda_q8_1_request(ggml_backend_cuda_context * cuda_ctx, const g
     }
 }
 
+// A one-token gate/up GLU (MUL_MAT, MUL_MAT, GLU) with a MUL_MAT_ID gate/up GLU of the same input and matrices of the
+//   same shape after it, e.g. the shared expert of Qwen3.5-MoE built before its routed experts: deferred to that launch,
+//   which runs it as one more channel past the used experts (one launch less per layer). Nothing in between may read its
+//   output or write its input or output. Returns the nodes to skip.
+static int ggml_cuda_try_defer_glu(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_DEFER_GLU") != nullptr;
+    if (disabled || cuda_ctx->glu_deferred.glu != nullptr ||
+            !ggml_cuda_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, {})) {
+        return 0;
+    }
+    const auto glu_pair = [&](int k, const ggml_tensor *& up, const ggml_tensor *& gate) {
+        const ggml_tensor * glu = cgraph->nodes[k + 2];
+        gate = glu->src[0];
+        up   = glu->src[1];
+        return ((gate == cgraph->nodes[k] && up == cgraph->nodes[k + 1]) || (gate == cgraph->nodes[k + 1] && up == cgraph->nodes[k])) &&
+            gate->src[1] == up->src[1] && gate->src[2] == up->src[2];
+    };
+    const ggml_tensor * up;
+    const ggml_tensor * gate;
+    ggml_tensor * glu = cgraph->nodes[i + 2];
+    if (!glu_pair(i, up, gate)) {
+        return 0;
+    }
+    const ggml_tensor * x = up->src[1];
+    if (x->type != GGML_TYPE_F32 || ggml_nrows(x) != 1 || glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) ||
+            !ggml_cuda_should_fuse_mul_mat_vec_q(up, true)) {
+        return 0;
+    }
+
+    for (int j = i + 3; j + 2 < cgraph->n_nodes; j++) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_MUL_MAT_ID && ggml_cuda_can_fuse(cgraph, j, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU }, {})) {
+            const ggml_tensor * up2;
+            const ggml_tensor * gate2;
+            const ggml_tensor * glu2 = cgraph->nodes[j + 2];
+            if (!glu_pair(j, up2, gate2)) {
+                return 0;
+            }
+            const ggml_tensor * x2  = up2->src[1];
+            const ggml_tensor * ids = up2->src[2];
+            bool ok = x2->data == x->data && x2->type == GGML_TYPE_F32 && ggml_nelements(x2) == ggml_nelements(x) &&
+                x2->ne[1] == 1 && glu2->ne[2] == 1 && glu2->ne[0] == glu->ne[0] &&
+                memcmp(glu2->op_params, glu->op_params, sizeof(glu->op_params)) == 0 &&
+                !ggml_cuda_tensors_overlap(glu, glu2) && !ggml_cuda_tensors_overlap(glu, ids) &&
+                ggml_cuda_should_fuse_mul_mat_vec_q(up2, true);
+            for (int k = 0; ok && k < 2; k++) {
+                const ggml_tensor * w  = (k == 0 ? up : gate)->src[0];
+                const ggml_tensor * w2 = (k == 0 ? up2 : gate2)->src[0];
+                ok = w->type == w2->type && w->ne[0] == w2->ne[0] && w->ne[1] == w2->ne[1] && w->nb[1] == w2->nb[1];
+            }
+            if (!ok) {
+                return 0;
+            }
+            cuda_ctx->glu_deferred = { up, gate, glu, j };
+            return 2;
+        }
+        if (ggml_cuda_is_view_or_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (ggml_cuda_tensors_overlap(n, glu) || ggml_cuda_tensors_overlap(n, x)) {
+            return 0;
+        }
+        for (int k = 0; k < GGML_MAX_SRC; k++) {
+            if (n->src[k] != nullptr && ggml_cuda_tensors_overlap(n->src[k], glu)) {
+                return 0;
+            }
+        }
+    }
+    return 0;
+}
+
+// At one token: the MUL_MAT_ID of the routed experts' down projection, their weighted sum, and a shared expert's down
+//   projection gated by sigmoid(g) and added to the sum (Qwen3.5-MoE builds them in this order): the shared expert runs
+//   in the experts' launch as one more channel and the sum adds it, two launches instead of three. Returns the nodes
+//   to skip.
+static int ggml_cuda_try_fuse_moe_down_shexp(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_SHEXP_MERGE") != nullptr;
+    ggml_tensor * down = cgraph->nodes[i];
+    if (disabled || down->type != GGML_TYPE_F32 || down->ne[2] != 1 || down->ne[3] != 1 || i + 1 >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_cuda_moe_weighted_reduction_match match;
+    if (!ggml_cuda_match_moe_weighted_reduction(cgraph, i + 1, match) || match.experts != down || match.expert_scale != nullptr) {
+        return 0;
+    }
+    const int t = i + 1 + match.node_count;
+    if (t + 3 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * mm  = cgraph->nodes[t];
+    const ggml_tensor * sig = cgraph->nodes[t + 1];
+    const ggml_tensor * mul = cgraph->nodes[t + 2];
+    ggml_tensor *       add = cgraph->nodes[t + 3];
+    if (mm->op != GGML_OP_MUL_MAT || sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID ||
+            mul->op != GGML_OP_MUL || add->op != GGML_OP_ADD) {
+        return 0;
+    }
+    const ggml_tensor * g = sig->src[0];
+    if (!((mul->src[0] == mm && mul->src[1] == sig) || (mul->src[0] == sig && mul->src[1] == mm)) ||
+            !((add->src[0] == match.dst && add->src[1] == mul) || (add->src[0] == mul && add->src[1] == match.dst)) ||
+            g->type != GGML_TYPE_F32 || ggml_nelements(g) != 1 || add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) ||
+            !ggml_are_same_shape(add, match.dst) || !ggml_are_same_shape(mm, match.dst) ||
+            !ggml_cuda_mul_mat_vec_q_short_sibling(down->src[0], down->src[1], down->src[2], mm->src[0], mm->src[1])) {
+        return 0;
+    }
+
+    // one fusion: nothing past it reads the sum or the shared expert's partial results
+    std::vector<ggml_op> ops;
+    for (int k = i; k <= t + 3; k++) {
+        ops.push_back(cgraph->nodes[k]->op);
+    }
+    const int out = t + 3;
+    if (ops.size() >= 32 || !ggml_can_fuse_subgraph(cgraph, i, (int) ops.size(), ops.data(), &out, 1)) {
+        return 0;
+    }
+
+    // as for the weighted sum alone (see ggml_cuda_try_fuse), with the add as dst; every block reads the gate, and the
+    //   shared expert's input is read in the launch that writes the experts
+    if (ggml_cuda_tensors_overlap(add, g) || ggml_cuda_tensors_overlap(down, mm->src[1])) {
+        return 0;
+    }
+    if (ggml_cuda_tensors_overlap(add, down)) {
+        const int64_t off = (const char *) add->data - (const char *) down->data;
+        if (off < 0 || off % (int64_t) down->nb[1] != 0 || off / (int64_t) down->nb[1] >= down->ne[1]) {
+            return 0;
+        }
+    }
+
+    ggml_cuda_pool_alloc<float> shexp(cuda_ctx->pool(), ggml_nelements(mm));
+    ggml_cuda_mm_fusion_args_host fusion_data{};
+    fusion_data.sib     = mm->src[0];
+    fusion_data.sib_y   = mm->src[1];
+    fusion_data.sib_out = shexp.get();
+    ggml_cuda_mul_mat_vec_q(*cuda_ctx, down->src[0], down->src[1], down->src[2], down, &fusion_data);
+    ggml_cuda_op_moe_weighted_reduction(*cuda_ctx, match.experts, nullptr, match.weights, add, false, shexp.get(), g);
+    return t + 3 - i;
+}
+
+// the deferred GLU on its own, as ggml_cuda_try_fuse would have run it
+static void ggml_cuda_flush_deferred_glu(ggml_backend_cuda_context * cuda_ctx) {
+    ggml_backend_cuda_context::deferred_glu & d = cuda_ctx->glu_deferred;
+    if (d.glu == nullptr) {
+        return;
+    }
+    ggml_cuda_mm_fusion_args_host fusion_data{};
+    fusion_data.gate      = d.gate->src[0];
+    fusion_data.glu_op    = ggml_get_glu_op(d.glu);
+    fusion_data.glu_limit = ggml_get_op_params_f32(d.glu, 3);
+    ggml_cuda_mul_mat_vec_q(*cuda_ctx, d.up->src[0], d.up->src[1], nullptr, d.glu, &fusion_data);
+    d = {};
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4845,6 +4997,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_ROPE || node->op == GGML_OP_MUL_MAT) {
         const int n_skip = ggml_cuda_try_fuse_attn_rot(cuda_ctx, cgraph, i);
+        if (n_skip != 0) {
+            return n_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT) {
+        const int n_skip = ggml_cuda_try_defer_glu(cuda_ctx, cgraph, i);
+        if (n_skip != 0) {
+            return n_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        const int n_skip = ggml_cuda_try_fuse_moe_down_shexp(cuda_ctx, cgraph, i);
         if (n_skip != 0) {
             return n_skip;
         }
@@ -5514,6 +5680,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 
+                // the GLU deferred to this launch, see ggml_cuda_try_defer_glu
+                ggml_backend_cuda_context::deferred_glu & d = cuda_ctx->glu_deferred;
+                if (op == GGML_OP_MUL_MAT_ID && d.target == i) {
+                    fusion_data.sib      = d.up->src[0];
+                    fusion_data.sib_gate = d.gate->src[0];
+                    fusion_data.sib_dst  = d.glu;
+                    d = {};
+                }
+
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
@@ -6084,6 +6259,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 prev_i = i;
 
+                if (cuda_ctx->glu_deferred.glu != nullptr && i > cuda_ctx->glu_deferred.target) {
+                    ggml_cuda_flush_deferred_glu(cuda_ctx);
+                }
+
                 if (ggml_cuda_is_view_or_noop(node)) {
                     continue;
                 }
@@ -6146,6 +6325,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+            ggml_cuda_flush_deferred_glu(cuda_ctx);
         }
 
 #ifdef USE_CUDA_GRAPH
