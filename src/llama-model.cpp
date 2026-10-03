@@ -897,8 +897,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_PARTIAL, "ffn_down_exps.weight");
         }
 
-        // output
-        if (std::regex_match(tensor_name, pattern_output_weight)) {
+        // output; a head tied to the token embeddings is a copy of token_embd.weight, the input one stays on the CPU
+        const bool tied_output = tensor_name == "token_embd.weight" && ud->model->output != nullptr &&
+            strcmp(ggml_get_name(ud->model->output), "token_embd.weight") == 0;
+        if (std::regex_match(tensor_name, pattern_output_weight) || tied_output) {
             // a DSpark draft's own head stays whole; the targets' head is split like any other, which on
             //   DeepSeek V4 cuts the 1 GiB BF16 head each device reads per token (~0.9 ms) and holds to a quarter
             if (is_dsv4 && ud->model->arch == LLM_ARCH_DFLASH) {
