@@ -25,6 +25,7 @@ struct ggml_cuda_p2p_ar_args {
 
     const float4 *     src;
     float4 *           dst;
+    unsigned int *     ll_seq; // this rank's sequence number per LL block, see ggml_cuda_p2p_ar_ll_kernel_n
     int64_t            nvec;
     int64_t            stage_stride;
     int64_t            ll_stride;
@@ -45,6 +46,7 @@ struct ggml_cuda_p2p_ar {
     float4 *             stage[GGML_CUDA_MAX_DEVICES] = {};
     unsigned long long * flag [GGML_CUDA_MAX_DEVICES] = {};
     uint4 *              ll   [GGML_CUDA_MAX_DEVICES] = {};
+    unsigned int *       ll_seq[GGML_CUDA_MAX_DEVICES] = {}; // device j's sequence number per LL block
 
     size_t             max_bytes    = 0; // per-rank payload cap, above which the caller uses NCCL
     size_t             ll_max_bytes = 0; // per-rank payload cap for the LL kernel, 0 = LL off
@@ -184,64 +186,72 @@ static __global__ void ggml_cuda_p2p_ar_ll_kernel(const ggml_cuda_p2p_ar_args a)
 
 // The same for a device count known at compile time: the lines of all ranks are loaded at once, and only the ones
 // that have not arrived yet are loaded again. A poll loop per line waits a round trip before the next line's load.
+// Each block keeps its sequence number on the device (ll_seq), so a launch takes no per-call argument and can sit in
+// a CUDA graph; every rank runs the same calls with the same blocks, so the numbers agree. The slots then alternate
+// per block, which keeps the guarantee above: a rank is at most one call ahead of any peer in each block.
 template <int n_devs>
 static __global__ void ggml_cuda_p2p_ar_ll_kernel_n(const ggml_cuda_p2p_ar_args a) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= a.nvec) {
-        return;
-    }
 
-    const uint32_t flag = (uint32_t) a.seq | 1u;
+    const uint32_t seq  = a.ll_seq[blockIdx.x] + 1;
+    const uint32_t flag = seq | 1u;
 
-    const int64_t slot_base = (int64_t) a.slot * n_devs * a.ll_stride;
+    const int64_t slot_base = (int64_t) (seq % GGML_CUDA_P2P_AR_NSLOTS) * n_devs * a.ll_stride;
 
-    const float4 v = ((a.contrib_mask >> a.rank) & 1u) ? a.src[i] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    const uint4 l0 = make_uint4(__float_as_uint(v.x), flag, __float_as_uint(v.y), flag);
-    const uint4 l1 = make_uint4(__float_as_uint(v.z), flag, __float_as_uint(v.w), flag);
+    if (i < a.nvec) {
+        const float4 v = ((a.contrib_mask >> a.rank) & 1u) ? a.src[i] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        const uint4 l0 = make_uint4(__float_as_uint(v.x), flag, __float_as_uint(v.y), flag);
+        const uint4 l1 = make_uint4(__float_as_uint(v.z), flag, __float_as_uint(v.w), flag);
 #pragma unroll
-    for (int j = 0; j < n_devs; ++j) {
-        uint4 * dst = a.ll[j] + slot_base + (int64_t) a.rank * a.ll_stride + 2*i;
-        ggml_cuda_p2p_ar_st_ll(dst + 0, l0);
-        ggml_cuda_p2p_ar_st_ll(dst + 1, l1);
-    }
-
-    const uint4 * src = a.ll[a.rank] + slot_base + 2*i;
-    uint4 r[n_devs][2];
-#pragma unroll
-    for (int j = 0; j < n_devs; ++j) {
-#pragma unroll
-        for (int l = 0; l < 2; ++l) {
-            r[j][l] = ggml_cuda_p2p_ar_ld_ll(src + (int64_t) j * a.ll_stride + l);
+        for (int j = 0; j < n_devs; ++j) {
+            uint4 * dst = a.ll[j] + slot_base + (int64_t) a.rank * a.ll_stride + 2*i;
+            ggml_cuda_p2p_ar_st_ll(dst + 0, l0);
+            ggml_cuda_p2p_ar_st_ll(dst + 1, l1);
         }
-    }
-    bool done;
-    do {
-        done = true;
+
+        const uint4 * src = a.ll[a.rank] + slot_base + 2*i;
+        uint4 r[n_devs][2];
 #pragma unroll
         for (int j = 0; j < n_devs; ++j) {
 #pragma unroll
             for (int l = 0; l < 2; ++l) {
-                if (r[j][l].y != flag || r[j][l].w != flag) {
-                    r[j][l] = ggml_cuda_p2p_ar_ld_ll(src + (int64_t) j * a.ll_stride + l);
-                    done = false;
-                }
+                r[j][l] = ggml_cuda_p2p_ar_ld_ll(src + (int64_t) j * a.ll_stride + l);
             }
         }
-    } while (!done);
-
-    // in rank order, as the kernels above
-    float4 sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        bool done;
+        do {
+            done = true;
 #pragma unroll
-    for (int j = 0; j < n_devs; ++j) {
-        if (((a.contrib_mask >> j) & 1u) == 0) {
-            continue;
+            for (int j = 0; j < n_devs; ++j) {
+#pragma unroll
+                for (int l = 0; l < 2; ++l) {
+                    if (r[j][l].y != flag || r[j][l].w != flag) {
+                        r[j][l] = ggml_cuda_p2p_ar_ld_ll(src + (int64_t) j * a.ll_stride + l);
+                        done = false;
+                    }
+                }
+            }
+        } while (!done);
+
+        // in rank order, as the kernels above
+        float4 sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+        for (int j = 0; j < n_devs; ++j) {
+            if (((a.contrib_mask >> j) & 1u) == 0) {
+                continue;
+            }
+            sum.x += __uint_as_float(r[j][0].x);
+            sum.y += __uint_as_float(r[j][0].z);
+            sum.z += __uint_as_float(r[j][1].x);
+            sum.w += __uint_as_float(r[j][1].z);
         }
-        sum.x += __uint_as_float(r[j][0].x);
-        sum.y += __uint_as_float(r[j][0].z);
-        sum.z += __uint_as_float(r[j][1].x);
-        sum.w += __uint_as_float(r[j][1].z);
+        a.dst[i] = sum;
     }
-    a.dst[i] = sum;
+
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        a.ll_seq[blockIdx.x] = seq;
+    }
 }
 
 void ggml_cuda_p2p_ar_free(ggml_cuda_p2p_ar * ar) {
@@ -255,6 +265,7 @@ void ggml_cuda_p2p_ar_free(ggml_cuda_p2p_ar * ar) {
         cudaFree(ar->stage[i]);
         cudaFree(ar->flag [i]);
         cudaFree(ar->ll   [i]);
+        cudaFree(ar->ll_seq[i]);
     }
     (void) cudaGetLastError();
     delete ar;
@@ -329,6 +340,7 @@ ggml_cuda_p2p_ar * ggml_cuda_p2p_ar_init(const int * devices, size_t n_devices) 
     const size_t flag_bytes  = (size_t) GGML_CUDA_P2P_AR_NSLOTS * n_devices *
                                ar->nblocks * sizeof(unsigned long long);
     const size_t ll_bytes    = (size_t) GGML_CUDA_P2P_AR_NSLOTS * n_devices * 2 * ll_max_bytes;
+    const size_t ll_seq_bytes = (ll_max_bytes/sizeof(float4) + GGML_CUDA_P2P_AR_LL_NTHREADS - 1) / GGML_CUDA_P2P_AR_LL_NTHREADS * sizeof(unsigned int);
 
     for (size_t i = 0; i < n_devices; ++i) {
         ar->devices[i] = devices[i];
@@ -358,7 +370,9 @@ ggml_cuda_p2p_ar * ggml_cuda_p2p_ar_init(const int * devices, size_t n_devices) 
             cudaMalloc((void **) &ar->flag [i], flag_bytes)  != cudaSuccess ||
             cudaMemset(ar->flag[i], 0, flag_bytes)           != cudaSuccess ||
             (ll_bytes > 0 && cudaMalloc((void **) &ar->ll[i], ll_bytes) != cudaSuccess) ||
-            (ll_bytes > 0 && cudaMemset(ar->ll[i], 0, ll_bytes)         != cudaSuccess)) {
+            (ll_bytes > 0 && cudaMemset(ar->ll[i], 0, ll_bytes)         != cudaSuccess) ||
+            (ll_bytes > 0 && cudaMalloc((void **) &ar->ll_seq[i], ll_seq_bytes) != cudaSuccess) ||
+            (ll_bytes > 0 && cudaMemset(ar->ll_seq[i], 0, ll_seq_bytes)         != cudaSuccess)) {
             (void) cudaGetLastError();
             GGML_LOG_INFO("%s: staging allocation failed, keeping NCCL for AllReduce\n", __func__);
             ggml_cuda_p2p_ar_free(ar);
@@ -387,9 +401,10 @@ void ggml_cuda_p2p_ar_launch(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, g
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backends[rank]->context;
 
     ggml_cuda_p2p_ar_args args = ar->args;
-    args.rank = (int) rank;
-    args.src  = (const float4 *) tensors[rank]->data;
-    args.dst  = (float4 *)       tensors[rank]->data;
+    args.rank   = (int) rank;
+    args.src    = (const float4 *) tensors[rank]->data;
+    args.dst    = (float4 *)       tensors[rank]->data;
+    args.ll_seq = ar->ll_seq[rank];
 
     ggml_cuda_set_device(cuda_ctx->device);
 
@@ -415,11 +430,9 @@ void ggml_cuda_p2p_ar_launch(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, g
     CUDA_CHECK(cudaGetLastError());
 }
 
-bool ggml_cuda_p2p_ar_prepare(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors) {
-    if (ar == nullptr) {
-        return false;
-    }
-
+// whether the call can take this path, and which ranks contribute
+static bool ggml_cuda_p2p_ar_check(const ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors,
+        unsigned int & contrib_mask) {
     const size_t  n_devices = ar->n_devices;
     const int64_t ne        = ggml_nelements(tensors[0]);
 
@@ -434,7 +447,7 @@ bool ggml_cuda_p2p_ar_prepare(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, 
         return false;
     }
 
-    unsigned int contrib_mask = 0;
+    contrib_mask = 0;
     for (size_t i = 0; i < n_devices; ++i) {
         const ggml_tensor * t = tensors[i];
         if (t == nullptr || t->type != GGML_TYPE_F32 || ggml_nelements(t) != ne) {
@@ -450,6 +463,62 @@ bool ggml_cuda_p2p_ar_prepare(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, 
         if (t->flags & GGML_TENSOR_FLAG_COMPUTE) {
             contrib_mask |= 1u << i;
         }
+    }
+    return true;
+}
+
+bool ggml_cuda_p2p_ar_ll_capturable(const ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors) {
+    unsigned int contrib_mask = 0;
+    return ar != nullptr && ar->n_devices >= 2 && ar->n_devices <= 4 && ar->ll_max_bytes > 0 &&
+        ggml_cuda_p2p_ar_check(ar, backends, tensors, contrib_mask) &&
+        (size_t) ggml_nelements(tensors[0]) * sizeof(float) <= ar->ll_max_bytes;
+}
+
+void ggml_cuda_p2p_ar_launch_ll(const ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors, size_t rank) {
+    unsigned int contrib_mask = 0;
+    GGML_ASSERT(ggml_cuda_p2p_ar_ll_capturable(ar, backends, tensors) && ggml_cuda_p2p_ar_check(ar, backends, tensors, contrib_mask));
+
+    ggml_cuda_p2p_ar_args args = {};
+    for (size_t j = 0; j < ar->n_devices; ++j) {
+        args.ll[j] = ar->ll[j];
+    }
+    args.nvec         = ggml_nelements(tensors[0]) / 4;
+    args.ll_stride    = ar->ll_stride;
+    args.n_devs       = (int) ar->n_devices;
+    args.contrib_mask = contrib_mask;
+    args.rank         = (int) rank;
+    args.src          = (const float4 *) tensors[rank]->data;
+    args.dst          = (float4 *)       tensors[rank]->data;
+    args.ll_seq       = ar->ll_seq[rank];
+
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backends[rank]->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    const int nblocks_ll = (int) ((args.nvec + GGML_CUDA_P2P_AR_LL_NTHREADS - 1) / GGML_CUDA_P2P_AR_LL_NTHREADS);
+    switch (args.n_devs) {
+        case 2:
+            ggml_cuda_p2p_ar_ll_kernel_n<2><<<nblocks_ll, GGML_CUDA_P2P_AR_LL_NTHREADS, 0, cuda_ctx->stream()>>>(args);
+            break;
+        case 3:
+            ggml_cuda_p2p_ar_ll_kernel_n<3><<<nblocks_ll, GGML_CUDA_P2P_AR_LL_NTHREADS, 0, cuda_ctx->stream()>>>(args);
+            break;
+        default:
+            ggml_cuda_p2p_ar_ll_kernel_n<4><<<nblocks_ll, GGML_CUDA_P2P_AR_LL_NTHREADS, 0, cuda_ctx->stream()>>>(args);
+            break;
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+bool ggml_cuda_p2p_ar_prepare(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors) {
+    if (ar == nullptr) {
+        return false;
+    }
+
+    const size_t  n_devices = ar->n_devices;
+    const int64_t ne        = ggml_nelements(tensors[0]);
+
+    unsigned int contrib_mask = 0;
+    if (!ggml_cuda_p2p_ar_check(ar, backends, tensors, contrib_mask)) {
+        return false;
     }
 
     ar->seq++;

@@ -40,3 +40,8 @@ bool ggml_cuda_p2p_ar_allreduce(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends
 // issue it from the thread that already owns that device's graph launch.
 bool ggml_cuda_p2p_ar_prepare(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors);
 void ggml_cuda_p2p_ar_launch (ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors, size_t rank);
+
+// The LL kernel of one rank with its arguments built from the tensors, nothing claimed on the host and the sequence
+// numbers kept on the device, so it can be captured into a CUDA graph. capturable tells whether a call takes this path.
+bool ggml_cuda_p2p_ar_ll_capturable(const ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors);
+void ggml_cuda_p2p_ar_launch_ll    (const ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors, size_t rank);
