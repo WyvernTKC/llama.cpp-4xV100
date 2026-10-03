@@ -524,6 +524,19 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
         ggml_build_forward_expand(gf, ffn_shexp);
     }
 
+    // the router and the shared expert gate read the same input: expanded back to back, a backend can run the
+    //   gate's one row in the router's launch (CUDA at one token, see ggml_cuda_try_fuse)
+    ggml_tensor * logits      = nullptr;
+    ggml_tensor * shared_gate = nullptr;
+    if (ffn_shexp != nullptr) {
+        logits = build_lora_mm(model.layers[il].ffn_gate_inp, cur);
+        cb(logits, "ffn_moe_logits", il);
+        shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
+        cb(shared_gate, "shared_expert_gate", il);
+        ggml_build_forward_expand(gf, logits);
+        ggml_build_forward_expand(gf, shared_gate);
+    }
+
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
@@ -535,7 +548,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
             LLM_FFN_SILU, true,
             hparams.expert_weights_scale,
             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            nullptr, model.layers[il].ffn_gate_up_exps,
+            logits, model.layers[il].ffn_gate_up_exps,
             model.layers[il].ffn_up_exps_s,
             model.layers[il].ffn_gate_exps_s,
             model.layers[il].ffn_down_exps_s);
@@ -545,9 +558,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     if (ffn_shexp != nullptr) {
         // Apply shared expert gating as in the reference implementation
         // The shared expert has its own gate that is sigmoided
-        // Note: ffn_gate_inp_shexp is the shared expert gate (outputs 1 value per token)
-        ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
-        cb(shared_gate, "shared_expert_gate", il);
+        // Note: ffn_gate_inp_shexp is the shared expert gate (outputs 1 value per token), built with the router
 
         // Apply sigmoid to the gate
         shared_gate = ggml_sigmoid(ctx0, shared_gate);
@@ -695,6 +706,16 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     cb(cur, "mtp_attn_post_norm", il);
 
     // MoE FFN — routed experts plus gated shared expert (mirrors qwen35moe).
+    // the router and the shared expert gate back to back, as in build_layer_ffn
+    ggml_tensor * logits      = nullptr;
+    ggml_tensor * shared_gate = nullptr;
+    if (layer.ffn_up_shexp != nullptr) {
+        logits = build_lora_mm(layer.ffn_gate_inp, cur);
+        cb(logits, "ffn_moe_logits", il);
+        shared_gate = build_lora_mm(layer.ffn_gate_inp_shexp, cur);
+        ggml_build_forward_expand(gf, logits);
+        ggml_build_forward_expand(gf, shared_gate);
+    }
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             layer.ffn_gate_inp,
@@ -706,7 +727,7 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
             LLM_FFN_SILU, true,
             hparams.expert_weights_scale,
             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            nullptr, layer.ffn_gate_up_exps,
+            logits, layer.ffn_gate_up_exps,
             layer.ffn_up_exps_s,
             layer.ffn_gate_exps_s,
             layer.ffn_down_exps_s);
@@ -722,7 +743,6 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
                 LLM_FFN_SILU, LLM_FFN_PAR, il);
         cb(ffn_shexp, "mtp_ffn_shexp", il);
 
-        ggml_tensor * shared_gate = build_lora_mm(layer.ffn_gate_inp_shexp, cur);
         shared_gate = ggml_sigmoid(ctx0, shared_gate);
         cb(shared_gate, "mtp_shared_expert_gate_sigmoid", il);
 
