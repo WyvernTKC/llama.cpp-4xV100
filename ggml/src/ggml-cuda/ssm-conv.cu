@@ -299,7 +299,12 @@ static __global__ void ssm_conv_state_halo_f32(const float * states, const int32
     }
 
     if (blockIdx.y == 0) {
-        for (int k = 0; k < slots.n; ++k) {
+        // constant indices keep the slot table among the kernel parameters instead of a copy in local memory
+#pragma unroll
+        for (int k = 0; k < GGML_CUDA_SSM_CONV_STATE_MAX_TOKENS + 1; ++k) {
+            if (k >= slots.n) {
+                break;
+            }
 #pragma unroll
             for (int kk = 0; kk < d_conv - 1; ++kk) {
                 const int p = slots.start[k] + kk;
@@ -341,7 +346,12 @@ static __global__ void ssm_conv_state_long_f32(const float * states, const int32
     }
 
     if (blockIdx.y == 0) {
-        for (int k = 0; k < slots.n; ++k) {
+        // constant indices keep the slot table among the kernel parameters instead of a copy in local memory
+#pragma unroll
+        for (int k = 0; k < GGML_CUDA_SSM_CONV_STATE_MAX_TOKENS + 1; ++k) {
+            if (k >= slots.n) {
+                break;
+            }
 #pragma unroll
             for (int kk = 0; kk < d_conv - 1; ++kk) {
                 const int p = slots.start[k] + kk;

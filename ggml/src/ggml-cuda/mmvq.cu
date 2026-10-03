@@ -1039,7 +1039,14 @@ static __global__ void mul_mat_vec_q_moe(
 
     // Write results
     if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
-        float result = tmp[threadIdx.x];
+        // picked with constant indices: indexed by threadIdx.x, tmp and tmp_gate would live in local memory
+        float result = tmp[0];
+#pragma unroll
+        for (int i = 1; i < c_rows_per_block; ++i) {
+            if ((int) threadIdx.x == i) {
+                result = tmp[i];
+            }
+        }
         if constexpr (has_fusion) {
             const uint32_t bias_idx = channel_x*stride_channel_dst + row0 + threadIdx.x;
 
@@ -1052,7 +1059,13 @@ static __global__ void mul_mat_vec_q_moe(
                 result += x_bias[bias_idx];
             }
             if (use_gate) {
-                float gate_value = tmp_gate[threadIdx.x];
+                float gate_value = tmp_gate[0];
+#pragma unroll
+                for (int i = 1; i < c_rows_per_block; ++i) {
+                    if ((int) threadIdx.x == i) {
+                        gate_value = tmp_gate[i];
+                    }
+                }
                 if constexpr (type == GGML_TYPE_NVFP4) {
                     if (gate_scale) {
                         gate_value *= gate_scale[channel_x];

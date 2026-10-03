@@ -549,7 +549,15 @@ static __global__ void mul_mat_vec_f(
     const int drow = row + tid/ncols_dst;
     const int dcol = tid % ncols_dst;
 
-    float value = sumf[tid];
+    // the sums of this thread, picked with constant indices: indexed by tid, sumf and sumf_gate would live in local
+    //   memory
+    float value = sumf[0];
+#pragma unroll
+    for (int i = 1; i < ncols_dst*rpb; ++i) {
+        if (tid == i) {
+            value = sumf[i];
+        }
+    }
 
     if constexpr (has_fusion) {
         if (use_bias) {
@@ -557,7 +565,13 @@ static __global__ void mul_mat_vec_f(
         }
 
         if (use_gate) {
-            float gate_value = sumf_gate[tid];
+            float gate_value = sumf_gate[0];
+#pragma unroll
+            for (int i = 1; i < ncols_dst*rpb; ++i) {
+                if (tid == i) {
+                    gate_value = sumf_gate[i];
+                }
+            }
             if (use_gate_bias) {
                 gate_value += gate_bias[dcol*stride_col_dst + drow];
             }
