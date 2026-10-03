@@ -4514,6 +4514,49 @@ struct test_mul_mat_sibling_row : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT + GGML_OP_UNARY(SIGMOID) + GGML_OP_MUL + GGML_OP_ADD (acc + sigmoid(g) * (w*x), the gated shared expert of qwen35moe)
+struct test_mul_mat_sigmoid_add : public test_case {
+    const ggml_type type;
+    const int64_t k;
+    const int64_t rows;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SIGMOID_ADD";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, k, rows, n_tokens);
+    }
+
+    test_mul_mat_sigmoid_add(ggml_type type = GGML_TYPE_Q8_0, int64_t k = 512, int64_t rows = 2048, int64_t n_tokens = 1)
+        : type(type), k(k), rows(rows), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w   = ggml_new_tensor_2d(ctx, type, k, rows);
+        ggml_tensor * x   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
+        ggml_tensor * g   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_tokens);
+        ggml_tensor * acc = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rows, n_tokens);
+        ggml_set_name(w, "w");
+        ggml_set_name(x, "x");
+        ggml_set_name(g, "g");
+        ggml_set_name(acc, "acc");
+
+        ggml_tensor * mm  = ggml_mul_mat(ctx, w, x);
+        ggml_tensor * out = ggml_add(ctx, acc, ggml_mul(ctx, mm, ggml_sigmoid(ctx, g)));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_UNARY + GGML_OP_MUL (rms_norm(x) * w * op(z), build_norm_gated)
 struct test_rms_norm_gated : public test_case {
     const ggml_type type;
@@ -11259,6 +11302,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             { 2048, 256, 1 }, { 1024, 64, 1 }, { 4096, 512, 1 }, { 2048, 2, 1 }, { 2048, 256, 3 } }) {
         test_cases.emplace_back(new test_mul_mat_sibling_row(s[0], s[1], s[2]));
     }
+    // one token fuses (k 128: a split shared expert, 512: a whole one), two tokens do not
+    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K }) {
+        for (int64_t k : { 256, 512 }) {
+            for (int64_t n_tokens : { 1, 2 }) {
+                test_cases.emplace_back(new test_mul_mat_sigmoid_add(type, k, 2048, n_tokens));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_sigmoid_add(GGML_TYPE_Q8_0, 128, 2048, 1));
     for (ggml_unary_op op : { GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SILU }) {
         for (int64_t n_tokens : { 1, 6, 32 }) {
             test_cases.emplace_back(new test_cont_unary_mul(256, 4,  n_tokens, op));

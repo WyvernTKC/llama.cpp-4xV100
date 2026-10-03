@@ -673,6 +673,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (std::regex_match(tensor_name, pattern_attn_out_b_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
             }
+        }
+
+        // A shared expert split like the routed ones gives a partial sum, which the meta backend reduces in the same
+        //   all-reduce as theirs if the model adds it right after them. Otherwise it is mirrored.
+        if (is_dsv4 || ud->model->arch == LLM_ARCH_QWEN35MOE) {
             if (std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                     std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight");

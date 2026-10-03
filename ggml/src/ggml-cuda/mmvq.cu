@@ -734,6 +734,7 @@ static __global__ void mul_mat_vec_q(
     [[maybe_unused]] float gate_biases[ncols_dst] = { 0.0f };
     [[maybe_unused]] float x_scales = 1.0f;
     [[maybe_unused]] float gate_scales = 1.0f;
+    [[maybe_unused]] float x_sig = 1.0f;
     if constexpr (has_fusion) {
         // 1. Hide latency by prefetching bias, gates and scales here
         // 2. load only on threads that won't die after partial sum calculation
@@ -753,6 +754,9 @@ static __global__ void mul_mat_vec_q(
                 for (int j = 0; j < ncols_dst; ++j) {
                     gate_biases[j] = gate_bias[j * stride_col_dst + threadIdx.x];
                 }
+            }
+            if (fusion.x_sigmoid) {
+                x_sig = ggml_cuda_op_sigmoid_single(*fusion.x_sigmoid);
             }
             if constexpr (type == GGML_TYPE_NVFP4) {
                 if (use_scale) {
@@ -893,6 +897,10 @@ static __global__ void mul_mat_vec_q(
                 if constexpr (has_fusion) {
                     if constexpr (type == GGML_TYPE_NVFP4) {
                         result *= x_scales;
+                    }
+                    if (fusion.x_sigmoid) {
+                        // rounded on its own, as the MUL before the ADD of the unfused ops
+                        result = __fmul_rn(result, x_sig);
                     }
                     result += x_biases[j];
                     if (gdn_beta) {
@@ -1670,6 +1678,11 @@ static void ggml_cuda_mul_mat_vec_q_impl(
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;
+        if (fusion->x_sigmoid) {
+            GGML_ASSERT(!ids && fusion->x_bias && !fusion->gate && !fusion->x_scale);
+            GGML_ASSERT(fusion->x_sigmoid->type == GGML_TYPE_F32 && ggml_nelements(fusion->x_sigmoid) == 1);
+            fusion_local.x_sigmoid = (const float *) fusion->x_sigmoid->data;
+        }
         if (fusion->gdn_beta) {
             GGML_ASSERT(!ids && fusion->gate && !fusion->x_bias && !fusion->gate_bias && !fusion->x_scale && !fusion->gate_scale);
             for (const ggml_tensor * t : { fusion->gdn_dt, fusion->gdn_a, (const ggml_tensor *) fusion->gdn_beta }) {

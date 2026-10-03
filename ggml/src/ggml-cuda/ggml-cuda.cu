@@ -5592,6 +5592,33 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // mul_mat, then times the sigmoid of one value, plus another tensor, at one token: Qwen3.5-MoE adds its gated shared
+    //   expert to the routed experts like this. Each thread reads the row of the added tensor it then writes.
+    if (node->op == GGML_OP_MUL_MAT) {
+        constexpr ggml_op ops[] = { GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
+        const int out_nodes[] = { i + 3 };
+        if (ggml_can_fuse_subgraph(cgraph, i, 4, ops, out_nodes, 1) &&
+                ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SIGMOID) {
+            const ggml_tensor * sig = cgraph->nodes[i + 1];
+            const ggml_tensor * mul = cgraph->nodes[i + 2];
+            ggml_tensor *       add = cgraph->nodes[i + 3];
+            const ggml_tensor * g   = sig->src[0];
+            const ggml_tensor * acc = add->src[0] == mul ? add->src[1] : add->src[0];
+            if (((mul->src[0] == node && mul->src[1] == sig) || (mul->src[0] == sig && mul->src[1] == node)) &&
+                    (add->src[0] == mul || add->src[1] == mul) &&
+                    g->type == GGML_TYPE_F32 && ggml_nelements(g) == 1 &&
+                    acc->type == GGML_TYPE_F32 && ggml_is_contiguous(acc) && ggml_are_same_shape(acc, node) &&
+                    ggml_is_contiguous(add) && ggml_cuda_should_fuse_mul_mat_vec_q(node) && !ggml_cuda_op_mul_mat_use_fwht(node) &&
+                    !ggml_cuda_tensors_overlap(add, g) && ggml_cuda_same_or_disjoint(add, acc)) {
+                ggml_cuda_mm_fusion_args_host fusion_data{};
+                fusion_data.x_bias    = acc;
+                fusion_data.x_sigmoid = g;
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr, add, &fusion_data);
+                return 3;
+            }
+        }
+    }
+
     // mul_mat + add
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;

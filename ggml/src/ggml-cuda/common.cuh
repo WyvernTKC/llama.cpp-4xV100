@@ -1711,6 +1711,8 @@ struct ggml_cuda_mm_fusion_args_host {
     // a sibling matrix of one row with the same input, computed as one more row: sib_dst = sib*y (f32, one token)
     const ggml_tensor * sib = nullptr;
     ggml_tensor * sib_dst = nullptr;
+    // one value per token gating the product before the bias: dst = x_bias + sigmoid(x_sigmoid)*(x*y), one token
+    const ggml_tensor * x_sigmoid = nullptr;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1725,6 +1727,7 @@ struct ggml_cuda_mm_fusion_args_device {
     float * gdn_beta = nullptr;
     const void * sib_x = nullptr;
     float * sib_dst = nullptr;
+    const float * x_sigmoid = nullptr;
 };
 
 struct ggml_cuda_kernel_launch_params {
