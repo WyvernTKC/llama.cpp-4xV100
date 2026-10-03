@@ -5653,6 +5653,29 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // A MUL_MAT of one f32 row right after another f32 MUL_MAT of the same input and width runs as one more row
+    //   of the first one's mmvf launch, at one token: Qwen3.5-MoE expands its shared expert gate right after its
+    //   router (one 1-block launch per layer, ~3 us). With no node between the two, the second one's dst holds
+    //   nothing live when it is written early. GGML_CUDA_NO_SIBLING_ROW=1 runs them apart.
+    if (node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes && cuda_ctx->stream_context().concurrent_events.empty()) {
+        static const bool no_sibling_row = getenv("GGML_CUDA_NO_SIBLING_ROW") != nullptr;
+        ggml_tensor * sib = cgraph->nodes[i + 1];
+        if (!no_sibling_row && sib->op == GGML_OP_MUL_MAT && sib->src[1] == node->src[1] &&
+                node->src[0]->type == GGML_TYPE_F32 && sib->src[0]->type == GGML_TYPE_F32 &&
+                sib->src[0]->ne[0] == node->src[0]->ne[0] && ggml_nrows(sib->src[0]) == 1 &&
+                ggml_is_contiguous(sib->src[0]) && ggml_nrows(node) == 1 && ggml_nelements(sib) == 1 &&
+                !ggml_cuda_op_mul_mat_use_fwht(node) && !ggml_cuda_op_mul_mat_use_fwht(sib) &&
+                ggml_cuda_should_fuse_mul_mat_vec_f(node) &&
+                ggml_cuda_mul_mat_choose(*cuda_ctx, sib->src[0], sib->src[1], sib) == GGML_CUDA_MUL_MAT_PATH_MMVF &&
+                !ggml_cuda_tensors_overlap(sib, node) && !ggml_cuda_tensors_overlap(sib, node->src[1])) {
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            fusion_data.sib     = sib->src[0];
+            fusion_data.sib_dst = sib;
+            ggml_cuda_mul_mat_vec_f(*cuda_ctx, node->src[0], node->src[1], nullptr, node, &fusion_data);
+            return 1;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_GET_ROWS_MEAN, GGML_OP_RESHAPE, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_ROPE }, {})) {
         ggml_cuda_op_get_rows_mean_norm_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 2], cgraph->nodes[i + 3], cgraph->nodes[i + 5]);
         return 5;

@@ -57,6 +57,13 @@ static __global__ void mul_mat_vec_f(
         y   += token_idx*stride_col_y2*2;
         dst += token_idx*stride_col_dst;
     }
+    if constexpr (has_fusion && std::is_same_v<T, float>) {
+        // the row of a sibling matrix with the same y is the last block's (one token, one row per block)
+        if (fusion.sib_x != nullptr && blockIdx.x == gridDim.x - 1) {
+            x   = (const T *) fusion.sib_x;
+            dst = fusion.sib_dst - row;
+        }
+    }
 
     bool use_gate = false;
     bool use_bias = false;
@@ -628,7 +635,8 @@ static void mul_mat_vec_f_switch_fusion(
             sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
     };
 
-    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+        fusion.sib_x != nullptr;
     if constexpr (ncols_dst > 1 && !is_multi_token_id && sizeof(T) == 2) {
         if (load16) {
             if (has_fusion) {
@@ -743,7 +751,8 @@ void launch_mul_mat_vec_f_cuda(
         }
     }
 
-    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+        fusion.sib_x != nullptr;
 
     // On Volta four rows per block share the y loads and keep more loads in flight. With the 16-byte loads
     // that pays for one token only for rows of <= 512 (bf16 4096x512 -10%, 8192x1024 +4%), and for 2-6 tokens for
@@ -753,7 +762,7 @@ void launch_mul_mat_vec_f_cuda(
     // very tall matrices (f16 62080x5120 -10%), rows of 2k-17k are within +-3%, and below ~8 blocks per SM it
     // loses.
     int rpb = 1;
-    if (ncols_dst == 1 && !is_multi_token_id && is_volta &&
+    if (ncols_dst == 1 && !is_multi_token_id && is_volta && fusion.sib_x == nullptr &&
             (load16 ? ncols <= 512 : (ncols <= 1024 || nrows >= 16384)) &&
             nrows % 4 == 0 && (nrows/4)*nchannels_dst*nsamples_or_ntokens >= 8*ggml_cuda_info().devices[device].nsm) {
         rpb = 4;
@@ -1011,6 +1020,14 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             fusion_local.gdn_a    = (const float *) fusion->gdn_a->data;
             fusion_local.gdn_beta = (float *) fusion->gdn_beta->data;
         }
+        if (fusion->sib) {
+            GGML_ASSERT(!ids && !fusion->gate && !fusion->x_bias && !fusion->gate_bias && !fusion->gdn_beta);
+            GGML_ASSERT(src0->type == GGML_TYPE_F32 && fusion->sib->type == GGML_TYPE_F32);
+            GGML_ASSERT(fusion->sib->ne[0] == ne00 && ggml_nrows(fusion->sib) == 1 && ggml_is_contiguous(fusion->sib));
+            GGML_ASSERT(ggml_nrows(dst) == 1 && fusion->sib_dst->type == GGML_TYPE_F32 && ggml_nelements(fusion->sib_dst) == 1);
+            fusion_local.sib_x   = fusion->sib->data;
+            fusion_local.sib_dst = (float *) fusion->sib_dst->data;
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1037,7 +1054,9 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     switch (src0->type) {
         case GGML_TYPE_F32: {
             const float * src0_d = (const float *) src0->data;
-            mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
+            // a sibling row is one more block
+            const int64_t nrows = ne01 + (fusion_local.sib_x != nullptr ? 1 : 0);
+            mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, nrows, ncols_dst, s01, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
                 ne03,              ne3,           s03, s13,              s3,                 ids_stride, prec, ctx.stream());
         } break;
