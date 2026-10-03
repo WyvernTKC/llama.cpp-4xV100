@@ -384,13 +384,16 @@ static __global__ void __launch_bounds__(block_size) rms_norm_pre_add_f32(const 
 template <int block_size, int cols_per_thread, bool has_scale>
 static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
         const float * x, const float * w1, const float * r, const float * s, const float * w2, float * y_out, float * dst,
-        const int ncols, const float eps1, const float eps2, const bool s_per_col) {
+        const int ncols, const float eps1, const float eps2, const bool s_per_col,
+        block_q8_1 * q8_dst = nullptr, const int nq8 = 0, unsigned int * flags = nullptr) {
     ggml_cuda_pdl_lc();
-    const int nrows     = gridDim.x;
+    // the q8_1 copy of dst as in rms_norm_pre_add_f32: blocks after the first, one row
+    const bool emitter  = q8_dst != nullptr && blockIdx.x > 0;
+    const int nrows     = q8_dst != nullptr ? 1 : gridDim.x;
     const int nchannels = gridDim.y;
     const int tid       = threadIdx.x;
 
-    const int64_t offset = ((int64_t(blockIdx.z)*nchannels + blockIdx.y)*nrows + blockIdx.x)*ncols;
+    const int64_t offset = q8_dst != nullptr ? 0 : ((int64_t(blockIdx.z)*nchannels + blockIdx.y)*nrows + blockIdx.x)*ncols;
     x     += offset;
     r     += offset;
     y_out += offset;
@@ -419,6 +422,23 @@ static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
         }
     }
 
+    // the inputs the outputs may sit on have been read (the predicate waits for them): tell block 0
+    if (emitter && flags != nullptr) {
+        bool nan = false;
+#pragma unroll
+        for (int i = 0; i < cols_per_thread; ++i) {
+            nan = nan || xv[i] != xv[i] || rv[i] != rv[i];
+            if constexpr (has_scale) {
+                nan = nan || sv[i] != sv[i];
+            }
+        }
+        __syncthreads_or(nan);
+        if (tid == 0) {
+            __threadfence();
+            atomicAdd(flags, 1u);
+        }
+    }
+
     extern __shared__ float s_sum[];
 
     float tmp = 0.0f;
@@ -431,6 +451,16 @@ static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
     tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
     const float scale1 = rsqrtf(tmp / ncols + eps1);
 
+    // the other blocks have read the inputs; lower the flag for the next launch
+    if (q8_dst != nullptr && !emitter && flags != nullptr) {
+        if (tid == 0) {
+            while (atomicAdd(flags, 0u) < gridDim.x - 1) {
+            }
+            atomicExch(flags, 0u);
+        }
+        __syncthreads();
+    }
+
     float tmp2 = 0.0f;
 #pragma unroll
     for (int i = 0; i < cols_per_thread; ++i) {
@@ -442,12 +472,30 @@ static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
         if constexpr (has_scale) {
             y = __fmul_rn(y, sv[i]);
         }
-        y_out[col] = y;
-        xv[i]      = y;
+        if (!emitter) {
+            y_out[col] = y;
+        }
+        xv[i] = y;
         tmp2 += y * y;
     }
     tmp2 = block_reduce<block_reduce_method::SUM, block_size>(tmp2, s_sum + 32);
     const float scale2 = rsqrtf(tmp2 / ncols + eps2);
+
+    if (emitter) {
+        const int slot = blockIdx.x - 1;
+        const int ib   = slot*(block_size/WARP_SIZE) + tid/WARP_SIZE;
+        float v = 0.0f;
+#pragma unroll
+        for (int i = 0; i < cols_per_thread; ++i) {
+            if (i == slot && tid + i*block_size < ncols) {
+                v = scale2 * xv[i] * w2v[i];
+            }
+        }
+        if (ib < nq8) {
+            rms_norm_quantize_q8_1(v, q8_dst + ib, tid % WARP_SIZE);
+        }
+        return;
+    }
 
 #pragma unroll
     for (int i = 0; i < cols_per_thread; ++i) {
@@ -1232,15 +1280,38 @@ void ggml_cuda_op_rms_norm_add_rms_norm(ggml_backend_cuda_context & ctx, ggml_te
     const bool s_per_col = s != nullptr && ggml_nelements(s) > 1;
     const dim3 blocks_num(x->ne[1], x->ne[2], x->ne[3]);
 
+    // the q8_1 copy for the matmul that reads the output, see ggml_cuda_q8_1_request and rms_norm_pre_add_f32
+    const int      block_size = ncols < 1024 ? 256 : 1024;
+    block_q8_1   * q8_d  = nullptr;
+    int            nq8   = 0;
+    unsigned int * flags = nullptr;
+    dim3 grid = blocks_num;
+    if (ctx.q8_1_emit == mul2 && ggml_nrows(mul2) == 1 && ggml_is_contiguous(mul2) && ncols <= 8*block_size) {
+        int64_t ne_padded = 0;
+        q8_d   = (block_q8_1 *) ctx.q8_1_emit_alloc(mul2, ne_padded);
+        nq8    = (int) (ne_padded / QK8_1);
+        grid.x = 1 + (nq8 + block_size/WARP_SIZE - 1) / (block_size/WARP_SIZE);
+        const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+            const char * a0 = (const char *) a->data;
+            const char * b0 = (const char *) b->data;
+            return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+        };
+        for (const ggml_tensor * in : { x, r, s }) {
+            if (in != nullptr && (overlaps(in, y) || overlaps(in, mul2))) {
+                flags = ctx.block_flags_get();
+            }
+        }
+    }
+
     const auto launch = [&](auto has_scale, auto block_size, auto cols) {
         constexpr int nc = decltype(cols)::value;
         if constexpr (nc > 0) {
             constexpr int bs = decltype(block_size)::value;
-            const ggml_cuda_kernel_launch_params launch_params{blocks_num, dim3(bs, 1, 1), 64 * sizeof(float), ctx.stream()};
+            const ggml_cuda_kernel_launch_params launch_params{grid, dim3(bs, 1, 1), 64 * sizeof(float), ctx.stream()};
             ggml_cuda_kernel_launch(rms_norm_add_rms_norm_f32<bs, nc, decltype(has_scale)::value>, launch_params,
                 (const float *) x->data, (const float *) w1->data, (const float *) r->data,
                 s != nullptr ? (const float *) s->data : nullptr, (const float *) w2->data, (float *) y->data,
-                (float *) mul2->data, ncols, eps1, eps2, s_per_col);
+                (float *) mul2->data, ncols, eps1, eps2, s_per_col, q8_d, nq8, flags);
         } else {
             GGML_ABORT("fatal error");
         }

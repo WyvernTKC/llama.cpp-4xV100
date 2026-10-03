@@ -4278,9 +4278,11 @@ struct test_rms_norm_add_rms_norm : public test_case {
     const int scale;
     const float eps1;
     const float eps2;
+    const int64_t mm_rows; // > 0: a q8_0 matmul reads the second norm
 
     ggml_tensor * y  = nullptr;
     ggml_tensor * n2 = nullptr;
+    ggml_tensor * mm = nullptr;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4288,14 +4290,24 @@ struct test_rms_norm_add_rms_norm : public test_case {
     }
 
     bool run_whole_graph() override { return true; }
-    std::vector<ggml_tensor *> fusion_test_nodes() override { return { y, n2 }; }
-
-    std::string vars() override {
-        return VARS_TO_STR4(ne, scale, eps1, eps2);
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (mm != nullptr) {
+            return { y, n2, mm };
+        }
+        return { y, n2 };
     }
 
-    test_rms_norm_add_rms_norm(std::array<int64_t, 4> ne = {64, 5, 4, 3}, int scale = 0, float eps1 = 1e-6f, float eps2 = 1e-6f)
-        : ne(ne), scale(scale), eps1(eps1), eps2(eps2) {}
+    std::string vars() override {
+        return VARS_TO_STR5(ne, scale, eps1, eps2, mm_rows);
+    }
+
+    double max_nmse_err() override {
+        return mm_rows > 0 ? 5e-4 : 1e-7;
+    }
+
+    test_rms_norm_add_rms_norm(std::array<int64_t, 4> ne = {64, 5, 4, 3}, int scale = 0, float eps1 = 1e-6f, float eps2 = 1e-6f,
+            int64_t mm_rows = 0)
+        : ne(ne), scale(scale), eps1(eps1), eps2(eps2), mm_rows(mm_rows) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x  = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
@@ -4319,6 +4331,14 @@ struct test_rms_norm_add_rms_norm : public test_case {
         // both are compared, so no other fusion may elide them
         ggml_set_output(y);
         ggml_set_output(n2);
+
+        if (mm_rows > 0) {
+            ggml_tensor * wq = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, ne[0], mm_rows);
+            ggml_set_name(wq, "wq");
+            mm = ggml_mul_mat(ctx, wq, n2);
+            ggml_set_name(mm, "out");
+            return mm;
+        }
 
         ggml_tensor * out = ggml_add(ctx, n2, y);
         ggml_set_name(out, "out");
@@ -11293,6 +11313,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_rms_norm_add_rms_norm({n, 6, 1, 1}, scale, 1e-6f, 1e-5f));
         }
         test_cases.emplace_back(new test_rms_norm_add_rms_norm({1025, 5, 4, 3}, scale, 1e-1f, 0.0f));
+        // one row writes the q8_1 copy for the matmul that reads the second norm, two rows do not
+        for (int64_t n : {768, 2816, 5376}) {
+            test_cases.emplace_back(new test_rms_norm_add_rms_norm({n, 1, 1, 1}, scale, 1e-6f, 1e-6f, 256));
+            test_cases.emplace_back(new test_rms_norm_add_rms_norm({n, 2, 1, 1}, scale, 1e-6f, 1e-6f, 256));
+        }
     }
     for (uint32_t n : {1, 511, 700, 1000, 1025, 3000, 5120, 7000, 8192, 33*512}) {
         for (bool multi_add : {false, true}) {
