@@ -6211,6 +6211,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cuda_ctx->q8_1_input_reset();
     cuda_ctx->cublas_input_reset();
 
+    // in a session the subgraph is one part of the session's graph, see ggml_backend_cuda_session_plan
+    if (cuda_ctx->session_mode != ggml_backend_cuda_context::SESSION_OFF) {
+        ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, nullptr);
+        return GGML_STATUS_SUCCESS;
+    }
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
@@ -6263,6 +6269,147 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 
     return GGML_STATUS_SUCCESS;
+}
+
+// A session: subgraphs a device runs in a row for a ggml_backend_meta graph and the all-reduces between them as one CUDA
+//   graph. Apart, each subgraph is a graph launch and each all-reduce an eager kernel, and on Volta every such boundary
+//   leaves the GPU idle for ~2-2.5 us, twice per all-reduce. plan says from all subgraphs at once whether the session's
+//   graph can be replayed, must be captured again or the subgraphs run eagerly (warmup, a changed subgraph); the caller
+//   takes the slowest mode of all devices. To capture or run eagerly, begin, graph_compute of each subgraph,
+//   session_allreduce after it and end; launch then starts the captured graph.
+static const void * ggml_cuda_session_key(ggml_cgraph * cgraph) {
+    // next to the key of the first subgraph, which keeps its own entry for its properties
+    return (const char *) ggml_cuda_graph_get_key(cgraph) + 1;
+}
+
+static int ggml_backend_cuda_session_plan(ggml_backend_t backend, ggml_cgraph ** cgraphs, int n_cgraphs) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    GGML_ASSERT(cuda_ctx->session_mode == ggml_backend_cuda_context::SESSION_OFF && n_cgraphs > 0);
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    ggml_backend_cuda_context::session_mode_t mode = ggml_backend_cuda_context::SESSION_EAGER;
+#ifdef USE_CUDA_GRAPH
+    const void * graph_key = ggml_cuda_session_key(cgraphs[0]);
+    ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    if (graph->is_enabled()) {
+        bool graph_compatible = true;
+        for (int i = 0; i < n_cgraphs; i++) {
+            graph_compatible = graph_compatible && ggml_cuda_graph_check_compability(cgraphs[i]);
+        }
+        if (graph_compatible) {
+            bool properties_changed = (int) graph->session_keys.size() != n_cgraphs;
+            graph->session_keys.resize(n_cgraphs);
+            for (int i = 0; i < n_cgraphs; i++) {
+                const void * key_i = ggml_cuda_graph_get_key(cgraphs[i]);
+                properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraphs[i]) || graph->session_keys[i] != key_i ||
+                    properties_changed;
+                graph->session_keys[i] = key_i;
+            }
+
+            if (!graph->warmup_complete) {
+                if (!properties_changed) {
+                    graph->warmup_complete = true;
+                    mode = ggml_backend_cuda_context::SESSION_CAPTURE;
+                }
+            } else if (properties_changed) {
+                graph->warmup_complete = false;
+            } else {
+                mode = graph->instance == nullptr ? ggml_backend_cuda_context::SESSION_CAPTURE : ggml_backend_cuda_context::SESSION_REPLAY;
+            }
+        }
+    }
+    graph->session_want = mode;
+#else
+    GGML_UNUSED(cgraphs);
+#endif // USE_CUDA_GRAPH
+    return mode;
+}
+
+static void ggml_backend_cuda_session_begin(ggml_backend_t backend, ggml_cgraph ** cgraphs, int n_cgraphs, int mode) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    GGML_ASSERT(cuda_ctx->session_mode == ggml_backend_cuda_context::SESSION_OFF && n_cgraphs > 0);
+    GGML_ASSERT(mode == ggml_backend_cuda_context::SESSION_EAGER || mode == ggml_backend_cuda_context::SESSION_CAPTURE);
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    const void * graph_key = ggml_cuda_session_key(cgraphs[0]);
+#ifdef USE_CUDA_GRAPH
+    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    if (mode == ggml_backend_cuda_context::SESSION_EAGER && graph->session_want == ggml_backend_cuda_context::SESSION_CAPTURE) {
+        graph->warmup_complete = false; // another device runs eagerly this time; capture on the next stable plan
+    }
+    if (mode == ggml_backend_cuda_context::SESSION_CAPTURE) {
+        {
+            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+            ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
+        }
+        CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+    }
+#else
+    GGML_ASSERT(mode == ggml_backend_cuda_context::SESSION_EAGER);
+#endif // USE_CUDA_GRAPH
+
+    cuda_ctx->session_key  = graph_key;
+    cuda_ctx->session_mode = (ggml_backend_cuda_context::session_mode_t) mode;
+}
+
+// whether the all-reduce of these tensors (one per device) can be part of a session graph
+static bool ggml_backend_cuda_session_allreduce_supported(void * comm_ctx_v, struct ggml_tensor ** tensors) {
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    return comm_ctx != nullptr && ggml_cuda_p2p_ar_ll_capturable(comm_ctx->p2p_ar, comm_ctx->backends.data(), tensors);
+}
+
+static void ggml_backend_cuda_session_allreduce(void * comm_ctx_v, struct ggml_tensor ** tensors, size_t rank) {
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    GGML_ASSERT(((ggml_backend_cuda_context *) comm_ctx->backends[rank]->context)->session_mode != ggml_backend_cuda_context::SESSION_OFF);
+    ggml_cuda_p2p_ar_launch_ll(comm_ctx->p2p_ar, comm_ctx->backends.data(), tensors, rank);
+}
+
+static void ggml_backend_cuda_session_end(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    const ggml_backend_cuda_context::session_mode_t mode = cuda_ctx->session_mode;
+    GGML_ASSERT(mode != ggml_backend_cuda_context::SESSION_OFF);
+    cuda_ctx->session_mode = ggml_backend_cuda_context::SESSION_OFF;
+
+#ifdef USE_CUDA_GRAPH
+    if (mode == ggml_backend_cuda_context::SESSION_CAPTURE) {
+        ggml_cuda_set_device(cuda_ctx->device);
+        ggml_cuda_graph * graph = cuda_ctx->cuda_graph(cuda_ctx->session_key);
+        if (graph->graph != nullptr) {
+            CUDA_CHECK(cudaGraphDestroy(graph->graph));
+            graph->graph = nullptr;
+        }
+        CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+        {
+            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+            if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+                ggml_cuda_lock_cv.notify_all();
+            }
+        }
+        if (graph->instance == nullptr) {
+            CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        } else {
+            ggml_cuda_graph_update_executable(cuda_ctx, cuda_ctx->session_key);
+        }
+    }
+#else
+    GGML_UNUSED(mode);
+#endif // USE_CUDA_GRAPH
+}
+
+// starts the graph of a session that was captured, now or before
+static void ggml_backend_cuda_session_launch(ggml_backend_t backend, ggml_cgraph ** cgraphs, int n_cgraphs) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    GGML_ASSERT(cuda_ctx->session_mode == ggml_backend_cuda_context::SESSION_OFF && n_cgraphs > 0);
+#ifdef USE_CUDA_GRAPH
+    ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(ggml_cuda_session_key(cgraphs[0]));
+    GGML_ASSERT(graph->instance != nullptr);
+    CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+#else
+    GGML_UNUSED(cgraphs);
+    GGML_ABORT("fatal error");
+#endif // USE_CUDA_GRAPH
 }
 
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -7600,6 +7747,24 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_launch") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_launch;
+    }
+    if (strcmp(name, "ggml_backend_session_plan") == 0) {
+        return (void *)ggml_backend_cuda_session_plan;
+    }
+    if (strcmp(name, "ggml_backend_session_begin") == 0) {
+        return (void *)ggml_backend_cuda_session_begin;
+    }
+    if (strcmp(name, "ggml_backend_session_launch") == 0) {
+        return (void *)ggml_backend_cuda_session_launch;
+    }
+    if (strcmp(name, "ggml_backend_session_allreduce_supported") == 0) {
+        return (void *)ggml_backend_cuda_session_allreduce_supported;
+    }
+    if (strcmp(name, "ggml_backend_session_allreduce") == 0) {
+        return (void *)ggml_backend_cuda_session_allreduce;
+    }
+    if (strcmp(name, "ggml_backend_session_end") == 0) {
+        return (void *)ggml_backend_cuda_session_end;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;

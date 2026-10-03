@@ -1321,6 +1321,8 @@ struct ggml_cuda_graph {
         size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
     };
     std::vector<node_properties> node_props;
+    std::vector<const void *> session_keys; // a session graph: the keys of its subgraphs, see ggml_backend_cuda_session_plan
+    int session_want = 0;                   // and the mode the last plan asked for
 
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
@@ -1550,6 +1552,11 @@ struct ggml_backend_cuda_context {
     }
 
     ggml_cuda_stream_context concurrent_stream_context;
+
+    // see ggml_backend_cuda_session_plan; the order is that of ggml-backend-meta's session modes
+    enum session_mode_t { SESSION_OFF = -1, SESSION_EAGER = 0, SESSION_CAPTURE = 1, SESSION_REPLAY = 2 };
+    session_mode_t session_mode = SESSION_OFF;
+    const void *   session_key  = nullptr;
 
     ~ggml_backend_cuda_context();
 

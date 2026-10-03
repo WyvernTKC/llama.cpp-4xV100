@@ -2892,6 +2892,7 @@ struct ggml_backend_meta_context {
     struct backend_graphs {
         std::vector<cgraph_config> cgraphs;
         std::vector<ggml_tensor *> nodes;
+        std::vector<ggml_cgraph *> session_cgraphs; // the cgraph_main of each subgraph, for a session
     };
     // collective that has to run after a subgraph to make its last node usable by the next subgraph
     enum subgraph_comm_type {
@@ -3108,6 +3109,24 @@ struct ggml_backend_meta_context {
     // one per backend, recorded before the fallback all-gather copies so that no src stream writes into a dst
     //   device that is still busy (created on first use, nullptr where the backend has no events)
     std::vector<ggml_backend_event_t>     gather_events;
+    std::vector<ggml_tensor *>            session_ar_nodes; // [subgraph][device], the tensors each session all-reduce sums
+    std::vector<int>                      session_modes;    // [device][chunk], what each device's plan asked for
+
+    // optional: the subgraphs of a device and the all-reduces between them as one graph launch (ggml-cuda's sessions);
+    //   GGML_META_NO_SESSION=1 keeps a launch per subgraph. A plan returns one of these, slowest first.
+    enum { SESSION_EAGER = 0, SESSION_CAPTURE = 1, SESSION_REPLAY = 2 };
+    typedef int  (*session_plan_t)(ggml_backend_t backend, ggml_cgraph ** cgraphs, int n_cgraphs);
+    typedef void (*session_begin_t)(ggml_backend_t backend, ggml_cgraph ** cgraphs, int n_cgraphs, int mode);
+    typedef bool (*session_allreduce_supported_t)(void * comm_ctx, ggml_tensor ** tensors);
+    typedef void (*session_allreduce_t)(void * comm_ctx, ggml_tensor ** tensors, size_t rank);
+    typedef void (*session_end_t)(ggml_backend_t backend);
+    typedef void (*session_launch_t)(ggml_backend_t backend, ggml_cgraph ** cgraphs, int n_cgraphs);
+    session_plan_t                session_plan                = nullptr;
+    session_begin_t               session_begin               = nullptr;
+    session_allreduce_supported_t session_allreduce_supported = nullptr;
+    session_allreduce_t           session_allreduce           = nullptr;
+    session_end_t                 session_end                 = nullptr;
+    session_launch_t              session_launch              = nullptr;
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -3154,6 +3173,20 @@ struct ggml_backend_meta_context {
                 if (comm_allreduce_prepare == nullptr || comm_allreduce_launch == nullptr) {
                     comm_allreduce_prepare = nullptr;
                     comm_allreduce_launch  = nullptr;
+                }
+            }
+
+            if (getenv("GGML_META_NO_SESSION") == nullptr) {
+                session_plan                = (session_plan_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_session_plan");
+                session_begin               = (session_begin_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_session_begin");
+                session_allreduce_supported = (session_allreduce_supported_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_session_allreduce_supported");
+                session_allreduce           = (session_allreduce_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_session_allreduce");
+                session_end                 = (session_end_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_session_end");
+                session_launch              = (session_launch_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_session_launch");
+                if (!session_plan || !session_begin || !session_allreduce_supported || !session_allreduce || !session_end ||
+                        !session_launch) {
+                    session_plan = nullptr;
                 }
             }
         }
@@ -4200,22 +4233,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     D->used = ++backend_ctx->dec_clock;
     backend_ctx->cur = D;
 
-    if (!needs_rebuild) {
-        // The decomposition is reusable but its contents are not static: staged expert weights get
-        // their per-device data pointer rebound to a different slot on every eval. ggml-cuda skips
-        // ggml_cuda_graph_update_required - and so misses that - whenever a subgraph uid matches the
-        // one it captured, which it now would, because the rebuild that used to mint a fresh uid per
-        // eval is exactly what we are skipping. Retire the uids so it revalidates node properties.
-        for (size_t j = 0; j < n_backends; j++) {
-            for (size_t i = 0; i < D->n_subgraphs; i++) {
-                ggml_cgraph * cgraph_ij = D->graphs[j].cgraphs[i].cgraph_main;
-                if (cgraph_ij) {
-                    cgraph_ij->uid = ggml_graph_next_uid();
-                }
-            }
-        }
-    }
-
     // graph_compute has multiple exit points, so accumulate the enqueue time from a scope guard
     struct enqueue_timer {
         ggml_backend_meta_stats & stats;
@@ -4871,7 +4888,175 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
     }
 
-    for (size_t i = 0; i < D->n_subgraphs; i++) {
+    if (!needs_rebuild && (D->gathers || !backend_ctx->stage_pending.empty() || !backend_ctx->expert_pools_pending.empty())) {
+        // The decomposition is reusable but its contents are not static: staged expert weights get
+        // their per-device data pointer rebound to a different slot on every eval. ggml-cuda skips
+        // ggml_cuda_graph_update_required - and so misses that - whenever a subgraph uid matches the
+        // one it captured, which it now would, because the rebuild that used to mint a fresh uid per
+        // eval is exactly what we are skipping. Retire the uids so it revalidates node properties.
+        // Without staged weights, pools or gathered host weights nothing is rebound (the staging of
+        // this eval is done by now), and the kept uids spare ggml-cuda comparing every node again.
+        for (size_t j = 0; j < n_backends; j++) {
+            for (size_t i = 0; i < D->n_subgraphs; i++) {
+                ggml_cgraph * cgraph_ij = D->graphs[j].cgraphs[i].cgraph_main;
+                if (cgraph_ij) {
+                    cgraph_ij->uid = ggml_graph_next_uid();
+                }
+            }
+        }
+    }
+
+    // Graph launches per device that hold its subgraphs and the all-reduces between them (ggml-cuda's sessions), when
+    //   nothing else comes between them: no all-gather, nothing staged, and every all-reduce one the backend can
+    //   capture. The all-reduce kernels synchronize the devices, so a device must not wait on the host for anything
+    //   while a peer may wait on the GPU for an all-reduce it has not launched yet: a pool allocation can synchronize
+    //   with the peers (3 GPUs hung that way, every device ran eagerly and the threads drifted ~50 all-reduces apart).
+    //   So only replayed graphs go out without a barrier; a captured graph goes out with the round after its capture,
+    //   and subgraphs that run eagerly get a round each, as below.
+    bool session_done = false;
+    if (backend_ctx->session_plan != nullptr && backend_ctx->lpool && n_backends > 1 && D->n_subgraphs > 1 &&
+            backend_ctx->stage_pending.empty() && backend_ctx->expert_pools_pending.empty() &&
+            D->subgraph_comm[D->n_subgraphs - 1] != ggml_backend_meta_context::SUBGRAPH_COMM_ALLGATHER) {
+        std::vector<ggml_tensor *> & ar_nodes = backend_ctx->session_ar_nodes;
+        ar_nodes.resize((D->n_subgraphs - 1)*n_backends);
+        bool session_ok = true;
+        for (size_t i = 0; i < D->n_subgraphs && session_ok; i++) {
+            for (size_t j = 0; j < n_backends && session_ok; j++) {
+                const ggml_cgraph * cgraph_ij = D->graphs[j].cgraphs[i].cgraph_main;
+                session_ok = cgraph_ij != nullptr && cgraph_ij->n_nodes > 0;
+                if (session_ok && i + 1 < D->n_subgraphs) {
+                    ar_nodes[i*n_backends + j] = cgraph_ij->nodes[cgraph_ij->n_nodes - 1];
+                }
+            }
+            if (session_ok && i + 1 < D->n_subgraphs) {
+                session_ok = D->subgraph_comm[i] == ggml_backend_meta_context::SUBGRAPH_COMM_ALLREDUCE &&
+                    backend_ctx->session_allreduce_supported(backend_ctx->comm_ctx, &ar_nodes[i*n_backends]);
+            }
+        }
+
+        if (session_ok) {
+            const int64_t t_launch_start_us = stats_enabled ? ggml_time_us() : 0;
+
+            // a graph per 8 subgraphs: one graph for all was slower (its nodes start ~0.6 us apart instead of ~0.3);
+            //   GGML_META_SESSION_CHUNK sets it
+            static const size_t chunk = getenv("GGML_META_SESSION_CHUNK") ?
+                (size_t) std::max(1, atoi(getenv("GGML_META_SESSION_CHUNK"))) : 8;
+            const size_t n_chunks = (D->n_subgraphs + chunk - 1) / chunk;
+            std::vector<int> & modes = backend_ctx->session_modes;
+            modes.resize(n_backends*n_chunks);
+
+            auto plan = [&](size_t j, size_t c) {
+                const size_t i0 = c*chunk;
+                const size_t i1 = std::min(D->n_subgraphs, i0 + chunk);
+                modes[j*n_chunks + c] = backend_ctx->session_plan(backend_ctx->backend_configs[j].backend,
+                    D->graphs[j].session_cgraphs.data() + i0, (int) (i1 - i0));
+            };
+            // the slowest mode of any device for all of them
+            auto reduce = [&](size_t c) {
+                for (size_t j = 1; j < n_backends; j++) {
+                    modes[c] = std::min(modes[c], modes[j*n_chunks + c]);
+                }
+            };
+
+            // the first chunk is planned alone and launched while the others are planned: the GPUs wait for one plan
+            backend_ctx->lpool->run(n_backends, [&](size_t j) {
+                std::vector<ggml_cgraph *> & cgraphs_j = D->graphs[j].session_cgraphs;
+                cgraphs_j.resize(D->n_subgraphs);
+                for (size_t i = 0; i < D->n_subgraphs; i++) {
+                    cgraphs_j[i] = D->graphs[j].cgraphs[i].cgraph_main;
+                }
+                plan(j, 0);
+            });
+            reduce(0);
+            const bool replay_0 = modes[0] == ggml_backend_meta_context::SESSION_REPLAY;
+            backend_ctx->lpool->run(n_backends, [&](size_t j) {
+                if (replay_0) {
+                    backend_ctx->session_launch(backend_ctx->backend_configs[j].backend, D->graphs[j].session_cgraphs.data(), 1);
+                }
+                for (size_t c = 1; c < n_chunks; c++) {
+                    plan(j, c);
+                }
+            });
+            for (size_t c = 1; c < n_chunks; c++) {
+                reduce(c);
+            }
+
+            ggml_status status[GGML_BACKEND_META_MAX_DEVICES];
+            for (size_t j = 0; j < n_backends; j++) {
+                status[j] = GGML_STATUS_SUCCESS;
+            }
+            // subgraph i of device j, and the all-reduce after it
+            auto run_subgraph = [&](size_t j, size_t i) {
+                ggml_backend_t backend_j = backend_ctx->backend_configs[j].backend;
+                if (status[j] == GGML_STATUS_SUCCESS) {
+                    status[j] = ggml_backend_graph_compute_async(backend_j, D->graphs[j].session_cgraphs[i]);
+                }
+                if (status[j] == GGML_STATUS_SUCCESS && i + 1 < D->n_subgraphs) {
+                    backend_ctx->session_allreduce(backend_ctx->comm_ctx, &ar_nodes[i*n_backends], j);
+                }
+            };
+
+            size_t c = replay_0 ? 1 : 0;
+            size_t c_launch = n_chunks; // a captured chunk to launch with the next round
+            while (c < n_chunks || c_launch < n_chunks) {
+                size_t c_end = c;
+                while (c_end < n_chunks && modes[c_end] == ggml_backend_meta_context::SESSION_REPLAY) {
+                    c_end++;
+                }
+                const int    next = c_end < n_chunks ? modes[c_end] : -1;
+                const size_t i0   = c_end*chunk;
+                const size_t i1   = std::min(D->n_subgraphs, i0 + chunk);
+
+                // launches, then a capture or the first eager subgraph
+                backend_ctx->lpool->run(n_backends, [&](size_t j) {
+                    ggml_backend_t backend_j  = backend_ctx->backend_configs[j].backend;
+                    ggml_cgraph ** cgraphs_j  = D->graphs[j].session_cgraphs.data();
+                    if (c_launch < n_chunks) {
+                        backend_ctx->session_launch(backend_j, cgraphs_j + c_launch*chunk, 1);
+                    }
+                    for (size_t cc = c; cc < c_end; cc++) {
+                        backend_ctx->session_launch(backend_j, cgraphs_j + cc*chunk, 1);
+                    }
+                    if (next < 0) {
+                        return;
+                    }
+                    backend_ctx->session_begin(backend_j, cgraphs_j + i0, (int) (i1 - i0), next);
+                    const size_t i_end = next == ggml_backend_meta_context::SESSION_CAPTURE ? i1 : i0 + 1;
+                    for (size_t i = i0; i < i_end; i++) {
+                        run_subgraph(j, i);
+                    }
+                    if (i_end == i1) {
+                        backend_ctx->session_end(backend_j);
+                    }
+                });
+                c_launch = next == ggml_backend_meta_context::SESSION_CAPTURE ? c_end : n_chunks;
+
+                if (next == ggml_backend_meta_context::SESSION_EAGER) {
+                    for (size_t i = i0 + 1; i < i1; i++) {
+                        backend_ctx->lpool->run(n_backends, [&](size_t j) {
+                            run_subgraph(j, i);
+                            if (i + 1 == i1) {
+                                backend_ctx->session_end(backend_ctx->backend_configs[j].backend);
+                            }
+                        });
+                    }
+                }
+                c = next < 0 ? n_chunks : c_end + 1;
+            }
+
+            if (stats_enabled) {
+                backend_ctx->stats.t_launch_us += ggml_time_us() - t_launch_start_us;
+            }
+            for (size_t j = 0; j < n_backends; j++) {
+                if (status[j] != GGML_STATUS_SUCCESS) {
+                    return status[j];
+                }
+            }
+            session_done = true;
+        }
+    }
+
+    for (size_t i = 0; i < D->n_subgraphs && !session_done; i++) {
         const int64_t t_launch_start_us = stats_enabled ? ggml_time_us() : 0;
 
         bool allreduce_done = false;
