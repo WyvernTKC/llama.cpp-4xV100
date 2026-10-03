@@ -723,6 +723,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
                 CUDA_CHECK(cudaFree(cublas_workspaces[i][j]));
             }
         }
+        if (block_flags[i] != nullptr) {
+            CUDA_CHECK(cudaFree(block_flags[i]));
+        }
     }
 }
 
@@ -4797,6 +4800,40 @@ static bool ggml_cuda_topk_moe_launch(ggml_backend_cuda_context * cuda_ctx, cons
     return true;
 }
 
+// Name t (the node at i_out, one row) for its kernel to write the q8_1 copy of, see q8_1_emit_alloc, if the first MMVQ
+//   matmul that reads t, or a view of all of it, comes before any node writes t again
+static void ggml_cuda_q8_1_request(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i_out) {
+    const ggml_tensor * t = cgraph->nodes[i_out];
+    cuda_ctx->q8_1_emit    = nullptr;
+    cuda_ctx->q8_1_emit_as = nullptr;
+    if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || !cuda_ctx->stream_context().concurrent_events.empty()) {
+        return;
+    }
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    for (int j = i_out + 1; j < cgraph->n_nodes && j <= i_out + 64; j++) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        const ggml_tensor * y = n->src[1];
+        if ((n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) && y != nullptr &&
+                (y == t || (y->view_src == t && y->view_offs == 0))) {
+            const bool mmvq = n->op == GGML_OP_MUL_MAT ?
+                ggml_cuda_mul_mat_choose(*cuda_ctx, n->src[0], y, n) == GGML_CUDA_MUL_MAT_PATH_MMVQ && !ggml_cuda_op_mul_mat_use_fwht(n) :
+                ggml_is_quantized(n->src[0]->type) && n->ne[2] <= get_mmvq_mmid_max_batch(n->src[0]->type, cc);
+            if (mmvq) {
+                if (ggml_is_contiguous(y) && ggml_nelements(y) == y->ne[0] && y->ne[0] == ggml_nelements(t)) {
+                    cuda_ctx->q8_1_emit    = t;
+                    cuda_ctx->q8_1_emit_as = y;
+                }
+                return;
+            }
+            // another kernel reads t, e.g. the f32 router of a MoE before its experts
+            continue;
+        }
+        if (n->data == t->data && !ggml_cuda_is_view_or_noop(n)) {
+            return;
+        }
+    }
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -5793,6 +5830,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int outputs[2] = { i, i + 2 };
         const enum ggml_op ops[3] = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
         if (ggml_can_fuse_subgraph(cgraph, i, 3, ops, outputs, 2)) {
+            ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + 2);
             ggml_cuda_op_rms_norm_pre_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
             return 2;
         }
@@ -5806,6 +5844,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int outputs[2] = { i + 3, i + 5 };
         const enum ggml_op ops[6] = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
         if (ggml_can_fuse_subgraph(cgraph, i, 6, ops, outputs, 2)) {
+            ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + 5);
             ggml_cuda_op_rms_norm_pre_add_gated(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3],
                                                 cgraph->nodes[i + 4], cgraph->nodes[i + 5]);
             return 5;
@@ -5818,6 +5857,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int outputs[1] = { i + 3 };
         const enum ggml_op ops[4] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
         if (ggml_can_fuse_subgraph(cgraph, i, 4, ops, outputs, 1)) {
+            ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + 3);
             ggml_cuda_op_rms_norm_gated(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3]);
             return 3;
         }
@@ -6067,6 +6107,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         cuda_ctx->q8_1_input_invalidate(cgraph->nodes[j]->data);
                         cuda_ctx->cublas_input_invalidate(cgraph->nodes[j]);
                     }
+                    // a q8_1 copy the fused kernel wrote of its output, see ggml_cuda_q8_1_request
+                    cuda_ctx->q8_1_commit_pending();
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",

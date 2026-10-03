@@ -4208,6 +4208,7 @@ struct test_add_rms_norm_mul : public test_case {
     const std::array<int64_t, 4> ne;
     const float eps;
     const bool gated;
+    const int64_t mm_rows; // > 0: a q8_0 matmul reads the norm instead of the next residual add
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4217,11 +4218,15 @@ struct test_add_rms_norm_mul : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR3(ne, eps, gated);
+        return VARS_TO_STR4(ne, eps, gated, mm_rows);
     }
 
-    test_add_rms_norm_mul(std::array<int64_t, 4> ne = {64, 5, 4, 3}, float eps = 1e-6f, bool gated = false)
-        : ne(ne), eps(eps), gated(gated) {}
+    double max_nmse_err() override {
+        return mm_rows > 0 ? 5e-4 : 1e-7;
+    }
+
+    test_add_rms_norm_mul(std::array<int64_t, 4> ne = {64, 5, 4, 3}, float eps = 1e-6f, bool gated = false, int64_t mm_rows = 0)
+        : ne(ne), eps(eps), gated(gated), mm_rows(mm_rows) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
@@ -4245,10 +4250,24 @@ struct test_add_rms_norm_mul : public test_case {
         ggml_tensor * n = ggml_mul(ctx, ggml_rms_norm(ctx, sum, eps), w);
         ggml_set_name(n, "norm");
 
+        if (mm_rows > 0) {
+            ggml_tensor * wq = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, ne[0], mm_rows);
+            ggml_set_name(wq, "wq");
+            ggml_tensor * out = ggml_mul_mat(ctx, wq, n);
+            ggml_set_name(out, "out");
+            return out;
+        }
+
         // the next residual reads the sum again
         ggml_tensor * out = ggml_add(ctx, n, sum);
         ggml_set_name(out, "out");
         return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -1.0f, 1.0f);
+        }
     }
 };
 
@@ -4562,6 +4581,7 @@ struct test_rms_norm_gated : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
     const ggml_unary_op op;
+    const int64_t mm_rows; // > 0: a q8_0 matmul reads the output as one row, as ssm_out does
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4571,12 +4591,16 @@ struct test_rms_norm_gated : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR2(type, ne) + ",op=" + ggml_unary_op_name(op);
+        return VARS_TO_STR2(type, ne) + ",op=" + ggml_unary_op_name(op) + ",mm_rows=" + std::to_string(mm_rows);
+    }
+
+    double max_nmse_err() override {
+        return mm_rows > 0 ? 5e-4 : 1e-7;
     }
 
     test_rms_norm_gated(ggml_type type = GGML_TYPE_F32, std::array<int64_t, 4> ne = {128, 12, 1, 1},
-            ggml_unary_op op = GGML_UNARY_OP_SILU)
-        : type(type), ne(ne), op(op) {}
+            ggml_unary_op op = GGML_UNARY_OP_SILU, int64_t mm_rows = 0)
+        : type(type), ne(ne), op(op), mm_rows(mm_rows) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor(ctx, type, 4, ne.data());
@@ -4591,12 +4615,19 @@ struct test_rms_norm_gated : public test_case {
         ggml_tensor * out    = ggml_mul(ctx, normed, gate);
         ggml_set_name(out, "out");
 
+        if (mm_rows > 0) {
+            ggml_tensor * wo = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, ne[0]*ne[1], mm_rows);
+            ggml_set_name(wo, "wo");
+            out = ggml_mul_mat(ctx, wo, ggml_reshape_2d(ctx, out, ne[0]*ne[1], ne[2]*ne[3]));
+            ggml_set_name(out, "out_mm");
+        }
+
         return out;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            init_tensor_uniform(t, -10.f, 10.f);
+            init_tensor_uniform(t, t->type == GGML_TYPE_Q8_0 ? -1.f : -10.f, t->type == GGML_TYPE_Q8_0 ? 1.f : 10.f);
         }
     }
 };
@@ -11272,6 +11303,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_add_rms_norm_mul({n, 1, 1, 1}, 1e-6f, true));
         test_cases.emplace_back(new test_add_rms_norm_mul({n, 6, 1, 1}, 1e-6f, true));
     }
+    // one row writes the q8_1 copy for the matmul that reads the norm (5376: with padding blocks); two rows do not
+    for (int64_t n : {768, 2048, 5120, 5376, 16896}) {
+        test_cases.emplace_back(new test_add_rms_norm_mul({n, 1, 1, 1}, 1e-6f, false, 256));
+        test_cases.emplace_back(new test_add_rms_norm_mul({n, 1, 1, 1}, 1e-6f, true, 256));
+        test_cases.emplace_back(new test_add_rms_norm_mul({n, 2, 1, 1}, 1e-6f, false, 256));
+    }
     for (uint32_t n : {64, 1025}) {
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F32, GGML_TYPE_F32, { n, 5, 4, 3 }, false, false));
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F32, GGML_TYPE_F32, { n, 5, 4, 3 }, true, false));
@@ -11325,6 +11362,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 128, 48, 4, 2 }, op));
         test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 64, 5, 4, 3 }, op));
         test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 1536, 2, 1, 1 }, op));
+        // one token writes the q8_1 copy for the matmul; not with rows wider than a block or with 2 tokens
+        test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 128, 8, 1, 1 }, op, 256));
+        test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 128, 12, 1, 1 }, op, 256));
+        test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 128, 8, 2, 1 }, op, 256));
+        test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 1536, 2, 1, 1 }, op, 64));
     }
 
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));

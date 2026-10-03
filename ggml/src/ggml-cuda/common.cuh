@@ -1583,6 +1583,18 @@ struct ggml_backend_cuda_context {
         return cublas_handles[device][curr_stream_no];
     }
 
+    // two flags for a kernel whose blocks wait on its first block (see rms_norm_emit_q8_1), zero between launches
+    unsigned int * block_flags[GGML_CUDA_MAX_DEVICES] = { nullptr };
+
+    unsigned int * block_flags_get() {
+        if (block_flags[device] == nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaMalloc(&block_flags[device], 2*sizeof(unsigned int)));
+            CUDA_CHECK(cudaMemset(block_flags[device], 0, 2*sizeof(unsigned int)));
+        }
+        return block_flags[device];
+    }
+
     // pool
     std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
 
@@ -1622,6 +1634,47 @@ struct ggml_backend_cuda_context {
 
     void q8_1_input_reset() {
         q8_1_inputs.clear();
+        q8_1_pending.clear();
+        q8_1_emit    = nullptr;
+        q8_1_emit_as = nullptr;
+    }
+
+    // A kernel can write the q8_1 copy of its output (one row) for the MMVQ matmul that reads it next, which then
+    //   skips its quantize launch. ggml_cuda_q8_1_request names the output and the tensor the matmul reads it as (the
+    //   output or a view of all of it); the launcher takes the buffer with q8_1_emit_alloc. The copy waits in
+    //   q8_1_pending until the evaluate loop has invalidated the copies of the nodes the kernel replaced.
+    const ggml_tensor * q8_1_emit    = nullptr;
+    const ggml_tensor * q8_1_emit_as = nullptr;
+    std::vector<std::pair<const void *, q8_1_input>> q8_1_pending;
+
+    // the buffer for the q8_1 copy of t if t is the named output, else nullptr; ne_padded is the padded row length
+    void * q8_1_emit_alloc(const ggml_tensor * t, int64_t & ne_padded) {
+        if (q8_1_emit == nullptr || q8_1_emit != t) {
+            return nullptr;
+        }
+        const ggml_tensor * y = q8_1_emit_as;
+        q8_1_emit    = nullptr;
+        q8_1_emit_as = nullptr;
+        ne_padded = GGML_PAD(y->ne[0], MATRIX_ROW_PADDING);
+        q8_1_input entry;
+        entry.buf       = std::make_unique<ggml_cuda_pool_alloc<char>>(pool(), ne_padded*sizeof(block_q8_1)/QK8_1);
+        entry.src1      = y->view_src ? y->view_src : y;
+        entry.ne_padded = ne_padded;
+        entry.stream_no = curr_stream_no;
+        std::copy_n(y->ne, GGML_MAX_DIMS, entry.ne);
+        std::copy_n(y->nb, GGML_MAX_DIMS, entry.nb);
+        void * ptr = entry.buf->get();
+        q8_1_pending.emplace_back(y->data, std::move(entry));
+        return ptr;
+    }
+
+    void q8_1_commit_pending() {
+        for (auto & p : q8_1_pending) {
+            q8_1_inputs[p.first] = std::move(p.second);
+        }
+        q8_1_pending.clear();
+        q8_1_emit    = nullptr;
+        q8_1_emit_as = nullptr;
     }
 
     // The f16 (or bf16) copy of an f32 matmul input that cuBLAS reads, kept for the next matmul of the same input: the
