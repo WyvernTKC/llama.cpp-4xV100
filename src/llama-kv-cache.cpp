@@ -12,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 
 static bool ggml_is_power_of_2(int n) {
@@ -1633,10 +1634,19 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
         seq_pos_min[seq_id] = std::min(seq_pos_min[seq_id], ubatch->pos[i]);
     }
 
+    // a row that starts from the finished row of its sequence: its token, the stream, and the row it copies
+    struct deferred_row {
+        uint32_t i;
+        uint32_t s;
+        uint32_t srct;
+    };
+    std::vector<deferred_row> deferred;
+    // bookkeeping of the KQ mask cells that could change for other tokens of the same sequence, per stream
+    std::vector<std::unordered_map<llama_seq_id, std::vector<uint32_t>>> stream_idxs(n_stream);
+
     for (uint32_t s = 0; s < n_stream; ++s) {
-        // bookkeeping of the KQ mask cells that could change for other tokens of the same sequence
-        std::unordered_map<llama_seq_id, uint32_t>              seq_srct;
-        std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idxs;
+        std::unordered_map<llama_seq_id, uint32_t>                 seq_srct;
+        std::unordered_map<llama_seq_id, std::vector<uint32_t>> & seq_idxs = stream_idxs[s];
 
         for (uint32_t ii = 0; ii < n_tps; ++ii) {
             const uint32_t i = s*n_tps + ii;
@@ -1664,19 +1674,13 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
             // keep track of those cells and shortcut the loop to save time
             // note: this optimization is not compatible with Alibi position encoding
             // ref:  https://github.com/ggml-org/llama.cpp/pull/18842
-            bool prev = false;
-
             auto & idxs = seq_idxs[seq_id];
 
             if (!alibi) {
                 if (seq_srct.find(seq_id) != seq_srct.end()) {
-                    const uint32_t srct = seq_srct[seq_id];
-
-                    const uint64_t idst_prev = n_kv*srct;
-
-                    std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
-
-                    prev = true;
+                    // the copy and the patch of this row wait until every first row (and its cells) is done
+                    deferred.push_back({ i, s, seq_srct[seq_id] });
+                    continue;
                 } else {
                     idxs.clear();
                     idxs.reserve(ubatch->n_tokens + n_swa + 32);
@@ -1685,20 +1689,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 }
             }
 
-            for (uint32_t jj = 0; jj < n_kv; ++jj) {
-                uint32_t j = jj;
-
-                // we have an exiting mask for this sequence -> update just seq_idxs
-                if (!alibi) {
-                    if (prev) {
-                        if (jj >= idxs.size()) {
-                            break;
-                        }
-
-                        j = idxs[jj];
-                    }
-                }
-
+            for (uint32_t j = 0; j < n_kv; ++j) {
                 if (cells.is_empty(j)) {
                     goto skip;
                 }
@@ -1711,11 +1702,9 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 p0 = cells.pos_get(j);
 
                 if (!alibi) {
-                    if (!prev) {
-                        // record all cells for which: p0 >= seq_pos_min[seq_id] - n_swa - 32
-                        if (p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id]) {
-                            idxs.push_back(j);
-                        }
+                    // record all cells for which: p0 >= seq_pos_min[seq_id] - n_swa - 32
+                    if (p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id]) {
+                        idxs.push_back(j);
                     }
                 }
 
@@ -1756,6 +1745,73 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 skip:
                 data[idst + j] = mask_drop;
             }
+        }
+    }
+
+    // The deferred rows copy the row of the first token of their sequence and redo only the cells near the batch:
+    //   n_kv values and ~n_tokens decisions each, 60 to 100 ms at 4096 tokens over 15k cells on one thread, and
+    //   on a meta backend that time is spent with the GPUs idle after every sync. The rows are independent.
+    auto patch_rows = [&](size_t r0, size_t r1) {
+        for (size_t r = r0; r < r1; ++r) {
+            const deferred_row & d = deferred[r];
+            const uint32_t i = d.i;
+
+            const llama_seq_id seq_id = ubatch->seq_id[i][0];
+            const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+            const bool seq_all = cells.seq_has_all(seq_id);
+
+            const llama_pos p1   = ubatch->pos[i];
+            const llama_pos p1_x = is_2d ? ubatch->pos[i + ubatch->n_tokens*2] : 0;
+            const llama_pos p1_y = is_2d ? ubatch->pos[i + ubatch->n_tokens]   : 0;
+
+            const uint64_t idst = n_kv*i;
+            std::copy(data + n_kv*d.srct, data + n_kv*d.srct + n_kv, data + idst);
+
+            const std::vector<uint32_t> & idxs = stream_idxs[d.s].at(seq_id);
+            for (const uint32_t j : idxs) {
+                bool keep = !cells.is_empty(j) && (seq_all || cells.seq_has(j, seq_id));
+                if (keep) {
+                    const llama_pos p0 = cells.pos_get(j);
+                    if (causal) {
+                        if (p0 > p1) {
+                            keep = false;
+                        } else if (is_2d && p0 == p1 && cells.ext_get(j).is_2d_gt(p1_x, p1_y)) {
+                            keep = false;
+                        }
+                    }
+                    if (keep && swa) {
+                        const bool in_span = !causal && args.hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_FULL && p0 >= seq_pos_min[seq_id];
+                        if (!in_span && llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
+                            keep = false;
+                        }
+                    }
+                }
+                data[idst + j] = keep ? mask_keep : mask_drop;
+            }
+        }
+    };
+    size_t work = 0;
+    for (const deferred_row & d : deferred) {
+        work += n_kv + stream_idxs[d.s].at(ubatch->seq_id[d.i][0]).size();
+    }
+    const size_t n_threads = std::min<size_t>({ (size_t) 16, std::max<size_t>(1, std::thread::hardware_concurrency()/2),
+        std::max<size_t>(1, work / (1u << 20)), deferred.size() });
+    if (n_threads <= 1) {
+        patch_rows(0, deferred.size());
+    } else {
+        std::vector<std::thread> workers;
+        workers.reserve(n_threads - 1);
+        const size_t per = (deferred.size() + n_threads - 1) / n_threads;
+        for (size_t t = 1; t < n_threads; ++t) {
+            const size_t r0 = std::min(deferred.size(), t*per);
+            const size_t r1 = std::min(deferred.size(), r0 + per);
+            if (r0 < r1) {
+                workers.emplace_back(patch_rows, r0, r1);
+            }
+        }
+        patch_rows(0, std::min(deferred.size(), per));
+        for (std::thread & w : workers) {
+            w.join();
         }
     }
 }
