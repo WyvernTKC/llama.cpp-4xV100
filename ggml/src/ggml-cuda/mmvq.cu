@@ -676,15 +676,21 @@ static __global__ void mul_mat_vec_q(
     const     int wy   = paired ? threadIdx.y % nwarps : threadIdx.y;
     const     int tid = warp_size*wy + threadIdx.x;
 
-    // without ids, sib_x: the blocks from sib_block0 on compute the rows of the sibling sib_x, which reads the same y
+    // without ids, sib_x: the blocks from sib_block0 on compute the rows of the sibling sib_x, which reads the same y;
+    //   gdn_x: the blocks from gdn_block0 on the rows of a gated delta net gate (with fusion.gate and its epilogue)
     bool sib_rows = false;
+    bool gdn_rows = false;
     if constexpr (ncols_dst == 1) {
-        sib_rows = ids_ptr == nullptr && fusion.sib_x != nullptr && blockIdx.x >= fusion.sib_block0;
+        gdn_rows = ids_ptr == nullptr && fusion.gdn_x != nullptr && blockIdx.x >= fusion.gdn_block0;
+        sib_rows = ids_ptr == nullptr && fusion.sib_x != nullptr && blockIdx.x >= fusion.sib_block0 && !gdn_rows;
     }
     if (sib_rows) {
         vx = fusion.sib_x;
     }
-    const     int row0 = rows_per_cuda_block*(sib_rows ? blockIdx.x - fusion.sib_block0 : blockIdx.x);
+    if (gdn_rows) {
+        vx = fusion.gdn_x;
+    }
+    const     int row0 = rows_per_cuda_block*(blockIdx.x - (gdn_rows ? fusion.gdn_block0 : sib_rows ? fusion.sib_block0 : 0));
     const     int blocks_per_row_x = ncols_x / qk;
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
 
@@ -726,10 +732,12 @@ static __global__ void mul_mat_vec_q(
     float * gdn_beta = nullptr;
 
     if constexpr (has_fusion) {
-        gdn_dt        = fusion.gdn_dt;
-        gdn_a         = fusion.gdn_a;
-        gdn_beta      = fusion.gdn_beta;
-        use_gate      = fusion.gate      != nullptr;
+        // with gdn_x only its blocks have the gate and the gated delta net epilogue
+        const bool gdn_here = fusion.gdn_x == nullptr || gdn_rows;
+        gdn_dt        = gdn_here ? fusion.gdn_dt   : nullptr;
+        gdn_a         = gdn_here ? fusion.gdn_a    : nullptr;
+        gdn_beta      = gdn_here ? fusion.gdn_beta : nullptr;
+        use_gate      = fusion.gate      != nullptr && gdn_here;
         use_bias      = fusion.x_bias    != nullptr;
         use_gate_bias = fusion.gate_bias != nullptr && use_gate;
         vgate         = fusion.gate;
@@ -879,10 +887,12 @@ static __global__ void mul_mat_vec_q(
         return;
     }
 
-    dst = sib || sib_rows ? fusion.sib_dst + row0 : dst + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
+    dst = gdn_rows ? fusion.gdn_dst + row0 : sib || sib_rows ? fusion.sib_dst + row0 :
+        dst + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
 
     // bound for the rows of a block past the last one; with ids the channels are the used experts, a row stride apart
-    const uint32_t nrows_dst = sib_rows ? fusion.sib_nrows : ncols_dst == 1 && ids ? stride_channel_dst : stride_col_dst;
+    const uint32_t nrows_dst = gdn_rows ? fusion.gdn_nrows : sib_rows ? fusion.sib_nrows :
+        ncols_dst == 1 && ids ? stride_channel_dst : stride_col_dst;
 
     // sum up partial sums and write back result
 #pragma unroll
@@ -1568,7 +1578,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const auto should_use_small_k = [&](int c_ncols_dst) {
         return multi_row(c_ncols_dst) && !volta_gate;
     };
-    const bool use_paired = volta_gate && !has_ids && ncols_dst == 1 && multi_row(1);
+    const bool use_paired = volta_gate && !has_ids && ncols_dst == 1 && multi_row(1) && fusion.gdn_x == nullptr;
 
     // Whether doubling nwarps pays off on the ncols_dst == 1 path, where K sets the K loop trip count.
     const auto should_halve_iters = [&] {
@@ -1625,11 +1635,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 }
                 // the sibling's rows after those of x, see mul_mat_vec_q
                 ggml_cuda_mm_fusion_args_device fusion_rows = fusion;
+                const int rpb = calc_rows_per_block(c_ncols_dst, table_id, c_small_k,
+                    calc_nwarps(type, c_ncols_dst, table_id, c_small_k, c_halve_iters));
                 if (!has_ids && fusion.sib_x != nullptr) {
-                    const int rpb = calc_rows_per_block(c_ncols_dst, table_id, c_small_k,
-                        calc_nwarps(type, c_ncols_dst, table_id, c_small_k, c_halve_iters));
                     fusion_rows.sib_block0 = dims.first.x;
                     dims.first.x += (fusion.sib_nrows + rpb - 1) / rpb;
+                }
+                if (!has_ids && fusion.gdn_x != nullptr) {
+                    fusion_rows.gdn_block0 = dims.first.x;
+                    dims.first.x += (fusion.gdn_nrows + rpb - 1) / rpb;
                 }
                 mul_mat_vec_q_switch_wide<type, c_ncols_dst, c_small_k, c_halve_iters, c_paired>(use_wide(c_ncols_dst),
                     vx, vy, ids, fusion_rows, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
@@ -1912,7 +1926,7 @@ static void ggml_cuda_mul_mat_vec_q_impl(
             fusion_local.x_bias = fusion->x_bias->data;
         }
         if (fusion->gate) {
-            GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
+            GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, fusion->gdn_x ? fusion->gdn_x : src0));
             fusion_local.gate = fusion->gate->data;
         }
         if (fusion->gate_bias) {
@@ -1953,9 +1967,10 @@ static void ggml_cuda_mul_mat_vec_q_impl(
             fusion_local.sib_dst  = (float *) fusion->sib_dst->data;
         }
         if (fusion->sib && !ids) {
-            // the sibling's rows after those of src0, one token and nothing else fused
-            GGML_ASSERT(fusion->sib_dst && !fusion->sib_gate && !fusion->sib_y && !fusion->gate && !fusion->x_bias &&
-                !fusion->x_scale && !fusion->x_sigmoid && !fusion->gdn_beta && ggml_nrows(src1) == 1);
+            // the sibling's rows after those of src0, one token and nothing else fused (but a gate's rows after them)
+            GGML_ASSERT(fusion->sib_dst && !fusion->sib_gate && !fusion->sib_y && !fusion->x_bias &&
+                !fusion->x_scale && !fusion->x_sigmoid && ggml_nrows(src1) == 1);
+            GGML_ASSERT((!fusion->gate && !fusion->gdn_beta) || fusion->gdn_x);
             GGML_ASSERT(fusion->sib->type == src0->type && fusion->sib->ne[0] == ne00 && fusion->sib->nb[1] == nb01 &&
                 ggml_nrows(fusion->sib) == fusion->sib->ne[1]);
             GGML_ASSERT(fusion->sib_dst->type == GGML_TYPE_F32 && ggml_is_contiguous(fusion->sib_dst) &&
@@ -1973,8 +1988,20 @@ static void ggml_cuda_mul_mat_vec_q_impl(
         }
         if (fusion->gdn_beta) {
             GGML_ASSERT(!ids && fusion->gate && !fusion->x_bias && !fusion->gate_bias && !fusion->x_scale && !fusion->gate_scale);
+            // with gdn_x its rows go after those of src0 (and sib) into gdn_dst
+            const int64_t nrows_gdn = fusion->gdn_x ? fusion->gdn_x->ne[1] : dst->ne[0];
             for (const ggml_tensor * t : { fusion->gdn_dt, fusion->gdn_a, (const ggml_tensor *) fusion->gdn_beta }) {
-                GGML_ASSERT(t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nelements(t) == dst->ne[0]);
+                GGML_ASSERT(t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nelements(t) == nrows_gdn);
+            }
+            if (fusion->gdn_x) {
+                GGML_ASSERT(ggml_nrows(src1) == 1 && fusion->gdn_dst && ggml_is_contiguous(fusion->gdn_dst) &&
+                    fusion->gdn_dst->type == GGML_TYPE_F32 && ggml_nelements(fusion->gdn_dst) == nrows_gdn);
+                for (const ggml_tensor * t : { fusion->gdn_x, fusion->gate }) {
+                    GGML_ASSERT(t->type == src0->type && t->ne[0] == ne00 && t->nb[1] == nb01 && t->ne[1] == nrows_gdn);
+                }
+                fusion_local.gdn_x     = fusion->gdn_x->data;
+                fusion_local.gdn_dst   = (float *) fusion->gdn_dst->data;
+                fusion_local.gdn_nrows = (uint32_t) nrows_gdn;
             }
             fusion_local.gdn_dt   = (const float *) fusion->gdn_dt->data;
             fusion_local.gdn_a    = (const float *) fusion->gdn_a->data;

@@ -1774,9 +1774,12 @@ struct ggml_cuda_mm_fusion_args_host {
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
     // gated delta net gate and beta instead of a GLU: dst = softplus(x*y + gdn_dt) * gdn_a, gdn_beta = sigmoid(gate*y)
+    // with gdn_x (mmvq, one token): these are the rows of gdn_x into gdn_dst, after the rows of src0 and sib
     const ggml_tensor * gdn_dt = nullptr;
     const ggml_tensor * gdn_a = nullptr;
     ggml_tensor * gdn_beta = nullptr;
+    const ggml_tensor * gdn_x = nullptr;
+    ggml_tensor * gdn_dst = nullptr;
     // a sibling matrix of one row with the same input, computed as one more row: sib_dst = sib*y (f32, one token)
     // mmvq without ids and nothing else fused: a sibling matrix of the same type and K with the same input, its rows
     //   computed after those of src0 in the same launch: sib_dst = sib*y (one token)
@@ -1809,6 +1812,10 @@ struct ggml_cuda_mm_fusion_args_device {
     const float * sib_y = nullptr;
     uint32_t sib_block0 = 0; // mmvq without ids: the first block of the sibling's rows, and their count
     uint32_t sib_nrows  = 0;
+    const void * gdn_x = nullptr; // and of the gated delta net gate's rows
+    float * gdn_dst = nullptr;
+    uint32_t gdn_block0 = 0;
+    uint32_t gdn_nrows  = 0;
     const float * x_sigmoid = nullptr;
 };
 

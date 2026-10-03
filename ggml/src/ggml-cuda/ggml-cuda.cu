@@ -6016,6 +6016,73 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     //   followed by elementwise ops of their own: two GEMV and two elementwise launches per layer, in one.
     //   The GEMV sums x and gate exactly as it sums x alone.
     ggml_cuda_mul_mat_vec_t gdn_gate_mul_mat_vec = node->op == GGML_OP_MUL_MAT ? ggml_cuda_should_fuse_gdn_gate(cgraph, i) : nullptr;
+
+    // ... and the qkv and z projections right after them, of the same input (qwen35 builds them in this order): one mmvq
+    //   launch, the qkv rows, z's after them, then alpha's with beta and the gate epilogue. Each row sums as in its own
+    //   launch. GGML_CUDA_NO_SIBLING_ROWS=1 runs them apart.
+    if (gdn_gate_mul_mat_vec == ggml_cuda_mul_mat_vec_q && getenv("GGML_CUDA_NO_SIBLING_ROWS") == nullptr) {
+        int j = i + 9;
+        while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            j++;
+        }
+        int k = j + 1;
+        while (k < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+            k++;
+        }
+        int l = k + 1;
+        while (l < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[l])) {
+            l++;
+        }
+        ggml_tensor * qkv = j < cgraph->n_nodes ? cgraph->nodes[j] : nullptr;
+        ggml_tensor * z   = k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr;
+        ggml_tensor * mul_a = cgraph->nodes[i + 4];
+        ggml_tensor * beta  = cgraph->nodes[i + 8];
+        const ggml_tensor * x = node->src[1];
+        const auto reads = [](const ggml_tensor * n, const ggml_tensor * t) {
+            for (int q = 0; q < GGML_MAX_SRC; q++) {
+                if (n->src[q] != nullptr && ggml_cuda_tensors_overlap(n->src[q], t)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        const auto same_rows = [&](const ggml_tensor * w) {
+            return w->type == node->src[0]->type && w->ne[0] == node->src[0]->ne[0] && w->nb[1] == node->src[0]->nb[1] &&
+                ggml_nrows(w) == w->ne[1];
+        };
+        bool ok = qkv != nullptr && z != nullptr && qkv->op == GGML_OP_MUL_MAT && z->op == GGML_OP_MUL_MAT &&
+            (qkv->flags & GGML_TENSOR_FLAG_COMPUTE) && (z->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+            qkv->src[1]->data == x->data && z->src[1]->data == x->data &&
+            ggml_are_same_shape(qkv->src[1], x) && ggml_are_same_stride(qkv->src[1], x) &&
+            ggml_are_same_shape(z->src[1], x) && ggml_are_same_stride(z->src[1], x) && ggml_nrows(x) == 1 &&
+            same_rows(qkv->src[0]) && same_rows(z->src[0]) && same_rows(cgraph->nodes[i + 6]->src[0]) &&
+            ggml_is_contiguous(qkv) && ggml_is_contiguous(z) &&
+            ggml_cuda_should_fuse_mul_mat_vec_q(qkv) && ggml_cuda_should_fuse_mul_mat_vec_q(z) &&
+            !ggml_cuda_op_mul_mat_use_fwht(qkv) && !ggml_cuda_op_mul_mat_use_fwht(z) &&
+            (l >= cgraph->n_nodes || !reads(cgraph->nodes[l], z));
+        const ggml_tensor * outs[4] = { qkv, z, mul_a, beta };
+        for (int a = 0; ok && a < 4; a++) {
+            ok = !ggml_cuda_tensors_overlap(outs[a], x);
+            for (int b = a + 1; ok && b < 4; b++) {
+                ok = !ggml_cuda_tensors_overlap(outs[a], outs[b]);
+            }
+        }
+        if (ok) {
+            ggml_tensor * add = cgraph->nodes[i + 2];
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            fusion_data.sib      = z->src[0];
+            fusion_data.sib_dst  = z;
+            fusion_data.gdn_x    = node->src[0];
+            fusion_data.gdn_dst  = mul_a;
+            fusion_data.gate     = cgraph->nodes[i + 6]->src[0];
+            fusion_data.gdn_dt   = add->src[0] == cgraph->nodes[i + 1] ? add->src[1] : add->src[0];
+            fusion_data.gdn_a    = mul_a->src[0] == cgraph->nodes[i + 3] ? mul_a->src[1] : mul_a->src[0];
+            fusion_data.gdn_beta = beta;
+            ggml_cuda_mul_mat_vec_q(*cuda_ctx, qkv->src[0], qkv->src[1], nullptr, qkv, &fusion_data);
+            return k - i;
+        }
+    }
+
     if (gdn_gate_mul_mat_vec) {
         ggml_tensor * mul_a = cgraph->nodes[i + 4];
         ggml_tensor * add   = cgraph->nodes[i + 2];
