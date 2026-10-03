@@ -4553,6 +4553,54 @@ struct test_mul_mat_sibling_row : public test_case {
     }
 };
 
+// Two MUL_MATs of one input, expanded together as qwen35 does with the qkv and z projections of a gated delta net layer
+struct test_mul_mat_sibling_rows : public test_case {
+    const ggml_type type;
+    const int64_t k;
+    const int64_t rows_a;
+    const int64_t rows_b;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SIBLING_ROWS";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, k, rows_a, rows_b, n_tokens);
+    }
+
+    test_mul_mat_sibling_rows(ggml_type type = GGML_TYPE_Q8_0, int64_t k = 2048, int64_t rows_a = 2048, int64_t rows_b = 1024,
+            int64_t n_tokens = 1)
+        : type(type), k(k), rows_a(rows_a), rows_b(rows_b), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * wa = ggml_new_tensor_2d(ctx, type, k, rows_a);
+        ggml_tensor * wb = ggml_new_tensor_2d(ctx, type, k, rows_b);
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
+        ggml_set_name(wa, "wa");
+        ggml_set_name(wb, "wb");
+        ggml_set_name(x, "x");
+
+        ggml_tensor * a = ggml_mul_mat(ctx, wa, x);
+        ggml_tensor * b = ggml_mul_mat(ctx, wb, x);
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, a);
+            ggml_build_forward_expand(gf, b);
+        }
+        // the node after the two reads only the first one
+        ggml_tensor * out = ggml_concat(ctx, ggml_scale(ctx, a, 0.5f), b, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_MUL_MAT + GGML_OP_UNARY(SIGMOID) + GGML_OP_MUL + GGML_OP_ADD (acc + sigmoid(g) * (w*x), the gated shared expert of qwen35moe)
 struct test_mul_mat_sigmoid_add : public test_case {
     const ggml_type type;
@@ -11457,6 +11505,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_mul_mat_sigmoid_add(GGML_TYPE_Q8_0, 128, 2048, 1));
+    // one token runs both in one launch
+    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K }) {
+        for (int64_t n_tokens : { 1, 2 }) {
+            test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 2048, 2048, 1024, n_tokens));
+            test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 1024, 100, 37, n_tokens));
+        }
+    }
     // one token runs the shared expert in the experts' launches (the down projection only for q8_0 rows of K 128),
     //   two tokens do not
     for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K }) {

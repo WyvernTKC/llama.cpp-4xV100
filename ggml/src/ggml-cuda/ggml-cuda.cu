@@ -5917,6 +5917,46 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // A one-token MUL_MAT and the next MUL_MAT of the same input, type and K with only views between them (the qkv and
+    //   z projections of a Qwen3.5 gated delta net layer): one mmvq launch, the second one's rows after the first's.
+    //   Nothing runs between them, so the second one's dst holds nothing live when it is written early.
+    if (node->op == GGML_OP_MUL_MAT) {
+        static const bool no_sibling_rows = getenv("GGML_CUDA_NO_SIBLING_ROWS") != nullptr;
+        int j = i + 1;
+        while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            j++;
+        }
+        int k = j + 1;
+        while (k < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+            k++;
+        }
+        ggml_tensor * sib = j < cgraph->n_nodes ? cgraph->nodes[j] : nullptr;
+        const auto reads = [](const ggml_tensor * n, const ggml_tensor * t) {
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                if (n->src[s] != nullptr && ggml_cuda_tensors_overlap(n->src[s], t)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (!no_sibling_rows && sib != nullptr && sib->op == GGML_OP_MUL_MAT && (sib->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                sib->src[1]->data == node->src[1]->data && ggml_are_same_shape(sib->src[1], node->src[1]) &&
+                ggml_are_same_stride(sib->src[1], node->src[1]) && node->src[1]->type == GGML_TYPE_F32 &&
+                ggml_nrows(node->src[1]) == 1 && sib->src[0]->type == node->src[0]->type &&
+                sib->src[0]->ne[0] == node->src[0]->ne[0] && sib->src[0]->nb[1] == node->src[0]->nb[1] &&
+                ggml_nrows(sib->src[0]) == sib->src[0]->ne[1] && ggml_is_contiguous(sib) && ggml_is_contiguous(node) &&
+                ggml_cuda_should_fuse_mul_mat_vec_q(node) && ggml_cuda_should_fuse_mul_mat_vec_q(sib) &&
+                !ggml_cuda_op_mul_mat_use_fwht(node) && !ggml_cuda_op_mul_mat_use_fwht(sib) &&
+                !ggml_cuda_tensors_overlap(sib, node) && !ggml_cuda_tensors_overlap(sib, node->src[1]) &&
+                (k >= cgraph->n_nodes || !reads(cgraph->nodes[k], sib))) {
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            fusion_data.sib     = sib->src[0];
+            fusion_data.sib_dst = sib;
+            ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr, node, &fusion_data);
+            return j - i;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_GET_ROWS_MEAN, GGML_OP_RESHAPE, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_ROPE }, {})) {
         ggml_cuda_op_get_rows_mean_norm_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 2], cgraph->nodes[i + 3], cgraph->nodes[i + 5]);
         return 5;

@@ -247,6 +247,10 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
     cb(z, "z", il);
 
+    // expanded together, the two projections of one input are adjacent and a backend can run them in one launch
+    ggml_build_forward_expand(gf, qkv_mixed);
+    ggml_build_forward_expand(gf, z);
+
     return { qkv_mixed, z };
 }
 
@@ -364,11 +368,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     GGML_ASSERT(ubatch.equal_seqs());
     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
 
-    // Input projections
-    auto qkvz = build_qkvz(cur, il);
-    ggml_tensor * qkv_mixed = qkvz.first;
-    ggml_tensor * z         = qkvz.second;
-
+    // the gate and beta projections before qkv and z: they all read cur, which qkv and z then keep alive while a backend
+    //   writes the gate and beta (ggml-cuda runs the two and their elementwise ops as one launch), and qkv and z are
+    //   adjacent
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
@@ -388,6 +390,13 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(gate, "gate", il);
 
     gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
+    ggml_build_forward_expand(gf, gate);
+    ggml_build_forward_expand(gf, beta);
+
+    // Input projections
+    auto qkvz = build_qkvz(cur, il);
+    ggml_tensor * qkv_mixed = qkvz.first;
+    ggml_tensor * z         = qkvz.second;
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);

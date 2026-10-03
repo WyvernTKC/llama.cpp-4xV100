@@ -1778,6 +1778,8 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gdn_a = nullptr;
     ggml_tensor * gdn_beta = nullptr;
     // a sibling matrix of one row with the same input, computed as one more row: sib_dst = sib*y (f32, one token)
+    // mmvq without ids and nothing else fused: a sibling matrix of the same type and K with the same input, its rows
+    //   computed after those of src0 in the same launch: sib_dst = sib*y (one token)
     // mmvq with ids and a gate: a sibling pair of the same shape as one expert, computed as one more channel past the
     //   used experts: sib_dst = glu(sib_gate*y, sib*y) (one token)
     // mmvq with ids, short q8_0 rows: a sibling of the same shape as one expert with its own f32 input, computed as one
@@ -1805,6 +1807,8 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * sib_gate = nullptr;
     float * sib_dst = nullptr;
     const float * sib_y = nullptr;
+    uint32_t sib_block0 = 0; // mmvq without ids: the first block of the sibling's rows, and their count
+    uint32_t sib_nrows  = 0;
     const float * x_sigmoid = nullptr;
 };
 
