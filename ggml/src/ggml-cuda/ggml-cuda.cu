@@ -3333,7 +3333,8 @@ static int ggml_cuda_gdn_gather_fusion(
         return -1;
     }
 
-    // the kernel reads the cache when the net runs, so no node from the GET_ROWS to it may write the cache
+    // the kernel reads the cache and the ids when the net runs, so no node from the GET_ROWS to it may write either:
+    //   past the GET_ROWS, their last reader in the graph, the ids may share memory with a later tensor
     int gr_idx = -1;
     for (int j = gdn_idx - 1; j >= 0 && j >= gdn_idx - 256; j--) {
         if (cgraph->nodes[j] == gr) {
@@ -3346,7 +3347,7 @@ static int ggml_cuda_gdn_gather_fusion(
     }
     for (int j = gr_idx + 1; j < gdn_idx; j++) {
         const ggml_tensor * n = cgraph->nodes[j];
-        if (!ggml_op_is_empty(n->op) && ggml_cuda_tensors_overlap(n, states)) {
+        if (!ggml_op_is_empty(n->op) && (ggml_cuda_tensors_overlap(n, states) || ggml_cuda_tensors_overlap(n, ids))) {
             return -1;
         }
     }
@@ -3542,7 +3543,8 @@ static bool ggml_cuda_ssm_conv_state_fusion_match(
         return false;
     }
 
-    // the kernel reads the cache at the concat, so no node from the GET_ROWS to it may write the cache
+    // the kernel reads the cache and the ids at the concat, so no node from the GET_ROWS to it may write either (as for
+    //   ggml_cuda_gdn_gather_fusion)
     for (int j = concat_idx - 1; j >= 0 && j >= concat_idx - 64; j--) {
         if (cgraph->nodes[j] == gr) {
             f.gr_idx = j;
@@ -3554,7 +3556,7 @@ static bool ggml_cuda_ssm_conv_state_fusion_match(
     }
     for (int j = f.gr_idx + 1; j < concat_idx; j++) {
         const ggml_tensor * n = cgraph->nodes[j];
-        if (!ggml_cuda_is_view_or_noop(n) && ggml_cuda_tensors_overlap(n, f.states)) {
+        if (!ggml_cuda_is_view_or_noop(n) && (ggml_cuda_tensors_overlap(n, f.states) || ggml_cuda_tensors_overlap(n, f.ids))) {
             return false;
         }
     }
