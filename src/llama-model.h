@@ -739,6 +739,10 @@ struct llama_model {
     // for quantized tensor split dither: the layers owning each blk. tensor, keyed by the part of the name after "blk.<il>."
     std::map<std::string, std::vector<uint32_t>> tensor_split_layers_by_suffix;
 
+    // the same for the blk. tensors outside the tensor parallel buffer (offloaded experts), and those tensors
+    std::map<std::string, std::vector<uint32_t>> tensor_split_offloaded_layers_by_suffix;
+    std::unordered_set<const ggml_tensor *>      tensor_split_offloaded;
+
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 

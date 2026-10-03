@@ -1341,6 +1341,57 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     tensor_config tc = get_tensor_config();
     split_state.axis = tc.axis;
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
+        // dither the choice of quantized split point across the layers sharing this tensor so the per-layer rounding errors
+        // cancel out class-wide; a one-sided floor to the block granularity would bias every tensor down by up to a full quantum
+        //
+        // the dither class is keyed on tensor_axis_0 rather than on the tensor's own name: every tensor whose split has to
+        //   line up with another one already anchors on it - the kv cache and the q/k/v projections on attn_output.weight,
+        //   the recurrent states on ssm_out.weight, gate/up on ffn_down.weight - so sharing the anchor's layer list makes
+        //   them round the same way by construction. Keying on the tensor's own name instead would split a class wherever
+        //   the layer sets differ: cache_k_l* covers every attention layer while an interleaved-SWA model classifies those
+        //   layers into two caches, and a hybrid trunk has FFN-only layers that own no attention tensor at all.
+        //
+        // An offloaded anchor (experts in host memory) dithers over the offloaded layers of its class only and without
+        //   the per-layer rotation: the devices stream the slices of those layers each batch, so their bytes have to
+        //   balance among themselves, and in order, since the copies run only a few layers ahead of the compute. Rank
+        //   bands of the whole class mapped through the rotation can pile the extra granules of the streamed subset on
+        //   one device (DeepSeek-V4.1, 9 granules: 10 of 28 layers on the last device, 6 on the others), and rank bands
+        //   of the subset give one device the extra for a run of consecutive layers, which stalls the stream (prefill
+        //   ~11% slower). The radical inverse of the rank in base n_devices instead rounds each boundary up for its
+        //   fraction of the layers, spread out: with an even split the extras go round robin, device by device.
+        //
+        // MiniMax-01 opts out: inp_slopes / inp_q_decay / inp_diag_decay are single per-head graph inputs shared
+        //   by every lightning attention layer, so one split of them has to line up with the Q split of all of
+        //   those layers at once. That holds only while no layer rounds differently - the same constraint that
+        //   pins rotation to 0 for this arch in get_tensor_config_impl - so it keeps the undithered floor.
+        int64_t d_rank  = 0;
+        int64_t d_count = 0; // 0 disables the dither and floors the split point, as it was done before
+        double  d_u     = -1.0; // >= 0: the dither position of an offloaded anchor in [0, 1), instead of d_rank / d_count
+        if (ud->model->arch != LLM_ARCH_MINIMAX_01) {
+            const std::string anchor_name = ggml_get_name(tc.tensor_axis_0);
+            if (anchor_name.compare(0, 4, "blk.") == 0) {
+                const size_t dot = anchor_name.find('.', 4);
+                GGML_ASSERT(dot != std::string::npos);
+                const bool offloaded = ud->model->tensor_split_offloaded.count(tc.tensor_axis_0) != 0;
+                const auto & lists   = offloaded ? ud->model->tensor_split_offloaded_layers_by_suffix : ud->model->tensor_split_layers_by_suffix;
+                const auto it_layers = lists.find(anchor_name.substr(dot + 1));
+                if (it_layers != lists.end()) {
+                    const std::vector<uint32_t> & layers = it_layers->second;
+                    d_count = 1 + (int64_t) layers.size();
+                    d_rank  = (int64_t) (std::lower_bound(layers.begin(), layers.end(), tc.il) - layers.begin());
+                    if (offloaded) {
+                        tc.rotation = 0;
+                        d_u = 0.0;
+                        double scale = 1.0;
+                        for (int64_t r = d_rank; r > 0; r /= (int64_t) ud->n_devices) {
+                            scale /= (double) ud->n_devices;
+                            d_u   += (double) (r % (int64_t) ud->n_devices) * scale;
+                        }
+                    }
+                }
+            }
+        }
+
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
         const float * tensor_split = ud->model->tensor_split();
         std::vector<float> tensor_split_scan;
@@ -1353,35 +1404,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
         const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
         const std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments);
-        // dither the choice of quantized split point across the layers sharing this tensor so the per-layer rounding errors
-        // cancel out class-wide; a one-sided floor to the block granularity would bias every tensor down by up to a full quantum
-        //
-        // the dither class is keyed on tensor_axis_0 rather than on the tensor's own name: every tensor whose split has to
-        //   line up with another one already anchors on it - the kv cache and the q/k/v projections on attn_output.weight,
-        //   the recurrent states on ssm_out.weight, gate/up on ffn_down.weight - so sharing the anchor's layer list makes
-        //   them round the same way by construction. Keying on the tensor's own name instead would split a class wherever
-        //   the layer sets differ: cache_k_l* covers every attention layer while an interleaved-SWA model classifies those
-        //   layers into two caches, and a hybrid trunk has FFN-only layers that own no attention tensor at all.
-        //
-        // MiniMax-01 opts out: inp_slopes / inp_q_decay / inp_diag_decay are single per-head graph inputs shared
-        //   by every lightning attention layer, so one split of them has to line up with the Q split of all of
-        //   those layers at once. That holds only while no layer rounds differently - the same constraint that
-        //   pins rotation to 0 for this arch in get_tensor_config_impl - so it keeps the undithered floor.
-        int64_t d_rank  = 0;
-        int64_t d_count = 0; // 0 disables the dither and floors the split point, as it was done before
-        if (ud->model->arch != LLM_ARCH_MINIMAX_01) {
-            const std::string anchor_name = ggml_get_name(tc.tensor_axis_0);
-            if (anchor_name.compare(0, 4, "blk.") == 0) {
-                const size_t dot = anchor_name.find('.', 4);
-                GGML_ASSERT(dot != std::string::npos);
-                const auto it_layers = ud->model->tensor_split_layers_by_suffix.find(anchor_name.substr(dot + 1));
-                if (it_layers != ud->model->tensor_split_layers_by_suffix.end()) {
-                    const std::vector<uint32_t> & layers = it_layers->second;
-                    d_count                              = 1 + (int64_t) layers.size();
-                    d_rank = (int64_t) (std::lower_bound(layers.begin(), layers.end(), tc.il) - layers.begin());
-                }
-            }
-        }
         for (size_t is = 0; is < segments.size(); is++) {
             const int64_t  ne_s = segments[is].first;
             const uint32_t nr_s = segments[is].second;
@@ -1394,7 +1416,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                                          (double) ne_s * tensor_split_scan[j] / tensor_split_scan.back();
                 const int64_t k0   = (int64_t) (b / g_s);
                 const int64_t cnt  = d_count == 0 ? 0 : (int64_t) llround((b - k0 * g_s) * (double) d_count / g_s);
-                int64_t       high = (k0 + (d_rank < cnt ? 1 : 0)) * g_s;
+                const bool    up   = d_u >= 0.0 ? d_u < (b - k0 * g_s) / g_s : d_rank < cnt;
+                int64_t       high = (k0 + (up ? 1 : 0)) * g_s;
                 if (high > ne_s) {
                     high = ne_s;
                 }
@@ -2333,15 +2356,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             strcmp(output->name, tok_embd->name) == 0 &&
             output->type == GGML_TYPE_NVFP4 &&
             (output_s || output_in_s)));
-    // populate tensors_by_name
-    for (auto & [_, ctx_ptr] : ml.ctx_map) {
+    // populate tensors_by_name; with tensor parallelism, a tensor outside the buffer type of the meta device is offloaded
+    ggml_backend_buffer_type_t meta_buft = nullptr;
+    for (const llama_device & dev : devices) {
+        if (dev.is_meta) {
+            meta_buft = ggml_backend_dev_buffer_type(dev.dev);
+            break;
+        }
+    }
+    for (auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
+        const bool offloaded = meta_buft != nullptr && ctx_key.buft != meta_buft;
         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
+            if (offloaded) {
+                tensor_split_offloaded.insert(cur);
+            }
         }
     }
 
     // build the per-suffix layer lists used to dither quantized tensor split points across layers (see llama_meta_device_get_split_state)
-    for (const auto & [name, _] : tensors_by_name) {
+    for (const auto & [name, cur] : tensors_by_name) {
         if (name.compare(0, 4, "blk.") != 0) {
             continue;
         }
@@ -2354,10 +2388,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             continue;
         }
         tensor_split_layers_by_suffix[name.substr(dot + 1)].push_back(il);
+        if (tensor_split_offloaded.count(cur) != 0) {
+            tensor_split_offloaded_layers_by_suffix[name.substr(dot + 1)].push_back(il);
+        }
     }
-    for (auto & [_, il_layers] : tensor_split_layers_by_suffix) {
-        std::sort(il_layers.begin(), il_layers.end());
-        il_layers.erase(std::unique(il_layers.begin(), il_layers.end()), il_layers.end());
+    for (auto * lists : { &tensor_split_layers_by_suffix, &tensor_split_offloaded_layers_by_suffix }) {
+        for (auto & [_, il_layers] : *lists) {
+            std::sort(il_layers.begin(), il_layers.end());
+            il_layers.erase(std::unique(il_layers.begin(), il_layers.end()), il_layers.end());
+        }
     }
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
