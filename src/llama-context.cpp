@@ -670,9 +670,12 @@ void llama_context::sched_reserve() {
     gf_slots_invalidate(true);
 
     {
-        // LLAMA_GRAPH_SLOTS: unset - MTP draft contexts only, 0 - off, 1 - every context
+        // LLAMA_GRAPH_SLOTS: unset or 1 - every context, 0 - off. With slots the graphs of the steps of a few tokens
+        //   outlive the prompts between them: a server request rebuilt and re-split its one-token graph and the small
+        //   ubatches of its prompt each time (~50 ms per request for the step, ~90 ms for a short prompt with -sm
+        //   tensor), for a few MiB of compute buffers
         const char * env = getenv("LLAMA_GRAPH_SLOTS");
-        gf_slots_on = env ? atoi(env) != 0 : cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+        gf_slots_max = env == nullptr || atoi(env) != 0 ? (uint32_t) gf_slots.size() : 0;
     }
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
@@ -2482,7 +2485,7 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 }
 
 llama_context::graph_slot * llama_context::get_gf_slot(const llama_ubatch & ubatch) {
-    if (!gf_slots_on || n_outputs == 0 || ubatch.n_tokens == 0 || ubatch.n_tokens > gf_slots.size()) {
+    if (n_outputs == 0 || ubatch.n_tokens == 0 || ubatch.n_tokens > gf_slots_max) {
         return nullptr;
     }
     auto & slot = gf_slots[ubatch.n_tokens - 1];

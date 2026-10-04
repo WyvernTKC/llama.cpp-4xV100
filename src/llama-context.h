@@ -408,7 +408,7 @@ private:
         bool                   active = false;
     };
     std::array<graph_slot, 8> gf_slots; // [n_tokens - 1]
-    bool gf_slots_on = false;
+    uint32_t gf_slots_max = 0; // the token counts up to this one take a slot
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

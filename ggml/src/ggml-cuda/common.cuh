@@ -1518,11 +1518,13 @@ struct ggml_backend_cuda_context {
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
         const int64_t time_now = ggml_time_us();
 
-        // sweep every 5s, evicting cuda graphs unused for >=10s
+        // sweep every 5s, evicting cuda graphs unused for >=10 min: a server between requests a person makes would
+        //   otherwise capture its decode graphs again for every request (~50 ms at 4 GPUs); the keys are the first
+        //   nodes of graphs built over the same tensors each time, so the map does not grow with that
         if (time_now - last_graph_eviction_sweep >= 5'000'000) {
             last_graph_eviction_sweep = time_now;
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
-                if (time_now - it->second->last_used_time >= 10'000'000) {
+                if (time_now - it->second->last_used_time >= 600'000'000) {
                     it = cuda_graphs.erase(it);
                 } else {
                     ++it;
