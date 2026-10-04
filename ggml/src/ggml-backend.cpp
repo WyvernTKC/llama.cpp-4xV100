@@ -857,6 +857,9 @@ struct ggml_backend_sched {
     int        prev_n_node_sig;
     uint64_t * prev_split_uids;    // [prev_n_split_uids]
     int        prev_n_split_uids;
+
+    // the bytes each tensor reshaped since the last allocation was allocated with, see ggml_backend_sched_reshape
+    std::unordered_map<const struct ggml_tensor *, size_t> * reshape_bytes;
     int      * prev_split_sig;     // [3*prev_n_split_uids] n_nodes, n_inputs, backend_id
 };
 
@@ -2542,6 +2545,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+    sched->reshape_bytes = new std::unordered_map<const struct ggml_tensor *, size_t>();
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
@@ -2609,6 +2613,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->prev_node_sig);
     free(sched->prev_split_uids);
     free(sched->prev_split_sig);
+    delete sched->reshape_bytes;
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_copies);
     free(sched->node_backend_ids);
@@ -2631,6 +2636,7 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
         sched->is_reset = true;
     }
     sched->is_alloc = false;
+    sched->reshape_bytes->clear();
 }
 
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
@@ -2671,6 +2677,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
+    sched->reshape_bytes->clear();
 
     ggml_backend_sched_split_graph(sched, graph);
 
@@ -2681,6 +2688,200 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->is_alloc = true;
 
     return true;
+}
+
+int ggml_backend_sched_reshape(ggml_backend_sched_t sched, int n, struct ggml_tensor ** tensors, const int * dims, const int64_t * sizes) {
+    GGML_ASSERT(sched);
+    if (!sched->is_alloc) {
+        return 0;
+    }
+
+    struct layout {
+        int64_t ne[GGML_MAX_DIMS];
+        size_t  nb[GGML_MAX_DIMS];
+    };
+    std::unordered_map<const ggml_tensor *, layout> fresh;
+    std::vector<ggml_tensor *> changed; // roots and their copies first, then the nodes in graph order
+    std::vector<ggml_tensor *> readers;
+
+    auto layout_of = [](const ggml_tensor * t) {
+        layout l;
+        for (int k = 0; k < GGML_MAX_DIMS; k++) {
+            l.ne[k] = t->ne[k];
+            l.nb[k] = t->nb[k];
+        }
+        return l;
+    };
+    auto add = [&](ggml_tensor * t, const layout & l) {
+        if (fresh.emplace(t, l).second) {
+            changed.push_back(t);
+        }
+    };
+    // ggml_nbytes for a layout
+    auto nbytes_of = [](ggml_type type, const layout & l) {
+        for (int k = 0; k < GGML_MAX_DIMS; k++) {
+            if (l.ne[k] <= 0) {
+                return (size_t) 0;
+            }
+        }
+        const int64_t blck = ggml_blck_size(type);
+        size_t nbytes = blck == 1 ? ggml_type_size(type) : l.ne[0]*l.nb[0]/blck;
+        for (int k = blck == 1 ? 0 : 1; k < GGML_MAX_DIMS; k++) {
+            nbytes += (l.ne[k] - 1)*l.nb[k];
+        }
+        return nbytes;
+    };
+
+    bool any = false;
+    for (int i = 0; i < n; i++) {
+        ggml_tensor * t = tensors[i];
+        GGML_ASSERT(dims[i] >= 0 && dims[i] < GGML_MAX_DIMS && sizes[i] > 0);
+        if (!ggml_hash_contains(&sched->hash_set, t)) {
+            return 0;
+        }
+        layout l = layout_of(t);
+        any = any || l.ne[dims[i]] != sizes[i];
+        l.ne[dims[i]] = sizes[i];
+        if (t->view_src == nullptr) {
+            if (!ggml_is_contiguous(t)) {
+                return 0;
+            }
+            l.nb[0] = ggml_type_size(t->type);
+            l.nb[1] = l.nb[0]*(l.ne[0]/ggml_blck_size(t->type));
+            for (int k = 2; k < GGML_MAX_DIMS; k++) {
+                l.nb[k] = l.nb[k - 1]*l.ne[k - 1];
+            }
+        }
+        add(t, l);
+        const size_t id = ggml_hash_find(&sched->hash_set, t);
+        for (int b = 0; b < sched->n_backends; b++) {
+            for (int c = 0; c < sched->n_copies; c++) {
+                ggml_tensor * cpy = tensor_id_copy(id, b, c);
+                if (cpy != nullptr && cpy != t) {
+                    add(cpy, l);
+                }
+            }
+        }
+    }
+    if (!any) {
+        return 1;
+    }
+
+    // the nodes that follow the new shapes, and the ones that read them
+    struct ggml_cgraph * graph = &sched->graph;
+    for (int i = 0; i < graph->n_nodes; i++) {
+        ggml_tensor * node = graph->nodes[i];
+        if (node->op == GGML_OP_NONE || fresh.count(node)) {
+            continue;
+        }
+        bool reads = false;
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            reads = reads || (node->src[s] != nullptr && fresh.count(node->src[s]));
+        }
+        if (!reads) {
+            continue;
+        }
+        switch (node->op) {
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE: {
+                if (node->src[0] == nullptr || !fresh.count(node->src[0])) {
+                    return 0;
+                }
+                const layout & ls = fresh.at(node->src[0]);
+                layout l = ls;
+                if (node->op == GGML_OP_PERMUTE) {
+                    const int32_t * axes = (const int32_t *) node->op_params;
+                    for (int k = 0; k < GGML_MAX_DIMS; k++) {
+                        l.ne[axes[k]] = ls.ne[k];
+                        l.nb[axes[k]] = ls.nb[k];
+                    }
+                } else {
+                    std::swap(l.ne[0], l.ne[1]);
+                    std::swap(l.nb[0], l.nb[1]);
+                }
+                add(node, l);
+            } break;
+            case GGML_OP_FLASH_ATTN_EXT: {
+                // the output takes its shape from q and the row length of v, not from the kv length
+                if (fresh.count(node->src[0])) {
+                    return 0;
+                }
+                auto ne_of = [&](const ggml_tensor * t, int k) {
+                    const auto it = fresh.find(t);
+                    return it != fresh.end() ? it->second.ne[k] : t->ne[k];
+                };
+                const ggml_tensor * k = node->src[1];
+                const ggml_tensor * v = node->src[2];
+                const ggml_tensor * m = node->src[3];
+                if (v != nullptr && ne_of(v, 1) != ne_of(k, 1)) {
+                    return 0;
+                }
+                if (m != nullptr && ne_of(m, 0) < ne_of(k, 1)) {
+                    return 0;
+                }
+                readers.push_back(node);
+            } break;
+            default:
+                return 0;
+        }
+    }
+
+    // a view must stay inside its source, any other tensor inside the bytes it was allocated with
+    for (ggml_tensor * t : changed) {
+        const size_t nbytes = nbytes_of(t->type, fresh.at(t));
+        if (t->view_src != nullptr) {
+            if (t->view_offs + nbytes > ggml_nbytes(t->view_src)) {
+                return 0;
+            }
+        } else {
+            const auto it = sched->reshape_bytes->find(t);
+            if (nbytes > (it != sched->reshape_bytes->end() ? it->second : ggml_nbytes(t))) {
+                return 0;
+            }
+        }
+    }
+
+    for (ggml_tensor * t : changed) {
+        if (t->view_src == nullptr) {
+            sched->reshape_bytes->emplace(t, ggml_nbytes(t)); // the first time since the allocation: its size then
+        }
+        const layout & l = fresh.at(t);
+        for (int k = 0; k < GGML_MAX_DIMS; k++) {
+            t->ne[k] = l.ne[k];
+            t->nb[k] = l.nb[k];
+        }
+    }
+    for (ggml_tensor * t : changed) {
+        if (t->buffer != nullptr && ggml_backend_buffer_is_meta(t->buffer) && !ggml_backend_meta_buffer_reshape_tensor(t)) {
+            return -1;
+        }
+    }
+    for (ggml_tensor * t : readers) {
+        if (t->buffer != nullptr && ggml_backend_buffer_is_meta(t->buffer) && !ggml_backend_meta_buffer_reshape_tensor(t)) {
+            return -1;
+        }
+    }
+
+    // a backend that caches what it derives from a split by its uid must look at the split again; the meta backend
+    //   keeps its per-device graphs, the tensors in them were rewritten in place, and retires their uids itself
+    for (int s = 0; s < sched->n_splits; s++) {
+        struct ggml_backend_sched_split * split = &sched->splits[s];
+        if (ggml_backend_is_meta(sched->backends[split->backend_id])) {
+            continue;
+        }
+        bool touched = false;
+        for (int i = 0; !touched && i < split->graph.n_nodes; i++) {
+            const ggml_tensor * node = split->graph.nodes[i];
+            touched = fresh.count(node) || std::find(readers.begin(), readers.end(), node) != readers.end();
+        }
+        for (int i = 0; !touched && i < split->n_inputs; i++) {
+            touched = fresh.count(split->inputs[i]) != 0;
+        }
+        if (touched) {
+            split->graph.uid = ggml_graph_next_uid();
+        }
+    }
+    return 1;
 }
 
 enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {

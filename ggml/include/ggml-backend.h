@@ -365,6 +365,14 @@ extern "C" {
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
 
+    // Change the shapes of tensors of the graph last allocated in place, without splitting or allocating it again:
+    //   tensors[i]->ne[dims[i]] becomes sizes[i]. A view keeps its strides, any other tensor gets contiguous ones within
+    //   the bytes it was allocated with. The copies the scheduler made of them follow, so do the views that permute or
+    //   transpose them, and flash attention may read them. Returns 1 when the graph can run with the new shapes, 0 when
+    //   nothing was changed because something else reads them or a tensor would outgrow its allocation or its view
+    //   source, and -1 when a backend could not follow, after which the graph must be split and allocated again.
+    GGML_API int ggml_backend_sched_reshape(ggml_backend_sched_t sched, int n, struct ggml_tensor ** tensors, const int * dims, const int64_t * sizes);
+
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
     // The correct way to use this API is to discard the deallocated tensors and create new ones.

@@ -131,6 +131,9 @@ extern "C" {
     // for all of them, each device waiting once, instead of a round and four waits per tensor.
     GGML_API void ggml_backend_meta_set_tensors(ggml_backend_t backend, size_t n, struct ggml_tensor * const * tensors,
                                                 const void * const * data);
+    // The shape of a tensor in a meta buffer changed in place after it was allocated (ggml_backend_sched_reshape):
+    //   rewrite its per-device tensors where they are. false if its split changed, which a reshape cannot follow.
+    GGML_API bool ggml_backend_meta_buffer_reshape_tensor(struct ggml_tensor * tensor);
     GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
     GGML_API bool ggml_backend_buft_is_meta  (ggml_backend_buffer_type_t buft);
 

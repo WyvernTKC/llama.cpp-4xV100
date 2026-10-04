@@ -2327,6 +2327,107 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
     return ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), tensor);
 }
 
+// bumped by every reshape: the per-device graphs of a decomposition hold the rewritten tensors, so their uids go
+static std::atomic<uint64_t> g_meta_reshape_epoch{0};
+
+static bool ggml_backend_meta_split_states_same(
+        const ggml_backend_meta_split_state & a, const ggml_backend_meta_split_state & b, size_t n_bufs) {
+    if (a.axis != b.axis || a.n_segments != b.n_segments) {
+        return false;
+    }
+    for (size_t s = 0; s < a.n_segments; s++) {
+        if (a.nr[s] != b.nr[s]) {
+            return false;
+        }
+        for (size_t j = 0; j < n_bufs; j++) {
+            if (a.ne[s*n_bufs + j] != b.ne[s*n_bufs + j]) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// The per-device tensors are rewritten where they are, so the cached decompositions that hold them stay valid. A
+//   reader that cut per-device views of a src of its own (the kv slice of flash attention) gets those rewritten too.
+bool ggml_backend_meta_buffer_reshape_tensor(ggml_tensor * tensor) {
+    GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
+    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context * ) tensor->buffer->context;
+    const size_t n_bufs = buf_ctx->bufs.size();
+
+    // the cached split of the old shape no longer matches the tensor: derive it again, it must not have moved
+    bool have_old = false;
+    ggml_backend_meta_split_state ss_old;
+    {
+        const auto key_sync = std::make_pair((const ggml_tensor *) tensor, true);
+        const auto it = buf_ctx->split_state_cache.find(key_sync);
+        if (it != buf_ctx->split_state_cache.end()) {
+            ss_old   = it->second.ss;
+            have_old = true;
+        }
+        buf_ctx->split_state_cache.erase(key_sync);
+        buf_ctx->split_state_cache.erase(std::make_pair((const ggml_tensor *) tensor, false));
+    }
+    ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(tensor);
+    const ggml_backend_meta_split_state ss_new = ggml_backend_meta_get_split_state(stc, tensor, /*assume_sync =*/ true);
+    if (have_old && !ggml_backend_meta_split_states_same(ss_old, ss_new, n_bufs)) {
+        return false;
+    }
+
+    const auto it = stc.simple_tensors.find(tensor);
+    if (it == stc.simple_tensors.end()) {
+        return false;
+    }
+    std::vector<ggml_tensor *> & mirrors = it->second;
+
+    ggml_backend_meta_simple_tensor_container & scratch = buf_ctx->stc_scratch;
+    if (scratch.ctxs.empty()) {
+        // a compute buffer gets its scratch on its first reshape: the tensor and up to 3 views per device
+        const ggml_init_params params_scratch = {
+            /*.mem_size   =*/ 16*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        scratch = ggml_backend_meta_simple_tensor_container(params_scratch, (int) n_bufs);
+    }
+    scratch.reset();
+    if (ggml_backend_meta_buffer_init_tensor_impl(scratch, tensor) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    const std::vector<ggml_tensor *> & fresh = scratch.simple_tensors.at(tensor);
+    bool ok = fresh.size() == mirrors.size();
+    for (size_t j = 0; ok && j < fresh.size(); j++) {
+        ggml_tensor tmp = *fresh[j];
+        for (int i = 0; ok && i < GGML_MAX_SRC; i++) {
+            ggml_tensor * f = fresh[j]->src[i];
+            ggml_tensor * m = mirrors[j]->src[i];
+            if (f == fresh[j]) {
+                tmp.src[i] = mirrors[j];
+                continue;
+            }
+            if (f == m) {
+                continue;
+            }
+            // two different per-device srcs: both must be views the reader cut for this device
+            const ggml_tensor * src = tensor->src[i];
+            const ggml_tensor * reg = src != nullptr && ggml_backend_buffer_is_meta(src->buffer) ?
+                ggml_backend_meta_buffer_simple_tensor(src, j) : nullptr;
+            ok = f != nullptr && m != nullptr && reg != nullptr && f != reg && m != reg &&
+                f->view_src != nullptr && m->view_src == f->view_src;
+            if (ok) {
+                *m = *f; // its view source is the mirror of the src, which stays where it is
+                tmp.src[i] = m;
+            }
+        }
+        if (ok) {
+            *mirrors[j] = tmp;
+        }
+    }
+    scratch.simple_tensors.clear();
+    g_meta_reshape_epoch++;
+    return ok;
+}
+
 static void ggml_backend_meta_buffer_memset_tensor(
         ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
@@ -3162,6 +3263,7 @@ struct ggml_backend_meta_context {
         int      sized_nnodes    = 0;
         size_t   sized_subgraphs = 0;
         bool     gathers         = false; // a MUL_MAT_ID reads a host weight through the device expert cache
+        uint64_t reshape_epoch   = 0;     // g_meta_reshape_epoch when the per-device uids were last minted
     };
     // unique_ptr so growing the pool never invalidates a decomposition pointer
     std::vector<std::unique_ptr<decomposition>> decs;
@@ -4315,6 +4417,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         // the scheduler copies every other host weight into the split, so one read in place is gathered
         D->gathers = false;
+        D->reshape_epoch = g_meta_reshape_epoch.load();
         for (int i = 0; i < cgraph->n_nodes && !D->gathers; i++) {
             const ggml_tensor * node = cgraph->nodes[i];
             D->gathers = node->op == GGML_OP_MUL_MAT_ID && node->src[0] != nullptr && node->src[0]->buffer != nullptr &&
@@ -4999,7 +5102,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
     }
 
-    if (!needs_rebuild && (D->gathers || !backend_ctx->stage_pending.empty() || !backend_ctx->expert_pools_pending.empty())) {
+    const uint64_t reshape_epoch = g_meta_reshape_epoch.load();
+    if (!needs_rebuild && (D->gathers || !backend_ctx->stage_pending.empty() || !backend_ctx->expert_pools_pending.empty() ||
+            D->reshape_epoch != reshape_epoch)) {
+        // a reshape rewrote per-device tensors of this decomposition in place, ggml-cuda must look at them again
+        D->reshape_epoch = reshape_epoch;
         // The decomposition is reusable but its contents are not static: staged expert weights get
         // their per-device data pointer rebound to a different slot on every eval. ggml-cuda skips
         // ggml_cuda_graph_update_required - and so misses that - whenever a subgraph uid matches the
