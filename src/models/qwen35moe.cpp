@@ -314,7 +314,8 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
 
-    // the K and V projections expanded together: at one token a backend can run them in one launch
+    // the Q, K and V projections expanded together: at one token a backend can run them in one launch
+    ggml_build_forward_expand(gf, Qcur_full);
     ggml_build_forward_expand(gf, Kcur);
     ggml_build_forward_expand(gf, Vcur);
 

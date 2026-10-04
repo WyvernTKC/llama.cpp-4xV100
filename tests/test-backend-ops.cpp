@@ -4575,12 +4575,14 @@ struct test_mul_mat_sibling_row : public test_case {
     }
 };
 
-// Two MUL_MATs of one input, expanded together as qwen35 does with the qkv and z projections of a gated delta net layer
+// Two or three MUL_MATs of one input, expanded together as qwen35 does with the qkv and z projections of a gated delta
+//   net layer and the Q, K and V projections of an attention layer
 struct test_mul_mat_sibling_rows : public test_case {
     const ggml_type type;
     const int64_t k;
     const int64_t rows_a;
     const int64_t rows_b;
+    const int64_t rows_c; // 0: two
     const int64_t n_tokens;
 
     std::string op_desc(ggml_tensor * t) override {
@@ -4595,12 +4597,12 @@ struct test_mul_mat_sibling_rows : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR5(type, k, rows_a, rows_b, n_tokens);
+        return VARS_TO_STR6(type, k, rows_a, rows_b, rows_c, n_tokens);
     }
 
     test_mul_mat_sibling_rows(ggml_type type = GGML_TYPE_Q8_0, int64_t k = 2048, int64_t rows_a = 2048, int64_t rows_b = 1024,
-            int64_t n_tokens = 1)
-        : type(type), k(k), rows_a(rows_a), rows_b(rows_b), n_tokens(n_tokens) {}
+            int64_t rows_c = 0, int64_t n_tokens = 1)
+        : type(type), k(k), rows_a(rows_a), rows_b(rows_b), rows_c(rows_c), n_tokens(n_tokens) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * wa = ggml_new_tensor_2d(ctx, type, k, rows_a);
@@ -4612,12 +4614,24 @@ struct test_mul_mat_sibling_rows : public test_case {
 
         ggml_tensor * a = ggml_mul_mat(ctx, wa, x);
         ggml_tensor * b = ggml_mul_mat(ctx, wb, x);
+        ggml_tensor * c = nullptr;
+        if (rows_c > 0) {
+            ggml_tensor * wc = ggml_new_tensor_2d(ctx, type, k, rows_c);
+            ggml_set_name(wc, "wc");
+            c = ggml_mul_mat(ctx, wc, x);
+        }
         if (mode == MODE_TEST) {
             ggml_build_forward_expand(gf, a);
             ggml_build_forward_expand(gf, b);
+            if (c) {
+                ggml_build_forward_expand(gf, c);
+            }
         }
-        // the node after the two reads only the first one
+        // the node after them reads only the first one
         ggml_tensor * out = ggml_concat(ctx, ggml_scale(ctx, a, 0.5f), b, 0);
+        if (c) {
+            out = ggml_concat(ctx, out, c, 0);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -11535,8 +11549,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // one token runs both in one launch
     for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K }) {
         for (int64_t n_tokens : { 1, 2 }) {
-            test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 2048, 2048, 1024, n_tokens));
-            test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 1024, 100, 37, n_tokens));
+            test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 2048, 2048, 1024, 0, n_tokens));
+            test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 1024, 100, 37, 0, n_tokens));
+            test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 2048, 2048, 512, 512, n_tokens));
+            test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 1024, 100, 37, 21, n_tokens));
         }
     }
     // one token runs the shared expert in the experts' launches (the down projection only for q8_0 rows of K 128),

@@ -1802,6 +1802,9 @@ struct ggml_cuda_mm_fusion_args_host {
     ggml_tensor * sib_dst = nullptr;
     const ggml_tensor * sib_y = nullptr;
     float * sib_out = nullptr;
+    // mmvq without ids, with sib: a second sibling of the same kind, its rows after those of sib (sib2_dst = sib2*y)
+    const ggml_tensor * sib2 = nullptr;
+    ggml_tensor * sib2_dst = nullptr;
     // one value per token gating the product before the bias: dst = x_bias + sigmoid(x_sigmoid)*(x*y), one token
     const ggml_tensor * x_sigmoid = nullptr;
 };
@@ -1822,6 +1825,10 @@ struct ggml_cuda_mm_fusion_args_device {
     const float * sib_y = nullptr;
     uint32_t sib_block0 = 0; // mmvq without ids: the first block of the sibling's rows, and their count
     uint32_t sib_nrows  = 0;
+    const void * sib2_x = nullptr; // and of the second sibling's rows
+    float * sib2_dst = nullptr;
+    uint32_t sib2_block0 = 0;
+    uint32_t sib2_nrows  = 0;
     const void * gdn_x = nullptr; // and of the gated delta net gate's rows
     float * gdn_dst = nullptr;
     uint32_t gdn_block0 = 0;

@@ -215,6 +215,8 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             Qcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, q_dim, n_tokens, qkv_fused->nb[1], 0));
         } else {
             Qcur = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s);
+            // expanded with the K and V projections: at one token a backend can run the three in one launch
+            ggml_build_forward_expand(gf, Qcur);
         }
         {
             cb(Qcur, "Qcur", il);

@@ -676,21 +676,29 @@ static __global__ void mul_mat_vec_q(
     const     int wy   = paired ? threadIdx.y % nwarps : threadIdx.y;
     const     int tid = warp_size*wy + threadIdx.x;
 
-    // without ids, sib_x: the blocks from sib_block0 on compute the rows of the sibling sib_x, which reads the same y;
-    //   gdn_x: the blocks from gdn_block0 on the rows of a gated delta net gate (with fusion.gate and its epilogue)
-    bool sib_rows = false;
-    bool gdn_rows = false;
+    // without ids, sib_x: the blocks from sib_block0 on compute the rows of the sibling sib_x, which reads the same y,
+    //   and those from sib2_block0 on the rows of a second one, sib2_x; gdn_x: the blocks from gdn_block0 on the rows of
+    //   a gated delta net gate (with fusion.gate and its epilogue)
+    bool sib_rows  = false;
+    bool sib2_rows = false;
+    bool gdn_rows  = false;
     if constexpr (ncols_dst == 1) {
-        gdn_rows = ids_ptr == nullptr && fusion.gdn_x != nullptr && blockIdx.x >= fusion.gdn_block0;
-        sib_rows = ids_ptr == nullptr && fusion.sib_x != nullptr && blockIdx.x >= fusion.sib_block0 && !gdn_rows;
+        gdn_rows  = ids_ptr == nullptr && fusion.gdn_x  != nullptr && blockIdx.x >= fusion.gdn_block0;
+        sib2_rows = ids_ptr == nullptr && fusion.sib2_x != nullptr && blockIdx.x >= fusion.sib2_block0 && !gdn_rows;
+        sib_rows  = ids_ptr == nullptr && fusion.sib_x  != nullptr && blockIdx.x >= fusion.sib_block0 && !gdn_rows &&
+            !sib2_rows;
     }
     if (sib_rows) {
         vx = fusion.sib_x;
     }
+    if (sib2_rows) {
+        vx = fusion.sib2_x;
+    }
     if (gdn_rows) {
         vx = fusion.gdn_x;
     }
-    const     int row0 = rows_per_cuda_block*(blockIdx.x - (gdn_rows ? fusion.gdn_block0 : sib_rows ? fusion.sib_block0 : 0));
+    const     int row0 = rows_per_cuda_block*(blockIdx.x - (gdn_rows ? fusion.gdn_block0 : sib2_rows ? fusion.sib2_block0 :
+        sib_rows ? fusion.sib_block0 : 0));
     const     int blocks_per_row_x = ncols_x / qk;
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
 
@@ -887,11 +895,11 @@ static __global__ void mul_mat_vec_q(
         return;
     }
 
-    dst = gdn_rows ? fusion.gdn_dst + row0 : sib || sib_rows ? fusion.sib_dst + row0 :
+    dst = gdn_rows ? fusion.gdn_dst + row0 : sib2_rows ? fusion.sib2_dst + row0 : sib || sib_rows ? fusion.sib_dst + row0 :
         dst + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
 
     // bound for the rows of a block past the last one; with ids the channels are the used experts, a row stride apart
-    const uint32_t nrows_dst = gdn_rows ? fusion.gdn_nrows : sib_rows ? fusion.sib_nrows :
+    const uint32_t nrows_dst = gdn_rows ? fusion.gdn_nrows : sib2_rows ? fusion.sib2_nrows : sib_rows ? fusion.sib_nrows :
         ncols_dst == 1 && ids ? stride_channel_dst : stride_col_dst;
 
     // sum up partial sums and write back result
@@ -1641,6 +1649,10 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     fusion_rows.sib_block0 = dims.first.x;
                     dims.first.x += (fusion.sib_nrows + rpb - 1) / rpb;
                 }
+                if (!has_ids && fusion.sib2_x != nullptr) {
+                    fusion_rows.sib2_block0 = dims.first.x;
+                    dims.first.x += (fusion.sib2_nrows + rpb - 1) / rpb;
+                }
                 if (!has_ids && fusion.gdn_x != nullptr) {
                     fusion_rows.gdn_block0 = dims.first.x;
                     dims.first.x += (fusion.gdn_nrows + rpb - 1) / rpb;
@@ -1978,6 +1990,16 @@ static void ggml_cuda_mul_mat_vec_q_impl(
             fusion_local.sib_x     = fusion->sib->data;
             fusion_local.sib_dst   = (float *) fusion->sib_dst->data;
             fusion_local.sib_nrows = (uint32_t) fusion->sib->ne[1];
+        }
+        if (fusion->sib2) {
+            GGML_ASSERT(fusion->sib && !ids && fusion->sib2_dst);
+            GGML_ASSERT(fusion->sib2->type == src0->type && fusion->sib2->ne[0] == ne00 && fusion->sib2->nb[1] == nb01 &&
+                ggml_nrows(fusion->sib2) == fusion->sib2->ne[1]);
+            GGML_ASSERT(fusion->sib2_dst->type == GGML_TYPE_F32 && ggml_is_contiguous(fusion->sib2_dst) &&
+                ggml_nelements(fusion->sib2_dst) == fusion->sib2->ne[1]);
+            fusion_local.sib2_x     = fusion->sib2->data;
+            fusion_local.sib2_dst   = (float *) fusion->sib2_dst->data;
+            fusion_local.sib2_nrows = (uint32_t) fusion->sib2->ne[1];
         }
         if (fusion->sib_y) {
             GGML_ASSERT(ggml_cuda_mul_mat_vec_q_short_sibling(src0, src1, ids, fusion->sib, fusion->sib_y) && fusion->sib_out);
