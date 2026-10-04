@@ -1336,7 +1336,8 @@ struct ggml_cuda_graph {
     };
     std::vector<node_properties> node_props;
     std::vector<const void *> session_keys; // a session graph: the keys of its subgraphs, see ggml_backend_cuda_session_plan
-    int session_want = 0;                   // and the mode the last plan asked for
+    int session_want  = 0;                  // and the mode the last plan asked for
+    int warmup_stable = 0;                  // and how many plans in a row found its properties unchanged
 
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);

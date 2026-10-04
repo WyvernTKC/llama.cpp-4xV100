@@ -6643,6 +6643,17 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 
     return graph->is_enabled();
 }
+
+// Capture a graph after two calls in a row that found nothing changed, not one: a capture costs ~2x an eager run,
+//   and a short prompt graph that comes back once (the same prompt length on the next chat turn) is never replayed.
+//   A one-token graph runs eagerly once more per rebuild. GGML_CUDA_GRAPH_WARMUP sets it.
+static int ggml_cuda_graph_n_warmup() {
+    static const int n = [] {
+        const char * env = getenv("GGML_CUDA_GRAPH_WARMUP");
+        return env != nullptr ? std::max(1, atoi(env)) : 2;
+    }();
+    return n;
+}
 #endif // USE_CUDA_GRAPH
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -6677,8 +6688,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
             if (!graph->warmup_complete) {
-                // Warmup: need at least 2 calls with no property change on the 2nd call
-                if (!properties_changed) {
+                // Warmup: ggml_cuda_graph_n_warmup calls in a row with no property change
+                if (properties_changed) {
+                    graph->warmup_stable = 0;
+                } else if (++graph->warmup_stable >= ggml_cuda_graph_n_warmup()) {
                     graph->warmup_complete = true;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
                     use_cuda_graph = true;
@@ -6690,6 +6703,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
+                    graph->warmup_stable   = 0;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                 } else {
                     use_cuda_graph = true;
@@ -6752,12 +6766,15 @@ static int ggml_backend_cuda_session_plan(ggml_backend_t backend, ggml_cgraph **
             }
 
             if (!graph->warmup_complete) {
-                if (!properties_changed) {
+                if (properties_changed) {
+                    graph->warmup_stable = 0;
+                } else if (++graph->warmup_stable >= ggml_cuda_graph_n_warmup()) {
                     graph->warmup_complete = true;
                     mode = ggml_backend_cuda_context::SESSION_CAPTURE;
                 }
             } else if (properties_changed) {
                 graph->warmup_complete = false;
+                graph->warmup_stable   = 0;
             } else {
                 mode = graph->instance == nullptr ? ggml_backend_cuda_context::SESSION_CAPTURE : ggml_backend_cuda_context::SESSION_REPLAY;
             }
