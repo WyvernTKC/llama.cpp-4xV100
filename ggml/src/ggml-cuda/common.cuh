@@ -1558,6 +1558,16 @@ struct ggml_backend_cuda_context {
     session_mode_t session_mode = SESSION_OFF;
     const void *   session_key  = nullptr;
 
+    // the MoE weighted sum (plus a gated shared expert) that ends a subgraph of a session, left to the all-reduce of its
+    //   output right after it, which computes it as its input; see ggml_cuda_try_fuse_moe_down_shexp
+    struct session_reduction_t {
+        const ggml_tensor * experts = nullptr; // [n_embd, n_used], one token
+        const ggml_tensor * weights = nullptr; // [n_used]
+        const ggml_tensor * add_g   = nullptr; // the shared expert's gate (one value)
+        ggml_tensor *       dst     = nullptr; // the sum
+        std::unique_ptr<ggml_cuda_pool_alloc<float>> add_x; // the shared expert's down projection
+    } session_red;
+
     ~ggml_backend_cuda_context();
 
     cudaStream_t stream(int device, int stream) {

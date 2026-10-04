@@ -45,3 +45,10 @@ void ggml_cuda_p2p_ar_launch (ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, 
 // numbers kept on the device, so it can be captured into a CUDA graph. capturable tells whether a call takes this path.
 bool ggml_cuda_p2p_ar_ll_capturable(const ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors);
 void ggml_cuda_p2p_ar_launch_ll    (const ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors, size_t rank);
+
+// The same with this rank's input computed in the kernel: the MoE weighted sum of n_used expert rows of one token
+// (experts [n_embd, n_used], weights [n_used]) plus add_x * sigmoid(*add_g) if add_x, as moe_weighted_reduction
+// computes it. Only the sum is written, into tensors[rank]; the call must be ll_capturable.
+void ggml_cuda_p2p_ar_launch_ll_moe_reduce(const ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors,
+                                           size_t rank, const float * experts, const float * weights, int n_used,
+                                           const float * add_x, const float * add_g);
