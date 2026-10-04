@@ -2980,6 +2980,120 @@ struct test_rms_norm_mul_rope : public test_case {
     }
 };
 
+// The norms and ropes of the Q, K and V of an attention layer, adjacent as gemma4 and qwen35 build them: the Q rms_norm,
+//   mul and rope; the K the same into a cache; the V a plain rms_norm into a cache (gemma4) or none (qwen35)
+struct test_qkv_norm_rope : public test_case {
+    const int64_t hs;
+    const int64_t nh_q;
+    const int64_t nh_kv;
+    const int64_t nb;
+    const int rope_mode;
+    const int n_dims;
+    const bool ff;
+    const bool with_v;
+    const ggml_type type_cache;
+
+    ggml_tensor * q_out = nullptr;
+    ggml_tensor * k_out = nullptr;
+    ggml_tensor * v_out = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "QKV_NORM_ROPE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    // a quantized cache: values next to a rounding step of q8_0 come out one step apart
+    double max_nmse_err() override {
+        return ggml_is_quantized(type_cache) ? 5e-6 : test_case::max_nmse_err();
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (v_out != nullptr) {
+            return { q_out, k_out, v_out };
+        }
+        return { q_out, k_out };
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR9(hs, nh_q, nh_kv, nb, rope_mode, n_dims, ff, with_v, type_cache);
+    }
+
+    test_qkv_norm_rope(int64_t hs = 256, int64_t nh_q = 8, int64_t nh_kv = 4, int64_t nb = 1,
+            int rope_mode = GGML_ROPE_TYPE_NEOX, int n_dims = 256, bool ff = false, bool with_v = true,
+            ggml_type type_cache = GGML_TYPE_F16)
+        : hs(hs), nh_q(nh_q), nh_kv(nh_kv), nb(nb), rope_mode(rope_mode), n_dims(n_dims), ff(ff), with_v(with_v),
+          type_cache(type_cache) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const bool is_mrope = rope_mode & GGML_ROPE_TYPE_MROPE;
+
+        ggml_tensor * q   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, nh_q,  nb);
+        ggml_tensor * k   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, nh_kv, nb);
+        ggml_tensor * wq  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hs);
+        ggml_tensor * wk  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hs);
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nb*(is_mrope ? 4 : 1));
+        ggml_tensor * ffs = ff ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_dims/2) : nullptr;
+        if (ffs != nullptr) {
+            ggml_set_name(ffs, "ff");
+        }
+
+        const auto rope = [&](ggml_tensor * a) {
+            if (is_mrope) {
+                int sections[4] = { 11, 11, 10, 0 };
+                return ggml_rope_multi(ctx, a, pos, ffs, n_dims, sections, rope_mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+            }
+            return ggml_rope_ext(ctx, a, pos, ffs, n_dims, rope_mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        };
+
+        q_out = rope(ggml_mul(ctx, ggml_rms_norm(ctx, q, 1e-6f), wq));
+        ggml_set_name(q_out, "q_out");
+
+        ggml_tensor * kr = rope(ggml_mul(ctx, ggml_rms_norm(ctx, k, 1e-6f), wk));
+        ggml_tensor * kc = ggml_new_tensor_2d(ctx, type_cache, hs*nh_kv, 2*nb);
+        ggml_tensor * ki = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, nb);
+        k_out = ggml_set_rows(ctx, kc, ggml_view_2d(ctx, kr, hs*nh_kv, nb, kr->nb[2], 0), ki);
+        ggml_set_name(k_out, "k_out");
+
+        if (with_v) {
+            ggml_tensor * v  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, nh_kv, nb);
+            ggml_tensor * vn = ggml_rms_norm(ctx, v, 1e-6f);
+            ggml_tensor * vc = ggml_new_tensor_2d(ctx, type_cache, hs*nh_kv, 2*nb);
+            ggml_tensor * vi = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, nb);
+            v_out = ggml_set_rows(ctx, vc, ggml_view_2d(ctx, vn, hs*nh_kv, nb, vn->nb[2], 0), vi);
+            ggml_set_name(v_out, "v_out");
+        }
+
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, q_out);
+            ggml_build_forward_expand(gf, k_out);
+            if (v_out != nullptr) {
+                ggml_build_forward_expand(gf, v_out);
+            }
+        }
+        return v_out != nullptr ? v_out : k_out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I64) {
+                init_set_rows_row_ids(t, 2*nb);
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int32_t & value : data) {
+                    value = rand() % 512;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "ff") == 0) {
+                init_tensor_uniform(t, 1.0f, 4.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // The attention rotation of a quantized K/V cache as llama_mul_mat_hadamard builds it (RESHAPE, MUL_MAT with the
 // Hadamard hint, RESHAPE) after an optional RMS_NORM (* weight) and ROPE, then optionally stored with VIEW + SET_ROWS
 // into a cache of set_rows_type, or read by a MUL_MAT with a weight of type w_type (the attention output)
@@ -11619,6 +11733,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_flash_attn_ext_mul_mat(128, 3, 1, kv, type_KV, GGML_TYPE_Q8_0, nb));
             }
         }
+    }
+    // the norms and ropes of the Q, K and V of a token in one launch: gemma4 (neox, freq factors, a plain V norm), qwen35
+    //   (imrope over 64 of 256, no V norm), an f32 cache, and a quantized cache that keeps them apart
+    for (int64_t nb : { 1, 2 }) {
+        test_cases.emplace_back(new test_qkv_norm_rope(256, 8, 4, nb, GGML_ROPE_TYPE_NEOX,   256, false, true,  GGML_TYPE_F16));
+        test_cases.emplace_back(new test_qkv_norm_rope(512, 8, 1, nb, GGML_ROPE_TYPE_NEOX,   128, true,  true,  GGML_TYPE_F16));
+        test_cases.emplace_back(new test_qkv_norm_rope(256, 6, 1, nb, GGML_ROPE_TYPE_IMROPE,  64, false, false, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_qkv_norm_rope(128, 8, 2, nb, GGML_ROPE_TYPE_NORMAL, 128, false, true,  GGML_TYPE_F32));
+        test_cases.emplace_back(new test_qkv_norm_rope(128, 8, 2, nb, GGML_ROPE_TYPE_NORMAL, 128, false, true,  GGML_TYPE_Q8_0));
     }
     // one token runs both in one launch
     for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K }) {

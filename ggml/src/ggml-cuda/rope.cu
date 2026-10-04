@@ -754,8 +754,9 @@ static __device__ __forceinline__ void rope_fused_store_quantized(const float * 
     }
 }
 
+// one row of rms_norm_mul_rope_f32 (nchannels: the channels of the grid), also of rms_norm_mul_rope_multi
 template <int block_size, bool has_ff, typename D>
-static __global__ void rms_norm_mul_rope_f32(
+static __device__ __forceinline__ void rms_norm_mul_rope_row(
         const float * x, D * dst, const int ncols,
         const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t s1, const int64_t s2, const int64_t s3,
@@ -770,11 +771,8 @@ static __global__ void rms_norm_mul_rope_f32(
         const float * freq_factors,
         const int64_t * row_indices, const int set_rows_stride,
         const bool is_neox, const mrope_sections sections, const bool is_mrope, const bool is_imrope,
-        const int n_offs, const int n_rot, const float rot_scale) {
-    ggml_cuda_pdl_lc();
-    const int row     = blockIdx.x;
-    const int channel = blockIdx.y;
-    const int sample  = blockIdx.z;
+        const int n_offs, const int n_rot, const float rot_scale,
+        const int row, const int channel, const int sample, const int nchannels) {
     const int tid     = threadIdx.x;
 
     x += sample*s03 + channel*s02 + row*s01;
@@ -843,7 +841,7 @@ static __global__ void rms_norm_mul_rope_f32(
             const int iw = i0 - n_offs;
 
             // multi-section rope takes each pair's position from its section, as rope_multi does
-            const float theta_base  = is_mrope ? rope_multi_theta_base(pos, channel, gridDim.y, iw, theta_scale, sections, is_imrope)
+            const float theta_base  = is_mrope ? rope_multi_theta_base(pos, channel, nchannels, iw, theta_scale, sections, is_imrope)
                                                : pos[channel]*powf(theta_scale, iw/2.0f);
             const float freq_factor = has_ff ? freq_factors[iw/2] : 1.0f;
 
@@ -883,6 +881,95 @@ static __global__ void rms_norm_mul_rope_f32(
             dst[col] = ggml_cuda_cast<D>(s_row[col]);
         }
     }
+}
+
+template <int block_size, bool has_ff, typename D>
+static __global__ void rms_norm_mul_rope_f32(
+        const float * x, D * dst, const int ncols,
+        const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t s1, const int64_t s2, const int64_t s3,
+        const bool has_norm, const float eps,
+        const float * mul,
+        const int64_t mul_s01, const int64_t mul_s02, const int64_t mul_s03,
+        const uint3 mul_ncols_packed, const uint3 mul_nrows_packed,
+        const uint3 mul_nchannels_packed, const uint3 mul_nsamples_packed,
+        const int n_dims, const int32_t * pos,
+        const float freq_scale, const float ext_factor, const float attn_factor,
+        const rope_corr_dims corr_dims, const float theta_scale,
+        const float * freq_factors,
+        const int64_t * row_indices, const int set_rows_stride,
+        const bool is_neox, const mrope_sections sections, const bool is_mrope, const bool is_imrope,
+        const int n_offs, const int n_rot, const float rot_scale) {
+    ggml_cuda_pdl_lc();
+    rms_norm_mul_rope_row<block_size, has_ff, D>(x, dst, ncols, s01, s02, s03, s1, s2, s3, has_norm, eps, mul,
+        mul_s01, mul_s02, mul_s03, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+        n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale, freq_factors, row_indices,
+        set_rows_stride, is_neox, sections, is_mrope, is_imrope, n_offs, n_rot, rot_scale,
+        blockIdx.x, blockIdx.y, blockIdx.z, gridDim.y);
+}
+
+// The arguments of rms_norm_mul_rope_f32 for the rows of one token of one fusion (f32 or f16 out, no rotation), a
+//   segment of rms_norm_mul_rope_multi; nrows 0: not one
+struct rms_norm_rope_seg {
+    const float *   x;
+    void *          dst;
+    int             ncols;
+    int64_t         s01, s02, s03;
+    int64_t         s1, s2, s3;
+    bool            has_norm;
+    float           eps;
+    const float *   mul;
+    int64_t         mul_s01, mul_s02, mul_s03;
+    uint3           mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed;
+    int             n_dims;
+    const int32_t * pos;
+    float           freq_scale, ext_factor, attn_factor;
+    rope_corr_dims  corr_dims;
+    float           theta_scale;
+    const float *   freq_factors;
+    const int64_t * row_indices;
+    int             set_rows_stride;
+    bool            is_neox;
+    mrope_sections  sections;
+    bool            is_mrope, is_imrope;
+    int             n_offs;
+    int             nrows;
+    ggml_type       dst_type;
+};
+
+template <typename D>
+static __device__ __forceinline__ void rms_norm_mul_rope_seg_row(const rms_norm_rope_seg & a, const int row) {
+    if (a.freq_factors != nullptr) {
+        rms_norm_mul_rope_row<256, true, D>(a.x, (D *) a.dst, a.ncols, a.s01, a.s02, a.s03, a.s1, a.s2, a.s3, a.has_norm,
+            a.eps, a.mul, a.mul_s01, a.mul_s02, a.mul_s03, a.mul_ncols_packed, a.mul_nrows_packed, a.mul_nchannels_packed,
+            a.mul_nsamples_packed, a.n_dims, a.pos, a.freq_scale, a.ext_factor, a.attn_factor, a.corr_dims, a.theta_scale,
+            a.freq_factors, a.row_indices, a.set_rows_stride, a.is_neox, a.sections, a.is_mrope, a.is_imrope, a.n_offs,
+            0, 0.0f, row, 0, 0, 1);
+    } else {
+        rms_norm_mul_rope_row<256, false, D>(a.x, (D *) a.dst, a.ncols, a.s01, a.s02, a.s03, a.s1, a.s2, a.s3, a.has_norm,
+            a.eps, a.mul, a.mul_s01, a.mul_s02, a.mul_s03, a.mul_ncols_packed, a.mul_nrows_packed, a.mul_nchannels_packed,
+            a.mul_nsamples_packed, a.n_dims, a.pos, a.freq_scale, a.ext_factor, a.attn_factor, a.corr_dims, a.theta_scale,
+            a.freq_factors, a.row_indices, a.set_rows_stride, a.is_neox, a.sections, a.is_mrope, a.is_imrope, a.n_offs,
+            0, 0.0f, row, 0, 0, 1);
+    }
+}
+
+// The rows of two or three fusions of one token in one launch of 256 threads per block: the blocks of a0, then those
+//   of a1 and a2. Each block runs the row as rms_norm_mul_rope_f32 does.
+template <typename D0, typename D1, typename D2>
+static __global__ void rms_norm_mul_rope_multi(const rms_norm_rope_seg a0, const rms_norm_rope_seg a1, const rms_norm_rope_seg a2) {
+    ggml_cuda_pdl_lc();
+    int row = blockIdx.x;
+    if (row < a0.nrows) {
+        rms_norm_mul_rope_seg_row<D0>(a0, row);
+        return;
+    }
+    row -= a0.nrows;
+    if (row < a1.nrows) {
+        rms_norm_mul_rope_seg_row<D1>(a1, row);
+        return;
+    }
+    rms_norm_mul_rope_seg_row<D2>(a2, row - a1.nrows);
 }
 
 template <typename D>
@@ -946,9 +1033,10 @@ static void rms_norm_mul_rope_cuda(
     }
 }
 
-void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
+// seg: fill in the arguments of a segment of rms_norm_mul_rope_multi instead of launching
+static void rms_norm_mul_rope_fused_impl(ggml_backend_cuda_context & ctx,
         ggml_tensor * rms_norm, ggml_tensor * mul, ggml_tensor * rope, ggml_tensor * set_rows,
-        ggml_tensor * rot, const ggml_tensor * rows) {
+        ggml_tensor * rot, const ggml_tensor * rows, rms_norm_rope_seg * seg) {
     GGML_ASSERT(rms_norm != nullptr || mul == nullptr);
     GGML_ASSERT(rms_norm != nullptr || rope != nullptr || rot != nullptr);
 
@@ -1078,6 +1166,51 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
         s3 = s2*rows->ne[2];
     }
 
+    if (seg != nullptr) {
+        *seg = {};
+        seg->dst_type = dst_type;
+        if (rows->ne[2] != 1 || rows->ne[3] != 1 || rot != nullptr || rows->ne[0] >= 1024 || rows->ne[0] % 2 != 0 ||
+                (dst_type != GGML_TYPE_F32 && dst_type != GGML_TYPE_F16)) {
+            return;
+        }
+        seg->x               = (const float *) x->data;
+        seg->dst             = dst_d;
+        seg->ncols           = rows->ne[0];
+        seg->s01             = s01;
+        seg->s02             = s02;
+        seg->s03             = s03;
+        seg->s1              = s1;
+        seg->s2              = s2;
+        seg->s3              = s3;
+        seg->has_norm        = rms_norm != nullptr;
+        seg->eps             = eps;
+        seg->mul             = mul_d;
+        seg->mul_s01         = mul_s01;
+        seg->mul_s02         = mul_s02;
+        seg->mul_s03         = mul_s03;
+        seg->mul_ncols_packed     = init_fastdiv_values(mul_ne0);
+        seg->mul_nrows_packed     = init_fastdiv_values(mul_ne1);
+        seg->mul_nchannels_packed = init_fastdiv_values(mul_ne2);
+        seg->mul_nsamples_packed  = init_fastdiv_values(mul_ne3);
+        seg->n_dims          = n_dims;
+        seg->pos             = pos;
+        seg->freq_scale      = freq_scale;
+        seg->ext_factor      = ext_factor;
+        seg->attn_factor     = attn_factor;
+        seg->corr_dims       = corr_dims;
+        seg->theta_scale     = n_dims > 0 ? powf(freq_base, -2.0f/n_dims) : 0.0f; // as rms_norm_mul_rope_cuda
+        seg->freq_factors    = freq_factors;
+        seg->row_indices     = row_indices;
+        seg->set_rows_stride = set_rows_stride;
+        seg->is_neox         = is_neox;
+        seg->sections        = sections;
+        seg->is_mrope        = is_mrope;
+        seg->is_imrope       = is_imrope;
+        seg->n_offs          = n_offs;
+        seg->nrows           = rows->ne[1];
+        return;
+    }
+
     cudaStream_t stream = ctx.stream();
 
     auto run = [&](auto * dst_typed) {
@@ -1102,6 +1235,42 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
         default:
             GGML_ABORT("fatal error");
     }
+}
+
+void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
+        ggml_tensor * rms_norm, ggml_tensor * mul, ggml_tensor * rope, ggml_tensor * set_rows,
+        ggml_tensor * rot, const ggml_tensor * rows) {
+    rms_norm_mul_rope_fused_impl(ctx, rms_norm, mul, rope, set_rows, rot, rows, nullptr);
+}
+
+bool ggml_cuda_op_rms_norm_mul_rope_multi(ggml_backend_cuda_context & ctx, ggml_tensor * nodes[][4], const int n) {
+    GGML_ASSERT(n == 2 || n == 3);
+    rms_norm_rope_seg segs[3] = {};
+    for (int s = 0; s < n; ++s) {
+        rms_norm_mul_rope_fused_impl(ctx, nodes[s][0], nodes[s][1], nodes[s][2], nodes[s][3], nullptr, nullptr, &segs[s]);
+        if (segs[s].nrows == 0) {
+            return false;
+        }
+    }
+    // the first one into f32 (a Q), the others into f32 or f16 (a K or V cache)
+    if (segs[0].dst_type != GGML_TYPE_F32) {
+        return false;
+    }
+    const bool h1 = segs[1].dst_type == GGML_TYPE_F16;
+    const bool h2 = n == 3 ? segs[2].dst_type == GGML_TYPE_F16 : h1;
+
+    const dim3 blocks_num(segs[0].nrows + segs[1].nrows + segs[2].nrows, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params(blocks_num, dim3(256, 1, 1), 32*sizeof(float), ctx.stream());
+    if (h1 && h2) {
+        ggml_cuda_kernel_launch(rms_norm_mul_rope_multi<float, half, half>, launch_params, segs[0], segs[1], segs[2]);
+    } else if (h1) {
+        ggml_cuda_kernel_launch(rms_norm_mul_rope_multi<float, half, float>, launch_params, segs[0], segs[1], segs[2]);
+    } else if (h2) {
+        ggml_cuda_kernel_launch(rms_norm_mul_rope_multi<float, float, half>, launch_params, segs[0], segs[1], segs[2]);
+    } else {
+        ggml_cuda_kernel_launch(rms_norm_mul_rope_multi<float, float, float>, launch_params, segs[0], segs[1], segs[2]);
+    }
+    return true;
 }
 
 bool ggml_cuda_rms_norm_mul_rope_fused_dst_supported(const ggml_type type) {
