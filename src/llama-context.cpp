@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -19,7 +20,9 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 
 //
 // llama_context
@@ -419,6 +422,12 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        // LLAMA_GRAPH_RESHAPE=0 builds the graph of every ubatch for the n_kv it needs, see llama_graph_reshape_group
+        if (memory) {
+            const char * env = getenv("LLAMA_GRAPH_RESHAPE");
+            memory->set_graph_reshape(env == nullptr || atoi(env) != 0);
+        }
     }
 
     // init backends
@@ -1452,7 +1461,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     const bool res_active = slot ? slot->active : gf_res_prev_active == res;
 
-    if (!graph_reuse_disable && res_active && res->can_reuse(gparams)) {
+    bool reused = !graph_reuse_disable && res_active && res->can_reuse(gparams);
+    if (reused) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1462,8 +1472,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ggml_backend_sched_synchronize(sched_cur);
         }
 
-        n_reused++;
-    } else {
+        // the n_kv may have moved
+        if (!res->reshape_groups.empty() && graph_reshape(res) < 0) {
+            reused = false;
+        } else {
+            n_reused++;
+        }
+    }
+    for (int attempt = 0; !reused; attempt++) {
         if (slot) {
             slot->active = false;
         } else {
@@ -1492,11 +1508,30 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        // built for more n_kv than this ubatch needs: shrink it to that in place
+        if (mctx) {
+            mctx->take_graph_reshape(res->reshape_groups);
+        }
+        if (!res->reshape_groups.empty()) {
+            if (attempt == 0) {
+                graph_reshape_check(res);
+            } else {
+                res->reshape_ok = false; // runs at the size it was built for
+            }
+            if (graph_reshape(res) < 0) {
+                // a backend could not follow: build it again, and the graphs of this context for their n_kv from now on
+                memory->set_graph_reshape(false);
+                GGML_ASSERT(attempt == 0);
+                continue;
+            }
+        }
+
         if (slot) {
             slot->active = true;
         } else {
             gf_res_prev_active = res;
         }
+        reused = true; // ends the loop
     }
 
     // set the input data for the input tensors
@@ -2508,6 +2543,72 @@ void llama_context::gf_slots_invalidate(bool free_slots) {
     }
     if (free_slots) {
         sched_cur = sched.get();
+    }
+}
+
+int llama_context::graph_reshape(llm_graph_result * res) {
+    std::vector<ggml_tensor *> tensors;
+    std::vector<int>           dims;
+    std::vector<int64_t>       sizes;
+    bool same = true;
+    bool fits = true; // the graph covers the n_kv as it is, attending padding cells
+    for (const auto & g : res->reshape_groups) {
+        const int64_t n_kv = g.kv->get_n_kv_cur();
+        for (const auto & [t, dim] : g.tensors) {
+            tensors.push_back(t);
+            dims.push_back(dim);
+            sizes.push_back(n_kv);
+            same = same && t->ne[dim] == n_kv;
+            fits = fits && t->ne[dim] >= n_kv;
+        }
+    }
+    if (same) {
+        return 1;
+    }
+    if (!res->reshape_ok) {
+        return fits ? 1 : -1;
+    }
+    const int64_t n_kv_before = tensors.front()->ne[dims.front()];
+    const int r = ggml_backend_sched_reshape(sched_cur, (int) tensors.size(), tensors.data(), dims.data(), sizes.data());
+    LLAMA_LOG_DEBUG("%s: n_kv %" PRId64 " -> %" PRId64 ": %d\n", __func__, n_kv_before, sizes.front(), r);
+    if (r == 0) {
+        // something reads them that cannot follow: this graph keeps its size, the next ones are built for their n_kv
+        LLAMA_LOG_INFO("%s: the graph cannot follow the n_kv in place, graphs are built for it from now on\n", __func__);
+        res->reshape_ok = false;
+        memory->set_graph_reshape(false);
+        return fits ? 1 : -1;
+    }
+    return r;
+}
+
+void llama_context::graph_reshape_check(llm_graph_result * res) {
+    // an input sized by the n_kv that the cache did not record would keep the size the graph was built with
+    std::unordered_set<const ggml_tensor *> roots;
+    std::vector<int64_t> n_kv_built;
+    for (const auto & g : res->reshape_groups) {
+        for (const auto & [t, dim] : g.tensors) {
+            roots.insert(t);
+            n_kv_built.push_back(t->ne[dim]);
+        }
+    }
+    const int n_nodes = ggml_graph_n_nodes(res->get_gf());
+    for (int i = 0; res->reshape_ok && i < n_nodes; i++) {
+        const ggml_tensor * node = ggml_graph_node(res->get_gf(), i);
+        for (int s = 0; res->reshape_ok && s < GGML_MAX_SRC; s++) {
+            const ggml_tensor * src = node->src[s];
+            if (src == nullptr || src->op != GGML_OP_NONE || !(src->flags & GGML_TENSOR_FLAG_INPUT) || roots.count(src)) {
+                continue;
+            }
+            for (int k = 0; k < GGML_MAX_DIMS; k++) {
+                if (std::find(n_kv_built.begin(), n_kv_built.end(), src->ne[k]) != n_kv_built.end()) {
+                    res->reshape_ok = false;
+                }
+            }
+        }
+    }
+    if (!res->reshape_ok) {
+        LLAMA_LOG_INFO("%s: an input of the graph is sized by the n_kv, graphs are built for it from now on\n", __func__);
+        memory->set_graph_reshape(false);
     }
 }
 

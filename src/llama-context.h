@@ -270,6 +270,11 @@ public:
 private:
     llm_graph_result * get_gf_res_prev();
 
+    // shrink or grow the n_kv dims of a graph in place to the n_kv of the ubatch applied last, see
+    //   llama_graph_reshape_group: 1 the graph can run, -1 it must be built again
+    int  graph_reshape(llm_graph_result * res);
+    void graph_reshape_check(llm_graph_result * res);
+
     struct graph_slot;
     graph_slot * get_gf_slot(const llama_ubatch & ubatch);
     void gf_slots_invalidate(bool free_slots);

@@ -146,6 +146,8 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    void set_graph_reshape(bool enable) override;
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
@@ -188,6 +190,14 @@ public:
 
     // n_tokens: of the ubatch the graph is for, 0 if unknown
     uint32_t get_n_kv(const slot_info & sinfo, uint32_t n_tokens = 0) const;
+
+    // the n_kv a graph is built for: more than n_kv for a small ubatch when graphs are reshaped, see set_graph_reshape
+    uint32_t get_n_kv_graph(uint32_t n_tokens, uint32_t n_kv) const;
+    bool     reshapes_graph(uint32_t n_tokens) const;
+
+    // the n_kv of the ubatch applied last
+    uint32_t get_n_kv_cur() const { return n_kv_cur; }
+    void     set_n_kv_cur(uint32_t n) { n_kv_cur = n; }
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -264,6 +274,9 @@ private:
     };
 
     bool v_trans = true;  // the value tensor is transposed
+
+    bool     graph_reshape = false;
+    uint32_t n_kv_cur      = 0;
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
@@ -405,7 +418,14 @@ public:
     // llama_kv_cache_context specific API
     //
 
+    // the n_kv the graph is built for, and the one this ubatch needs; they differ when the graph is shrunk in place
     uint32_t get_n_kv() const;
+    uint32_t get_n_kv_used() const;
+
+    // record a tensor of the graph being built whose dim is the n_kv, false if graphs are not reshaped
+    bool add_graph_root(ggml_tensor * t, int dim) const;
+
+    void take_graph_reshape(std::vector<llama_graph_reshape_group> & groups) const override;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -477,4 +497,8 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+    int32_t n_kv_used = 0;
+    bool    reshape   = false;
+
+    mutable std::vector<std::pair<ggml_tensor *, int>> graph_roots;
 };

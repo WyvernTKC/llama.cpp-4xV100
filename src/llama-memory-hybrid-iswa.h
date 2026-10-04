@@ -83,6 +83,8 @@ public:
     llama_kv_cache_iswa * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
 
+    void set_graph_reshape(bool enable) override;
+
 private:
     const llama_hparams & hparams;
 
@@ -127,6 +129,8 @@ public:
 
     const llama_kv_cache_iswa_context * get_attn() const;
     const llama_memory_recurrent_context * get_recr() const;
+
+    void take_graph_reshape(std::vector<llama_graph_reshape_group> & groups) const override;
 
 private:
     // the index of the next ubatch to process

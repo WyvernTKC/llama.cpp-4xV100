@@ -213,6 +213,14 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     }
 }
 
+void llama_memory_hybrid::set_graph_reshape(bool enable) {
+    mem_attn->set_graph_reshape(enable);
+}
+
+void llama_memory_hybrid_context::take_graph_reshape(std::vector<llama_graph_reshape_group> & groups) const {
+    get_attn()->take_graph_reshape(groups);
+}
+
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
     return mem_attn.get();
 }

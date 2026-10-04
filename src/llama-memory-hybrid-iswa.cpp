@@ -202,6 +202,14 @@ void llama_memory_hybrid_iswa::state_read(llama_io_read_i & io, llama_seq_id seq
     mem_recr->state_read(io, seq_id, flags);
 }
 
+void llama_memory_hybrid_iswa::set_graph_reshape(bool enable) {
+    mem_attn->set_graph_reshape(enable);
+}
+
+void llama_memory_hybrid_iswa_context::take_graph_reshape(std::vector<llama_graph_reshape_group> & groups) const {
+    get_attn()->take_graph_reshape(groups);
+}
+
 llama_kv_cache_iswa * llama_memory_hybrid_iswa::get_mem_attn() const {
     return mem_attn.get();
 }

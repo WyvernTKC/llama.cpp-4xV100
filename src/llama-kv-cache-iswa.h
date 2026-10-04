@@ -90,6 +90,8 @@ public:
     llama_kv_cache * get_base() const;
     llama_kv_cache * get_swa () const;
 
+    void set_graph_reshape(bool enable) override;
+
 private:
     const bool unified;
 
@@ -139,6 +141,8 @@ public:
 
     const llama_kv_cache_context * get_base() const;
     const llama_kv_cache_context * get_swa()  const;
+
+    void take_graph_reshape(std::vector<llama_graph_reshape_group> & groups) const override;
 
 private:
     //llama_kv_cache_iswa * kv;

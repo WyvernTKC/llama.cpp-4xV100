@@ -64,6 +64,9 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // hand over the tensors of the graph just built that follow the n_kv of later ubatches in place
+    virtual void take_graph_reshape(std::vector<llama_graph_reshape_group> & groups) const { GGML_UNUSED(groups); }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
@@ -99,6 +102,9 @@ struct llama_memory_i {
 
     // getters
     virtual bool get_can_shift() const = 0;
+
+    // build the graphs of small ubatches for more than their n_kv and shrink them in place, see llama_graph_reshape_group
+    virtual void set_graph_reshape(bool enable) { GGML_UNUSED(enable); }
 
     //
     // ops

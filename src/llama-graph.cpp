@@ -42,6 +42,11 @@ static ggml_tensor * build_attn_inp_kq_mask(
     ggml_set_input(res);
     ggml_set_name(res, "attn_inp_kq_mask");
 
+    // a mask that can be shrunk in place keeps the n_kv it was built for, see can_reuse_kq_mask
+    if (mctx->add_graph_root(res, 0)) {
+        res->op_params[0] = (int32_t) n_kv;
+    }
+
     return res;
 }
 
@@ -50,13 +55,15 @@ static bool can_reuse_kq_mask(
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
         const llama_cparams & cparams) {
-    const auto n_kv     = mctx->get_n_kv();
+    const auto n_kv     = mctx->get_n_kv_used();
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
     bool res = true;
 
-    res &= (kq_mask->ne[0] == n_kv);
+    // a graph built for a larger n_kv runs this ubatch once shrunk in place, see llama_graph_reshape_group
+    const int32_t n_kv_built = kq_mask->op_params[0];
+    res &= (kq_mask->ne[0] == n_kv || (n_kv_built > 0 && n_kv <= (uint32_t) n_kv_built));
     res &= (kq_mask->ne[1] == n_tokens/n_stream);
     res &= (kq_mask->ne[2] == 1);
     res &= (kq_mask->ne[3] == n_stream);
@@ -1339,6 +1346,9 @@ void llm_graph_result::reset() {
 
     inputs.clear();
     fused_nodes.clear();
+
+    reshape_groups.clear();
+    reshape_ok = true;
 
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 

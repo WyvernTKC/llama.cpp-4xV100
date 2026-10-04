@@ -350,6 +350,16 @@ const llama_ubatch & llama_kv_cache_iswa_context::get_ubatch() const {
     return ubatches[i_next];
 }
 
+void llama_kv_cache_iswa::set_graph_reshape(bool enable) {
+    kv_base->set_graph_reshape(enable);
+    kv_swa ->set_graph_reshape(enable);
+}
+
+void llama_kv_cache_iswa_context::take_graph_reshape(std::vector<llama_graph_reshape_group> & groups) const {
+    get_base()->take_graph_reshape(groups);
+    get_swa ()->take_graph_reshape(groups);
+}
+
 const llama_kv_cache_context * llama_kv_cache_iswa_context::get_base() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 

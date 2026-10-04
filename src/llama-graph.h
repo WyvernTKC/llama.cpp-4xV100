@@ -770,6 +770,15 @@ public:
 using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il)>;
 
 class llm_graph_result;
+class llama_kv_cache;
+
+// The tensors of a graph whose size along one dim is the n_kv of a KV cache. A graph of a small ubatch is built for
+//   more than it needs and shrunk in place to the n_kv of each ubatch it runs (ggml_backend_sched_reshape), so that a
+//   growing n_kv does not build it again.
+struct llama_graph_reshape_group {
+    const llama_kv_cache * kv = nullptr;
+    std::vector<std::pair<ggml_tensor *, int>> tensors; // tensor, dim
+};
 
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -950,6 +959,9 @@ public:
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
+
+    std::vector<llama_graph_reshape_group> reshape_groups;
+    bool reshape_ok = true; // false once a reshape found something it cannot follow: the graph keeps its size
 
     ggml_context_ptr ctx_compute;
 

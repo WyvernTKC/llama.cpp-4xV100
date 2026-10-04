@@ -1284,6 +1284,29 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
+void llama_kv_cache::set_graph_reshape(bool enable) {
+    graph_reshape = enable;
+}
+
+bool llama_kv_cache::reshapes_graph(uint32_t n_tokens) const {
+    // flash attention only: the transposed V of the other path is read by ops that cannot follow
+    return graph_reshape && !v_trans && n_tokens > 0 && n_tokens <= 8;
+}
+
+// A graph of a small ubatch is built for LLAMA_KV_RESHAPE_HEADROOM (8192) more than it needs and shrunk to it in
+//   place, so it is only built again when the cache has grown past that. Its kq mask is allocated for the larger
+//   n_kv: rows of a few tokens.
+uint32_t llama_kv_cache::get_n_kv_graph(uint32_t n_tokens, uint32_t n_kv) const {
+    if (!reshapes_graph(n_tokens)) {
+        return n_kv;
+    }
+    static const uint32_t headroom = [] {
+        const char * env = getenv("LLAMA_KV_RESHAPE_HEADROOM");
+        return env != nullptr ? (uint32_t) std::max(0, atoi(env)) : 8192u;
+    }();
+    return std::max(n_kv, std::min(get_size(), GGML_PAD(n_kv + headroom, 256u)));
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) const {
     uint32_t result = 0;
 
@@ -2903,7 +2926,8 @@ llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : sta
 
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
-    n_kv = kv->get_size();
+    n_kv      = kv->get_size();
+    n_kv_used = n_kv;
 
     const uint32_t n_stream = kv->get_n_stream();
 
@@ -2957,7 +2981,11 @@ bool llama_kv_cache_context::apply() {
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
-    n_kv = kv->get_n_kv(sinfos[i_cur], ubatches[i_cur].n_tokens);
+    n_kv_used = kv->get_n_kv(sinfos[i_cur], ubatches[i_cur].n_tokens);
+    n_kv      = kv->get_n_kv_graph(ubatches[i_cur].n_tokens, n_kv_used);
+    reshape   = kv->reshapes_graph(ubatches[i_cur].n_tokens);
+    kv->set_n_kv_cur(n_kv_used);
+    graph_roots.clear();
 
     return true;
 }
@@ -2976,6 +3004,25 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
 
+uint32_t llama_kv_cache_context::get_n_kv_used() const {
+    return n_kv_used;
+}
+
+bool llama_kv_cache_context::add_graph_root(ggml_tensor * t, int dim) const {
+    if (!reshape) {
+        return false;
+    }
+    graph_roots.emplace_back(t, dim);
+    return true;
+}
+
+void llama_kv_cache_context::take_graph_reshape(std::vector<llama_graph_reshape_group> & groups) const {
+    if (!graph_roots.empty()) {
+        groups.push_back({ kv, std::move(graph_roots) });
+        graph_roots.clear();
+    }
+}
+
 ggml_type llama_kv_cache_context::type_k() const {
     return kv->type_k();
 }
@@ -2985,11 +3032,15 @@ ggml_type llama_kv_cache_context::type_v() const {
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
-    return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
+    ggml_tensor * k = kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
+    add_graph_root(k, 2);
+    return k;
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
-    return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+    ggml_tensor * v = kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+    add_graph_root(v, 2); // reshape is off for a transposed V
+    return v;
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
