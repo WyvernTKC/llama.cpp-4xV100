@@ -994,15 +994,10 @@ struct ggml_backend_cuda_comm_context {
     ggml_cuda_p2p_ar *          p2p_ar = nullptr;
 
 #ifdef GGML_USE_NCCL
-    std::vector<ncclComm_t>     comms;
+    std::vector<ncclComm_t>     comms; // not owned, see ggml_cuda_nccl_comms
 #endif // GGML_USE_NCCL
 
     ~ggml_backend_cuda_comm_context() {
-#ifdef GGML_USE_NCCL
-        for (ncclComm_t comm : comms) {
-            NCCL_CHECK(ncclCommDestroy(comm));
-        }
-#endif // GGML_USE_NCCL
         ggml_cuda_ar_pipeline_free(ar_pipeline);
         ggml_cuda_p2p_ar_free(p2p_ar);
     }
@@ -1288,6 +1283,27 @@ static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context 
     ggml_backend_cuda_comm_init_none(ret);
 }
 
+#ifdef GGML_USE_NCCL
+// One set of communicators per set of devices for the whole process, shared by its contexts and never destroyed:
+//   ncclCommDestroy, and ncclCommAbort alike, could wait forever on a proxy thread (NCCL 2.32 on Windows) when a
+//   context was freed before the process exited. NCCL orders the operations of a communicator across streams.
+static const std::vector<ncclComm_t> * ggml_cuda_nccl_comms(const std::vector<int> & dev_ids, ncclResult_t & rc) {
+    static std::mutex mtx;
+    static std::map<std::vector<int>, std::vector<ncclComm_t>> cliques;
+    std::lock_guard<std::mutex> lock(mtx);
+    auto it = cliques.find(dev_ids);
+    if (it != cliques.end()) {
+        return &it->second;
+    }
+    std::vector<ncclComm_t> comms(dev_ids.size());
+    rc = ncclCommInitAll(comms.data(), (int) comms.size(), dev_ids.data());
+    if (rc != ncclSuccess) {
+        return nullptr;
+    }
+    return &cliques.emplace(dev_ids, std::move(comms)).first->second;
+}
+#endif // GGML_USE_NCCL
+
 static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * ret) {
 #ifdef GGML_USE_NCCL
     // Disabling NCCL path when CUDA virtual devices are in use since NCCL requires one distinct physical GPU per rank.
@@ -1299,15 +1315,14 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
         return;
     }
 
-    const size_t n = ret->dev_ids.size();
-    ret->comms.resize(n);
-    ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
-    if (rc == ncclSuccess) {
+    ncclResult_t rc = ncclSuccess;
+    const std::vector<ncclComm_t> * comms = ggml_cuda_nccl_comms(ret->dev_ids, rc);
+    if (comms != nullptr) {
+        ret->comms = *comms;
         ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
         return;
     }
 
-    ret->comms.clear();
     GGML_LOG_WARN("NCCL init failed (%s); falling back to internal AllReduce\n",
                   ncclGetErrorString(rc));
 #else // GGML_USE_NCCL
