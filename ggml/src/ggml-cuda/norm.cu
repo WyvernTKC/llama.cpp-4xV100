@@ -216,20 +216,6 @@ static __global__ void __launch_bounds__(block_size) rms_norm_f32(const float * 
     }
 }
 
-// The q8_1 copy of the output, as quantize_q8_1 writes it: one value per lane of a block of 32.
-static __device__ __forceinline__ void rms_norm_quantize_q8_1(const float v, block_q8_1 * yb, const int lane) {
-    float amax = fabsf(v);
-    float sum  = v;
-    amax = warp_reduce_max<QK8_1>(amax);
-    sum  = warp_reduce_sum<QK8_1>(sum);
-    const float  d = amax / 127.0f;
-    const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
-    yb->qs[lane] = q;
-    if (lane == 0) {
-        yb->ds = make_half2(d, sum);
-    }
-}
-
 // sum = a + b and dst = rms_norm(sum) * mul in one pass: a residual add and the norm that follows it, which also
 //   leaves the sum for the next residual. It reduces exactly like rms_norm_f32 with the same block size, so both
 //   results are those of the three ops apart. a, b, sum and dst are contiguous. cols_per_thread as in rms_norm_f32.
@@ -334,7 +320,7 @@ static __global__ void __launch_bounds__(block_size) rms_norm_pre_add_f32(const 
                 }
             }
             if (ib < nq8) {
-                rms_norm_quantize_q8_1(v, q8_dst + ib, tid % WARP_SIZE);
+                quantize_q8_1_lane(v, q8_dst + ib, tid % WARP_SIZE);
             }
             return;
         }
@@ -492,7 +478,7 @@ static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
             }
         }
         if (ib < nq8) {
-            rms_norm_quantize_q8_1(v, q8_dst + ib, tid % WARP_SIZE);
+            quantize_q8_1_lane(v, q8_dst + ib, tid % WARP_SIZE);
         }
         return;
     }
@@ -563,7 +549,7 @@ static __global__ void rms_norm_gated_f32(const float * x, const float * gate, f
     // the q8_1 copy of the output as one row, as quantize_q8_1 writes it: the launcher asks for it only with one value
     //   per thread and whole warps per block of 32, the lanes of which are those of quantize_q8_1
     if (q8_dst != nullptr && tid < ncols) {
-        rms_norm_quantize_q8_1(v, q8_dst + (row_flat*ncols + tid)/QK8_1, tid % QK8_1);
+        quantize_q8_1_lane(v, q8_dst + (row_flat*ncols + tid)/QK8_1, tid % QK8_1);
     }
 }
 

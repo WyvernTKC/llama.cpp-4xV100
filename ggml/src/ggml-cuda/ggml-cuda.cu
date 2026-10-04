@@ -6472,11 +6472,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                // one token: the combine of a split KV writes the q8_1 copy of the output, see launch_fattn
+                static const bool fattn_no_q8_1 = getenv("GGML_CUDA_NO_FATTN_Q8_1") != nullptr;
+                const bool fattn_q8_1 = node->op == GGML_OP_FLASH_ATTN_EXT && node->src[0]->ne[1] == 1 && !fattn_no_q8_1;
+                if (fattn_q8_1) {
+                    ggml_cuda_q8_1_request(cuda_ctx, cgraph, i);
+                }
+
                 bool ok = ggml_cuda_glu_with_f16_copy(*cuda_ctx, cgraph, i) || ggml_cuda_compute_forward(*cuda_ctx, node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                if (fattn_q8_1) {
+                    cuda_ctx->q8_1_commit_pending();
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);

@@ -987,7 +987,8 @@ static __global__ void flash_attn_combine_results(
         const float  * VKQ_parts_ptr,
         const float2 * VKQ_meta_ptr,
         float * dst_ptr,
-        const int parallel_blocks) {
+        const int parallel_blocks,
+        block_q8_1 * q8_dst) {
     ggml_cuda_pdl_lc();
     const float  * GGML_CUDA_RESTRICT VKQ_parts = VKQ_parts_ptr;
     const float2 * GGML_CUDA_RESTRICT VKQ_meta  = VKQ_meta_ptr;
@@ -1036,7 +1037,13 @@ static __global__ void flash_attn_combine_results(
         VKQ_denominator += KQ_max_scale * meta[l].y;
     }
 
-    dst[tid] = VKQ_numerator / VKQ_denominator;
+    const float val = VKQ_numerator / VKQ_denominator;
+    dst[tid] = val;
+
+    // the q8_1 copy of one token's output for the matmul that reads it (D a multiple of 32), see launch_fattn
+    if (q8_dst != nullptr) {
+        quantize_q8_1_lane(val, q8_dst + (j_dst_unrolled*D + tid)/QK8_1, tid % QK8_1);
+    }
 }
 
 template <int DV, int ncols1, int ncols2>
@@ -1368,9 +1375,19 @@ void launch_fattn(
         const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
         const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
 
+        // the q8_1 copy of one token's output for the MMVQ matmul that reads it, see ggml_cuda_q8_1_request: whole
+        //   blocks of 32 in a head and no padding
+        block_q8_1 * q8_dst = nullptr;
+        if (DV % QK8_1 == 0 && Q->ne[1] == 1 && Q->ne[3] == 1 && ggml_is_contiguous(KQV) &&
+                ggml_nelements(KQV) % MATRIX_ROW_PADDING == 0) {
+            int64_t ne_padded = 0;
+            q8_dst = (block_q8_1 *) ctx.q8_1_emit_alloc(KQV, ne_padded);
+            GGML_ASSERT(q8_dst == nullptr || ne_padded == ggml_nelements(KQV));
+        }
+
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
         ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
-            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks, q8_dst);
     }
     CUDA_CHECK(cudaGetLastError());
 }

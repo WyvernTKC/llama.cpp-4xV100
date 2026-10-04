@@ -4637,6 +4637,68 @@ struct test_mul_mat_sibling_rows : public test_case {
     }
 };
 
+// FLASH_ATTN_EXT and the matmul that reads its output, the output projection of an attention layer: at one token the
+//   combine of a KV split writes the q8_1 copy of the output
+struct test_flash_attn_ext_mul_mat : public test_case {
+    const int64_t hs;
+    const int64_t nh;
+    const int64_t nr2;
+    const int64_t kv;
+    const ggml_type type_KV;
+    const ggml_type type_w;
+    const int64_t nb;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FLASH_ATTN_EXT_MUL_MAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR7(hs, nh, nr2, kv, type_KV, type_w, nb);
+    }
+
+    test_flash_attn_ext_mul_mat(int64_t hs = 256, int64_t nh = 2, int64_t nr2 = 4, int64_t kv = 512,
+            ggml_type type_KV = GGML_TYPE_F16, ggml_type type_w = GGML_TYPE_Q8_0, int64_t nb = 1)
+        : hs(hs), nh(nh), nr2(nr2), kv(kv), type_KV(type_KV), type_w(type_w), nb(nb) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*nr2, 1);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, 1);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, 1);
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(m, "m");
+
+        ggml_tensor * fa = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_prec_set_acc(fa, GGML_PREC_F32);
+        ggml_tensor * x  = ggml_reshape_2d(ctx, fa, hs*nh*nr2, nb);
+        ggml_tensor * w  = ggml_new_tensor_2d(ctx, type_w, hs*nh*nr2, 512);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * out = ggml_mul_mat(ctx, w, x);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_MUL_MAT + GGML_OP_UNARY(SIGMOID) + GGML_OP_MUL + GGML_OP_ADD (acc + sigmoid(g) * (w*x), the gated shared expert of qwen35moe)
 struct test_mul_mat_sigmoid_add : public test_case {
     const ggml_type type;
@@ -11546,6 +11608,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_mul_mat_sigmoid_add(GGML_TYPE_Q8_0, 128, 2048, 1));
+    // the FA of a token writes the q8_1 copy of its output for the matmul after it: with and without a KV split, vec and
+    //   tile kernels, a row of 384 that would need padding
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        for (int64_t kv : { 64, 512, 4096 }) {
+            for (int64_t nb : { 1, 2 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_mul_mat(256, 2, 1, kv, type_KV, GGML_TYPE_Q8_0, nb));
+                test_cases.emplace_back(new test_flash_attn_ext_mul_mat(256, 2, 4, kv, type_KV, GGML_TYPE_Q4_K, nb));
+                test_cases.emplace_back(new test_flash_attn_ext_mul_mat(512, 1, 8, kv, type_KV, GGML_TYPE_Q8_0, nb));
+                test_cases.emplace_back(new test_flash_attn_ext_mul_mat(128, 3, 1, kv, type_KV, GGML_TYPE_Q8_0, nb));
+            }
+        }
+    }
     // one token runs both in one launch
     for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K }) {
         for (int64_t n_tokens : { 1, 2 }) {

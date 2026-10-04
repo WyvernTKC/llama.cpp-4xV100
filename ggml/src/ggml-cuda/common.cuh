@@ -546,6 +546,20 @@ static __device__ __forceinline__ float warp_reduce_max(float x) {
     return x;
 }
 
+// The q8_1 copy of a row as quantize_q8_1 writes it: v is value lane of the block of 32 at yb, one per lane of a warp.
+static __device__ __forceinline__ void quantize_q8_1_lane(const float v, block_q8_1 * yb, const int lane) {
+    float amax = fabsf(v);
+    float sum  = v;
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+    yb->qs[lane] = q;
+    if (lane == 0) {
+        yb->ds = make_half2(d, sum);
+    }
+}
+
 template<typename T, int width = WARP_SIZE>
 static __device__ __forceinline__ T warp_prefix_inclusive_sum(T x) {
     const int lane_id = threadIdx.x % width;
