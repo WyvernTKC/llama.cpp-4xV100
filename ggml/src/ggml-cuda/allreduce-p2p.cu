@@ -190,7 +190,105 @@ static __global__ void ggml_cuda_p2p_ar_ll_kernel(const ggml_cuda_p2p_ar_args a)
 // Each block keeps its sequence number on the device (ll_seq), so a launch takes no per-call argument and can sit in
 // a CUDA graph; every rank runs the same calls with the same blocks, so the numbers agree. The slots then alternate
 // per block, which keeps the guarantee above: a rank is at most one call ahead of any peer in each block.
-template <int n_devs>
+// payload 1 (f16) or 2 (bf16): two values per {d, flag} pair instead of one, half the bytes on the links; every rank
+//   sums the same rounded values, its own included, so the ranks still agree.
+template <int payload>
+static __device__ __forceinline__ uint32_t ggml_cuda_p2p_ar_pack2(const float x, const float y) {
+    uint32_t bits;
+    if constexpr (payload == 1) {
+        const half2 h = make_half2(__float2half_rn(x), __float2half_rn(y));
+        memcpy(&bits, &h, sizeof(bits));
+    } else {
+        const nv_bfloat162 h = __floats2bfloat162_rn(x, y);
+        memcpy(&bits, &h, sizeof(bits));
+    }
+    return bits;
+}
+
+template <int payload>
+static __device__ __forceinline__ float2 ggml_cuda_p2p_ar_unpack2(const uint32_t bits) {
+    if constexpr (payload == 1) {
+        half2 h;
+        memcpy(&h, &bits, sizeof(bits));
+        return __half22float2(h);
+    } else {
+        nv_bfloat162 h;
+        memcpy(&h, &bits, sizeof(bits));
+        return __bfloat1622float2(h);
+    }
+}
+
+// This rank's float4 i, v, to the LL lines of every rank, and the sum of all ranks' in rank order, as the kernels
+//   above: one line {d0, flag, d1, flag} per two values, or with payload one line per four
+template <int n_devs, int payload>
+static __device__ __forceinline__ float4 ggml_cuda_p2p_ar_ll_exchange(const ggml_cuda_p2p_ar_args & a, const float4 v,
+        const int64_t i, const uint32_t flag, const int64_t slot_base) {
+    constexpr int nl = payload == 0 ? 2 : 1; // lines per float4
+    uint4 l[nl];
+    if constexpr (payload == 0) {
+        l[0] = make_uint4(__float_as_uint(v.x), flag, __float_as_uint(v.y), flag);
+        l[1] = make_uint4(__float_as_uint(v.z), flag, __float_as_uint(v.w), flag);
+    } else {
+        l[0] = make_uint4(ggml_cuda_p2p_ar_pack2<payload>(v.x, v.y), flag, ggml_cuda_p2p_ar_pack2<payload>(v.z, v.w), flag);
+    }
+#pragma unroll
+    for (int j = 0; j < n_devs; ++j) {
+        uint4 * dst = a.ll[j] + slot_base + (int64_t) a.rank * a.ll_stride + nl*i;
+#pragma unroll
+        for (int k = 0; k < nl; ++k) {
+            ggml_cuda_p2p_ar_st_ll(dst + k, l[k]);
+        }
+    }
+
+    const uint4 * src = a.ll[a.rank] + slot_base + nl*i;
+    uint4 r[n_devs][nl];
+#pragma unroll
+    for (int j = 0; j < n_devs; ++j) {
+#pragma unroll
+        for (int k = 0; k < nl; ++k) {
+            r[j][k] = ggml_cuda_p2p_ar_ld_ll(src + (int64_t) j * a.ll_stride + k);
+        }
+    }
+    bool done;
+    do {
+        done = true;
+#pragma unroll
+        for (int j = 0; j < n_devs; ++j) {
+#pragma unroll
+            for (int k = 0; k < nl; ++k) {
+                if (r[j][k].y != flag || r[j][k].w != flag) {
+                    r[j][k] = ggml_cuda_p2p_ar_ld_ll(src + (int64_t) j * a.ll_stride + k);
+                    done = false;
+                }
+            }
+        }
+    } while (!done);
+
+    // in rank order, as the kernels above
+    float4 sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+    for (int j = 0; j < n_devs; ++j) {
+        if (((a.contrib_mask >> j) & 1u) == 0) {
+            continue;
+        }
+        if constexpr (payload == 0) {
+            sum.x += __uint_as_float(r[j][0].x);
+            sum.y += __uint_as_float(r[j][0].z);
+            sum.z += __uint_as_float(r[j][1].x);
+            sum.w += __uint_as_float(r[j][1].z);
+        } else {
+            const float2 lo = ggml_cuda_p2p_ar_unpack2<payload>(r[j][0].x);
+            const float2 hi = ggml_cuda_p2p_ar_unpack2<payload>(r[j][0].z);
+            sum.x += lo.x;
+            sum.y += lo.y;
+            sum.z += hi.x;
+            sum.w += hi.y;
+        }
+    }
+    return sum;
+}
+
+template <int n_devs, int payload = 0>
 static __global__ void ggml_cuda_p2p_ar_ll_kernel_n(const ggml_cuda_p2p_ar_args a) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -201,52 +299,7 @@ static __global__ void ggml_cuda_p2p_ar_ll_kernel_n(const ggml_cuda_p2p_ar_args 
 
     if (i < a.nvec) {
         const float4 v = ((a.contrib_mask >> a.rank) & 1u) ? a.src[i] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        const uint4 l0 = make_uint4(__float_as_uint(v.x), flag, __float_as_uint(v.y), flag);
-        const uint4 l1 = make_uint4(__float_as_uint(v.z), flag, __float_as_uint(v.w), flag);
-#pragma unroll
-        for (int j = 0; j < n_devs; ++j) {
-            uint4 * dst = a.ll[j] + slot_base + (int64_t) a.rank * a.ll_stride + 2*i;
-            ggml_cuda_p2p_ar_st_ll(dst + 0, l0);
-            ggml_cuda_p2p_ar_st_ll(dst + 1, l1);
-        }
-
-        const uint4 * src = a.ll[a.rank] + slot_base + 2*i;
-        uint4 r[n_devs][2];
-#pragma unroll
-        for (int j = 0; j < n_devs; ++j) {
-#pragma unroll
-            for (int l = 0; l < 2; ++l) {
-                r[j][l] = ggml_cuda_p2p_ar_ld_ll(src + (int64_t) j * a.ll_stride + l);
-            }
-        }
-        bool done;
-        do {
-            done = true;
-#pragma unroll
-            for (int j = 0; j < n_devs; ++j) {
-#pragma unroll
-                for (int l = 0; l < 2; ++l) {
-                    if (r[j][l].y != flag || r[j][l].w != flag) {
-                        r[j][l] = ggml_cuda_p2p_ar_ld_ll(src + (int64_t) j * a.ll_stride + l);
-                        done = false;
-                    }
-                }
-            }
-        } while (!done);
-
-        // in rank order, as the kernels above
-        float4 sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-#pragma unroll
-        for (int j = 0; j < n_devs; ++j) {
-            if (((a.contrib_mask >> j) & 1u) == 0) {
-                continue;
-            }
-            sum.x += __uint_as_float(r[j][0].x);
-            sum.y += __uint_as_float(r[j][0].z);
-            sum.z += __uint_as_float(r[j][1].x);
-            sum.w += __uint_as_float(r[j][1].z);
-        }
-        a.dst[i] = sum;
+        a.dst[i] = ggml_cuda_p2p_ar_ll_exchange<n_devs, payload>(a, v, i, flag, slot_base);
     }
 
     __syncthreads();
@@ -258,7 +311,7 @@ static __global__ void ggml_cuda_p2p_ar_ll_kernel_n(const ggml_cuda_p2p_ar_args 
 // ggml_cuda_p2p_ar_ll_kernel_n with its input computed on the way: the MoE weighted sum of the token's n_used expert
 // rows (and add_x times sigmoid(add_g) after it), as moe_weighted_reduction_f32 sums each column, so the values are
 // those of the two kernels apart. Same blocks, sequence numbers and slots, so a peer may run either kernel.
-template <int n_devs>
+template <int n_devs, int payload = 0>
 static __global__ void ggml_cuda_p2p_ar_ll_moe_reduce_kernel(const ggml_cuda_p2p_ar_args a, const float * experts,
         const float * weights, const int n_used, const int64_t n_embd, const float * add_x, const float * add_g) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -284,51 +337,7 @@ static __global__ void ggml_cuda_p2p_ar_ll_moe_reduce_kernel(const ggml_cuda_p2p
                                 __fadd_rn(v.z, __fmul_rn(x.z, sig)), __fadd_rn(v.w, __fmul_rn(x.w, sig)));
             }
         }
-        const uint4 l0 = make_uint4(__float_as_uint(v.x), flag, __float_as_uint(v.y), flag);
-        const uint4 l1 = make_uint4(__float_as_uint(v.z), flag, __float_as_uint(v.w), flag);
-#pragma unroll
-        for (int j = 0; j < n_devs; ++j) {
-            uint4 * dl = a.ll[j] + slot_base + (int64_t) a.rank * a.ll_stride + 2*i;
-            ggml_cuda_p2p_ar_st_ll(dl + 0, l0);
-            ggml_cuda_p2p_ar_st_ll(dl + 1, l1);
-        }
-
-        const uint4 * src = a.ll[a.rank] + slot_base + 2*i;
-        uint4 r[n_devs][2];
-#pragma unroll
-        for (int j = 0; j < n_devs; ++j) {
-#pragma unroll
-            for (int l = 0; l < 2; ++l) {
-                r[j][l] = ggml_cuda_p2p_ar_ld_ll(src + (int64_t) j * a.ll_stride + l);
-            }
-        }
-        bool done;
-        do {
-            done = true;
-#pragma unroll
-            for (int j = 0; j < n_devs; ++j) {
-#pragma unroll
-                for (int l = 0; l < 2; ++l) {
-                    if (r[j][l].y != flag || r[j][l].w != flag) {
-                        r[j][l] = ggml_cuda_p2p_ar_ld_ll(src + (int64_t) j * a.ll_stride + l);
-                        done = false;
-                    }
-                }
-            }
-        } while (!done);
-
-        float4 sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-#pragma unroll
-        for (int j = 0; j < n_devs; ++j) {
-            if (((a.contrib_mask >> j) & 1u) == 0) {
-                continue;
-            }
-            sum.x += __uint_as_float(r[j][0].x);
-            sum.y += __uint_as_float(r[j][0].z);
-            sum.z += __uint_as_float(r[j][1].x);
-            sum.w += __uint_as_float(r[j][1].z);
-        }
-        a.dst[i] = sum;
+        a.dst[i] = ggml_cuda_p2p_ar_ll_exchange<n_devs, payload>(a, v, i, flag, slot_base);
     }
 
     __syncthreads();
@@ -480,6 +489,36 @@ bool ggml_cuda_p2p_ar_allreduce(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends
     return true;
 }
 
+// the values on the LL lines, GGML_CUDA_P2P_AR_LL_PAYLOAD: f32 (0, default), f16 (1) or bf16 (2). A 16-bit payload
+//   halves the bytes on the links and rounds what each rank adds (opt-in, it changes the results)
+static int ggml_cuda_p2p_ar_ll_payload() {
+    static const int payload = [] {
+        const char * env = getenv("GGML_CUDA_P2P_AR_LL_PAYLOAD");
+        return env == nullptr ? 0 : strcmp(env, "f16") == 0 ? 1 : strcmp(env, "bf16") == 0 ? 2 : 0;
+    }();
+    return payload;
+}
+
+// the LL kernel of 2 to 4 devices
+static void ggml_cuda_p2p_ar_launch_ll_n(const ggml_cuda_p2p_ar_args & args, const int nblocks_ll, cudaStream_t stream) {
+    const int payload = ggml_cuda_p2p_ar_ll_payload();
+    const auto launch = [&](auto kernel) {
+        kernel<<<nblocks_ll, GGML_CUDA_P2P_AR_LL_NTHREADS, 0, stream>>>(args);
+    };
+    switch (args.n_devs * 3 + payload) {
+        case 2*3 + 0: launch(ggml_cuda_p2p_ar_ll_kernel_n<2, 0>); break;
+        case 2*3 + 1: launch(ggml_cuda_p2p_ar_ll_kernel_n<2, 1>); break;
+        case 2*3 + 2: launch(ggml_cuda_p2p_ar_ll_kernel_n<2, 2>); break;
+        case 3*3 + 0: launch(ggml_cuda_p2p_ar_ll_kernel_n<3, 0>); break;
+        case 3*3 + 1: launch(ggml_cuda_p2p_ar_ll_kernel_n<3, 1>); break;
+        case 3*3 + 2: launch(ggml_cuda_p2p_ar_ll_kernel_n<3, 2>); break;
+        case 4*3 + 0: launch(ggml_cuda_p2p_ar_ll_kernel_n<4, 0>); break;
+        case 4*3 + 1: launch(ggml_cuda_p2p_ar_ll_kernel_n<4, 1>); break;
+        case 4*3 + 2: launch(ggml_cuda_p2p_ar_ll_kernel_n<4, 2>); break;
+        default: GGML_ABORT("fatal error");
+    }
+}
+
 void ggml_cuda_p2p_ar_launch(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors, size_t rank) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backends[rank]->context;
 
@@ -493,19 +532,10 @@ void ggml_cuda_p2p_ar_launch(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, g
 
     if ((size_t) args.nvec * sizeof(float4) <= ar->ll_max_bytes) {
         const int nblocks_ll = (int) ((args.nvec + GGML_CUDA_P2P_AR_LL_NTHREADS - 1) / GGML_CUDA_P2P_AR_LL_NTHREADS);
-        switch (args.n_devs) {
-            case 2:
-                ggml_cuda_p2p_ar_ll_kernel_n<2><<<nblocks_ll, GGML_CUDA_P2P_AR_LL_NTHREADS, 0, cuda_ctx->stream()>>>(args);
-                break;
-            case 3:
-                ggml_cuda_p2p_ar_ll_kernel_n<3><<<nblocks_ll, GGML_CUDA_P2P_AR_LL_NTHREADS, 0, cuda_ctx->stream()>>>(args);
-                break;
-            case 4:
-                ggml_cuda_p2p_ar_ll_kernel_n<4><<<nblocks_ll, GGML_CUDA_P2P_AR_LL_NTHREADS, 0, cuda_ctx->stream()>>>(args);
-                break;
-            default:
-                ggml_cuda_p2p_ar_ll_kernel<<<nblocks_ll, GGML_CUDA_P2P_AR_LL_NTHREADS, 0, cuda_ctx->stream()>>>(args);
-                break;
+        if (args.n_devs >= 2 && args.n_devs <= 4) {
+            ggml_cuda_p2p_ar_launch_ll_n(args, nblocks_ll, cuda_ctx->stream());
+        } else {
+            ggml_cuda_p2p_ar_ll_kernel<<<nblocks_ll, GGML_CUDA_P2P_AR_LL_NTHREADS, 0, cuda_ctx->stream()>>>(args);
         }
     } else {
         ggml_cuda_p2p_ar_kernel<<<ar->nblocks, GGML_CUDA_P2P_AR_NTHREADS, 0, cuda_ctx->stream()>>>(args);
@@ -577,17 +607,7 @@ void ggml_cuda_p2p_ar_launch_ll(const ggml_cuda_p2p_ar * ar, ggml_backend_t * ba
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backends[rank]->context;
     ggml_cuda_set_device(cuda_ctx->device);
     const int nblocks_ll = (int) ((args.nvec + GGML_CUDA_P2P_AR_LL_NTHREADS - 1) / GGML_CUDA_P2P_AR_LL_NTHREADS);
-    switch (args.n_devs) {
-        case 2:
-            ggml_cuda_p2p_ar_ll_kernel_n<2><<<nblocks_ll, GGML_CUDA_P2P_AR_LL_NTHREADS, 0, cuda_ctx->stream()>>>(args);
-            break;
-        case 3:
-            ggml_cuda_p2p_ar_ll_kernel_n<3><<<nblocks_ll, GGML_CUDA_P2P_AR_LL_NTHREADS, 0, cuda_ctx->stream()>>>(args);
-            break;
-        default:
-            ggml_cuda_p2p_ar_ll_kernel_n<4><<<nblocks_ll, GGML_CUDA_P2P_AR_LL_NTHREADS, 0, cuda_ctx->stream()>>>(args);
-            break;
-    }
+    ggml_cuda_p2p_ar_launch_ll_n(args, nblocks_ll, cuda_ctx->stream());
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -613,19 +633,21 @@ void ggml_cuda_p2p_ar_launch_ll_moe_reduce(const ggml_cuda_p2p_ar * ar, ggml_bac
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backends[rank]->context;
     ggml_cuda_set_device(cuda_ctx->device);
     const int nblocks_ll = (int) ((args.nvec + GGML_CUDA_P2P_AR_LL_NTHREADS - 1) / GGML_CUDA_P2P_AR_LL_NTHREADS);
-    switch (args.n_devs) {
-        case 2:
-            ggml_cuda_p2p_ar_ll_moe_reduce_kernel<2><<<nblocks_ll, GGML_CUDA_P2P_AR_LL_NTHREADS, 0, cuda_ctx->stream()>>>(
-                args, experts, weights, n_used, n_embd, add_x, add_g);
-            break;
-        case 3:
-            ggml_cuda_p2p_ar_ll_moe_reduce_kernel<3><<<nblocks_ll, GGML_CUDA_P2P_AR_LL_NTHREADS, 0, cuda_ctx->stream()>>>(
-                args, experts, weights, n_used, n_embd, add_x, add_g);
-            break;
-        default:
-            ggml_cuda_p2p_ar_ll_moe_reduce_kernel<4><<<nblocks_ll, GGML_CUDA_P2P_AR_LL_NTHREADS, 0, cuda_ctx->stream()>>>(
-                args, experts, weights, n_used, n_embd, add_x, add_g);
-            break;
+    const auto launch = [&](auto kernel) {
+        kernel<<<nblocks_ll, GGML_CUDA_P2P_AR_LL_NTHREADS, 0, cuda_ctx->stream()>>>(
+            args, experts, weights, n_used, n_embd, add_x, add_g);
+    };
+    switch ((args.n_devs < 4 ? args.n_devs : 4) * 3 + ggml_cuda_p2p_ar_ll_payload()) {
+        case 2*3 + 0: launch(ggml_cuda_p2p_ar_ll_moe_reduce_kernel<2, 0>); break;
+        case 2*3 + 1: launch(ggml_cuda_p2p_ar_ll_moe_reduce_kernel<2, 1>); break;
+        case 2*3 + 2: launch(ggml_cuda_p2p_ar_ll_moe_reduce_kernel<2, 2>); break;
+        case 3*3 + 0: launch(ggml_cuda_p2p_ar_ll_moe_reduce_kernel<3, 0>); break;
+        case 3*3 + 1: launch(ggml_cuda_p2p_ar_ll_moe_reduce_kernel<3, 1>); break;
+        case 3*3 + 2: launch(ggml_cuda_p2p_ar_ll_moe_reduce_kernel<3, 2>); break;
+        case 4*3 + 0: launch(ggml_cuda_p2p_ar_ll_moe_reduce_kernel<4, 0>); break;
+        case 4*3 + 1: launch(ggml_cuda_p2p_ar_ll_moe_reduce_kernel<4, 1>); break;
+        case 4*3 + 2: launch(ggml_cuda_p2p_ar_ll_moe_reduce_kernel<4, 2>); break;
+        default: GGML_ABORT("fatal error");
     }
     CUDA_CHECK(cudaGetLastError());
 }
