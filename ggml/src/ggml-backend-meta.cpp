@@ -530,7 +530,7 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
 // Container to hold the tensor slices per simple ggml backend buffer.
 struct ggml_backend_meta_simple_tensor_container {
     std::vector<ggml_context_ptr> ctxs;
-    std::map<const ggml_tensor *, std::vector<ggml_tensor *>> simple_tensors;
+    std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> simple_tensors;
 
     // A growable container adds a context of grow_size bytes per device once the current one is full, so the
     //   mirrors of a compute buffer can start small. The contexts are allocated in full up front, and a fixed
@@ -610,6 +610,12 @@ struct ggml_backend_meta_buffer_context {
     ggml_backend_meta_simple_tensor_container stc_scratch; // a view mirror is built here, then copied
     std::vector<std::vector<ggml_context_ptr>> view_pools; // [device]
 
+    // Each graph has views of the KV cache and the recurrent state of its own, so a change of a view mirror
+    //   bumps a generation of that view, not mirror_gen: a new prompt graph used to rebuild the cached
+    //   decompositions of every other graph, the graph slots of the one-token steps included.
+    uint64_t view_clock = 0;                                     // bumped on every view mirror change
+    std::unordered_map<const ggml_tensor *, uint64_t> view_gens; // view -> view_clock at its last change
+
     ggml_tensor * alloc_view_mirror(size_t j) {
         auto & pool = view_pools[j];
         if (pool.empty() || ggml_get_mem_size(pool.back().get()) - ggml_used_mem(pool.back().get()) < ggml_tensor_overhead()) {
@@ -627,7 +633,17 @@ struct ggml_backend_meta_buffer_context {
     // The size of the split state cache is unbounded and can theoretically grow infinitely large.
     // However, it is also expensive to build and clearing it on every rebuild in ggml_backend_meta_graph_compute is too expensive.
     static constexpr size_t nbtc = GGML_TENSOR_SIZE - sizeof(ggml_tensor::padding);
-    std::map<std::pair<const ggml_tensor *, bool>, std::pair<ggml_backend_meta_split_state, char[nbtc]>> split_state_cache;
+    struct split_state_key_hash {
+        size_t operator()(const std::pair<const ggml_tensor *, bool> & k) const {
+            return std::hash<const ggml_tensor *>()(k.first) ^ size_t(k.second);
+        }
+    };
+    struct split_state_cache_entry {
+        ggml_backend_meta_split_state ss;
+        bool sync_dependent; // a reduction that assume_sync turned from PARTIAL into MIRRORED decided it
+        char tensor_bytes[nbtc];
+    };
+    std::unordered_map<std::pair<const ggml_tensor *, bool>, split_state_cache_entry, split_state_key_hash> split_state_cache;
 
     int debug;
 
@@ -1062,7 +1078,7 @@ static bool ggml_backend_meta_split_state_cached(const struct ggml_tensor * tens
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     const auto it = buf_ctx->split_state_cache.find(std::make_pair(tensor, assume_sync));
     return it != buf_ctx->split_state_cache.end() &&
-        memcmp(it->second.second, (const char *) tensor, sizeof(it->second.second)) == 0;
+        memcmp(it->second.tensor_bytes, (const char *) tensor, sizeof(it->second.tensor_bytes)) == 0;
 }
 
 // Cache the split state of every transitive src, deepest first.
@@ -1107,6 +1123,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     // However, in a broader ggml context with arbitrary ggml graphs this can lead to unexpected results.
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
+    bool sync_dependent = false; // see split_state_cache_entry
 
     auto split_states_equal = [&](const ggml_backend_meta_split_state & a, const ggml_backend_meta_split_state & b) -> bool {
         if (a.axis != b.axis) {
@@ -1179,6 +1196,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     //   and every other reduction here is not additive). Any other split keeps whole rows per device.
     auto handle_sum_rows = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            sync_dependent = true;
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
         }
         return handle_per_row(src_ss);
@@ -1230,6 +1248,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0) {
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
+            sync_dependent = true;
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
         }
         // dims 2 and 3 are batch dims that are not reduced over, if both srcs are split the same way along one of
@@ -1906,15 +1925,33 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
     const std::pair key = std::make_pair(tensor, assume_sync);
     auto it = buf_ctx->split_state_cache.find(key);
-    if (it != buf_ctx->split_state_cache.end() && memcmp(it->second.second, (const char *) tensor, sizeof(it->second.second)) != 0) {
+    if (it != buf_ctx->split_state_cache.end() && memcmp(it->second.tensor_bytes, (const char *) tensor, sizeof(it->second.tensor_bytes)) != 0) {
         buf_ctx->split_state_cache.clear();
         it = buf_ctx->split_state_cache.end();
     }
+    // the srcs are always derived with assume_sync, so without it only a reduction that leaves partial sums differs:
+    //   the graph compute asks for every node once more after the allocation did, take the result from there
+    auto it_sync = buf_ctx->split_state_cache.end();
+    if (it == buf_ctx->split_state_cache.end() && !assume_sync) {
+        it_sync = buf_ctx->split_state_cache.find(std::make_pair(tensor, true));
+        if (it_sync != buf_ctx->split_state_cache.end() && (it_sync->second.sync_dependent ||
+                memcmp(it_sync->second.tensor_bytes, (const char *) tensor, sizeof(it_sync->second.tensor_bytes)) != 0)) {
+            it_sync = buf_ctx->split_state_cache.end();
+        }
+    }
 
-    if (it == buf_ctx->split_state_cache.end()) {
+    ggml_backend_meta_split_state ret;
+    if (it != buf_ctx->split_state_cache.end()) {
+        ret = it->second.ss;
+    } else if (it_sync != buf_ctx->split_state_cache.end()) {
+        ret = it_sync->second.ss;
+    } else {
         ggml_backend_meta_warm_split_state_srcs(stc, tensor);
-        buf_ctx->split_state_cache[key].first = calculate_split_state();
-        memcpy(buf_ctx->split_state_cache[key].second, tensor, sizeof(buf_ctx->split_state_cache[key].second));
+        ret = calculate_split_state();
+        auto & entry = buf_ctx->split_state_cache[key];
+        entry.ss             = ret;
+        entry.sync_dependent = sync_dependent;
+        memcpy(entry.tensor_bytes, tensor, sizeof(entry.tensor_bytes));
         if (buf_ctx->debug > 0) {
             std::string srcs_info;
             for (size_t i = 0; i < GGML_MAX_SRC; i++) {
@@ -1943,15 +1980,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 if (!ne_info.empty()) {
                     ne_info += ", ";
                 }
-                const ggml_backend_meta_split_state & ss = buf_ctx->split_state_cache[key].first;
-                ne_info += std::to_string(ss.ne[j]) + "x" + std::to_string(ss.nr[0]);
+                ne_info += std::to_string(ret.ne[j]) + "x" + std::to_string(ret.nr[0]);
             }
             GGML_LOG_DEBUG("SPLIT_STATE: {%s} -> %s[%s, %s, {%s}]\n", srcs_info.c_str(), tensor->name, ggml_op_name(tensor->op),
-                ggml_backend_meta_split_axis_name(buf_ctx->split_state_cache[key].first.axis), ne_info.c_str());
+                ggml_backend_meta_split_axis_name(ret.axis), ne_info.c_str());
         }
     }
 
-    ggml_backend_meta_split_state ret = buf_ctx->split_state_cache[key].first;
     GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_NONE);
 #ifndef NDEBUG
     if (ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
@@ -2228,7 +2263,8 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
         const std::vector<ggml_tensor *> & fresh = scratch.simple_tensors.at(tensor);
         std::vector<ggml_tensor *> & stable = buf_ctx->stc_views.simple_tensors[tensor];
         // a new view cannot be in any cached decomposition yet, but a new tensor at the address of a dead one
-        //   can meet that one's decomposition again, so both it and a changed view invalidate them
+        //   can meet that one's decomposition again, so both it and a changed view invalidate the decompositions
+        //   that read the view
         bool changed = stable.empty();
         for (size_t j = 0; j < fresh.size(); j++) {
             if (stable.size() <= j) {
@@ -2247,7 +2283,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
         }
         scratch.simple_tensors.clear();
         if (changed) {
-            buf_ctx->mirror_gen++;
+            buf_ctx->view_gens[tensor] = ++buf_ctx->view_clock;
         }
         return status;
     }
@@ -3082,6 +3118,10 @@ struct ggml_backend_meta_context {
         uint64_t uid        = 0;  // the split graph this was built for, 0 = empty
         // the meta buffers this entry mirrors, each with its mirror_gen when it was built
         std::vector<std::pair<ggml_backend_meta_buffer_context *, uint64_t>> used_bufs;
+        // the view_clock of each used buffer when the views below were last found unchanged, and the views of
+        //   persistent buffers this entry reads with their generations
+        std::vector<uint64_t>                              used_view_clocks;
+        std::vector<std::pair<const uint64_t *, uint64_t>> used_views;
         uint64_t used       = 0;  // for LRU eviction
         // what this entry was sized for, so a recycled one knows to grow
         int      sized_nnodes    = 0;
@@ -4175,11 +4215,27 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (d->uid != cgraph->uid) {
                 continue;
             }
-            bool mirrors_ok = true;
-            for (const auto & ub : d->used_bufs) {
+            bool mirrors_ok  = true;
+            bool views_moved = false;
+            for (size_t k = 0; k < d->used_bufs.size(); k++) {
+                const auto & ub = d->used_bufs[k];
                 if (ub.first->mirror_gen != ub.second) {
                     mirrors_ok = false;
                     break;
+                }
+                views_moved = views_moved || ub.first->view_clock != d->used_view_clocks[k];
+            }
+            if (mirrors_ok && views_moved) {
+                for (const auto & uv : d->used_views) {
+                    if (*uv.first != uv.second) {
+                        mirrors_ok = false;
+                        break;
+                    }
+                }
+                if (mirrors_ok) {
+                    for (size_t k = 0; k < d->used_bufs.size(); k++) {
+                        d->used_view_clocks[k] = d->used_bufs[k].first->view_clock;
+                    }
                 }
             }
             if (mirrors_ok) {
@@ -4545,8 +4601,26 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         backend_ctx->uid         = cgraph->uid;
         D->uid         = cgraph->uid;
         // only now that every mirror exists is the generation the one this entry matches
+        D->used_view_clocks.clear();
         for (auto & ub : D->used_bufs) {
             ub.second = ub.first->mirror_gen;
+            D->used_view_clocks.push_back(ub.first->view_clock);
+        }
+        D->used_views.clear();
+        for (int pass = 0; pass < 2; pass++) {
+            ggml_tensor ** ts = pass == 0 ? cgraph->leafs   : cgraph->nodes;
+            const int      n  = pass == 0 ? cgraph->n_leafs : cgraph->n_nodes;
+            for (int i = 0; i < n; i++) {
+                const ggml_tensor * t = ts[i];
+                if (t->view_src == nullptr || !ggml_backend_buffer_is_meta(t->buffer)) {
+                    continue;
+                }
+                const ggml_backend_meta_buffer_context * buf_ctx = (const ggml_backend_meta_buffer_context *) t->buffer->context;
+                const auto it = buf_ctx->view_gens.find(t);
+                if (it != buf_ctx->view_gens.end()) {
+                    D->used_views.emplace_back(&it->second, it->second);
+                }
+            }
         }
         D->n_subgraphs = n_subgraphs;
 
