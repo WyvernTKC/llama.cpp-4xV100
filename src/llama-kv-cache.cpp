@@ -1284,12 +1284,19 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
-uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) const {
     uint32_t result = 0;
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    // A ubatch of a few tokens (a generation step, a draft, the tail of a prompt) pads 4x coarser: each time n_kv moves
+    //   on, its graph is built and captured again, ~40-60 ms under -sm tensor, which outweighs reading the padding
+    //   (2048 tokens: Ornith +2.4%, gemma-4-31B even). LLAMA_KV_PAD_SMALL sets it, 256 pads every ubatch alike.
+    static const uint32_t n_pad_small = [] {
+        const char * env = getenv("LLAMA_KV_PAD_SMALL");
+        return env != nullptr ? std::max(256u, (uint32_t) atoi(env)) : 1024u;
+    }();
+    const uint32_t n_pad_cur = std::max(n_pad, n_tokens > 0 && n_tokens <= 8 ? n_pad_small : 256u);
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
@@ -2950,7 +2957,7 @@ bool llama_kv_cache_context::apply() {
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
-    n_kv = kv->get_n_kv(sinfos[i_cur]);
+    n_kv = kv->get_n_kv(sinfos[i_cur], ubatches[i_cur].n_tokens);
 
     return true;
 }
