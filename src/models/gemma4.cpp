@@ -245,6 +245,9 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                 Vcur = model.layers[il].wv
                        ? build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s)
                        : Kcur; // if v_proj is not present, use Kcur as Vcur
+                // expanded together: at one token a backend can run the two projections in one launch
+                ggml_build_forward_expand(gf, Kcur);
+                ggml_build_forward_expand(gf, Vcur);
             }
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
