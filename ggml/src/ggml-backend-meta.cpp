@@ -722,6 +722,15 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
     return it->second[index];
 }
 
+// all per-device tensors of a tensor at once, nullptr if it has none yet
+static const std::vector<ggml_tensor *> * ggml_backend_meta_buffer_simple_tensors(const struct ggml_tensor * tensor) {
+    GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
+    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
+    ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(tensor);
+    auto it = stc.simple_tensors.find(tensor);
+    return it == stc.simple_tensors.end() ? nullptr : &it->second;
+}
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
 
 // Expert cache in device memory (GGML_META_EXPERT_CACHE_DEVICE=1 with GGML_META_EXPERT_CACHE=<cap>). A MoE
@@ -1621,10 +1630,22 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             return ret;
         }
 
-        std::vector<ggml_backend_meta_split_state> src_ss(GGML_MAX_SRC, {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1});
+        // A split state is ~2 kiB: a vector of them allocated and filled for every node of a new graph was most of
+        //   the cost of deriving its split. One per depth of the recursion, every entry is written below.
+        thread_local std::vector<std::unique_ptr<std::vector<ggml_backend_meta_split_state>>> src_ss_pool;
+        thread_local size_t src_ss_depth = 0;
+        if (src_ss_pool.size() <= src_ss_depth) {
+            src_ss_pool.emplace_back(new std::vector<ggml_backend_meta_split_state>(GGML_MAX_SRC));
+        }
+        std::vector<ggml_backend_meta_split_state> & src_ss = *src_ss_pool[src_ss_depth];
+        struct depth_guard {
+            size_t & depth;
+            ~depth_guard() { depth--; }
+        } src_ss_guard = {++src_ss_depth};
+        static const ggml_backend_meta_split_state ss_unknown = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
         for (size_t i = 0; i < GGML_MAX_SRC; i++) {
             if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
-                src_ss[i] = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+                src_ss[i] = ss_unknown;
                 continue;
             }
             // a MoE weight in host memory that the device-side expert cache reads: split as the model says
@@ -2050,6 +2071,19 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         nb[k] = tensor->nb[k];
     }
 
+    // the per-device tensors of the view source and of the srcs, and the split of the view source, looked up once
+    const bool view_src_is_meta = tensor->view_src != nullptr && ggml_backend_buffer_is_meta(tensor->view_src->buffer);
+    const std::vector<ggml_tensor *> * view_src_simple = view_src_is_meta ?
+        ggml_backend_meta_buffer_simple_tensors(tensor->view_src) : nullptr;
+    const int split_dim_view_src = view_src_is_meta && tensor->view_offs > 0 && split_dim >= 0 && split_dim < GGML_MAX_DIMS ?
+        ggml_backend_meta_get_split_state(tensor->view_src, /*assume_sync =*/ true).axis : GGML_BACKEND_SPLIT_AXIS_UNKNOWN;
+    const std::vector<ggml_tensor *> * src_simple[GGML_MAX_SRC] = {};
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (tensor->src[i] != nullptr && tensor->src[i] != tensor && ggml_backend_buffer_is_meta(tensor->src[i]->buffer)) {
+            src_simple[i] = ggml_backend_meta_buffer_simple_tensors(tensor->src[i]);
+        }
+    }
+
     std::vector<ggml_tensor *> simple_tensors;
     simple_tensors.reserve(n_simple_bufs);
     for (size_t j = 0; j < n_simple_bufs; j++) {
@@ -2086,11 +2120,10 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         t_ij->buffer = simple_buf;
         t_ij->view_src = tensor->view_src;
         t_ij->view_offs = tensor->view_offs;
-        if (t_ij->view_src != nullptr && ggml_backend_buffer_is_meta(t_ij->view_src->buffer)) {
-            t_ij->view_src = ggml_backend_meta_buffer_simple_tensor(tensor->view_src, j);
+        if (view_src_is_meta) {
+            t_ij->view_src = view_src_simple != nullptr ? (*view_src_simple)[j] : nullptr;
             if (t_ij->view_offs > 0 && split_dim >= 0 && split_dim < GGML_MAX_DIMS) {
                 GGML_ASSERT(tensor->ne[split_dim] != 0);
-                const int split_dim_view_src = ggml_backend_meta_get_split_state(tensor->view_src, /*assume_sync =*/ true).axis;
                 if (split_dim_view_src < 0 || split_dim_view_src >= GGML_MAX_DIMS) {
                     GGML_ABORT("%s is split along dim %d but its view source %s is not split (axis %d)",
                         tensor->name, split_dim, tensor->view_src->name, split_dim_view_src);
@@ -2136,8 +2169,10 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             t_ij->src[i] = tensor->src[i];
             if (tensor->src[i] == tensor) {
                 t_ij->src[i] = t_ij;
+            } else if (src_simple[i] != nullptr) {
+                t_ij->src[i] = (*src_simple[i])[j];
             } else if (t_ij->src[i] != nullptr && ggml_backend_buffer_is_meta(t_ij->src[i]->buffer)) {
-                t_ij->src[i] = ggml_backend_meta_buffer_simple_tensor(tensor->src[i], j);
+                t_ij->src[i] = nullptr; // no per-device tensors yet, as ggml_backend_meta_buffer_simple_tensor says
             }
         }
 
@@ -4350,20 +4385,22 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
 
-        for (size_t j = 0; j < n_backends; j++) {
-            auto & bcj = backend_ctx->backend_configs[j];
-
-            for (int i = 0; i < cgraph->n_nodes; i++) {
-                ggml_tensor * node = cgraph->nodes[i];
-                if (ggml_backend_meta_view_src_is_host(node)) {
-                    // Views of host-resident data end up in this graph even though the meta backend has
-                    //   nothing to do with them (s_copy_main, and the reshape of an embedding lookup that
-                    //   was scheduled on the CPU). They carry no computation, so pass them through as they
-                    //   are - asking for their per-device tensors would crash, they have none.
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            ggml_tensor * node = cgraph->nodes[i];
+            if (ggml_backend_meta_view_src_is_host(node)) {
+                // Views of host-resident data end up in this graph even though the meta backend has
+                //   nothing to do with them (s_copy_main, and the reshape of an embedding lookup that
+                //   was scheduled on the CPU). They carry no computation, so pass them through as they
+                //   are - asking for their per-device tensors would crash, they have none.
+                for (size_t j = 0; j < n_backends; j++) {
                     D->graphs[j].nodes[i] = node;
-                    continue;
                 }
-                D->graphs[j].nodes[i] = ggml_backend_meta_buffer_simple_tensor(node, j);
+                continue;
+            }
+            const std::vector<ggml_tensor *> * simple = ggml_backend_meta_buffer_simple_tensors(node);
+            GGML_ASSERT(simple != nullptr && simple->size() >= n_backends);
+            for (size_t j = 0; j < n_backends; j++) {
+                D->graphs[j].nodes[i] = (*simple)[j];
                 GGML_ASSERT(D->graphs[j].nodes[i]);
             }
         }
