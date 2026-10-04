@@ -401,7 +401,9 @@ extern "C" {
     // Meta backend
     //
 
-#define GGML_BACKEND_META_MAX_DEVICES 16
+// a split state holds 16 segments x this many devices; it is copied for every node of a new graph, so 8 instead of 16
+//   halves ~2 kiB copies (a new Ornith graph -1.7 ms of host time)
+#define GGML_BACKEND_META_MAX_DEVICES 8
 
     enum ggml_backend_meta_split_axis {
         // tensor split by tensor dimensions:
