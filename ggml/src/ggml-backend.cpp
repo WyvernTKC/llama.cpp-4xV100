@@ -1935,7 +1935,8 @@ static int ggml_backend_sched_expert_cache_cap() {
     // GGML_META_PARTIAL_COPY. Setting the cache alone still forces the unconditional MoE offload
     // (ggml_backend_meta_moe_offload_always), so a whole layer of experts moves per ubatch and the
     // cache never gets used - measured 30x slower than leaving both off.
-    if (cap > 0 && !getenv("GGML_META_PARTIAL_COPY")) {
+    static const bool partial_copy = getenv("GGML_META_PARTIAL_COPY") != nullptr;
+    if (cap > 0 && !partial_copy) {
         static bool warned = false;
         if (!warned) {
             warned = true;
@@ -2060,7 +2061,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // GGML_META_MMID_DEBUG=1: where each MUL_MAT_ID landed and what the offload decision saw. The
     // scheduler only moves a host weight to a GPU when op_offload is set and that backend answers yes
     // to both supports_op and offload_op - see ggml_backend_sched_backend_id_from_cur.
-    if (getenv("GGML_META_MMID_DEBUG")) {
+    static const bool mmid_debug = getenv("GGML_META_MMID_DEBUG") != nullptr;
+    if (mmid_debug) {
         static bool mmid_shown = false;
         if (!mmid_shown) {
             mmid_shown = true;
@@ -2216,7 +2218,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 // GGML_META_PARTIAL_DEBUG=1: say why a host-resident weight did or did not take the
                 // used-experts-only path, once per weight.
-                if (getenv("GGML_META_PARTIAL_DEBUG") &&
+                static const bool partial_debug = getenv("GGML_META_PARTIAL_DEBUG") != nullptr;
+                if (partial_debug &&
                         ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                     static std::unordered_map<std::string, bool> seen;
                     if (seen.emplace(input->name, true).second) {

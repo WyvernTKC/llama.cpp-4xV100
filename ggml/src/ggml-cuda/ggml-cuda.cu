@@ -1863,21 +1863,32 @@ static ggml_type ggml_cuda_mul_mat_cublas_compute_type(const int cc, const ggml_
         compute_type = GGML_TYPE_F32;
     }
 
-    const char * env_c = getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
-    if (env_c != nullptr) {
+    // read once: a getenv takes a lock and scans the environment, and this runs for every cuBLAS matmul
+    static const ggml_type env_type = [] {
+        const char * env_c = getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
+        if (env_c == nullptr) {
+            return GGML_TYPE_COUNT;
+        }
         std::string env_cpp = env_c;
         for (char & c : env_cpp) {
             c = std::tolower(c);
         }
         if (env_cpp == "f32" || env_cpp == "fp32") {
-            compute_type = GGML_TYPE_F32;
-        } else if (env_cpp == "f16" || env_cpp == "fp16") {
-            compute_type = GGML_TYPE_F16;
-        } else if (env_cpp == "bf16") {
-            compute_type = GGML_TYPE_BF16;
-        } else if (env_cpp != "auto") {
+            return GGML_TYPE_F32;
+        }
+        if (env_cpp == "f16" || env_cpp == "fp16") {
+            return GGML_TYPE_F16;
+        }
+        if (env_cpp == "bf16") {
+            return GGML_TYPE_BF16;
+        }
+        if (env_cpp != "auto") {
             GGML_LOG_WARN("%s: unknown value for GGML_CUDA_CUBLAS_COMPUTE_TYPE: %s", __func__, env_cpp.c_str());
         }
+        return GGML_TYPE_COUNT;
+    }();
+    if (env_type != GGML_TYPE_COUNT) {
+        compute_type = env_type;
     }
     return compute_type;
 }
@@ -2881,6 +2892,7 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
+    int  cc             = -1; // looked up at the first MUL_MAT_ID: cudaGetDevice is not free
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -2892,7 +2904,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
-            const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+            if (cc < 0) {
+                cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+            }
             if (ggml_cuda_mul_mat_id_needs_sync(node, cc)) {
                 // the mul_mat_id fallback path synchronizes the stream, so we cannot use CUDA graphs
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
@@ -2923,7 +2937,6 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
     if (cgraph->uid != 0 &&
         cgraph->uid == graph->uid) {
-        GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
         GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
         return false;
     }
@@ -6158,7 +6171,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // ... and the qkv and z projections right after them, of the same input (qwen35 builds them in this order): one mmvq
     //   launch, the qkv rows, z's after them, then alpha's with beta and the gate epilogue. Each row sums as in its own
     //   launch. GGML_CUDA_NO_SIBLING_ROWS=1 runs them apart.
-    if (gdn_gate_mul_mat_vec == ggml_cuda_mul_mat_vec_q && getenv("GGML_CUDA_NO_SIBLING_ROWS") == nullptr) {
+    static const bool no_sibling_rows = getenv("GGML_CUDA_NO_SIBLING_ROWS") != nullptr;
+    if (gdn_gate_mul_mat_vec == ggml_cuda_mul_mat_vec_q && !no_sibling_rows) {
         int j = i + 9;
         while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
             j++;
