@@ -219,11 +219,14 @@ static __device__ __forceinline__ float2 ggml_cuda_p2p_ar_unpack2(const uint32_t
 }
 
 // This rank's float4 i, v, to the LL lines of every rank, and the sum of all ranks' in rank order, as the kernels
-//   above: one line {d0, flag, d1, flag} per two values, or with payload one line per four
+//   above: one line {d0, flag, d1, flag} per two values, or with payload one line per four. The k-th lines of the 32
+//   float4s of a warp are next to each other (32 lines apart from its other ones), so that every store of a warp is
+//   512 contiguous bytes, which cross the link to a peer in large packets.
 template <int n_devs, int payload>
 static __device__ __forceinline__ float4 ggml_cuda_p2p_ar_ll_exchange(const ggml_cuda_p2p_ar_args & a, const float4 v,
         const int64_t i, const uint32_t flag, const int64_t slot_base) {
     constexpr int nl = payload == 0 ? 2 : 1; // lines per float4
+    const int64_t line0 = (i & ~(int64_t) (WARP_SIZE - 1))*nl + (i & (WARP_SIZE - 1)); // its line k is line0 + k*32
     uint4 l[nl];
     if constexpr (payload == 0) {
         l[0] = make_uint4(__float_as_uint(v.x), flag, __float_as_uint(v.y), flag);
@@ -233,20 +236,20 @@ static __device__ __forceinline__ float4 ggml_cuda_p2p_ar_ll_exchange(const ggml
     }
 #pragma unroll
     for (int j = 0; j < n_devs; ++j) {
-        uint4 * dst = a.ll[j] + slot_base + (int64_t) a.rank * a.ll_stride + nl*i;
+        uint4 * dst = a.ll[j] + slot_base + (int64_t) a.rank * a.ll_stride + line0;
 #pragma unroll
         for (int k = 0; k < nl; ++k) {
-            ggml_cuda_p2p_ar_st_ll(dst + k, l[k]);
+            ggml_cuda_p2p_ar_st_ll(dst + k*WARP_SIZE, l[k]);
         }
     }
 
-    const uint4 * src = a.ll[a.rank] + slot_base + nl*i;
+    const uint4 * src = a.ll[a.rank] + slot_base + line0;
     uint4 r[n_devs][nl];
 #pragma unroll
     for (int j = 0; j < n_devs; ++j) {
 #pragma unroll
         for (int k = 0; k < nl; ++k) {
-            r[j][k] = ggml_cuda_p2p_ar_ld_ll(src + (int64_t) j * a.ll_stride + k);
+            r[j][k] = ggml_cuda_p2p_ar_ld_ll(src + (int64_t) j * a.ll_stride + k*WARP_SIZE);
         }
     }
     bool done;
@@ -257,7 +260,7 @@ static __device__ __forceinline__ float4 ggml_cuda_p2p_ar_ll_exchange(const ggml
 #pragma unroll
             for (int k = 0; k < nl; ++k) {
                 if (r[j][k].y != flag || r[j][k].w != flag) {
-                    r[j][k] = ggml_cuda_p2p_ar_ld_ll(src + (int64_t) j * a.ll_stride + k);
+                    r[j][k] = ggml_cuda_p2p_ar_ld_ll(src + (int64_t) j * a.ll_stride + k*WARP_SIZE);
                     done = false;
                 }
             }
@@ -425,13 +428,14 @@ ggml_cuda_p2p_ar * ggml_cuda_p2p_ar_init(const int * devices, size_t n_devices) 
     ar->max_bytes    = max_bytes;
     ar->ll_max_bytes = ll_max_bytes;
     ar->stage_stride = (int64_t) (max_bytes / sizeof(float4));
-    ar->ll_stride    = (int64_t) (2 * ll_max_bytes / sizeof(uint4));
+    // whole warps of lines, see ggml_cuda_p2p_ar_ll_exchange
+    ar->ll_stride    = (int64_t) (2 * GGML_PAD(ll_max_bytes, WARP_SIZE*sizeof(float4)) / sizeof(uint4));
     ar->nblocks      = nblocks;
 
     const size_t stage_bytes = (size_t) GGML_CUDA_P2P_AR_NSLOTS * n_devices * max_bytes;
     const size_t flag_bytes  = (size_t) GGML_CUDA_P2P_AR_NSLOTS * n_devices *
                                ar->nblocks * sizeof(unsigned long long);
-    const size_t ll_bytes    = (size_t) GGML_CUDA_P2P_AR_NSLOTS * n_devices * 2 * ll_max_bytes;
+    const size_t ll_bytes    = (size_t) GGML_CUDA_P2P_AR_NSLOTS * n_devices * 2 * GGML_PAD(ll_max_bytes, WARP_SIZE*sizeof(float4));
     const size_t ll_seq_bytes = (ll_max_bytes/sizeof(float4) + GGML_CUDA_P2P_AR_LL_NTHREADS - 1) / GGML_CUDA_P2P_AR_LL_NTHREADS * sizeof(unsigned int);
 
     for (size_t i = 0; i < n_devices; ++i) {
