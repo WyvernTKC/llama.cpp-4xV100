@@ -2980,8 +2980,50 @@ struct test_rms_norm_mul_rope : public test_case {
     }
 };
 
+// The attention output gate of qwen35 and the output projection: the gate, the second half of each head of the Q
+//   projection, made contiguous, its sigmoid times the attention output, read by an MMVQ matmul (at one token the
+//   gate kernel writes the q8_1 copy of its output)
+struct test_attn_gate_mul_mat : public test_case {
+    const int64_t hs;
+    const int64_t nh;
+    const int64_t nb;
+    const ggml_type type_w;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ATTN_GATE_MUL_MAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(hs, nh, nb, type_w);
+    }
+
+    test_attn_gate_mul_mat(int64_t hs = 256, int64_t nh = 4, int64_t nb = 1, ggml_type type_w = GGML_TYPE_Q8_0)
+        : hs(hs), nh(nh), nb(nb), type_w(type_w) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * qf   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*hs, nh, nb);
+        ggml_tensor * attn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hs*nh, nb);
+        ggml_tensor * wo   = ggml_new_tensor_2d(ctx, type_w, hs*nh, 512);
+
+        ggml_tensor * gate = ggml_view_3d(ctx, qf, hs, nh, nb, qf->nb[1], qf->nb[2], hs*ggml_element_size(qf));
+        gate = ggml_cont_2d(ctx, gate, hs*nh, nb);
+        ggml_tensor * cur = ggml_mul(ctx, attn, ggml_sigmoid(ctx, gate));
+        ggml_tensor * out = ggml_mul_mat(ctx, wo, cur);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // The norms and ropes of the Q, K and V of an attention layer, adjacent as gemma4 and qwen35 build them: the Q rms_norm,
-//   mul and rope; the K the same into a cache; the V a plain rms_norm into a cache (gemma4) or none (qwen35)
+//   mul and rope; the K the same into a cache; the V a plain rms_norm into a cache (gemma4) or, with v_store, stored as
+//   it is between the Q and the K (qwen35)
 struct test_qkv_norm_rope : public test_case {
     const int64_t hs;
     const int64_t nh_q;
@@ -2992,6 +3034,7 @@ struct test_qkv_norm_rope : public test_case {
     const bool ff;
     const bool with_v;
     const ggml_type type_cache;
+    const bool v_store;
 
     ggml_tensor * q_out = nullptr;
     ggml_tensor * k_out = nullptr;
@@ -3017,14 +3060,18 @@ struct test_qkv_norm_rope : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR9(hs, nh_q, nh_kv, nb, rope_mode, n_dims, ff, with_v, type_cache);
+        std::string res = VARS_TO_STR9(hs, nh_q, nh_kv, nb, rope_mode, n_dims, ff, with_v, type_cache);
+        if (v_store) {
+            res += "," + VARS_TO_STR1(v_store);
+        }
+        return res;
     }
 
     test_qkv_norm_rope(int64_t hs = 256, int64_t nh_q = 8, int64_t nh_kv = 4, int64_t nb = 1,
             int rope_mode = GGML_ROPE_TYPE_NEOX, int n_dims = 256, bool ff = false, bool with_v = true,
-            ggml_type type_cache = GGML_TYPE_F16)
+            ggml_type type_cache = GGML_TYPE_F16, bool v_store = false)
         : hs(hs), nh_q(nh_q), nh_kv(nh_kv), nb(nb), rope_mode(rope_mode), n_dims(n_dims), ff(ff), with_v(with_v),
-          type_cache(type_cache) {}
+          type_cache(type_cache), v_store(v_store) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const bool is_mrope = rope_mode & GGML_ROPE_TYPE_MROPE;
@@ -3058,7 +3105,7 @@ struct test_qkv_norm_rope : public test_case {
 
         if (with_v) {
             ggml_tensor * v  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, nh_kv, nb);
-            ggml_tensor * vn = ggml_rms_norm(ctx, v, 1e-6f);
+            ggml_tensor * vn = v_store ? v : ggml_rms_norm(ctx, v, 1e-6f);
             ggml_tensor * vc = ggml_new_tensor_2d(ctx, type_cache, hs*nh_kv, 2*nb);
             ggml_tensor * vi = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, nb);
             v_out = ggml_set_rows(ctx, vc, ggml_view_2d(ctx, vn, hs*nh_kv, nb, vn->nb[2], 0), vi);
@@ -3067,6 +3114,9 @@ struct test_qkv_norm_rope : public test_case {
 
         if (mode == MODE_TEST) {
             ggml_build_forward_expand(gf, q_out);
+            if (v_store && v_out != nullptr) {
+                ggml_build_forward_expand(gf, v_out);
+            }
             ggml_build_forward_expand(gf, k_out);
             if (v_out != nullptr) {
                 ggml_build_forward_expand(gf, v_out);
@@ -11742,6 +11792,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_qkv_norm_rope(256, 6, 1, nb, GGML_ROPE_TYPE_IMROPE,  64, false, false, GGML_TYPE_F16));
         test_cases.emplace_back(new test_qkv_norm_rope(128, 8, 2, nb, GGML_ROPE_TYPE_NORMAL, 128, false, true,  GGML_TYPE_F32));
         test_cases.emplace_back(new test_qkv_norm_rope(128, 8, 2, nb, GGML_ROPE_TYPE_NORMAL, 128, false, true,  GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_qkv_norm_rope(256, 6, 2, nb, GGML_ROPE_TYPE_IMROPE,  64, false, true,  GGML_TYPE_F16, true));
+        test_cases.emplace_back(new test_qkv_norm_rope(256, 6, 4, nb, GGML_ROPE_TYPE_IMROPE,  64, false, true,  GGML_TYPE_F16, true));
+    }
+    // the qwen35 attention gate writes the q8_1 copy of its output for the output projection: rows of 1024 and of 1536,
+    //   which needs padding
+    for (int64_t nb : { 1, 2 }) {
+        for (int64_t nh : { 4, 6 }) {
+            test_cases.emplace_back(new test_attn_gate_mul_mat(256, nh, nb, GGML_TYPE_Q8_0));
+            test_cases.emplace_back(new test_attn_gate_mul_mat(256, nh, nb, GGML_TYPE_Q4_K));
+        }
     }
     // one token runs both in one launch
     for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K }) {

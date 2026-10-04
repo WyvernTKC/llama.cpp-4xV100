@@ -1038,9 +1038,10 @@ static void rms_norm_mul_rope_fused_impl(ggml_backend_cuda_context & ctx,
         ggml_tensor * rms_norm, ggml_tensor * mul, ggml_tensor * rope, ggml_tensor * set_rows,
         ggml_tensor * rot, const ggml_tensor * rows, rms_norm_rope_seg * seg) {
     GGML_ASSERT(rms_norm != nullptr || mul == nullptr);
-    GGML_ASSERT(rms_norm != nullptr || rope != nullptr || rot != nullptr);
+    // a segment may also be a SET_ROWS alone of its rows
+    GGML_ASSERT(rms_norm != nullptr || rope != nullptr || rot != nullptr || (seg != nullptr && set_rows != nullptr && rows != nullptr));
 
-    const ggml_tensor * x = rms_norm ? rms_norm->src[0] : rope ? rope->src[0] : rot->src[1];
+    const ggml_tensor * x = rms_norm ? rms_norm->src[0] : rope ? rope->src[0] : rot ? rot->src[1] : rows;
     // mul is null for a plain rms_norm straight into the rope
     const ggml_tensor * mul_src = mul == nullptr ? nullptr : mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
 
@@ -1247,7 +1248,10 @@ bool ggml_cuda_op_rms_norm_mul_rope_multi(ggml_backend_cuda_context & ctx, ggml_
     GGML_ASSERT(n == 2 || n == 3);
     rms_norm_rope_seg segs[3] = {};
     for (int s = 0; s < n; ++s) {
-        rms_norm_mul_rope_fused_impl(ctx, nodes[s][0], nodes[s][1], nodes[s][2], nodes[s][3], nullptr, nullptr, &segs[s]);
+        // a SET_ROWS alone stores its rows as they are
+        const bool store = nodes[s][0] == nullptr && nodes[s][2] == nullptr;
+        rms_norm_mul_rope_fused_impl(ctx, nodes[s][0], nodes[s][1], nodes[s][2], nodes[s][3], nullptr,
+            store ? nodes[s][3]->src[0] : nullptr, &segs[s]);
         if (segs[s].nrows == 0) {
             return false;
         }

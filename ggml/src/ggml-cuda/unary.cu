@@ -259,13 +259,21 @@ void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 /* gated ops */
 
-// f16_copy also writes the output as f16 to dst_f16, the input a cuBLAS matmul after it would convert
-template <float (*op)(float), typename T, bool f16_copy = false>
-static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, half * dst_f16, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1) {
+// f16_copy also writes the output as f16 to dst_f16, the input a cuBLAS matmul after it would convert; q8_copy the q8_1
+//   copy of one row (k a multiple of 32) to q8 for an MMVQ matmul, with zero blocks up to k_padded
+template <float (*op)(float), typename T, bool f16_copy = false, bool q8_copy = false>
+static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, half * dst_f16, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1,
+        block_q8_1 * q8, const int64_t k_padded) {
     ggml_cuda_pdl_lc();
     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
 
     if (i >= k) {
+        if constexpr (q8_copy) {
+            // whole warps, k being a multiple of 32
+            if (i < k_padded) {
+                quantize_q8_1_lane(0.0f, q8 + i/QK8_1, i % QK8_1);
+            }
+        }
         return;
     }
 
@@ -279,6 +287,9 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, 
     if constexpr (f16_copy) {
         dst_f16[i] = ggml_cuda_cast<half>(v);
     }
+    if constexpr (q8_copy) {
+        quantize_q8_1_lane((float) v, q8 + i/QK8_1, i % QK8_1);
+    }
 }
 
 template <float (*op)(float), typename T>
@@ -287,12 +298,12 @@ static void unary_gated_cuda(const T * x, const T * g, T * dst, half * dst_f16, 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
     if constexpr (std::is_same_v<T, float>) {
         if (dst_f16 != nullptr) {
-            ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T, true>, launch_params, x, g, dst, dst_f16, k, n, o0, o1);
+            ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T, true>, launch_params, x, g, dst, dst_f16, k, n, o0, o1, nullptr, 0);
             return;
         }
     }
     GGML_ASSERT(dst_f16 == nullptr);
-    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, dst_f16, k, n, o0, o1);
+    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, dst_f16, k, n, o0, o1, nullptr, 0);
 }
 
 template <float (*op)(float)>
@@ -774,6 +785,20 @@ void ggml_cuda_op_cont_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const float * x  = (const float *) v->data;
     const float * g  = (const float *) other->data;
     float *       d  = (float *) mul->data;
+
+    // one token: the q8_1 copy of the output for the MMVQ matmul that reads it, see ggml_cuda_q8_1_request
+    if (ggml_nrows(mul) == 1 && k % QK8_1 == 0 && ggml_get_unary_op(unary) == GGML_UNARY_OP_SIGMOID) {
+        int64_t ne_padded = 0;
+        block_q8_1 * q8 = (block_q8_1 *) ctx.q8_1_emit_alloc(mul, ne_padded);
+        if (q8 != nullptr) {
+            const int64_t num_blocks = (ne_padded + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, ctx.stream());
+            ggml_cuda_kernel_launch(unary_gated_op_kernel<op_sigmoid, float, false, true>, launch_params,
+                x, g, d, nullptr, k, nc, o0, nc, q8, ne_padded);
+            return;
+        }
+    }
+
     switch (ggml_get_unary_op(unary)) {
         case GGML_UNARY_OP_SILU:
             unary_gated_cuda<op_silu>(x, g, d, nullptr, k, nc, o0, nc, ctx.stream());

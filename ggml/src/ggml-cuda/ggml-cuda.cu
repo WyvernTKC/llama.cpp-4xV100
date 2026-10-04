@@ -6011,7 +6011,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // the norms (and ropes) of the Q, K and V of one token, two or three of the fusions below with only views between
-    //   them: one launch
+    //   them, or after the first the plain SET_ROWS of a V into its cache: one launch
     if (node->op == GGML_OP_RMS_NORM) {
         static const bool no_norm_rope_multi = getenv("GGML_CUDA_NO_NORM_ROPE_MULTI") != nullptr;
         // the fusion at j as { rms_norm, mul, rope, set_rows } and its last node, else -1
@@ -6042,8 +6042,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_tensor * segs[3][4];
         int n_segs = 0;
         int last   = -1;
-        for (int j = i; !no_norm_rope_multi && n_segs < 3 && j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_RMS_NORM; ) {
-            const int end = match(j, segs[n_segs]);
+        for (int j = i; !no_norm_rope_multi && n_segs < 3 && j < cgraph->n_nodes; ) {
+            ggml_tensor * n = cgraph->nodes[j];
+            int end = -1;
+            if (n->op == GGML_OP_RMS_NORM) {
+                end = match(j, segs[n_segs]);
+            } else if (n_segs > 0 && n->op == GGML_OP_SET_ROWS && (n->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                    n->src[0]->type == GGML_TYPE_F32 && ggml_nrows(n->src[0]) == 1) {
+                segs[n_segs][0] = nullptr;
+                segs[n_segs][1] = nullptr;
+                segs[n_segs][2] = nullptr;
+                segs[n_segs][3] = n;
+                end = j;
+            }
             if (end < 0) {
                 break;
             }
@@ -6058,10 +6069,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const auto out = [&](const int s) {
             return segs[s][3] ? segs[s][3] : segs[s][2] ? segs[s][2] : segs[s][1] ? segs[s][1] : segs[s][0];
         };
+        const auto in = [&](const int s) {
+            return segs[s][0] ? segs[s][0]->src[0] : segs[s][3]->src[0];
+        };
         bool apart = true;
         for (int s = 0; s < n_segs; ++s) {
             for (int t = 0; t < n_segs; ++t) {
-                if (s != t && (ggml_cuda_tensors_overlap(out(s), segs[t][0]->src[0]) || ggml_cuda_tensors_overlap(out(s), out(t)))) {
+                if (s != t && (ggml_cuda_tensors_overlap(out(s), in(t)) || ggml_cuda_tensors_overlap(out(s), out(t)))) {
                     apart = false;
                 }
             }
@@ -6320,6 +6334,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int outputs[1] = { i + 2 };
         const enum ggml_op ops[3] = { GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL };
         if (ggml_can_fuse_subgraph(cgraph, i, 3, ops, outputs, 1)) {
+            // one token: the q8_1 copy of the output for the output projection
+            static const bool no_gate_q8_1 = getenv("GGML_CUDA_NO_GATE_Q8_1") != nullptr;
+            if (!no_gate_q8_1) {
+                ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + 2);
+            }
             ggml_cuda_op_cont_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
             return 2;
         }
