@@ -2967,6 +2967,9 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
     }
 
+    if (res) {
+        graph->props_gen++;
+    }
     return res;
 }
 
@@ -6614,6 +6617,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+            graph->captured_gen = graph->props_gen;
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -6714,8 +6718,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 // else: properties changed or first call - execute directly (use_cuda_graph stays false)
             } else {
                 // Post-warmup: normal CUDA graph operation
-                if (properties_changed) {
-                    // Properties changed - reset warmup, execute directly until stable again
+                if (properties_changed || graph->captured_gen != graph->props_gen) {
+                    // Properties changed, here or in a session since the capture - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
                     graph->warmup_stable   = 0;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
@@ -6771,12 +6775,15 @@ static int ggml_backend_cuda_session_plan(ggml_backend_t backend, ggml_cgraph **
         }
         if (graph_compatible) {
             bool properties_changed = (int) graph->session_keys.size() != n_cgraphs;
+            // a subgraph whose properties changed since the capture, here or computed alone, even if they match again
+            bool stale = (int) graph->session_gens.size() != n_cgraphs;
             graph->session_keys.resize(n_cgraphs);
             for (int i = 0; i < n_cgraphs; i++) {
                 const void * key_i = ggml_cuda_graph_get_key(cgraphs[i]);
                 properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraphs[i]) || graph->session_keys[i] != key_i ||
                     properties_changed;
                 graph->session_keys[i] = key_i;
+                stale = stale || graph->session_gens[i] != cuda_ctx->cuda_graph(key_i)->props_gen;
             }
 
             if (!graph->warmup_complete) {
@@ -6786,7 +6793,7 @@ static int ggml_backend_cuda_session_plan(ggml_backend_t backend, ggml_cgraph **
                     graph->warmup_complete = true;
                     mode = ggml_backend_cuda_context::SESSION_CAPTURE;
                 }
-            } else if (properties_changed) {
+            } else if (properties_changed || stale) {
                 graph->warmup_complete = false;
                 graph->warmup_stable   = 0;
             } else {
@@ -6876,6 +6883,10 @@ static void ggml_backend_cuda_session_end(ggml_backend_t backend) {
             if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
                 ggml_cuda_lock_cv.notify_all();
             }
+        }
+        graph->session_gens.resize(graph->session_keys.size());
+        for (size_t i = 0; i < graph->session_keys.size(); i++) {
+            graph->session_gens[i] = cuda_ctx->cuda_graph(graph->session_keys[i])->props_gen;
         }
         if (graph->instance == nullptr) {
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));

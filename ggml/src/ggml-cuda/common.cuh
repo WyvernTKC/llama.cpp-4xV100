@@ -1337,6 +1337,13 @@ struct ggml_cuda_graph {
     std::vector<node_properties> node_props;
     std::vector<const void *> session_keys; // a session graph: the keys of its subgraphs, see ggml_backend_cuda_session_plan
     int session_want  = 0;                  // and the mode the last plan asked for
+    // A subgraph's properties are checked both alone and as part of a session, and each path captures its own
+    //   instance. props_gen counts the changes of node_props: an instance is valid only for the generation it was
+    //   captured at (a session's for those of its subgraphs), so properties that another path changed and that match
+    //   again do not replay a capture of different tensors.
+    uint64_t props_gen    = 0;
+    uint64_t captured_gen = 0;
+    std::vector<uint64_t> session_gens;
     int warmup_stable = 0;                  // and how many plans in a row found its properties unchanged
 
     bool is_enabled() const {
