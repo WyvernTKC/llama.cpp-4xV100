@@ -1,6 +1,6 @@
 #include "common.cuh"
-#include "dsv4-hc.cuh"
 #include "unary.cuh"
+#include "dsv4-hc.cuh"
 
 
 static constexpr int DSV4_HC = 4;
@@ -184,18 +184,15 @@ static __global__ void dsv4_hc_post_f32(
     const int64_t idst = (ir / n_embd) % hc;
     const int64_t it   = ir / (n_embd * hc);
 
-    float p = post[idst*sp0 + it*sp1];
-    if constexpr (gated) {
-        // the SCALE -> SIGMOID -> SCALE that made the weights, in the order and form of those ops
-        p = ps_out * ggml_cuda_op_sigmoid_single(ps_in * p + pb_in) + pb_out;
-    }
-    float sum = x[i0*sx0 + it*sx1] * p;
+    const float p = dsv4_hc_post_weight<gated>(post[idst*sp0 + it*sp1], ps_in, pb_in, ps_out, pb_out);
+    float sum;
     if constexpr (has_comb) {
+        sum = x[i0*sx0 + it*sx1] * p;
         for (int64_t isrc = 0; isrc < hc; ++isrc) {
             sum += residual[i0*sr0 + isrc*sr1 + it*sr2] * comb[idst*sc0 + isrc*sc1 + it*sc2];
         }
     } else {
-        sum += residual[i0*sr0 + idst*sr1 + it*sr2];
+        sum = dsv4_hc_post_identity(x[i0*sx0 + it*sx1], p, residual[i0*sr0 + idst*sr1 + it*sr2]);
     }
 
     dst[i0*sd0 + idst*sd1 + it*sd2] = sum;

@@ -27,6 +27,12 @@ void ggml_cuda_op_rms_norm_pre_add_gated(ggml_backend_cuda_context & ctx, ggml_t
 //   next pre-norm of one row; y is the output of add or of scale
 bool ggml_cuda_should_fuse_rms_norm_add_rms_norm(const ggml_tensor * norm1, const ggml_tensor * mul1, const ggml_tensor * add,
                                                  const ggml_tensor * scale, const ggml_tensor * norm2, const ggml_tensor * mul2);
+// an identity-comb DSV4_HC_POST (its post weights made by SCALE -> SIGMOID -> SCALE when scale_in is set) and the
+//   RMS_NORM -> MUL of each of its streams that follows, qwen4exp's hyper-connection combine and the next grouped norm
+bool ggml_cuda_should_fuse_dsv4_hc_post_rms_norm(const ggml_tensor * post, const ggml_tensor * rms_norm, const ggml_tensor * mul);
+void ggml_cuda_op_dsv4_hc_post_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * post, const ggml_tensor * scale_in,
+                                        const ggml_tensor * scale_out, ggml_tensor * rms_norm, ggml_tensor * mul);
+
 // the two post-norms of a gemma4 MoE block summed (rms_norm(a) * wa + rms_norm(b) * wb) as the x of the above
 bool ggml_cuda_should_fuse_rms_norm_pair_add(const ggml_tensor * norm_a, const ggml_tensor * mul_a, const ggml_tensor * norm_b,
                                              const ggml_tensor * mul_b, const ggml_tensor * add_ab, const ggml_tensor * norm1,

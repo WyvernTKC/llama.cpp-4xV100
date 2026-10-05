@@ -1,6 +1,26 @@
 #include "common.cuh"
 #include "ggml.h"
 
+#include "unary.cuh"
+
+// the post weight of a hyper-connection combine: with gated, the SCALE -> SIGMOID -> SCALE that made it from raw, in the
+//   order and form of those ops
+template <bool gated>
+static __device__ __forceinline__ float dsv4_hc_post_weight(float p, const float ps_in, const float pb_in,
+        const float ps_out, const float pb_out) {
+    if constexpr (gated) {
+        p = ps_out * ggml_cuda_op_sigmoid_single(ps_in * p + pb_in) + pb_out;
+    }
+    return p;
+}
+
+// one value of an identity-comb hyper-connection combine: x * p + the stream's residual
+static __device__ __forceinline__ float dsv4_hc_post_identity(const float x, const float p, const float r) {
+    float sum = x * p;
+    sum += r;
+    return sum;
+}
+
 void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

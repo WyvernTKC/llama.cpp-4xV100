@@ -5812,6 +5812,10 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     const int64_t n_tokens;
     const bool    identity;
     const bool    gated;
+    const int     norm; // 1: the grouped RMS_NORM -> MUL of the next block after it (qwen4exp), 2: and a q8_0 matmul of it
+
+    ggml_tensor * normed = nullptr;
+    ggml_tensor * mm     = nullptr;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5819,14 +5823,30 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(n_embd, n_tokens, identity, gated);
+        std::string s = VARS_TO_STR4(n_embd, n_tokens, identity, gated);
+        if (norm) {
+            s += "," + VARS_TO_STR1(norm);
+        }
+        return s;
     }
 
     // gated: post = 2*sigmoid(post/hc), as qwen4exp builds it, so backends can fuse the chain
-    bool run_whole_graph() override { return gated; }
+    bool run_whole_graph() override { return gated || norm; }
 
-    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool gated = false)
-        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated) {}
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (!norm) {
+            return {};
+        }
+        if (mm) {
+            return { out, normed, mm };
+        }
+        return { out, normed };
+    }
+
+    double max_nmse_err() override { return mm ? 5e-4 : 1e-7; }
+
+    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool gated = false, int norm = 0)
+        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated), norm(norm) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
@@ -5850,7 +5870,24 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
 
         out = ggml_dsv4_hc_post(ctx, x, residual, post, comb);
         ggml_set_name(out, "out");
-        return out;
+        if (!norm) {
+            return out;
+        }
+        ggml_set_output(out);
+
+        ggml_tensor * w_norm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+        ggml_set_name(w_norm, "w_norm");
+        normed = ggml_mul(ctx, ggml_rms_norm(ctx, out, 1e-6f), w_norm);
+        ggml_set_name(normed, "normed");
+        if (norm < 2) {
+            return normed;
+        }
+        ggml_set_output(normed);
+        ggml_tensor * wq = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd*hc, 64);
+        ggml_set_name(wq, "wq");
+        mm = ggml_mul_mat(ctx, wq, ggml_reshape_2d(ctx, normed, n_embd*hc, n_tokens));
+        ggml_set_name(mm, "mm");
+        return mm;
     }
 };
 
@@ -11147,6 +11184,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
+    // with the grouped norm of the next block (qwen4exp), the q8_1 copy for its matmul at one token
+    test_cases.emplace_back(new test_dsv4_hc_post(2048, 1, true, true, 1));
+    test_cases.emplace_back(new test_dsv4_hc_post(2048, 1, true, true, 2));
+    test_cases.emplace_back(new test_dsv4_hc_post(2048, 5, true, true, 1));
+    test_cases.emplace_back(new test_dsv4_hc_post(512,  3, true, true, 2));
+    test_cases.emplace_back(new test_dsv4_hc_post(4096, 2, true, true, 1));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {

@@ -1,5 +1,6 @@
 #include "norm.cuh"
 #include "unary.cuh"
+#include "dsv4-hc.cuh"
 #include <cstdint>
 
 template <int block_size>
@@ -283,6 +284,74 @@ static __global__ void __launch_bounds__(block_size) rms_norm_mul_q8_f32(const f
         const float v = scale * xv[i] * mv[i];
         dst[col] = v;
         quantize_q8_1_lane(v, q8 + col/QK8_1, col % QK8_1);
+    }
+}
+
+// An identity-comb hyper-connection combine and the grouped norm the next block takes of it (qwen4exp: DSV4_HC_POST,
+//   gated, then RMS_NORM -> MUL of each stream): y = x * p + r of one stream row is written for the next combine, then
+//   reduced and scaled like rms_norm_mul_q8_f32, optionally with the q8_1 copy. Block (stream, token); y, dst and the
+//   weights are contiguous rows. Every value is that of the ops apart.
+template <int block_size, int cols_per_thread, bool gated, bool q8>
+static __global__ void __launch_bounds__(block_size) dsv4_hc_post_rms_norm_mul_f32(
+        const float * x, const float * residual, const float * post, float * y, float * dst, const float * w,
+        const int ncols, const int hc, const int64_t sx1, const int64_t sr1, const int64_t sr2, const int64_t sp0,
+        const int64_t sp1, const float ps_in, const float pb_in, const float ps_out, const float pb_out, const float eps,
+        const int64_t w_stride_stream, block_q8_1 * q8_dst) {
+    ggml_cuda_pdl_lc();
+    const int s   = blockIdx.x;
+    const int t   = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    const int64_t row_flat = (int64_t) t*hc + s;
+    x        += t*sx1;
+    residual += s*sr1 + t*sr2;
+    y        += row_flat*ncols;
+    dst      += row_flat*ncols;
+    w        += s*w_stride_stream;
+
+    float tmp = 0.0f;
+    extern __shared__ float s_sum[];
+
+    ggml_cuda_pdl_sync();
+    const float p = dsv4_hc_post_weight<gated>(post[s*sp0 + t*sp1], ps_in, pb_in, ps_out, pb_out);
+    float yv[cols_per_thread];
+    float wv[cols_per_thread];
+#pragma unroll
+    for (int i = 0; i < cols_per_thread; ++i) {
+        const int col = tid + i*block_size;
+        yv[i] = col < ncols ? dsv4_hc_post_identity(x[col], p, residual[col]) : 0.0f;
+    }
+#pragma unroll
+    for (int i = 0; i < cols_per_thread; ++i) {
+        const int col = tid + i*block_size;
+        wv[i] = col < ncols ? w[col] : 0.0f;
+    }
+#pragma unroll
+    for (int i = 0; i < cols_per_thread; ++i) {
+        const int col = tid + i*block_size;
+        if (col < ncols) {
+            y[col] = yv[i];
+            tmp += yv[i] * yv[i];
+        }
+    }
+
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    [[maybe_unused]] block_q8_1 * q8_row = q8 ? q8_dst + row_flat*(ncols/QK8_1) : nullptr;
+#pragma unroll
+    for (int i = 0; i < cols_per_thread; ++i) {
+        const int col = tid + i*block_size;
+        if (col >= ncols) {
+            continue;
+        }
+        const float v = scale * yv[i] * wv[i];
+        dst[col] = v;
+        if constexpr (q8) {
+            quantize_q8_1_lane(v, q8_row + col/QK8_1, col % QK8_1);
+        }
     }
 }
 
@@ -1078,6 +1147,98 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
     const int64_t s03 = nb03 / ts0;
 
     rms_norm_f32_cuda<true>(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream, scale);
+}
+
+bool ggml_cuda_should_fuse_dsv4_hc_post_rms_norm(const ggml_tensor * post, const ggml_tensor * rms_norm, const ggml_tensor * mul) {
+    if (post->op != GGML_OP_DSV4_HC_POST || rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL ||
+            rms_norm->src[0] != post || post->src[3] != nullptr) {
+        return false;
+    }
+    const ggml_tensor * x = post->src[0];
+    const ggml_tensor * r = post->src[1];
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : (mul->src[1] == rms_norm ? mul->src[0] : nullptr);
+    if (w == nullptr || w == rms_norm) {
+        return false;
+    }
+    for (const ggml_tensor * t : { x, r, w, post, rms_norm, mul }) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    const int64_t ncols = post->ne[0];
+    const int64_t hc    = post->ne[1];
+    // rows held in registers; one weight row per stream (or one for all). The combine and the norm output may each sit
+    //   exactly on the residual (ggml-alloc gives its memory to the norm), as a block reads its row of it before it
+    //   writes the same row; neither on anything else it reads, nor on each other
+    return ncols <= 8*1024 && ncols % QK8_1 == 0 && x->nb[0] == sizeof(float) && r->nb[0] == sizeof(float) &&
+        ggml_is_contiguous(post) && ggml_is_contiguous(mul) && ggml_are_same_shape(mul, post) && post->ne[3] == 1 &&
+        ggml_is_contiguous(w) && w->ne[0] == ncols && (ggml_nelements(w) == ncols || ggml_nelements(w) == ncols*hc) &&
+        post->ne[2] <= 65535 && hc <= INT_MAX &&
+        ggml_cuda_same_or_disjoint(post, r) && !ggml_cuda_tensors_overlap(post, x) && !ggml_cuda_tensors_overlap(post, w) &&
+        !ggml_cuda_tensors_overlap(mul, x) && ggml_cuda_same_or_disjoint(mul, r) && !ggml_cuda_tensors_overlap(mul, w) &&
+        !ggml_cuda_tensors_overlap(mul, post);
+}
+
+void ggml_cuda_op_dsv4_hc_post_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * post, const ggml_tensor * scale_in,
+                                        const ggml_tensor * scale_out, ggml_tensor * rms_norm, ggml_tensor * mul) {
+    const ggml_tensor * x = post->src[0];
+    const ggml_tensor * r = post->src[1];
+    const bool          gated = scale_in != nullptr;
+    const ggml_tensor * p = gated ? scale_in->src[0] : post->src[2];
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    float ps_in = 1.0f, pb_in = 0.0f, ps_out = 1.0f, pb_out = 0.0f;
+    if (gated) {
+        memcpy(&ps_in,  (const float *) scale_in->op_params  + 0, sizeof(float));
+        memcpy(&pb_in,  (const float *) scale_in->op_params  + 1, sizeof(float));
+        memcpy(&ps_out, (const float *) scale_out->op_params + 0, sizeof(float));
+        memcpy(&pb_out, (const float *) scale_out->op_params + 1, sizeof(float));
+    }
+
+    const int     ncols    = post->ne[0];
+    const int     hc       = post->ne[1];
+    const int64_t n_tokens = post->ne[2];
+    const int64_t w_stride = ggml_nelements(w) == ncols ? 0 : ncols;
+
+    // the q8_1 copy of the output for the matmul that reads all of it, as in ggml_cuda_op_rms_norm_fused
+    block_q8_1 * q8 = nullptr;
+    if (ctx.q8_1_emit == mul && ggml_nelements(mul) % MATRIX_ROW_PADDING == 0) {
+        int64_t ne_padded = 0;
+        q8 = (block_q8_1 *) ctx.q8_1_emit_alloc(mul, ne_padded);
+        GGML_ASSERT(q8 == nullptr || ne_padded == ggml_nelements(mul));
+    }
+
+    const dim3 blocks_num(hc, n_tokens, 1);
+    const auto launch = [&](auto block, auto cols, auto gated_c, auto q8_c) {
+        constexpr int bs = decltype(block)::value;
+        constexpr int nc = decltype(cols)::value;
+        if constexpr (nc > 0) {
+            const ggml_cuda_kernel_launch_params launch_params{blocks_num, dim3(bs, 1, 1), 32 * sizeof(float), ctx.stream()};
+            ggml_cuda_kernel_launch(dsv4_hc_post_rms_norm_mul_f32<bs, nc, decltype(gated_c)::value, decltype(q8_c)::value>,
+                launch_params, (const float *) x->data, (const float *) r->data, (const float *) p->data,
+                (float *) post->data, (float *) mul->data, (const float *) w->data, ncols, hc,
+                (int64_t) (x->nb[1]/sizeof(float)), (int64_t) (r->nb[1]/sizeof(float)), (int64_t) (r->nb[2]/sizeof(float)),
+                (int64_t) (p->nb[0]/sizeof(float)), (int64_t) (p->nb[1]/sizeof(float)),
+                ps_in, pb_in, ps_out, pb_out, eps, w_stride, q8);
+        } else {
+            GGML_ABORT("fatal error");
+        }
+    };
+    const auto with_flags = [&](auto block, auto cols) {
+        if (gated) {
+            if (q8) { launch(block, cols, std::true_type(), std::true_type()); } else { launch(block, cols, std::true_type(), std::false_type()); }
+        } else {
+            if (q8) { launch(block, cols, std::false_type(), std::true_type()); } else { launch(block, cols, std::false_type(), std::false_type()); }
+        }
+    };
+    // the block size rms_norm_f32 would pick, which fixes the order of the reduction
+    if (ncols < 1024) {
+        rms_norm_launch_cols<256, 4>(ncols, [&](auto cols) { with_flags(std::integral_constant<int, 256>(), cols); });
+    } else {
+        rms_norm_launch_cols<1024, 8>(ncols, [&](auto cols) { with_flags(std::integral_constant<int, 1024>(), cols); });
+    }
 }
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor,
