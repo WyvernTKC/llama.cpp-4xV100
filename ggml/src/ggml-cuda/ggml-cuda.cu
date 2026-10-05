@@ -3824,11 +3824,63 @@ static int ggml_cuda_try_rwkv7_output_fusion(
     return matched_count - 1;
 }
 
+// The group selection of grouped routing (DeepSeek-V3, see build_moe_ffn) between the bias ADD and the expert ARGSORT
+static const ggml_op ggml_cuda_topk_moe_group_ops[] = {
+    GGML_OP_RESHAPE, GGML_OP_RESHAPE, GGML_OP_ARGSORT,  GGML_OP_VIEW,     GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_SUM_ROWS,
+    GGML_OP_RESHAPE, GGML_OP_ARGSORT, GGML_OP_VIEW,     GGML_OP_GET_ROWS, GGML_OP_FILL,     GGML_OP_SET_ROWS, GGML_OP_RESHAPE,
+};
+static constexpr int ggml_cuda_topk_moe_n_group_ops = (int) (sizeof(ggml_cuda_topk_moe_group_ops) / sizeof(ggml_op));
+
+// Matches the group selection at node k (after the bias ADD) and sets args.n_groups, n_group_used
+static bool ggml_cuda_topk_moe_match_groups(ggml_tensor ** nodes, const int n_nodes, const int k, ggml_cuda_topk_moe_args & args) {
+    static const bool disabled = getenv("GGML_CUDA_NO_TOPK_GROUPS") != nullptr;
+    if (disabled || k < 1 || k + ggml_cuda_topk_moe_n_group_ops > n_nodes) {
+        return false;
+    }
+    for (int j = 0; j < ggml_cuda_topk_moe_n_group_ops; j++) {
+        if (nodes[k + j]->op != ggml_cuda_topk_moe_group_ops[j]) {
+            return false;
+        }
+    }
+    const ggml_tensor * add      = nodes[k - 1];
+    const ggml_tensor * groups   = nodes[k];       // [G, n_groups, n_tokens]
+    const ggml_tensor * groups4  = nodes[k + 1];   // [1, G, n_groups, n_tokens]
+    const ggml_tensor * sort2    = nodes[k + 2];
+    const ggml_tensor * top2     = nodes[k + 3];
+    const ggml_tensor * top2_val = nodes[k + 4];
+    const ggml_tensor * score    = nodes[k + 7];   // [n_groups, n_tokens]
+    const ggml_tensor * sort_g   = nodes[k + 8];
+    const ggml_tensor * top_g    = nodes[k + 9];   // [n_group_used, n_tokens]
+    const ggml_tensor * kept     = nodes[k + 10];
+    const ggml_tensor * fill     = nodes[k + 11];
+    const ggml_tensor * masked   = nodes[k + 12];
+    const ggml_tensor * masked2  = nodes[k + 13];  // [n_expert, n_tokens]
+
+    const bool chain = groups->src[0] == add && groups4->src[0] == groups && sort2->src[0] == groups &&
+        top2->src[0] == sort2 && top2_val->src[0] == groups4 && top2_val->src[1] == top2 &&
+        nodes[k + 5]->src[0] == top2_val && nodes[k + 6]->src[0] == nodes[k + 5] && score->src[0] == nodes[k + 6] &&
+        sort_g->src[0] == score && top_g->src[0] == sort_g && kept->src[0] == groups && kept->src[1] == top_g &&
+        fill->src[0] == groups && masked->src[0] == kept && masked->src[1] == top_g && masked->src[2] == fill &&
+        masked2->src[0] == masked;
+    if (!chain || ggml_get_op_params_i32(sort2, 0) != GGML_SORT_ORDER_DESC ||
+            ggml_get_op_params_i32(sort_g, 0) != GGML_SORT_ORDER_DESC || ggml_get_op_params_f32(fill, 0) != -INFINITY ||
+            top2->ne[0] != 2 || top2->view_offs != 0 || top_g->view_offs != 0 || top_g->type != GGML_TYPE_I32 ||
+            masked2->ne[0] != add->ne[0] || groups->ne[0] * groups->ne[1] != add->ne[0] ||
+            !ggml_cuda_topk_moe_groups_supported(add->ne[0], groups->ne[1], top_g->ne[0])) {
+        return false;
+    }
+    args.n_groups     = groups->ne[1];
+    args.n_group_used = top_g->ne[0];
+    return true;
+}
+
 static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int node_idx, ggml_cuda_topk_moe_args & args) {
     args.sigmoid         = false;
     args.sqrt_softplus   = false;
     args.softmax         = false;
     args.delayed_softmax = false;
+    args.n_groups        = 1;
+    args.n_group_used    = 1;
     args.prob_bias       = false;
     args.norm            = false;
 
@@ -3876,6 +3928,13 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
         if (nodes[node_idx]->op == GGML_OP_ADD && nodes[node_idx]->src[0] == nodes[node_idx - 2]) {
             args.prob_bias = true;
             node_idx++;
+            // ADD -> group selection -> RESHAPE
+            if (node_idx < n_nodes && nodes[node_idx]->op == GGML_OP_RESHAPE) {
+                if (!ggml_cuda_topk_moe_match_groups(nodes, n_nodes, node_idx, args)) {
+                    return false;
+                }
+                node_idx += ggml_cuda_topk_moe_n_group_ops;
+            }
         }
         // RESHAPE/ADD -> ARGSORT
         if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_ARGSORT) {
@@ -3922,6 +3981,11 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
         // GET_ROWS
         if (node_idx >= n_nodes || nodes[node_idx]->src[1] != nodes[node_idx - 1] ||
                 nodes[node_idx]->src[0] != probs_reshaped) {
+            return false;
+        }
+        // the kept groups must hold the used experts
+        if (args.n_groups > 1 &&
+                nodes[node_idx]->ne[0] * args.n_groups > (int64_t) args.n_group_used * nodes[node_idx - 1]->ne[0]) {
             return false;
         }
         node_idx++;
@@ -5249,7 +5313,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_topk_moe_args args;
         const bool              can_fuse = ggml_cuda_topk_moe_fusion(cgraph, i, args);
         std::vector<ggml_op>    ops;
-        ops.reserve(13);  // max ops; avoids gcc -Wstringop-overflow false positive
+        ops.reserve(13 + ggml_cuda_topk_moe_n_group_ops);  // max ops; avoids gcc -Wstringop-overflow false positive
 
         if (can_fuse) {
             const ggml_tensor * logits  = node->src[0];
@@ -5273,9 +5337,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
                 if (args.prob_bias) {
                     bias = cgraph->nodes[i_probs + 2]->src[1];
-                    ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_ARGSORT, GGML_OP_VIEW,
-                                            GGML_OP_GET_ROWS });
-                    out_nodes[0] = i_probs + 4;
+                    ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_ADD });
+                    if (args.n_groups > 1) {
+                        ops.insert(ops.end(), std::begin(ggml_cuda_topk_moe_group_ops), std::end(ggml_cuda_topk_moe_group_ops));
+                    }
+                    ops.insert(ops.end(), { GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS });
+                    out_nodes[0] = i + (int) ops.size() - 2;
                 } else {
                     ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS });
                     out_nodes[0] = i_probs + 3;
@@ -7010,7 +7077,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 ggml_cuda_topk_moe_args args;
                 const bool              can_fuse = ggml_cuda_topk_moe_fusion(cgraph, i, args);
                 std::vector<ggml_op>    ops;
-                ops.reserve(13);  // max ops; avoids gcc -Wstringop-overflow false positive
+                ops.reserve(13 + ggml_cuda_topk_moe_n_group_ops);  // max ops; avoids gcc -Wstringop-overflow false positive
 
                 const ggml_tensor * node = cgraph->nodes[i];
 
@@ -7032,9 +7099,13 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         const int i_probs = i + (int) ops.size() - 1;  // last node of the gating activation
 
                         if (args.prob_bias) {
-                            ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_ARGSORT, GGML_OP_VIEW,
-                                                    GGML_OP_GET_ROWS });
-                            out_nodes[0] = i_probs + 4;
+                            ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_ADD });
+                            if (args.n_groups > 1) {
+                                ops.insert(ops.end(), std::begin(ggml_cuda_topk_moe_group_ops),
+                                           std::end(ggml_cuda_topk_moe_group_ops));
+                            }
+                            ops.insert(ops.end(), { GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS });
+                            out_nodes[0] = i + (int) ops.size() - 2;
                         } else {
                             ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS });
                             out_nodes[0] = i_probs + 3;

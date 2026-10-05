@@ -8563,6 +8563,8 @@ struct test_topk_moe : public test_case {
     const bool bias_probs;
     const MoeGatingFunc gating_func;
     const float scale_w;
+    const int n_groups;     // grouped routing (DeepSeek-V3) when > 1
+    const int n_group_used;
     ggml_tensor * weights {};
     ggml_tensor * selected_experts {};
 
@@ -8571,17 +8573,28 @@ struct test_topk_moe : public test_case {
                   bool                   with_norm       = false,
                   bool                   bias_probs      = false,
                   MoeGatingFunc          gating_func     = GATING_FUNC_SOFTMAX,
-                  float                  scale_w         = 0.0f) :
+                  float                  scale_w         = 0.0f,
+                  int                    n_groups        = 1,
+                  int                    n_group_used    = 1) :
         ne(ne),
         n_expert_used(n_expert_used),
         with_norm(with_norm),
         bias_probs(bias_probs),
         gating_func(gating_func),
-        scale_w(scale_w) {
+        scale_w(scale_w),
+        n_groups(n_groups),
+        n_group_used(n_group_used) {
         GGML_ASSERT(n_expert_used <= ne[0]);
+        GGML_ASSERT(ne[0] % n_groups == 0 && n_group_used <= n_groups);
     }
 
-    std::string vars() override { return VARS_TO_STR6(ne, n_expert_used, with_norm, bias_probs, gating_func, scale_w); }
+    std::string vars() override {
+        std::string s = VARS_TO_STR6(ne, n_expert_used, with_norm, bias_probs, gating_func, scale_w);
+        if (n_groups > 1) {
+            s += "," + VARS_TO_STR2(n_groups, n_group_used);
+        }
+        return s;
+    }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -8607,6 +8620,20 @@ struct test_topk_moe : public test_case {
             ggml_set_name(exp_probs_b, "exp_probs_b");
             selection_probs = ggml_add(ctx, probs, exp_probs_b);
             ggml_set_name(selection_probs, "selection_probs");
+        }
+
+        if (n_groups > 1) {
+            // as build_moe_ffn: keep the n_group_used groups with the largest sum of their top 2
+            const int64_t n_exp_per_group = n_expert / n_groups;
+            ggml_tensor * groups = ggml_reshape_3d(ctx, selection_probs, n_exp_per_group, n_groups, n_tokens);
+            ggml_tensor * scores = ggml_argsort_top_k(ctx, groups, 2);
+            scores = ggml_get_rows(ctx, ggml_reshape_4d(ctx, groups, 1, groups->ne[0], groups->ne[1], groups->ne[2]), scores);
+            scores = ggml_sum_rows(ctx, ggml_reshape_3d(ctx, scores, scores->ne[1], scores->ne[2], scores->ne[3]));
+            scores = ggml_reshape_2d(ctx, scores, scores->ne[1], scores->ne[2]);
+            ggml_tensor * kept = ggml_argsort_top_k(ctx, scores, n_group_used);
+            selection_probs = ggml_get_rows(ctx, groups, kept);
+            selection_probs = ggml_set_rows(ctx, ggml_fill(ctx, groups, -INFINITY), selection_probs, kept);
+            selection_probs = ggml_reshape_2d(ctx, selection_probs, n_expert, n_tokens);
         }
 
         selected_experts = ggml_argsort_top_k(ctx, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
@@ -13376,6 +13403,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     test_cases.emplace_back(new test_topk_moe({288, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w)); // Used by StepFun 3.7
                     test_cases.emplace_back(new test_topk_moe({384, 22, 1, 1}, 6, with_norm, bias_probs, gate, scale_w)); // Used by DeepSeek-V4.1
                     test_cases.emplace_back(new test_topk_moe({384, 1, 1, 1}, 6, with_norm, bias_probs, gate, scale_w));
+                    if (bias_probs) {
+                        // grouped routing
+                        test_cases.emplace_back(new test_topk_moe({256, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w, 8, 4)); // DeepSeek-V3
+                        test_cases.emplace_back(new test_topk_moe({512, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w, 8, 4)); // Ling-3.0
+                        test_cases.emplace_back(new test_topk_moe({512, 1, 1, 1}, 8, with_norm, bias_probs, gate, scale_w, 8, 4));
+                        test_cases.emplace_back(new test_topk_moe({128, 9, 1, 1}, 4, with_norm, bias_probs, gate, scale_w, 4, 1));
+                        test_cases.emplace_back(new test_topk_moe({384, 3, 1, 1}, 6, with_norm, bias_probs, gate, scale_w, 3, 2));
+                        test_cases.emplace_back(new test_topk_moe({64, 5, 1, 1}, 2, with_norm, bias_probs, gate, scale_w, 2, 1));
+                    }
                     // rows at and just past the limit where one block still covers all rows
                     test_cases.emplace_back(new test_topk_moe({32, 8, 1, 1}, 4, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({32, 8, 1, 1}, 8, with_norm, bias_probs, gate, scale_w));

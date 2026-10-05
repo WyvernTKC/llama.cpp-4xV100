@@ -11,6 +11,8 @@ struct topk_moe_config {
     bool use_sqrt_softplus;
     bool with_norm;
     bool delayed_softmax;
+    int  n_groups;     // grouped routing: groups of n_experts / n_groups experts, a multiple of WARP_SIZE
+    int  n_group_used; //   groups kept
 };
 
 // Warp-local softmax used for both the pre-top-k logits and the post-top-k delayed path.
@@ -78,6 +80,63 @@ __device__ void sqrt_softplus_warp_inplace(float (&vals)[experts_per_thread], co
     }
 }
 
+// Grouped routing (DeepSeek-V3): keeps the n_group_used groups with the largest sum of their top 2 selection values
+//   (lowest group first on ties) and masks the experts of the others. A group is spg whole slots of sel.
+template <int experts_per_thread>
+__device__ __forceinline__ void topk_moe_mask_groups(float (&sel)[experts_per_thread], const int n_groups,
+                                                     const int n_group_used, const int lane) {
+    const int spg = experts_per_thread / n_groups;
+
+    // top 2 of every slot over the warp; the first round has no second value on either side
+    float s1[experts_per_thread];
+    float s2[experts_per_thread];
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) {
+        const float o = __shfl_xor_sync(0xFFFFFFFF, sel[i], WARP_SIZE / 2, WARP_SIZE);
+        s1[i]         = fmaxf(sel[i], o);
+        s2[i]         = fminf(sel[i], o);
+    }
+#pragma unroll
+    for (int offset = WARP_SIZE / 4; offset > 0; offset >>= 1) {
+#pragma unroll
+        for (int i = 0; i < experts_per_thread; i++) {
+            const float o1 = __shfl_xor_sync(0xFFFFFFFF, s1[i], offset, WARP_SIZE);
+            const float o2 = __shfl_xor_sync(0xFFFFFFFF, s2[i], offset, WARP_SIZE);
+            s2[i]          = fmaxf(fminf(s1[i], o1), fmaxf(s2[i], o2));
+            s1[i]          = fmaxf(s1[i], o1);
+        }
+    }
+
+    // lane g holds the score of group g
+    float g1 = -INFINITY;
+    float g2 = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) {
+        const bool  mine = i >= lane * spg && i < (lane + 1) * spg;
+        const float n2   = fmaxf(fminf(g1, s1[i]), fmaxf(g2, s2[i]));
+        const float n1   = fmaxf(g1, s1[i]);
+        g1               = mine ? n1 : g1;
+        g2               = mine ? n2 : g2;
+    }
+    const float score = g1 + g2;
+
+    int rank = 0;
+    for (int h = 0; h < n_groups; h++) {
+        const float sh = __shfl_sync(0xFFFFFFFF, score, h, WARP_SIZE);
+        rank += sh > score || (sh == score && h < lane);
+    }
+    const unsigned keep = __ballot_sync(0xFFFFFFFF, lane < n_groups && rank < n_group_used);
+
+    unsigned slot_keep = 0;
+    for (int g = 0; g < n_groups; g++) {
+        slot_keep |= (keep >> g) & 1 ? ((1u << spg) - 1) << (g * spg) : 0u;
+    }
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) {
+        sel[i] = (slot_keep >> i) & 1 ? sel[i] : -INFINITY;
+    }
+}
+
 /*
     This kernel does the following:
     1. optionally softmax over the logits per token [n_experts, n_tokens]
@@ -87,7 +146,7 @@ __device__ void sqrt_softplus_warp_inplace(float (&vals)[experts_per_thread], co
 
     It is intended as fusion of softmax->top-k->get_rows pipeline for MoE models
 */
-template <int n_experts, bool has_bias>
+template <int n_experts, bool has_bias, bool grouped>
 __launch_bounds__(TOPK_MOE_ROWS_PER_BLOCK * WARP_SIZE, 1)
 __global__ void topk_moe_cuda(const float *         logits,
                               float *               weights,
@@ -168,6 +227,9 @@ __global__ void topk_moe_cuda(const float *         logits,
             const int expert = i + threadIdx.x;
             selection_wt[i / WARP_SIZE] =
                 (n_experts % WARP_SIZE == 0 || expert < n_experts) ? wt[i / WARP_SIZE] + bias[expert] : -INFINITY;
+        }
+        if constexpr (grouped) {
+            topk_moe_mask_groups<experts_per_thread>(selection_wt, config.n_groups, config.n_group_used, threadIdx.x);
         }
     }
 
@@ -286,7 +348,22 @@ __global__ void topk_moe_cuda(const float *         logits,
     }
 }
 
-template<bool has_bias>
+template <int n_experts, bool has_bias, bool grouped>
+static void launch_topk_moe_cuda_n(const ggml_cuda_kernel_launch_params & launch_params,
+                                   const float *                          logits,
+                                   float *                                weights,
+                                   int32_t *                              ids,
+                                   float *                                bias,
+                                   const int                              n_rows,
+                                   const int                              n_expert_used,
+                                   const float                            clamp_val,
+                                   const float                            scale_val,
+                                   const topk_moe_config                  config) {
+    ggml_cuda_kernel_launch(topk_moe_cuda<n_experts, has_bias, grouped>, launch_params,
+        logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+}
+
+template<bool has_bias, bool grouped>
 static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
                                  const float *               logits,
                                  float *                     weights,
@@ -306,63 +383,51 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
     cudaStream_t stream = ctx.stream();
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
 
-    switch (n_expert) {
-        case 1:
-            ggml_cuda_kernel_launch(topk_moe_cuda<1, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+#define TOPK_MOE_CASE(n) \
+        case n: \
+            launch_topk_moe_cuda_n<n, has_bias, grouped>(launch_params, logits, weights, ids, bias, n_rows, n_expert_used, \
+                clamp_val, scale_val, config); \
             break;
-        case 2:
-            ggml_cuda_kernel_launch(topk_moe_cuda<2, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
-            break;
-        case 4:
-            ggml_cuda_kernel_launch(topk_moe_cuda<4, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
-            break;
-        case 8:
-            ggml_cuda_kernel_launch(topk_moe_cuda<8, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
-            break;
-        case 16:
-            ggml_cuda_kernel_launch(topk_moe_cuda<16, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
-            break;
-        case 32:
-            ggml_cuda_kernel_launch(topk_moe_cuda<32, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
-            break;
-        case 64:
-            ggml_cuda_kernel_launch(topk_moe_cuda<64, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
-            break;
-        case 128:
-            ggml_cuda_kernel_launch(topk_moe_cuda<128, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
-            break;
-        case 256:
-            ggml_cuda_kernel_launch(topk_moe_cuda<256, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
-            break;
-        case 288: // StepFun 3.7
-            ggml_cuda_kernel_launch(topk_moe_cuda<288, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
-            break;
-        case 384: // DeepSeek-V4.1
-            ggml_cuda_kernel_launch(topk_moe_cuda<384, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
-            break;
-        case 512:
-            ggml_cuda_kernel_launch(topk_moe_cuda<512, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
-            break;
-        case 576:
-            ggml_cuda_kernel_launch(topk_moe_cuda<576, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
-            break;
-        default:
-            GGML_ASSERT(false && "fatal error");
-            break;
+
+    if constexpr (grouped) {
+        // see ggml_cuda_topk_moe_groups_supported
+        switch (n_expert) {
+            TOPK_MOE_CASE(64)
+            TOPK_MOE_CASE(128)
+            TOPK_MOE_CASE(256)
+            TOPK_MOE_CASE(384)
+            TOPK_MOE_CASE(512)
+            default:
+                GGML_ABORT("fatal error");
+        }
+    } else {
+        switch (n_expert) {
+            TOPK_MOE_CASE(1)
+            TOPK_MOE_CASE(2)
+            TOPK_MOE_CASE(4)
+            TOPK_MOE_CASE(8)
+            TOPK_MOE_CASE(16)
+            TOPK_MOE_CASE(32)
+            TOPK_MOE_CASE(64)
+            TOPK_MOE_CASE(128)
+            TOPK_MOE_CASE(256)
+            TOPK_MOE_CASE(288) // StepFun 3.7
+            TOPK_MOE_CASE(384) // DeepSeek-V4.1
+            TOPK_MOE_CASE(512)
+            TOPK_MOE_CASE(576)
+            default:
+                GGML_ABORT("fatal error");
+        }
     }
+#undef TOPK_MOE_CASE
+}
+
+bool ggml_cuda_topk_moe_groups_supported(const int n_expert, const int n_groups, const int n_group_used) {
+    if (n_expert != 64 && n_expert != 128 && n_expert != 256 && n_expert != 384 && n_expert != 512) {
+        return false;
+    }
+    return n_groups > 1 && n_groups <= WARP_SIZE && n_expert % (n_groups * WARP_SIZE) == 0 &&
+           n_group_used >= 1 && n_group_used <= n_groups;
 }
 
 void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
@@ -403,13 +468,20 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     config.use_sqrt_softplus = args.sqrt_softplus;
     config.with_norm         = with_norm;
     config.delayed_softmax   = args.delayed_softmax;
+    config.n_groups          = args.n_groups;
+    config.n_group_used      = args.n_group_used;
 
-    if (bias) {
-        launch_topk_moe_cuda<true>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
-                             scale_val, config);
+    if (bias && args.n_groups > 1) {
+        GGML_ASSERT(ggml_cuda_topk_moe_groups_supported(n_experts, args.n_groups, args.n_group_used));
+        launch_topk_moe_cuda<true, true>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used,
+                                         clamp_val, scale_val, config);
+    } else if (bias) {
+        launch_topk_moe_cuda<true, false>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used,
+                                          clamp_val, scale_val, config);
     } else {
-        launch_topk_moe_cuda<false>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
-                             scale_val, config);
+        GGML_ASSERT(args.n_groups <= 1);
+        launch_topk_moe_cuda<false, false>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used,
+                                           clamp_val, scale_val, config);
     }
 }
 
