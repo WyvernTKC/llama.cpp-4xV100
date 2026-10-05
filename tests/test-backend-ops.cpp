@@ -5167,6 +5167,40 @@ struct test_scale_silu : public test_case {
     }
 };
 
+// GGML_OP_MUL + GGML_OP_UNARY(SIGMOID) + GGML_OP_SCALE, the forget gate of bailingmoe3 (m per head)
+struct test_mul_sigmoid_scale : public test_case {
+    const std::array<int64_t, 4> ne;
+    const std::array<int64_t, 4> ne_m;
+    const float s;
+    const float b;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_SIGMOID_SCALE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(ne, ne_m, s, b);
+    }
+
+    test_mul_sigmoid_scale(std::array<int64_t, 4> ne = { 128, 32, 1, 1 }, std::array<int64_t, 4> ne_m = { 1, 32, 1, 1 },
+                           float s = -5.0f, float b = 0.0f)
+        : ne(ne), ne_m(ne_m), s(s), b(b) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * m = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_m.data());
+        ggml_set_name(x, "x");
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = ggml_scale_bias(ctx, ggml_sigmoid(ctx, ggml_mul(ctx, x, m)), s, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_ADD (fused residual chain)
 struct test_add_add : public test_case {
     const ggml_type type;
@@ -5800,6 +5834,7 @@ struct test_ssm_conv_bias_silu : public test_case {
     const std::array<int64_t, 4> ne_a;
     const std::array<int64_t, 4> ne_b;
     const bool fuse_bias;
+    const bool reshape; // silu of the output reshaped to [d_inner, n_tokens] (bailingmoe3)
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5809,12 +5844,16 @@ struct test_ssm_conv_bias_silu : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR4(type, ne_a, ne_b, fuse_bias);
+        std::string s = VARS_TO_STR4(type, ne_a, ne_b, fuse_bias);
+        if (reshape) {
+            s += "," + VARS_TO_STR1(reshape);
+        }
+        return s;
     }
 
     test_ssm_conv_bias_silu(ggml_type type, std::array<int64_t, 4> ne_a, std::array<int64_t, 4> ne_b,
-            bool fuse_bias)
-        : type(type), ne_a(ne_a), ne_b(ne_b), fuse_bias(fuse_bias) {}
+            bool fuse_bias, bool reshape = false)
+        : type(type), ne_a(ne_a), ne_b(ne_b), fuse_bias(fuse_bias), reshape(reshape) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
@@ -5830,6 +5869,9 @@ struct test_ssm_conv_bias_silu : public test_case {
             out = ggml_add(ctx, out, bias);
         }
 
+        if (reshape) {
+            out = ggml_reshape_2d(ctx, out, out->ne[0], out->ne[1] * out->ne[2]);
+        }
         out = ggml_silu(ctx, out);
 
         ggml_set_name(out, "out");
@@ -5839,18 +5881,20 @@ struct test_ssm_conv_bias_silu : public test_case {
 
 // build_conv_state + GGML_OP_SSM_CONV + silu of one sequence, in the node order of the model: the conv state is
 //   GET_ROWS of a cache, concatenated with the transposed new tokens, a CPY stores a window of the concat to each
-//   rollback slot, and the convolution reads the concat. Checks the silu output and the whole cache.
+//   rollback slot, and the convolution reads the concat. Checks the silu output and the whole cache. With n_conv 3 the
+//   row holds the states of three convolutions, each a view of the GET_ROWS, and the silu reads a reshape (bailingmoe3).
 struct test_ssm_conv_state : public test_case {
     const int64_t nr;       // channels
     const int64_t n_t;      // tokens
     const int64_t K;        // rollback slots, n_rs_seq + 1
     const int32_t src_row;  // the cache row of the start state
     const int64_t kv_head;  // the cell the slots store to
+    const int64_t n_conv;   // convolutions of one cache row
 
     static constexpr int64_t d_conv  = 4;
     static constexpr int64_t n_cells = 3;
 
-    ggml_tensor * silu      = nullptr;
+    std::vector<ggml_tensor *> silu;
     ggml_tensor * cache_out = nullptr;
 
     std::string op_desc(ggml_tensor * t) override {
@@ -5859,41 +5903,65 @@ struct test_ssm_conv_state : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR5(nr, n_t, K, src_row, kv_head);
+        std::string v = VARS_TO_STR5(nr, n_t, K, src_row, kv_head);
+        if (n_conv > 1) {
+            v += "," + VARS_TO_STR1(n_conv);
+        }
+        return v;
     }
 
     bool run_whole_graph() override { return true; }
-    std::vector<ggml_tensor *> fusion_test_nodes() override { return { silu, cache_out }; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        std::vector<ggml_tensor *> out = silu;
+        out.push_back(cache_out);
+        return out;
+    }
 
-    test_ssm_conv_state(int64_t nr = 256, int64_t n_t = 1, int64_t K = 1, int32_t src_row = 1, int64_t kv_head = 1)
-        : nr(nr), n_t(n_t), K(K), src_row(src_row), kv_head(kv_head) {}
+    test_ssm_conv_state(int64_t nr = 256, int64_t n_t = 1, int64_t K = 1, int32_t src_row = 1, int64_t kv_head = 1,
+                        int64_t n_conv = 1)
+        : nr(nr), n_t(n_t), K(K), src_row(src_row), kv_head(kv_head), n_conv(n_conv) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        const int64_t row = (d_conv - 1)*nr;
+        const int64_t css = (d_conv - 1)*nr;
+        const int64_t row = n_conv*css;
         ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row, n_cells*K);
         ggml_tensor * ids   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
-        ggml_tensor * x     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nr, n_t, 1);
-        ggml_tensor * w     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, nr);
         ggml_set_name(cache, "cache");
         ggml_set_name(ids,   "ids");
-        ggml_set_name(x,     "x");
-        ggml_set_name(w,     "w");
 
-        ggml_tensor * states     = ggml_reshape_3d(ctx, ggml_get_rows(ctx, cache, ids), d_conv - 1, nr, 1);
-        ggml_tensor * conv_input = ggml_concat(ctx, states, ggml_transpose(ctx, x), 0);
+        ggml_tensor * state_row = ggml_get_rows(ctx, cache, ids);
+        silu.clear();
+        for (int64_t c = 0; c < n_conv; ++c) {
+            ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nr, n_t, 1);
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, nr);
+            ggml_format_name(x, "x%d", (int) c);
+            ggml_format_name(w, "w%d", (int) c);
 
-        // slot s holds the window that ends s tokens before the last
-        const int64_t n_slots = std::min<int64_t>(n_t, K - 1);
-        for (int64_t s = 0; s <= n_slots; ++s) {
-            ggml_tensor * win = ggml_view_3d(ctx, conv_input, d_conv - 1, nr, 1, conv_input->nb[1], conv_input->nb[2],
-                    ggml_row_size(conv_input->type, n_t - s));
-            ggml_tensor * dst = ggml_view_2d(ctx, cache, row, 1, cache->nb[1], (s*n_cells + kv_head)*cache->nb[1]);
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, win, dst));
+            ggml_tensor * states = n_conv == 1 ? ggml_reshape_3d(ctx, state_row, d_conv - 1, nr, 1) :
+                ggml_view_3d(ctx, state_row, d_conv - 1, nr, 1, (d_conv - 1)*sizeof(float), row*sizeof(float), c*css*sizeof(float));
+            ggml_tensor * conv_input = ggml_concat(ctx, states, ggml_transpose(ctx, x), 0);
+
+            // slot s holds the window that ends s tokens before the last
+            const int64_t n_slots = std::min<int64_t>(n_t, K - 1);
+            for (int64_t s = 0; s <= n_slots; ++s) {
+                ggml_tensor * win = ggml_view_3d(ctx, conv_input, d_conv - 1, nr, 1, conv_input->nb[1], conv_input->nb[2],
+                        ggml_row_size(conv_input->type, n_t - s));
+                ggml_tensor * dst = ggml_view_2d(ctx, cache, css, 1, cache->nb[1],
+                        (s*n_cells + kv_head)*cache->nb[1] + c*css*sizeof(float));
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, win, dst));
+            }
+
+            ggml_tensor * conv = ggml_ssm_conv(ctx, conv_input, w);
+            if (n_conv > 1) {
+                conv = ggml_reshape_2d(ctx, conv, nr, n_t);
+            }
+            silu.push_back(ggml_silu(ctx, conv));
+            ggml_format_name(silu.back(), "silu%d", (int) c);
         }
-
-        silu = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, w));
-        ggml_set_name(silu, "silu");
-        ggml_build_forward_expand(gf, silu);
+        // the convolutions after all slot copies, as in the model
+        for (ggml_tensor * t : silu) {
+            ggml_build_forward_expand(gf, t);
+        }
 
         // the cache after the slot copies
         cache_out = ggml_scale(ctx, cache, 1.0f);
@@ -11943,6 +12011,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_mm(768, 2, 64));
     for (bool with_mm : { false, true }) {
         test_cases.emplace_back(new test_scale_silu(320, 1, 0.25f, 0.0f, with_mm));
+        if (!with_mm) {
+            // bailingmoe3 forget gate: one token, a batch, and other broadcasts
+            test_cases.emplace_back(new test_mul_sigmoid_scale({128, 32, 1, 1}, {1, 32, 1, 1}, -5.0f, 0.0f));
+            test_cases.emplace_back(new test_mul_sigmoid_scale({128, 32, 7, 1}, {1, 32, 1, 1}, -5.0f, 0.0f));
+            test_cases.emplace_back(new test_mul_sigmoid_scale({64, 6, 3, 2}, {64, 1, 3, 1}, 0.5f, 0.25f));
+            test_cases.emplace_back(new test_mul_sigmoid_scale({100, 5, 1, 1}, {100, 5, 1, 1}, 2.0f, -1.0f));
+        }
         test_cases.emplace_back(new test_scale_silu(320, 3, 0.25f, 0.0f, with_mm));
         test_cases.emplace_back(new test_scale_silu(1024, 1, 0.5f, 0.125f, with_mm));
         test_cases.emplace_back(new test_scale_silu(96, 1, 2.0f, -0.5f, with_mm));
@@ -12026,6 +12101,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // the silu of the output reshaped to [d_inner, n_tokens] (bailingmoe3): one token, a batch, several sequences
+    test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {4,  4096, 1, 1}, {4, 4096, 1, 1}, false, true));
+    test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {67, 1024, 1, 1}, {4, 1024, 1, 1}, false, true));
+    test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {8,  256,  3, 1}, {4, 256,  1, 1}, false, true));
 
     // build_conv_state, which CUDA runs as one kernel: decode without and with rollback slots, a draft step and an MTP
     //   verify, a channel count the block does not divide, a start state read from a row the slots write (cell 1 is
@@ -12044,6 +12123,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_conv_state(256,  100, 6, 0, 2));
     test_cases.emplace_back(new test_ssm_conv_state(2560, 2048, 1, 1, 1));
     test_cases.emplace_back(new test_ssm_conv_state(2560, 2048, 4, 1, 1));
+    // bailingmoe3: the states of q, k and v in one row
+    test_cases.emplace_back(new test_ssm_conv_state(4096, 1, 1, 1, 1, 3));
+    test_cases.emplace_back(new test_ssm_conv_state(4096, 1, 1, 1, 0, 3));
+    test_cases.emplace_back(new test_ssm_conv_state(512,  3, 4, 1, 1, 3));
+    test_cases.emplace_back(new test_ssm_conv_state(512,  2, 4, 4, 1, 3));
+    test_cases.emplace_back(new test_ssm_conv_state(1000, 100, 2, 0, 2, 3));
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 96, 64, 128, 8, 1, 1)); // Nemotron-3-Puzzle decode (scan path, unused warp in last block)
