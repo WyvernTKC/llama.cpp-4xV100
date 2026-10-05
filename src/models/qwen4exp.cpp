@@ -742,6 +742,10 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
     cb(z, "z", il);
 
+    // expanded together, the two projections of one input are adjacent and a backend can run them in one launch
+    ggml_build_forward_expand(gf, qkv_mixed);
+    ggml_build_forward_expand(gf, z);
+
     return { qkv_mixed, z };
 }
 
@@ -1325,10 +1329,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
     GGML_ASSERT(head_v_dim * num_v_heads == d_inner);
 
-    auto qkvz = build_qkvz(cur, il);
-    ggml_tensor * qkv_mixed = qkvz.first;
-    ggml_tensor * z         = qkvz.second;
-
+    // the gate and beta projections before qkv and z, as qwen35moe: they all read cur, which qkv and z then keep alive
+    //   while a backend writes the gate and beta (ggml-cuda runs the two and their elementwise ops as one launch with
+    //   qkv and z at one token), and qkv and z are adjacent
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
@@ -1348,6 +1351,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     cb(gate, "gate", il);
 
     gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
+    ggml_build_forward_expand(gf, gate);
+    ggml_build_forward_expand(gf, beta);
+
+    auto qkvz = build_qkvz(cur, il);
+    ggml_tensor * qkv_mixed = qkvz.first;
+    ggml_tensor * z         = qkvz.second;
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
@@ -1655,7 +1664,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
                 conv_states_all->nb[1],
                 (slot * mem_size + kv_head) * row_size);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        // the window copied as a view of the concat, as build_conv_state does: ggml-cuda then runs the gather, the
+        //   concat, these copies and the convolution as one kernel at one token (ggml_cuda_ssm_conv_state_fusion_match)
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
     }
 
     return conv_input;
