@@ -6398,6 +6398,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // the scatter weights of a hyper-connection combine (qwen4exp): 2*sigmoid(inject/hc) computed in the HC_POST that
+    //   reads them, three launches less per block
+    if (node->op == GGML_OP_SCALE && i + 3 < cgraph->n_nodes) {
+        ggml_tensor * sig  = cgraph->nodes[i + 1];
+        ggml_tensor * sc2  = cgraph->nodes[i + 2];
+        ggml_tensor * post = cgraph->nodes[i + 3];
+        const ggml_tensor * raw = node->src[0];
+        if (sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID && sig->src[0] == node &&
+                sc2->op == GGML_OP_SCALE && sc2->src[0] == sig && post->op == GGML_OP_DSV4_HC_POST && post->src[2] == sc2 &&
+                ggml_node_has_n_uses(cgraph, i, 1) && ggml_node_has_n_uses(cgraph, i + 1, 1) && ggml_node_has_n_uses(cgraph, i + 2, 1) &&
+                (sig->flags & GGML_TENSOR_FLAG_COMPUTE) && (sc2->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                (post->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                raw->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 && sig->type == GGML_TYPE_F32 && sc2->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(raw) && ggml_is_contiguous(sc2) && ggml_are_same_shape(raw, sc2) &&
+                !ggml_cuda_tensors_overlap(post, raw)) {
+            ggml_cuda_op_dsv4_hc_post_gated(*cuda_ctx, post, node, sc2);
+            return 3;
+        }
+    }
+
     return 0;
 }
 
