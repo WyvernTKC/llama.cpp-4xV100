@@ -6340,6 +6340,7 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     const int64_t n_seqs;
     const int64_t K; // snapshot slot count (>1)
     const bool gather; // the state is GET_ROWS of a cache, as build_rs makes it
+    const bool l2_rms; // q and k normalized as build_gdn_l2_norm does (rms_norm + scale), which CUDA folds in
 
     ggml_tensor * cpy_node = nullptr;
     ggml_tensor * pre_node = nullptr;
@@ -6347,14 +6348,18 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     static constexpr int64_t n_cells = 3;
 
     std::string vars() override {
-        return VARS_TO_STR7(type, head_count, head_size, n_seq_tokens, n_seqs, K, gather);
+        std::string s = VARS_TO_STR7(type, head_count, head_size, n_seq_tokens, n_seqs, K, gather);
+        if (l2_rms) {
+            s += "," + VARS_TO_STR1(l2_rms);
+        }
+        return s;
     }
 
     test_gated_delta_net_cache_fusion(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 2, int64_t n_seqs = 1,
-            int64_t K = 2, bool gather = false)
+            int64_t K = 2, bool gather = false, bool l2_rms = false)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K),
-          gather(gather) {}
+          gather(gather), l2_rms(l2_rms) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t S_v = head_size;
@@ -6385,8 +6390,14 @@ struct test_gated_delta_net_cache_fusion : public test_case {
             ggml_set_name(state, "state");
         }
 
-        q = ggml_l2_norm(ctx, q, 1e-6f);
-        k = ggml_l2_norm(ctx, k, 1e-6f);
+        if (l2_rms) {
+            const float n = head_size;
+            q = ggml_scale(ctx, ggml_rms_norm(ctx, q, 1e-6f/n), 1.0f/sqrtf(n));
+            k = ggml_scale(ctx, ggml_rms_norm(ctx, k, 1e-6f/n), 1.0f/sqrtf(n));
+        } else {
+            q = ggml_l2_norm(ctx, q, 1e-6f);
+            k = ggml_l2_norm(ctx, k, 1e-6f);
+        }
 
         ggml_tensor * gdn_out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
         ggml_set_name(gdn_out, "gdn_out");
@@ -13621,6 +13632,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8, 128, 512, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2));
@@ -13665,6 +13677,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // gdn + cache cpy fusion (K > 1)
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
+    // the l2 norm as build_gdn_l2_norm makes it, folded into the kernel: decode, a batch, more tokens than slots
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 128,  1, 1, 2, false, true));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 128,  4, 1, 4, true,  true));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 64,  70, 1, 2, false, true));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 64,   4, 1, 2));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
