@@ -8757,16 +8757,41 @@ struct test_moe_reduce : public test_case {
     const bool unaligned_experts;
     const bool with_expert_scale;
     const bool interleaved_views_adds;
+    const int64_t n_expert_table; // > 0: the scales gathered from a table of this many by expert ids (build_lora_mm_id)
 
     test_moe_reduce(
             int64_t n_embd, int64_t n_expert_used, int64_t n_tokens,
-            bool unaligned_experts = false, bool with_expert_scale = false, bool interleaved_views_adds = false) :
+            bool unaligned_experts = false, bool with_expert_scale = false, bool interleaved_views_adds = false,
+            int64_t n_expert_table = 0) :
         n_embd(n_embd), n_expert_used(n_expert_used), n_tokens(n_tokens),
         unaligned_experts(unaligned_experts), with_expert_scale(with_expert_scale),
-        interleaved_views_adds(interleaved_views_adds) {}
+        interleaved_views_adds(interleaved_views_adds), n_expert_table(n_expert_table) {}
 
     std::string vars() override {
-        return VARS_TO_STR6(n_embd, n_expert_used, n_tokens, unaligned_experts, with_expert_scale, interleaved_views_adds);
+        std::string s = VARS_TO_STR6(n_embd, n_expert_used, n_tokens, unaligned_experts, with_expert_scale, interleaved_views_adds);
+        if (n_expert_table > 0) {
+            s += "," + VARS_TO_STR1(n_expert_table);
+        }
+        return s;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (strcmp(t->name, "ids") == 0) {
+                std::vector<int32_t> ids(ggml_nelements(t));
+                std::uniform_int_distribution<int32_t> dist(0, (int32_t) n_expert_table - 1);
+                for (auto & id : ids) {
+                    id = dist(rng);
+                }
+                ggml_backend_tensor_set(t, ids.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -8792,7 +8817,19 @@ struct test_moe_reduce : public test_case {
         ggml_set_name(weights, "weights");
 
         ggml_tensor * scaled = experts;
-        if (with_expert_scale) {
+        if (with_expert_scale && n_expert_table > 0) {
+            // as build_lora_mm_id, with the ids a view of a sort of all experts
+            ggml_tensor * table = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert_table);
+            ggml_tensor * ids   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_table, n_tokens);
+            ggml_set_name(table, "table");
+            ggml_set_name(ids,   "ids");
+            ggml_tensor * ids_used = ggml_view_2d(ctx, ids, n_expert_used, n_tokens, ids->nb[1], 0);
+            ggml_tensor * s = ggml_reshape_3d(ctx, table, 1, n_expert_table, 1);
+            s = ggml_repeat_4d(ctx, s, 1, n_expert_table, n_tokens, 1);
+            s = ggml_get_rows(ctx, s, ids_used);
+            scaled = ggml_mul(ctx, experts, s);
+            ggml_set_name(scaled, "scaled_experts");
+        } else if (with_expert_scale) {
             ggml_tensor * expert_scale = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_expert_used, n_tokens);
             ggml_set_name(expert_scale, "expert_scale");
             scaled = ggml_mul(ctx, experts, expert_scale);
@@ -13516,6 +13553,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // one token, which the CUDA kernel runs as a single block (Ornith, Goetia with expert scales, an odd width)
     test_cases.emplace_back(new test_moe_reduce(2048, 8, 1));
     test_cases.emplace_back(new test_moe_reduce(2816, 8, 1, false, true));
+    // the scales gathered from a table by the expert ids (gemma4): one token, a batch
+    test_cases.emplace_back(new test_moe_reduce(2816, 8, 1,  false, true, false, 128));
+    test_cases.emplace_back(new test_moe_reduce(2816, 8, 5,  false, true, false, 128));
+    test_cases.emplace_back(new test_moe_reduce(64,   4, 33, false, true, false, 16));
     test_cases.emplace_back(new test_moe_reduce(63,   2, 1));
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));

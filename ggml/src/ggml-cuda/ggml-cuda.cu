@@ -5236,6 +5236,42 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // build_lora_mm_id's per-expert scale (gemma4): the scale vector REPEATed over the tokens and GET_ROWS by the expert
+    //   ids right before the weighted reduction, which reads the table through the ids instead (two launches less)
+    if (node->op == GGML_OP_REPEAT && i + 2 < cgraph->n_nodes) {
+        int i_gr = i + 1; // views may come between (the ids)
+        while (i_gr + 1 < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[i_gr])) {
+            i_gr++;
+        }
+        const ggml_tensor * table = node->src[0];
+        const ggml_tensor * gr    = cgraph->nodes[i_gr];
+        ggml_cuda_moe_weighted_reduction_match match;
+        if (i_gr + 1 < cgraph->n_nodes &&
+                gr->op == GGML_OP_GET_ROWS && gr->src[0] == node && table->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(table) && table->ne[0] == 1 && ggml_nelements(table) == table->ne[1] &&
+                node->ne[0] == 1 && node->ne[1] == table->ne[1] && node->ne[3] == 1 &&
+                ggml_cuda_graph_use_count(cgraph, node) == 1 && ggml_cuda_graph_use_count(cgraph, gr) == 1 &&
+                !(node->flags & GGML_TENSOR_FLAG_OUTPUT) && !(gr->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                ggml_cuda_match_moe_weighted_reduction(cgraph, i_gr + 1, match) && match.expert_scale == gr) {
+            const ggml_tensor * ids      = gr->src[1];
+            const int64_t       n_tokens = match.experts->ne[2] * match.experts->ne[3];
+            const bool over_w   = ggml_cuda_tensors_overlap(match.dst, match.weights);
+            const bool over_ids = ggml_cuda_tensors_overlap(match.dst, ids);
+            bool       safe     = ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t) &&
+                ids->ne[0] == match.experts->ne[1] && ggml_nrows(ids) == n_tokens && (!over_ids || n_tokens == 1);
+            if (safe && ggml_cuda_tensors_overlap(match.dst, match.experts)) {
+                const int64_t off = (const char *) match.dst->data - (const char *) match.experts->data;
+                safe = n_tokens == 1 && off >= 0 && off % (int64_t) match.experts->nb[1] == 0 &&
+                    off / (int64_t) match.experts->nb[1] < match.experts->ne[1];
+            }
+            if (safe) {
+                ggml_cuda_op_moe_weighted_reduction(*cuda_ctx, match.experts, table, match.weights, match.dst,
+                    over_w && n_tokens > 1, nullptr, nullptr, ids);
+                return i_gr - i + match.node_count;
+            }
+        }
+    }
+
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
