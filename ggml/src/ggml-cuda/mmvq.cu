@@ -763,6 +763,13 @@ static __global__ void mul_mat_vec_q(
             vx    = fusion.sib_x;
             vgate = fusion.sib_gate;
         }
+        // gate_ids: the gate's expert sits at its own channel, so its rows are offset from x's
+        if constexpr (ncols_dst == 1) {
+            if (ids && fusion.gate_ids != nullptr && !sib) {
+                vgate = (const char *) vgate + ((int64_t) fusion.gate_ids[channel_dst] - (int64_t) channel_x)*
+                    stride_channel_x*ggml_cuda_type_traits<type>::bs;
+            }
+        }
     }
 
 
@@ -1220,6 +1227,12 @@ static __global__ void mul_mat_vec_q_moe(
     ggml_cuda_pdl_sync();
     const uint32_t channel_x = ids[channel_dst + token_idx * ids_stride];
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
+    if constexpr (has_fusion) {
+        if (fusion.gate_ids != nullptr) {
+            vgate = (const char *) vgate + ((int64_t) fusion.gate_ids[channel_dst + token_idx * ids_stride] - (int64_t) channel_x)*
+                stride_channel_x*ggml_cuda_type_traits<type>::bs;
+        }
+    }
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
     const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
@@ -1961,6 +1974,14 @@ static void ggml_cuda_mul_mat_vec_q_impl(
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;
+        if (fusion->gate_ids) {
+            // a bias or scale would be read at x's channel
+            GGML_ASSERT(ids && fusion->gate && !fusion->x_bias && !fusion->gate_bias && !fusion->x_scale && !fusion->gate_scale &&
+                !fusion->x_sigmoid && !fusion->gdn_beta);
+            GGML_ASSERT(fusion->gate_ids->type == GGML_TYPE_I32 && ggml_are_same_shape(fusion->gate_ids, ids) &&
+                fusion->gate_ids->nb[0] == ids->nb[0] && fusion->gate_ids->nb[1] == ids->nb[1]);
+            fusion_local.gate_ids = (const int32_t *) fusion->gate_ids->data;
+        }
         if (fusion->x_sigmoid) {
             GGML_ASSERT(!ids && fusion->x_bias && !fusion->gate && !fusion->x_scale);
             GGML_ASSERT(fusion->x_sigmoid->type == GGML_TYPE_F32 && ggml_nelements(fusion->x_sigmoid) == 1);

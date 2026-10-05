@@ -2044,7 +2044,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     return use_mul_mat_vec_f;
 }
 
-static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool with_gate = false) {
+// cache_ok: the caller passes a pool of cached experts its gathered ids, see ggml_cuda_expert_cache_remap
+static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool with_gate = false, const bool cache_ok = false) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -2057,7 +2058,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, cons
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 
     // a pool of cached experts is gathered inside ggml_cuda_mul_mat_id, the fused path would read it stale
-    if (ggml_cuda_expert_cache_is(src0)) {
+    if (ggml_cuda_expert_cache_is(src0) && !cache_ok) {
         return false;
     }
 
@@ -2228,6 +2229,20 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     return true;
 }
 
+// A pool of cached experts: bring in the routed ones and return the ids to read the pool with, unless an earlier
+//   MUL_MAT_ID of the same ids has done that for it
+static void ggml_cuda_expert_cache_remap(ggml_backend_cuda_context & ctx, const ggml_tensor * pool, const ggml_tensor * ids,
+        ggml_tensor * ids_remap) {
+    for (size_t k = 0; k < ctx.expert_cache_ahead.size(); k++) {
+        if (ctx.expert_cache_ahead[k].pool == pool && ctx.expert_cache_ahead[k].ids == ids) {
+            *ids_remap = ctx.expert_cache_ahead[k].remap;
+            ctx.expert_cache_ahead.erase(ctx.expert_cache_ahead.begin() + k);
+            return;
+        }
+    }
+    ggml_cuda_expert_cache_gather(ctx, pool, ids, ids_remap);
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -2236,22 +2251,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
-    // src0 is a pool of cached experts: bring in the routed ones and read the pool through remapped ids, unless an
-    //   earlier MUL_MAT_ID of the same ids has done that for it
+    // src0 is a pool of cached experts: read it through remapped ids
     ggml_tensor ids_remap;
     if (ggml_cuda_expert_cache_is(src0)) {
-        bool ahead = false;
-        for (size_t k = 0; k < ctx.expert_cache_ahead.size(); k++) {
-            if (ctx.expert_cache_ahead[k].pool == src0 && ctx.expert_cache_ahead[k].ids == ids) {
-                ids_remap = ctx.expert_cache_ahead[k].remap;
-                ctx.expert_cache_ahead.erase(ctx.expert_cache_ahead.begin() + k);
-                ahead = true;
-                break;
-            }
-        }
-        if (!ahead) {
-            ggml_cuda_expert_cache_gather(ctx, src0, ids, &ids_remap);
-        }
+        ggml_cuda_expert_cache_remap(ctx, src0, ids, &ids_remap);
         ids = &ids_remap;
     }
 
@@ -4976,6 +4979,17 @@ static void ggml_cuda_q8_1_request(ggml_backend_cuda_context * cuda_ctx, const g
     }
 }
 
+// The gate and up MUL_MAT_IDs of a GLU whose weights are pools of cached experts of the same layout: each pool holds the
+//   used experts in its own slots, so the fused launch reads the gate through its own remapped ids (gate_ids)
+static bool ggml_cuda_expert_cache_glu_pair(const ggml_tensor * up, const ggml_tensor * gate) {
+    static const bool disabled = getenv("GGML_CUDA_NO_EXPERT_CACHE_GLU") != nullptr;
+    return !disabled && up->op == GGML_OP_MUL_MAT_ID && gate->op == GGML_OP_MUL_MAT_ID &&
+        up->src[1] == gate->src[1] && up->src[2] == gate->src[2] &&
+        ggml_cuda_expert_cache_is(up->src[0]) && ggml_cuda_expert_cache_is(gate->src[0]) &&
+        up->src[0]->type == gate->src[0]->type && ggml_are_same_shape(up->src[0], gate->src[0]) &&
+        ggml_are_same_stride(up->src[0], gate->src[0]) && ggml_cuda_should_fuse_mul_mat_vec_q(up, true, true);
+}
+
 // A one-token gate/up GLU (MUL_MAT, MUL_MAT, GLU) with a MUL_MAT_ID gate/up GLU of the same input and matrices of the
 //   same shape after it, e.g. the shared expert of Qwen3.5-MoE built before its routed experts: deferred to that launch,
 //   which runs it as one more channel past the used experts (one launch less per layer). Nothing in between may read its
@@ -5020,7 +5034,7 @@ static int ggml_cuda_try_defer_glu(ggml_backend_cuda_context * cuda_ctx, const g
                 x2->ne[1] == 1 && glu2->ne[2] == 1 && glu2->ne[0] == glu->ne[0] &&
                 memcmp(glu2->op_params, glu->op_params, sizeof(glu->op_params)) == 0 &&
                 !ggml_cuda_tensors_overlap(glu, glu2) && !ggml_cuda_tensors_overlap(glu, ids) &&
-                ggml_cuda_should_fuse_mul_mat_vec_q(up2, true);
+                (ggml_cuda_should_fuse_mul_mat_vec_q(up2, true) || ggml_cuda_expert_cache_glu_pair(up2, gate2));
             for (int k = 0; ok && k < 2; k++) {
                 const ggml_tensor * w  = (k == 0 ? up : gate)->src[0];
                 const ggml_tensor * w2 = (k == 0 ? up2 : gate2)->src[0];
@@ -5055,11 +5069,6 @@ static int ggml_cuda_try_fuse_moe_down_shexp(ggml_backend_cuda_context * cuda_ct
     static const bool disabled = getenv("GGML_CUDA_NO_SHEXP_MERGE") != nullptr;
     ggml_tensor * down = cgraph->nodes[i];
     if (disabled || down->type != GGML_TYPE_F32 || down->ne[2] != 1 || down->ne[3] != 1 || i + 1 >= cgraph->n_nodes) {
-        return 0;
-    }
-    // a pool of cached experts is gathered inside ggml_cuda_mul_mat_id: the merged launch would read slots that hold
-    //   other experts and copy none of the missing ones
-    if (ggml_cuda_expert_cache_is(down->src[0])) {
         return 0;
     }
     ggml_cuda_moe_weighted_reduction_match match;
@@ -5109,12 +5118,20 @@ static int ggml_cuda_try_fuse_moe_down_shexp(ggml_backend_cuda_context * cuda_ct
         }
     }
 
+    // a pool of cached experts is read through its remapped ids
+    const ggml_tensor * ids = down->src[2];
+    ggml_tensor ids_remap;
+    if (ggml_cuda_expert_cache_is(down->src[0])) {
+        ggml_cuda_expert_cache_remap(*cuda_ctx, down->src[0], ids, &ids_remap);
+        ids = &ids_remap;
+    }
+
     auto shexp = std::make_unique<ggml_cuda_pool_alloc<float>>(cuda_ctx->pool(), ggml_nelements(mm));
     ggml_cuda_mm_fusion_args_host fusion_data{};
     fusion_data.sib     = mm->src[0];
     fusion_data.sib_y   = mm->src[1];
     fusion_data.sib_out = shexp->get();
-    ggml_cuda_mul_mat_vec_q(*cuda_ctx, down->src[0], down->src[1], down->src[2], down, &fusion_data);
+    ggml_cuda_mul_mat_vec_q(*cuda_ctx, down->src[0], down->src[1], ids, down, &fusion_data);
 
     // In a session, a sum that ends the subgraph is the input of the all-reduce right after it, which can compute it
     //   (ggml_backend_cuda_session_allreduce): the sum is not written here, one launch less per layer.
@@ -5929,7 +5946,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up, true)) {
+            const bool cache_pair = op == GGML_OP_MUL_MAT_ID && ggml_cuda_expert_cache_glu_pair(up, gate);
+            if (cache_pair || ggml_cuda_should_fuse_mul_mat_vec_q(up, true)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
@@ -5942,6 +5960,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     fusion_data.sib_gate = d.gate->src[0];
                     fusion_data.sib_dst  = d.glu;
                     d = {};
+                }
+
+                // pools of cached experts, each read through its own remapped ids
+                ggml_tensor remap[2];
+                if (cache_pair) {
+                    ggml_cuda_expert_cache_remap(*cuda_ctx, src0, ids, &remap[0]);
+                    ggml_cuda_expert_cache_remap(*cuda_ctx, gate->src[0], ids, &remap[1]);
+                    fusion_data.gate_ids = &remap[1];
+                    ids = &remap[0];
                 }
 
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);

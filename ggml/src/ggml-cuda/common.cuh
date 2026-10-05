@@ -1840,6 +1840,9 @@ struct ggml_cuda_mm_fusion_args_host {
     ggml_tensor * sib2_dst = nullptr;
     // one value per token gating the product before the bias: dst = x_bias + sigmoid(x_sigmoid)*(x*y), one token
     const ggml_tensor * x_sigmoid = nullptr;
+    // mmvq with ids, a gate and nothing else: the gate's own ids, of the same layout (pools of cached experts that each
+    //   hold the used experts in their own slots)
+    const ggml_tensor * gate_ids = nullptr;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1867,6 +1870,7 @@ struct ggml_cuda_mm_fusion_args_device {
     uint32_t gdn_block0 = 0;
     uint32_t gdn_nrows  = 0;
     const float * x_sigmoid = nullptr;
+    const int32_t * gate_ids = nullptr;
 };
 
 struct ggml_cuda_kernel_launch_params {
