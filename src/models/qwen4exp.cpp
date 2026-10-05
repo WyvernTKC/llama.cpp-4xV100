@@ -350,6 +350,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     cb(xn, "hc_norm", il);
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
+    if (inject) {
+        // the injection reads the same input: expanded right after the down projection, a backend can run both in one
+        //   launch (CUDA at one token) instead of quantizing the input again after the block's all-reduce
+        *inject = build_lora_mm(w_inject, xn);
+        cb(*inject, "hc_inject", il);
+        ggml_build_forward_expand(gf, lo);
+        ggml_build_forward_expand(gf, *inject);
+    }
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
     ggml_tensor * gate = build_lora_mm(w_up, lo);
     cb(gate, "hc_gate", il);
@@ -378,11 +386,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
     }
     cb(mixed, "hc_mixed", il);
-
-    if (inject) {
-        *inject = build_lora_mm(w_inject, xn);
-        cb(*inject, "hc_inject", il);
-    }
 
     return mixed;
 }
