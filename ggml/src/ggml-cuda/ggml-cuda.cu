@@ -4948,6 +4948,11 @@ static int ggml_cuda_try_fuse_moe_down_shexp(ggml_backend_cuda_context * cuda_ct
     if (disabled || down->type != GGML_TYPE_F32 || down->ne[2] != 1 || down->ne[3] != 1 || i + 1 >= cgraph->n_nodes) {
         return 0;
     }
+    // a pool of cached experts is gathered inside ggml_cuda_mul_mat_id: the merged launch would read slots that hold
+    //   other experts and copy none of the missing ones
+    if (ggml_cuda_expert_cache_is(down->src[0])) {
+        return 0;
+    }
     ggml_cuda_moe_weighted_reduction_match match;
     if (!ggml_cuda_match_moe_weighted_reduction(cgraph, i + 1, match) || match.experts != down || match.expert_scale != nullptr) {
         return 0;
