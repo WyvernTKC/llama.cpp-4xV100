@@ -5185,6 +5185,38 @@ struct test_scale_silu : public test_case {
     }
 };
 
+// GGML_OP_UNARY(SIGMOID) + GGML_OP_MUL + GGML_OP_ADD: the gated shared expert of qwen35moe added to the routed experts
+struct test_sigmoid_mul_add : public test_case {
+    const int64_t n;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SIGMOID_MUL_ADD";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(n, n_tokens);
+    }
+
+    test_sigmoid_mul_add(int64_t n = 2048, int64_t n_tokens = 4) : n(n), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * g    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_tokens);
+        ggml_tensor * x    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+        ggml_tensor * base = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+        ggml_set_name(g,    "g");
+        ggml_set_name(x,    "x");
+        ggml_set_name(base, "base");
+
+        ggml_tensor * out = ggml_add(ctx, base, ggml_mul(ctx, x, ggml_sigmoid(ctx, g)));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_MUL + GGML_OP_UNARY(SIGMOID) + GGML_OP_SCALE, the forget gate of bailingmoe3 (m per head)
 struct test_mul_sigmoid_scale : public test_case {
     const std::array<int64_t, 4> ne;
@@ -12072,6 +12104,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (bool with_mm : { false, true }) {
         test_cases.emplace_back(new test_scale_silu(320, 1, 0.25f, 0.0f, with_mm));
         if (!with_mm) {
+            // qwen35moe gated shared expert: one token, a batch, a prefill ubatch
+            test_cases.emplace_back(new test_sigmoid_mul_add(2048, 1));
+            test_cases.emplace_back(new test_sigmoid_mul_add(2048, 3));
+            test_cases.emplace_back(new test_sigmoid_mul_add(2048, 512));
+            test_cases.emplace_back(new test_sigmoid_mul_add(100, 7));
             // bailingmoe3 forget gate: one token, a batch, and other broadcasts
             test_cases.emplace_back(new test_mul_sigmoid_scale({128, 32, 1, 1}, {1, 32, 1, 1}, -5.0f, 0.0f));
             test_cases.emplace_back(new test_mul_sigmoid_scale({128, 32, 7, 1}, {1, 32, 1, 1}, -5.0f, 0.0f));

@@ -117,6 +117,10 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
 void ggml_cuda_op_mul_add_sigmoid_scale(ggml_backend_cuda_context & ctx, ggml_tensor * mul_node, ggml_tensor * add_node,
         ggml_tensor * scale_node);
 
+// base + x * sigmoid(g) with one g per row: the shared expert gate of qwen35moe / qwen4exp for more than one token
+bool ggml_cuda_should_fuse_sigmoid_mul_add(const ggml_tensor * sigmoid, const ggml_tensor * mul, const ggml_tensor * add);
+void ggml_cuda_op_sigmoid_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * sigmoid, ggml_tensor * mul, ggml_tensor * add);
+
 // scale(sigmoid(x * m)) with m broadcast as by the MUL, the forget gate of bailingmoe3 (m per head)
 bool ggml_cuda_should_fuse_mul_sigmoid_scale(const ggml_tensor * mul, const ggml_tensor * sigmoid, const ggml_tensor * scale);
 void ggml_cuda_op_mul_sigmoid_scale(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * scale);

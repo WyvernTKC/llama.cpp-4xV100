@@ -6666,6 +6666,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // the gated shared expert of qwen35moe / qwen4exp added to the routed experts, for more than one token (one token
+    //   folds it into the weighted reduction, see ggml_cuda_try_fuse_moe_down_shexp)
+    if (node->op == GGML_OP_UNARY && i + 2 < cgraph->n_nodes &&
+            ggml_cuda_should_fuse_sigmoid_mul_add(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+        const ggml_op ops[3]     = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
+        const int     outputs[1] = { i + 2 };
+        if (ggml_can_fuse_subgraph(cgraph, i, 3, ops, outputs, 1)) {
+            ggml_cuda_op_sigmoid_mul_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+            return 2;
+        }
+    }
+
     // the forget gate of bailingmoe3: scale * sigmoid(gate * a), a per head
     if (ggml_can_fuse(cgraph, i, { GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_SCALE }) &&
             ggml_cuda_should_fuse_mul_sigmoid_scale(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {

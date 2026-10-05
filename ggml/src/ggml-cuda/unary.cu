@@ -1001,6 +1001,57 @@ void ggml_cuda_op_mul_add_sigmoid_scale(ggml_backend_cuda_context & ctx, ggml_te
         (int) x->ne[0], k, (int64_t) (x->nb[1] / sizeof(float)), (int) m->ne[0], (int) a->ne[0], scale, bias);
 }
 
+/* fused sigmoid + mul + add */
+
+// dst = base + x * sigmoid(g[row]), each step rounded like its own kernel
+static __global__ void sigmoid_mul_add_f32(const float * g, const float * x, const float * base, float * dst,
+        const int ncols, const int64_t k) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    const float sg = op_sigmoid(g[i / ncols]);
+    dst[i] = __fadd_rn(base[i], __fmul_rn(x[i], sg));
+}
+
+bool ggml_cuda_should_fuse_sigmoid_mul_add(const ggml_tensor * sigmoid, const ggml_tensor * mul, const ggml_tensor * add) {
+    if (sigmoid->op != GGML_OP_UNARY || ggml_get_unary_op(sigmoid) != GGML_UNARY_OP_SIGMOID || mul->op != GGML_OP_MUL ||
+            add->op != GGML_OP_ADD) {
+        return false;
+    }
+    const ggml_tensor * g    = sigmoid->src[0];
+    const ggml_tensor * x    = mul->src[0] == sigmoid ? mul->src[1] : (mul->src[1] == sigmoid ? mul->src[0] : nullptr);
+    const ggml_tensor * base = add->src[0] == mul ? add->src[1] : (add->src[1] == mul ? add->src[0] : nullptr);
+    if (x == nullptr || base == nullptr || x == sigmoid || base == mul) {
+        return false;
+    }
+    for (const ggml_tensor * t : { g, x, base, sigmoid, mul, add }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            return false;
+        }
+    }
+    // one gate per row; the output may sit exactly on x or base (each element is read before it is written), not on g
+    return g->ne[0] == 1 && ggml_nelements(g) == ggml_nrows(x) && ggml_are_same_shape(x, mul) &&
+        ggml_are_same_shape(base, add) && ggml_are_same_shape(mul, add) && ggml_nelements(add) <= INT64_MAX/2 &&
+        ggml_cuda_same_or_disjoint(add, x) && ggml_cuda_same_or_disjoint(add, base) && !ggml_cuda_tensors_overlap(add, g);
+}
+
+void ggml_cuda_op_sigmoid_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * sigmoid, ggml_tensor * mul, ggml_tensor * add) {
+    const ggml_tensor * g    = sigmoid->src[0];
+    const ggml_tensor * x    = mul->src[0] == sigmoid ? mul->src[1] : mul->src[0];
+    const ggml_tensor * base = add->src[0] == mul ? add->src[1] : add->src[0];
+
+    const int64_t k = ggml_nelements(add);
+    const int64_t num_blocks = (k + CUDA_SIGMOID_BLOCK_SIZE - 1) / CUDA_SIGMOID_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3) num_blocks, CUDA_SIGMOID_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(sigmoid_mul_add_f32, launch_params,
+        (const float *) g->data, (const float *) x->data, (const float *) base->data, (float *) add->data, (int) x->ne[0], k);
+}
+
 /* fused mul + sigmoid + scale */
 
 // each step rounds like its own kernel: m is read as the MUL broadcasts it
