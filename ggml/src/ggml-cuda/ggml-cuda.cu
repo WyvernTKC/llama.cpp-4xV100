@@ -5218,6 +5218,221 @@ static void ggml_cuda_try_gather_expert_group(ggml_backend_cuda_context * cuda_c
     }
 }
 
+// The scores of the qwen4exp QSA indexer as its unfused branch builds them (llama_model_qwen4exp::graph, every batch
+//   size): RELU of the heads' block scores, their sum over the heads (CONT of head 0, ADD of each next), ADD of the
+//   block bias, CONT of the transpose, GET_ROWS of each cell's block, CONT of the transpose back, CPY of the f16 KQ mask
+//   to f32 and ADD of it. Eleven launches per layer at four heads, here two (see ggml_cuda_qsa_cell_scores). Returns
+//   the nodes to skip.
+static int ggml_cuda_try_fuse_qsa_cell_scores(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_QSA_SCORES") != nullptr;
+    const ggml_tensor * relu = cgraph->nodes[i];
+    if (disabled || relu->op != GGML_OP_UNARY || ggml_get_unary_op(relu) != GGML_UNARY_OP_RELU ||
+            relu->type != GGML_TYPE_F32 || relu->src[0]->type != GGML_TYPE_F32 || !ggml_is_contiguous(relu) ||
+            relu->src[0]->nb[0] != sizeof(float) || !ggml_are_same_shape(relu, relu->src[0])) {
+        return 0;
+    }
+    const ggml_tensor * x = relu->src[0];
+    const int64_t n_blocks = relu->ne[0];
+    const int64_t n_h      = relu->ne[1];
+    const int64_t n_tps    = relu->ne[2];
+    const int64_t n_stream = relu->ne[3];
+
+    // the compute nodes after i, past views; any other node in between ends the match
+    int j = i;
+    auto next = [&]() -> ggml_tensor * {
+        for (j++; j < cgraph->n_nodes && j < i + 31; j++) {
+            if (!ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+                return cgraph->nodes[j];
+            }
+        }
+        return nullptr;
+    };
+    // head h of the rectified scores, [n_blocks, n_tps, n_stream]
+    auto is_head = [&](const ggml_tensor * v, const int64_t h) {
+        return v->op == GGML_OP_VIEW && v->src[0] == relu && v->view_offs == (size_t) h*relu->nb[1] &&
+            v->ne[0] == n_blocks && v->ne[1] == n_tps && v->ne[2] == n_stream && v->ne[3] == 1 &&
+            v->nb[1] == relu->nb[2] && v->nb[2] == relu->nb[3];
+    };
+    // t is CONT(PERMUTE(a, 1, 0, 2, 3))
+    auto is_transpose = [&](const ggml_tensor * t, const ggml_tensor * a) {
+        const ggml_tensor * p = t->src[0];
+        return t->op == GGML_OP_CONT && p->op == GGML_OP_PERMUTE && p->src[0] == a &&
+            p->ne[0] == a->ne[1] && p->ne[1] == a->ne[0] && p->ne[2] == a->ne[2] && p->ne[3] == a->ne[3] &&
+            p->nb[0] == a->nb[1] && p->nb[1] == a->nb[0] && p->nb[2] == a->nb[2] && p->nb[3] == a->nb[3];
+    };
+
+    ggml_tensor * n = next();
+    if (n == nullptr || n->op != GGML_OP_CONT || !is_head(n->src[0], 0)) {
+        return 0;
+    }
+    const ggml_tensor * sum = n;
+    for (int64_t h = 1; h < n_h; h++) {
+        n = next();
+        if (n == nullptr || n->op != GGML_OP_ADD || n->src[0] != sum || !is_head(n->src[1], h)) {
+            return 0;
+        }
+        sum = n;
+    }
+    n = next();
+    if (n == nullptr || n->op != GGML_OP_ADD || n->src[0] != sum) {
+        return 0;
+    }
+    const ggml_tensor * bias = n->src[1];
+    if (bias->type != GGML_TYPE_F32 || !ggml_are_same_shape(bias, n) || bias->nb[0] != sizeof(float)) {
+        return 0;
+    }
+    sum = n;
+    n = next();
+    if (n == nullptr || !is_transpose(n, sum)) {
+        return 0;
+    }
+    const ggml_tensor * tr = n;
+    n = next();
+    if (n == nullptr || n->op != GGML_OP_GET_ROWS || n->src[0] != tr) {
+        return 0;
+    }
+    const ggml_tensor * cell_blk = n->src[1];
+    if (cell_blk->type != GGML_TYPE_I32 || cell_blk->ne[1] != n_stream || cell_blk->ne[2] != 1 ||
+            cell_blk->nb[0] != sizeof(int32_t)) {
+        return 0;
+    }
+    const int64_t n_kv = cell_blk->ne[0];
+    const ggml_tensor * rows = n;
+    n = next();
+    if (n == nullptr || !is_transpose(n, rows)) {
+        return 0;
+    }
+    const ggml_tensor * expanded = n;
+    n = next();
+    if (n == nullptr || n->op != GGML_OP_CPY) {
+        return 0;
+    }
+    const ggml_tensor * cast   = n;
+    const int           i_cast = j;
+    ggml_tensor * dst = next();
+    if (dst == nullptr || dst->op != GGML_OP_ADD || dst->src[0] != expanded || dst->type != GGML_TYPE_F32 ||
+            dst->ne[0] != n_kv || dst->ne[1] != n_tps || dst->ne[2] != n_stream || dst->nb[0] != sizeof(float)) {
+        return 0;
+    }
+    // the mask is the f32 copy made here of an f16 mask [n_kv, n_tps, 1, n_stream], read through reshapes
+    const ggml_tensor * m = dst->src[1];
+    while (m != cast && (m->op == GGML_OP_RESHAPE || (m->op == GGML_OP_VIEW && m->view_offs == 0))) {
+        m = m->src[0];
+    }
+    const ggml_tensor * mask = cast->src[0];
+    if (m != cast || cast->type != GGML_TYPE_F32 || !ggml_are_same_shape(cast, mask) || mask->type != GGML_TYPE_F16 ||
+            mask->nb[0] != ggml_type_size(mask->type) || mask->ne[0] != n_kv || mask->ne[1] != n_tps || mask->ne[2] != 1 ||
+            mask->ne[3] != n_stream) {
+        return 0;
+    }
+
+    const int count = j - i + 1;
+    if (count >= 32) {
+        return 0;
+    }
+    ggml_op ops[32];
+    for (int k = 0; k < count; k++) {
+        ops[k] = cgraph->nodes[i + k]->op;
+    }
+    // the cast is its own src[1] (ggml_cast), which its use count may include: checked here, not by the subgraph
+    const int outputs[2] = { i_cast, j };
+    if (!ggml_can_fuse_subgraph(cgraph, i, count, ops, outputs, 2)) {
+        return 0;
+    }
+    int cast_uses = 0;
+    for (int k = i_cast + 1; k <= j; k++) {
+        for (int l = 0; l < GGML_MAX_SRC; l++) {
+            cast_uses += cgraph->nodes[k]->src[l] == cast;
+        }
+    }
+    const int cast_count = ggml_node_get_use_count(cgraph, i_cast);
+    if ((cast->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            (cast_count != cast_uses && !(cast->src[1] == cast && cast_count == cast_uses + 1))) {
+        return 0;
+    }
+    // the inputs other than the scores are graph inputs; the scores may lie under dst, they are read in a first pass
+    for (const ggml_tensor * t : { bias, cell_blk, mask }) {
+        if (ggml_cuda_tensors_overlap(dst, t)) {
+            return 0;
+        }
+    }
+
+    ggml_cuda_qsa_cell_scores(*cuda_ctx, x, bias, cell_blk, mask, mask->nb[3], dst);
+    return count - 1;
+}
+
+// The attention mask of the qwen4exp QSA top-k (build_attn_qsa): FILL of a KQ-mask-shaped tensor, SET_ROWS of the picked
+//   cells through a view of it as rows of one, ADD of the KQ mask through a view back: one launch instead of three (see
+//   ggml_cuda_qsa_topk_mask). Returns the nodes to skip.
+static int ggml_cuda_try_fuse_qsa_topk_mask(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_QSA_MASK") != nullptr;
+    const ggml_tensor * fill = cgraph->nodes[i];
+    if (disabled || fill->op != GGML_OP_FILL || (fill->type != GGML_TYPE_F16 && fill->type != GGML_TYPE_F32) ||
+            !ggml_is_contiguous(fill) || fill->ne[2] != 1) {
+        return 0;
+    }
+    int j = i;
+    auto next = [&]() -> ggml_tensor * {
+        for (j++; j < cgraph->n_nodes && j < i + 8; j++) {
+            if (!ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+                return cgraph->nodes[j];
+            }
+        }
+        return nullptr;
+    };
+    const ggml_tensor * sr = next();
+    if (sr == nullptr || sr->op != GGML_OP_SET_ROWS) {
+        return 0;
+    }
+    // the fill as rows of one: [1, n_kv, n_tps, n_stream]
+    const ggml_tensor * rows = sr->src[2];
+    if (rows->op != GGML_OP_VIEW || rows->src[0] != fill || rows->view_offs != 0 || rows->ne[0] != 1 ||
+            rows->ne[1] != fill->ne[0] || rows->ne[2] != fill->ne[1] || rows->ne[3] != fill->ne[3] ||
+            rows->nb[1] != fill->nb[0] || rows->nb[2] != fill->nb[1] || rows->nb[3] != fill->nb[3]) {
+        return 0;
+    }
+    const ggml_tensor * vals = sr->src[0];
+    const ggml_tensor * idx  = sr->src[1];
+    if ((vals->type != GGML_TYPE_F32 && vals->type != GGML_TYPE_F16) || idx->type != GGML_TYPE_I32 ||
+            idx->nb[0] != sizeof(int32_t) || idx->ne[1] != fill->ne[1] || idx->ne[2] != fill->ne[3] || idx->ne[3] != 1) {
+        return 0;
+    }
+    ggml_tensor * dst = next();
+    if (dst == nullptr || dst->op != GGML_OP_ADD || dst->type != fill->type || !ggml_are_same_shape(dst, fill) ||
+            !ggml_is_contiguous(dst)) {
+        return 0;
+    }
+    // the rows viewed back as the fill: [n_kv, n_tps, 1, n_stream]
+    const ggml_tensor * back = dst->src[0];
+    const ggml_tensor * kq   = dst->src[1];
+    if (back->op != GGML_OP_VIEW || back->src[0] != sr || back->view_offs != 0 || !ggml_are_same_shape(back, fill) ||
+            back->nb[1] != fill->nb[1] || back->nb[3] != fill->nb[3] || kq->type != fill->type ||
+            !ggml_are_same_shape(kq, fill) || kq->nb[0] != ggml_type_size(kq->type)) {
+        return 0;
+    }
+
+    const int count = j - i + 1;
+    ggml_op ops[8];
+    for (int k = 0; k < count; k++) {
+        ops[k] = cgraph->nodes[i + k]->op;
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, i, count, ops, &j, 1)) {
+        return 0;
+    }
+    // a block reads its cells' kq before it writes them, so dst may sit exactly on kq; idx and vals are copied first
+    //   when dst covers them
+    if (!(dst->data == kq->data ? ggml_are_same_stride(dst, kq) : !ggml_cuda_tensors_overlap(dst, kq)) ||
+            (ggml_cuda_tensors_overlap(dst, idx) && !ggml_is_contiguous(idx)) ||
+            (ggml_cuda_tensors_overlap(dst, vals) && !ggml_is_contiguous(vals))) {
+        return 0;
+    }
+
+    float value;
+    memcpy(&value, fill->op_params, sizeof(float));
+    ggml_cuda_qsa_topk_mask(*cuda_ctx, value, vals, idx, kq, dst);
+    return count - 1;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     ggml_cuda_try_gather_expert_group(cuda_ctx, cgraph, i);
 
@@ -5227,6 +5442,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_UNARY) {
+        const int n_skip = ggml_cuda_try_fuse_qsa_cell_scores(cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_FILL) {
+        const int n_skip = ggml_cuda_try_fuse_qsa_topk_mask(cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
+        }
+    }
 
     if (node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_ROPE || node->op == GGML_OP_MUL_MAT) {
         const int n_skip = ggml_cuda_try_fuse_attn_rot(cuda_ctx, cgraph, i);

@@ -761,3 +761,193 @@ bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst) 
             return false;
     }
 }
+
+// qwen4exp QSA indexer scores, see ggml_cuda_qsa_cell_scores
+static __device__ __forceinline__ float qsa_mask_value(const half v)  { return __half2float(v); }
+static __device__ __forceinline__ float qsa_mask_value(const float v) { return v; }
+
+// the block score of block b for token t of stream s: the heads' rectified scores summed in order, then the bias
+static __global__ void qsa_block_scores_f32(const float * x, const float * bias, float * dst, const int n_blocks,
+        const int n_h, const int64_t sx1, const int64_t sx2, const int64_t sx3, const int64_t sb1, const int64_t sb2) {
+    const int b = blockIdx.x*blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    const int s = blockIdx.z;
+    if (b >= n_blocks) {
+        return;
+    }
+    const float * xb = x + s*sx3 + t*sx2 + b;
+    float v = fmaxf(xb[0], 0.0f);
+    for (int h = 1; h < n_h; ++h) {
+        v = v + fmaxf(xb[h*sx1], 0.0f);
+    }
+    dst[((int64_t) s*gridDim.y + t)*n_blocks + b] = v + bias[s*sb2 + t*sb1 + b];
+}
+
+// the block scores, [n_blocks, n_tps, n_stream] contiguous, expanded to the cells and masked
+template <typename mask_t>
+static __global__ void qsa_cell_scores_f32(const float * scores, const int32_t * cell_blk, const mask_t * mask,
+        float * dst, const int n_kv, const int n_blocks, const int64_t sc1, const int64_t sm1, const int64_t sm2,
+        const int64_t sd1, const int64_t sd2) {
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    const int s = blockIdx.z;
+    if (c >= n_kv) {
+        return;
+    }
+    const int b = cell_blk[s*sc1 + c];
+    const float v = scores[((int64_t) s*gridDim.y + t)*n_blocks + b];
+    dst[s*sd2 + t*sd1 + c] = v + qsa_mask_value(mask[s*sm2 + t*sm1 + c]);
+}
+
+void ggml_cuda_qsa_cell_scores(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * bias,
+        const ggml_tensor * cell_blk, const ggml_tensor * mask, const size_t mask_nb_stream, ggml_tensor * dst) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && bias->type == GGML_TYPE_F32 && cell_blk->type == GGML_TYPE_I32);
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->nb[0] == sizeof(float) && bias->nb[0] == sizeof(float) && cell_blk->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(mask->nb[0] == ggml_type_size(mask->type) && dst->nb[0] == sizeof(float));
+
+    const int n_blocks = (int) x->ne[0];
+    const int n_h      = (int) x->ne[1];
+    const int n_tps    = (int) x->ne[2];
+    const int n_stream = (int) x->ne[3];
+    const int n_kv     = (int) cell_blk->ne[0];
+    GGML_ASSERT(dst->ne[0] == n_kv && dst->ne[1] == n_tps && dst->ne[2] == n_stream);
+    GGML_ASSERT(n_tps <= 65535 && n_stream <= 65535);
+
+    cudaStream_t stream = ctx.stream();
+    const int block_size = 256;
+
+    // the block scores first: dst often sits on x (ggml-alloc freed it after the RELU), and a cell reads its block's
+    //   sum instead of summing the heads again
+    ggml_cuda_pool_alloc<float> scores(ctx.pool(), (size_t) n_blocks*n_tps*n_stream);
+    {
+        const dim3 grid((n_blocks + block_size - 1)/block_size, n_tps, n_stream);
+        qsa_block_scores_f32<<<grid, block_size, 0, stream>>>((const float *) x->data, (const float *) bias->data,
+            scores.get(), n_blocks, n_h, x->nb[1]/sizeof(float), x->nb[2]/sizeof(float), x->nb[3]/sizeof(float),
+            bias->nb[1]/sizeof(float), bias->nb[2]/sizeof(float));
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    const size_t  ts  = ggml_type_size(mask->type);
+    const int64_t sc1 = cell_blk->nb[1]/sizeof(int32_t);
+    const int64_t sm1 = mask->nb[1]/ts;
+    const int64_t sm2 = mask_nb_stream/ts;
+    const int64_t sd1 = dst->nb[1]/sizeof(float);
+    const int64_t sd2 = dst->nb[2]/sizeof(float);
+    const dim3 grid((n_kv + block_size - 1)/block_size, n_tps, n_stream);
+    if (mask->type == GGML_TYPE_F16) {
+        qsa_cell_scores_f32<<<grid, block_size, 0, stream>>>(scores.get(), (const int32_t *) cell_blk->data,
+            (const half *) mask->data, (float *) dst->data, n_kv, n_blocks, sc1, sm1, sm2, sd1, sd2);
+    } else {
+        qsa_cell_scores_f32<<<grid, block_size, 0, stream>>>(scores.get(), (const int32_t *) cell_blk->data,
+            (const float *) mask->data, (float *) dst->data, n_kv, n_blocks, sc1, sm1, sm2, sd1, sd2);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// the QSA attention mask, see ggml_cuda_qsa_topk_mask; a block owns chunk cells of one row and keeps their kq values,
+//   so dst may sit exactly on kq
+template <typename dst_t, typename val_t, int chunk>
+static __global__ void qsa_topk_mask(const dst_t fill, const val_t * vals, const int32_t * idx, const dst_t * kq,
+        dst_t * dst, const int n_kv, const int n_top_k, const int64_t sv1, const int64_t sv2, const int64_t sv3,
+        const int64_t si1, const int64_t si2, const int64_t sk1, const int64_t sk3, const int64_t sd1, const int64_t sd3) {
+    __shared__ dst_t kq_chunk[chunk];
+
+    const int t  = blockIdx.y;
+    const int s  = blockIdx.z;
+    const int c0 = blockIdx.x*chunk;
+    const int c1 = min(c0 + chunk, n_kv);
+
+    const dst_t * kq_row  = kq  + s*sk3 + t*sk1;
+    dst_t       * dst_row = dst + s*sd3 + t*sd1;
+    for (int c = c0 + threadIdx.x; c < c1; c += blockDim.x) {
+        const dst_t m = kq_row[c];
+        kq_chunk[c - c0] = m;
+        dst_row[c] = ggml_cuda_cast<dst_t>(ggml_cuda_cast<float>(fill) + ggml_cuda_cast<float>(m));
+    }
+    __syncthreads();
+
+    const int32_t * idx_row  = idx  + s*si2 + t*si1;
+    const val_t   * vals_row = vals + s*sv3 + t*sv2;
+    for (int k = threadIdx.x; k < n_top_k; k += blockDim.x) {
+        const int c = idx_row[k];
+        if (c >= c0 && c < c1) {
+            const dst_t v = ggml_cuda_cast<dst_t>(ggml_cuda_cast<float>(vals_row[k*sv1]));
+            dst_row[c] = ggml_cuda_cast<dst_t>(ggml_cuda_cast<float>(v) + ggml_cuda_cast<float>(kq_chunk[c - c0]));
+        }
+    }
+}
+
+void ggml_cuda_qsa_topk_mask(ggml_backend_cuda_context & ctx, const float fill, const ggml_tensor * vals,
+        const ggml_tensor * idx, const ggml_tensor * kq, ggml_tensor * dst) {
+    GGML_ASSERT(dst->type == kq->type && (dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F32));
+    GGML_ASSERT(vals->type == GGML_TYPE_F16 || vals->type == GGML_TYPE_F32);
+    GGML_ASSERT(idx->type == GGML_TYPE_I32 && idx->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(ggml_are_same_shape(dst, kq) && dst->ne[2] == 1);
+    GGML_ASSERT(dst->nb[0] == ggml_type_size(dst->type) && kq->nb[0] == ggml_type_size(kq->type));
+    GGML_ASSERT(dst->data == kq->data ? ggml_are_same_stride(dst, kq) : !ggml_cuda_tensors_overlap(dst, kq));
+
+    const int n_kv     = (int) dst->ne[0];
+    const int n_tps    = (int) dst->ne[1];
+    const int n_stream = (int) dst->ne[3];
+    const int n_top_k  = (int) idx->ne[0];
+    GGML_ASSERT(idx->ne[1] == n_tps && idx->ne[2] == n_stream);
+    GGML_ASSERT(vals->ne[0] == 1 && vals->ne[1] == n_top_k && vals->ne[2] == n_tps && vals->ne[3] == n_stream);
+    GGML_ASSERT(n_tps <= 65535 && n_stream <= 65535);
+
+    cudaStream_t stream = ctx.stream();
+
+    // the picked cells and their values are read after other blocks write their rows: copied first if dst covers them
+    const char * idx_d  = (const char *) idx->data;
+    const char * vals_d = (const char *) vals->data;
+    ggml_cuda_pool_alloc<char> idx_copy(ctx.pool());
+    ggml_cuda_pool_alloc<char> vals_copy(ctx.pool());
+    for (int k = 0; k < 2; k++) {
+        const ggml_tensor * t = k == 0 ? idx : vals;
+        if (!ggml_cuda_tensors_overlap(dst, t)) {
+            continue;
+        }
+        GGML_ASSERT(ggml_is_contiguous(t));
+        char * copy = (k == 0 ? idx_copy : vals_copy).alloc(ggml_nbytes(t));
+        CUDA_CHECK(cudaMemcpyAsync(copy, t->data, ggml_nbytes(t), cudaMemcpyDeviceToDevice, stream));
+        (k == 0 ? idx_d : vals_d) = copy;
+    }
+
+    const size_t  tv  = ggml_type_size(vals->type);
+    const size_t  td  = ggml_type_size(dst->type);
+    const int64_t sv1 = vals->nb[1]/tv;
+    const int64_t sv2 = vals->nb[2]/tv;
+    const int64_t sv3 = vals->nb[3]/tv;
+    const int64_t si1 = idx->nb[1]/sizeof(int32_t);
+    const int64_t si2 = idx->nb[2]/sizeof(int32_t);
+    const int64_t sk1 = kq->nb[1]/td;
+    const int64_t sk3 = kq->nb[3]/td;
+    const int64_t sd1 = dst->nb[1]/td;
+    const int64_t sd3 = dst->nb[3]/td;
+
+    // every block reads the row's whole top-k list, so a chunk is several cells per thread
+    const int     block_size = 256;
+    constexpr int chunk      = 2048;
+    const dim3 grid((n_kv + chunk - 1)/chunk, n_tps, n_stream);
+
+#define QSA_TOPK_MASK(dst_t, val_t) \
+    qsa_topk_mask<dst_t, val_t, chunk><<<grid, block_size, 0, stream>>>(ggml_cuda_cast<dst_t>(fill), (const val_t *) vals_d, \
+        (const int32_t *) idx_d, (const dst_t *) kq->data, (dst_t *) dst->data, n_kv, n_top_k, sv1, sv2, sv3, si1, si2, \
+        sk1, sk3, sd1, sd3)
+    if (dst->type == GGML_TYPE_F16) {
+        if (vals->type == GGML_TYPE_F32) {
+            QSA_TOPK_MASK(half, float);
+        } else {
+            QSA_TOPK_MASK(half, half);
+        }
+    } else {
+        if (vals->type == GGML_TYPE_F32) {
+            QSA_TOPK_MASK(float, float);
+        } else {
+            QSA_TOPK_MASK(float, half);
+        }
+    }
+#undef QSA_TOPK_MASK
+    CUDA_CHECK(cudaGetLastError());
+}

@@ -8874,6 +8874,183 @@ struct test_topk_moe : public test_case {
     }
 };
 
+// The attention mask of the qwen4exp QSA top-k (build_attn_qsa): the KQ mask filled with -inf, the picked cells set
+//   through a view as rows of one, the KQ mask added back
+struct test_qsa_topk_mask : public test_case {
+    const ggml_type type;
+    const int64_t   n_kv;
+    const int64_t   n_top_k;
+    const int64_t   n_tps;
+    const int64_t   n_stream;
+    const bool      zeros;  // the picked cells are set from a FILL of zeros, as the model does; else from an input
+    const bool      inf;    // fill with -inf and put -inf in the KQ mask, as the model does: only the positions of the
+                            //   infinities are checked then, so the other cases fill with a finite value
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "QSA_TOPK_MASK";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR7(type, n_kv, n_top_k, n_tps, n_stream, zeros, inf);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_qsa_topk_mask(ggml_type type = GGML_TYPE_F16, int64_t n_kv = 256, int64_t n_top_k = 64, int64_t n_tps = 1,
+            int64_t n_stream = 1, bool zeros = true, bool inf = false)
+        : type(type), n_kv(n_kv), n_top_k(n_top_k), n_tps(n_tps), n_stream(n_stream), zeros(zeros), inf(inf) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (strcmp(t->name, "idx") == 0) {
+                // distinct cells per row
+                std::vector<int32_t> v(ggml_nelements(t));
+                std::vector<int32_t> perm(n_kv);
+                for (int64_t r = 0; r < (int64_t) v.size()/n_top_k; r++) {
+                    for (int64_t c = 0; c < n_kv; c++) {
+                        perm[c] = (int32_t) c;
+                    }
+                    std::shuffle(perm.begin(), perm.end(), rng);
+                    std::copy_n(perm.begin(), n_top_k, v.begin() + r*n_top_k);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "kq") == 0) {
+                std::vector<float> f(ggml_nelements(t));
+                std::uniform_int_distribution<int> dist(0, 3);
+                for (float & v : f) {
+                    const int r = dist(rng);
+                    v = r == 0 ? (inf ? -INFINITY : -8.0f) : r == 1 ? -1.5f : 0.0f;
+                }
+                if (t->type == GGML_TYPE_F16) {
+                    std::vector<ggml_fp16_t> h(f.size());
+                    ggml_fp32_to_fp16_row(f.data(), h.data(), (int64_t) f.size());
+                    ggml_backend_tensor_set(t, h.data(), 0, ggml_nbytes(t));
+                } else {
+                    ggml_backend_tensor_set(t, f.data(), 0, ggml_nbytes(t));
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * kq = ggml_new_tensor_4d(ctx, type, n_kv, n_tps, 1, n_stream);
+        ggml_set_name(kq, "kq");
+        ggml_tensor * idx = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_top_k, n_tps, n_stream);
+        ggml_set_name(idx, "idx");
+
+        ggml_tensor * vals = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, n_top_k, n_tps, n_stream);
+        ggml_set_name(vals, "vals");
+        if (zeros) {
+            vals = ggml_fill(ctx, vals, 0.0f);
+        }
+
+        ggml_tensor * all = ggml_fill(ctx, kq, inf ? -INFINITY : -60.0f);
+        all = ggml_view_4d(ctx, all, 1, all->ne[0], all->ne[1], all->ne[3], all->nb[0], all->nb[1], all->nb[2], 0);
+        ggml_tensor * picked = ggml_set_rows(ctx, all, vals, idx);
+        picked = ggml_view_4d(ctx, picked, picked->ne[1], picked->ne[2], 1, picked->ne[3], picked->nb[2], picked->nb[3],
+                picked->nb[3], 0);
+        ggml_tensor * out = ggml_add(ctx, picked, kq);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// The scores of the qwen4exp QSA indexer as its unfused branch builds them: the heads' block scores rectified and summed,
+//   the block bias added, expanded to the cells through each cell's block, and the f16 KQ mask added as f32
+struct test_qsa_cell_scores : public test_case {
+    const int64_t n_blocks;
+    const int64_t n_h;
+    const int64_t n_tps;
+    const int64_t n_stream;
+    const int64_t ratio;       // cells per block
+    const bool    computed;    // the scores come out of an op in the graph, so the output may reuse their memory
+    const bool    inf_mask;    // the mask holds -inf (its positions are checked, the values only where all are finite)
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "QSA_CELL_SCORES";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR7(n_blocks, n_h, n_tps, n_stream, ratio, computed, inf_mask);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_qsa_cell_scores(int64_t n_blocks = 64, int64_t n_h = 4, int64_t n_tps = 1, int64_t n_stream = 1,
+            int64_t ratio = 4, bool computed = false, bool inf_mask = false)
+        : n_blocks(n_blocks), n_h(n_h), n_tps(n_tps), n_stream(n_stream), ratio(ratio), computed(computed),
+          inf_mask(inf_mask) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (strcmp(t->name, "cell_blk") == 0) {
+                // every cell in its block, the last block short
+                std::vector<int32_t> v(ggml_nelements(t));
+                const int64_t n_kv = t->ne[0];
+                for (int64_t i = 0; i < (int64_t) v.size(); i++) {
+                    v[i] = (int32_t) ((i % n_kv)/ratio);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "mask") == 0) {
+                std::vector<ggml_fp16_t> v(ggml_nelements(t));
+                std::uniform_int_distribution<int> dist(0, 3);
+                for (auto & m : v) {
+                    const int r = dist(rng);
+                    m = ggml_fp32_to_fp16(r == 0 ? (inf_mask ? -INFINITY : -8.0f) : r == 1 ? -2.5f : 0.0f);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_kv = n_blocks*ratio - ratio/2;
+
+        ggml_tensor * score = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_blocks, n_h, n_tps, n_stream);
+        ggml_set_name(score, "score");
+        if (computed) {
+            score = ggml_scale(ctx, score, 1.5f);
+            ggml_set_name(score, "score_scaled");
+        }
+        ggml_tensor * bias = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_tps, n_stream);
+        ggml_set_name(bias, "bias");
+        ggml_tensor * cell_blk = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_stream);
+        ggml_set_name(cell_blk, "cell_blk");
+        ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
+        ggml_set_name(mask, "mask");
+
+        ggml_tensor * relu = ggml_relu(ctx, score);
+        ggml_tensor * summed = nullptr;
+        for (int64_t h = 0; h < n_h; ++h) {
+            ggml_tensor * slice = ggml_view_3d(ctx, relu, n_blocks, n_tps, n_stream, relu->nb[2], relu->nb[3], h*relu->nb[1]);
+            summed = summed ? ggml_add(ctx, summed, slice) : ggml_cont(ctx, slice);
+        }
+        summed = ggml_add(ctx, summed, bias);
+
+        ggml_tensor * expanded = ggml_get_rows(ctx, ggml_cont(ctx, ggml_permute(ctx, summed, 1, 0, 2, 3)), cell_blk);
+        expanded = ggml_cont(ctx, ggml_permute(ctx, expanded, 1, 0, 2, 3));
+
+        ggml_tensor * maskf = ggml_cast(ctx, mask, GGML_TYPE_F32);
+        ggml_tensor * out = ggml_add(ctx, expanded, ggml_reshape_3d(ctx, maskf, n_kv, n_tps, n_stream));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_moe_reduce : public test_case {
     const int64_t n_embd;
     const int64_t n_expert_used;
@@ -13689,6 +13866,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
     test_cases.emplace_back(new test_moe_reduce(63,  2, 17));
+    test_cases.emplace_back(new test_qsa_cell_scores(64,   4, 1));
+    test_cases.emplace_back(new test_qsa_cell_scores(64,   4, 1, 1, 4, true));
+    test_cases.emplace_back(new test_qsa_cell_scores(64,   4, 1, 1, 4, false, true));
+    test_cases.emplace_back(new test_qsa_cell_scores(1000, 4, 1, 1, 4, true));
+    test_cases.emplace_back(new test_qsa_cell_scores(257,  4, 7, 1, 4));
+    test_cases.emplace_back(new test_qsa_cell_scores(129,  8, 33, 2, 8, true));
+    test_cases.emplace_back(new test_qsa_cell_scores(64,   2, 512, 1, 16, true));
+    test_cases.emplace_back(new test_qsa_topk_mask(GGML_TYPE_F16, 256,   256, 1));
+    test_cases.emplace_back(new test_qsa_topk_mask(GGML_TYPE_F16, 9000,  515, 1, 1, true, true));
+    test_cases.emplace_back(new test_qsa_topk_mask(GGML_TYPE_F16, 9000,  515, 1));
+    test_cases.emplace_back(new test_qsa_topk_mask(GGML_TYPE_F16, 4096,  1027, 5, 1, false));
+    test_cases.emplace_back(new test_qsa_topk_mask(GGML_TYPE_F16, 3000,  700, 3, 2));
+    test_cases.emplace_back(new test_qsa_topk_mask(GGML_TYPE_F32, 5000,  300, 2, 1, false));
     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128));
     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128, false, true));
     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
