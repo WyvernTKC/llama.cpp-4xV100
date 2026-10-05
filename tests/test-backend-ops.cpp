@@ -4465,6 +4465,7 @@ struct test_rms_norm_add_rms_norm : public test_case {
     const float eps1;
     const float eps2;
     const int64_t mm_rows; // > 0: a q8_0 matmul reads the second norm
+    const bool pre;        // x is the sum of two norms (the post-norms of a gemma4 MoE block)
 
     ggml_tensor * y  = nullptr;
     ggml_tensor * n2 = nullptr;
@@ -4484,7 +4485,11 @@ struct test_rms_norm_add_rms_norm : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR5(ne, scale, eps1, eps2, mm_rows);
+        std::string v = VARS_TO_STR5(ne, scale, eps1, eps2, mm_rows);
+        if (pre) {
+            v += "," + VARS_TO_STR1(pre);
+        }
+        return v;
     }
 
     double max_nmse_err() override {
@@ -4492,11 +4497,24 @@ struct test_rms_norm_add_rms_norm : public test_case {
     }
 
     test_rms_norm_add_rms_norm(std::array<int64_t, 4> ne = {64, 5, 4, 3}, int scale = 0, float eps1 = 1e-6f, float eps2 = 1e-6f,
-            int64_t mm_rows = 0)
-        : ne(ne), scale(scale), eps1(eps1), eps2(eps2), mm_rows(mm_rows) {}
+            int64_t mm_rows = 0, bool pre = false)
+        : ne(ne), scale(scale), eps1(eps1), eps2(eps2), mm_rows(mm_rows), pre(pre) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * x  = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * x;
+        if (pre) {
+            ggml_tensor * a  = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            ggml_tensor * b  = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            ggml_tensor * wa = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+            ggml_tensor * wb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+            ggml_set_name(a,  "a");
+            ggml_set_name(b,  "b");
+            ggml_set_name(wa, "wa");
+            ggml_set_name(wb, "wb");
+            x = ggml_add(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, a, 1e-6f), wa), ggml_mul(ctx, ggml_rms_norm(ctx, b, 1e-5f), wb));
+        } else {
+            x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        }
         ggml_tensor * r  = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
         ggml_tensor * w1 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
         ggml_tensor * w2 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
@@ -11923,6 +11941,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_rms_norm_add_rms_norm({n, 6, 1, 1}, scale, 1e-6f, 1e-5f));
         }
         test_cases.emplace_back(new test_rms_norm_add_rms_norm({1025, 5, 4, 3}, scale, 1e-1f, 0.0f));
+        // gemma4 MoE: the two post-norms summed first (Goetia: 2816 columns, a scalar layer scale)
+        test_cases.emplace_back(new test_rms_norm_add_rms_norm({2816, 1, 1, 1}, scale, 1e-6f, 1e-6f, 0, true));
+        test_cases.emplace_back(new test_rms_norm_add_rms_norm({2816, 3, 1, 1}, scale, 1e-6f, 1e-6f, 0, true));
+        test_cases.emplace_back(new test_rms_norm_add_rms_norm({1000, 2, 2, 1}, scale, 1e-6f, 1e-5f, 0, true));
+        test_cases.emplace_back(new test_rms_norm_add_rms_norm({2816, 1, 1, 1}, scale, 1e-6f, 1e-6f, 256, true));
         // one row writes the q8_1 copy for the matmul that reads the second norm, two rows do not
         for (int64_t n : {768, 2816, 5376}) {
             test_cases.emplace_back(new test_rms_norm_add_rms_norm({n, 1, 1, 1}, scale, 1e-6f, 1e-6f, 256));

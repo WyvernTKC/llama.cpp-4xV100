@@ -6282,6 +6282,33 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // gemma4's MoE block ends in the post-norms of the dense MLP and of the experts, summed, before the sandwich norms
+    //   below: the sum is made in the same launch
+    if (node->op == GGML_OP_RMS_NORM && i + 9 < cgraph->n_nodes && cgraph->nodes[i + 2]->op == GGML_OP_RMS_NORM &&
+            cgraph->nodes[i + 4]->op == GGML_OP_ADD && cgraph->nodes[i + 5]->op == GGML_OP_RMS_NORM) {
+        const int  j         = i + 5;
+        const bool has_scale = cgraph->nodes[j + 3]->op == GGML_OP_MUL;
+        const int  n_ops     = 5 + (has_scale ? 6 : 5);
+        if (i + n_ops <= cgraph->n_nodes &&
+                ggml_cuda_should_fuse_rms_norm_add_rms_norm(cgraph->nodes[j], cgraph->nodes[j + 1], cgraph->nodes[j + 2],
+                    has_scale ? cgraph->nodes[j + 3] : nullptr, cgraph->nodes[i + n_ops - 2], cgraph->nodes[i + n_ops - 1]) &&
+                ggml_cuda_should_fuse_rms_norm_pair_add(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3],
+                    cgraph->nodes[i + 4], cgraph->nodes[j], cgraph->nodes[i + n_ops - 3], cgraph->nodes[i + n_ops - 1])) {
+            const int outputs[2] = { i + n_ops - 3, i + n_ops - 1 };
+            const enum ggml_op ops_scale[11] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD,
+                GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL, GGML_OP_RMS_NORM, GGML_OP_MUL };
+            const enum ggml_op ops[10]       = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD,
+                GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
+            if (ggml_can_fuse_subgraph(cgraph, i, n_ops, has_scale ? ops_scale : ops, outputs, 2)) {
+                ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + n_ops - 1);
+                ggml_cuda_op_rms_norm_add_rms_norm(*cuda_ctx, cgraph->nodes[j], cgraph->nodes[j + 1], cgraph->nodes[j + 2],
+                    has_scale ? cgraph->nodes[j + 3] : nullptr, cgraph->nodes[i + n_ops - 2], cgraph->nodes[i + n_ops - 1],
+                    node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3]);
+                return n_ops - 1;
+            }
+        }
+    }
+
     // the sandwich norms of gemma: a block's post-norm, the residual add (and the layer output scale) and the next block's
     //   pre-norm of the same row, two or three launches per block
     if (node->op == GGML_OP_RMS_NORM && i + 4 < cgraph->n_nodes) {

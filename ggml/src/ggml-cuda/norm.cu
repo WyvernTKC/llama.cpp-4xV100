@@ -437,11 +437,22 @@ static __global__ void __launch_bounds__(block_size) rms_norm_pre_add_f32(const 
 //   next block on the same row in one launch. Both norms reduce like rms_norm_f32 with the same block size and the y
 //   of the separate kernels is written, so both outputs are those of the ops apart. Every input is read before the
 //   first reduction, so an output may sit exactly on an input; the second reduction has its own shared slots.
-template <int block_size, int cols_per_thread, bool has_scale>
+// has_pre: x is not read but made as rms_norm(a) * wa + rms_norm(b) * wb, the two post-norms of a gemma4 MoE block (the
+//   dense MLP and the experts) summed, rounded like the RMS_NORM -> MUL and RMS_NORM -> MUL -> ADD kernels apart.
+struct rms_norm_pre_pair {
+    const float * a  = nullptr;
+    const float * wa = nullptr;
+    const float * b  = nullptr;
+    const float * wb = nullptr;
+    float eps_a = 0.0f;
+    float eps_b = 0.0f;
+};
+
+template <int block_size, int cols_per_thread, bool has_scale, bool has_pre = false>
 static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
         const float * x, const float * w1, const float * r, const float * s, const float * w2, float * y_out, float * dst,
         const int ncols, const float eps1, const float eps2, const bool s_per_col,
-        block_q8_1 * q8_dst = nullptr, const int nq8 = 0, unsigned int * flags = nullptr) {
+        block_q8_1 * q8_dst = nullptr, const int nq8 = 0, unsigned int * flags = nullptr, const rms_norm_pre_pair pre = {}) {
     ggml_cuda_pdl_lc();
     // the q8_1 copy of dst as in rms_norm_pre_add_f32: blocks after the first, one row
     const bool emitter  = q8_dst != nullptr && blockIdx.x > 0;
@@ -450,7 +461,6 @@ static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
     const int tid       = threadIdx.x;
 
     const int64_t offset = q8_dst != nullptr ? 0 : ((int64_t(blockIdx.z)*nchannels + blockIdx.y)*nrows + blockIdx.x)*ncols;
-    x     += offset;
     r     += offset;
     y_out += offset;
     dst   += offset;
@@ -460,12 +470,24 @@ static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
     float rv[cols_per_thread];
     float w2v[cols_per_thread];
     [[maybe_unused]] float sv[cols_per_thread];
+    [[maybe_unused]] float av[cols_per_thread];
+    [[maybe_unused]] float bv[cols_per_thread];
 
     ggml_cuda_pdl_sync();
+    if constexpr (has_pre) {
 #pragma unroll
-    for (int i = 0; i < cols_per_thread; ++i) {
-        const int col = tid + i*block_size;
-        xv[i] = col < ncols ? x[col] : 0.0f;
+        for (int i = 0; i < cols_per_thread; ++i) {
+            const int col = tid + i*block_size;
+            av[i] = col < ncols ? pre.a[offset + col] : 0.0f;
+            bv[i] = col < ncols ? pre.b[offset + col] : 0.0f;
+        }
+    } else {
+        x += offset;
+#pragma unroll
+        for (int i = 0; i < cols_per_thread; ++i) {
+            const int col = tid + i*block_size;
+            xv[i] = col < ncols ? x[col] : 0.0f;
+        }
     }
 #pragma unroll
     for (int i = 0; i < cols_per_thread; ++i) {
@@ -483,7 +505,11 @@ static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
         bool nan = false;
 #pragma unroll
         for (int i = 0; i < cols_per_thread; ++i) {
-            nan = nan || xv[i] != xv[i] || rv[i] != rv[i];
+            if constexpr (has_pre) {
+                nan = nan || av[i] != av[i] || bv[i] != bv[i] || rv[i] != rv[i];
+            } else {
+                nan = nan || xv[i] != xv[i] || rv[i] != rv[i];
+            }
             if constexpr (has_scale) {
                 nan = nan || sv[i] != sv[i];
             }
@@ -496,6 +522,30 @@ static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
     }
 
     extern __shared__ float s_sum[];
+
+    if constexpr (has_pre) {
+        float ta = 0.0f;
+        float tb = 0.0f;
+#pragma unroll
+        for (int i = 0; i < cols_per_thread; ++i) {
+            if (tid + i*block_size < ncols) {
+                ta += av[i] * av[i];
+                tb += bv[i] * bv[i];
+            }
+        }
+        ta = block_reduce<block_reduce_method::SUM, block_size>(ta, s_sum + 64);
+        tb = block_reduce<block_reduce_method::SUM, block_size>(tb, s_sum + 96);
+        const float scale_a = rsqrtf(ta / ncols + pre.eps_a);
+        const float scale_b = rsqrtf(tb / ncols + pre.eps_b);
+#pragma unroll
+        for (int i = 0; i < cols_per_thread; ++i) {
+            const int   col = tid + i*block_size;
+            const float wa  = col < ncols ? pre.wa[col] : 0.0f;
+            const float wb  = col < ncols ? pre.wb[col] : 0.0f;
+            const float ya  = __fmul_rn(__fmul_rn(scale_a, av[i]), wa);
+            xv[i] = col < ncols ? scale_b * bv[i] * wb + ya : 0.0f;
+        }
+    }
 
     float tmp = 0.0f;
 #pragma unroll
@@ -1352,8 +1402,40 @@ bool ggml_cuda_should_fuse_rms_norm_add_rms_norm(const ggml_tensor * norm1, cons
         (s == nullptr || (!ggml_cuda_tensors_overlap(y, s) && !ggml_cuda_tensors_overlap(mul2, s)));
 }
 
+bool ggml_cuda_should_fuse_rms_norm_pair_add(const ggml_tensor * norm_a, const ggml_tensor * mul_a, const ggml_tensor * norm_b,
+                                             const ggml_tensor * mul_b, const ggml_tensor * add_ab, const ggml_tensor * norm1,
+                                             const ggml_tensor * y, const ggml_tensor * mul2) {
+    if (norm_a->op != GGML_OP_RMS_NORM || mul_a->op != GGML_OP_MUL || norm_b->op != GGML_OP_RMS_NORM ||
+            mul_b->op != GGML_OP_MUL || add_ab->op != GGML_OP_ADD || norm1->src[0] != add_ab) {
+        return false;
+    }
+    const ggml_tensor * a  = norm_a->src[0];
+    const ggml_tensor * b  = norm_b->src[0];
+    const ggml_tensor * wa = ggml_cuda_other_src(mul_a, norm_a);
+    const ggml_tensor * wb = ggml_cuda_other_src(mul_b, norm_b);
+    if (wa == nullptr || wa == norm_a || wb == nullptr || wb == norm_b ||
+            !((add_ab->src[0] == mul_a && add_ab->src[1] == mul_b) || (add_ab->src[0] == mul_b && add_ab->src[1] == mul_a))) {
+        return false;
+    }
+    const int64_t ncols = add_ab->ne[0];
+    for (const ggml_tensor * t : { a, b, wa, wb, norm_a, mul_a, norm_b, mul_b, add_ab }) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    // a and b are read before the first reduction, as x is: an output may sit exactly on them
+    return ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_are_same_shape(a, add_ab) && ggml_are_same_shape(b, add_ab) &&
+        ggml_are_same_shape(mul_a, add_ab) && ggml_are_same_shape(mul_b, add_ab) &&
+        ggml_is_contiguous(wa) && ggml_nelements(wa) == ncols && ggml_is_contiguous(wb) && ggml_nelements(wb) == ncols &&
+        ggml_cuda_same_or_disjoint(y, a) && ggml_cuda_same_or_disjoint(y, b) && ggml_cuda_same_or_disjoint(mul2, a) &&
+        ggml_cuda_same_or_disjoint(mul2, b) && !ggml_cuda_tensors_overlap(y, wa) && !ggml_cuda_tensors_overlap(y, wb) &&
+        !ggml_cuda_tensors_overlap(mul2, wa) && !ggml_cuda_tensors_overlap(mul2, wb);
+}
+
 void ggml_cuda_op_rms_norm_add_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * norm1, ggml_tensor * mul1, ggml_tensor * add,
-                                        ggml_tensor * scale, ggml_tensor * norm2, ggml_tensor * mul2) {
+                                        ggml_tensor * scale, ggml_tensor * norm2, ggml_tensor * mul2,
+                                        const ggml_tensor * norm_a, const ggml_tensor * mul_a,
+                                        const ggml_tensor * norm_b, const ggml_tensor * mul_b) {
     const ggml_tensor * x  = norm1->src[0];
     const ggml_tensor * w1 = ggml_cuda_other_src(mul1, norm1);
     const ggml_tensor * r  = ggml_cuda_other_src(add, mul1);
@@ -1366,6 +1448,17 @@ void ggml_cuda_op_rms_norm_add_rms_norm(ggml_backend_cuda_context & ctx, ggml_te
     memcpy(&eps1, norm1->op_params, sizeof(float));
     memcpy(&eps2, norm2->op_params, sizeof(float));
     GGML_ASSERT(eps1 >= 0.0f && eps2 >= 0.0f);
+
+    const bool has_pre = norm_a != nullptr;
+    rms_norm_pre_pair pre;
+    if (has_pre) {
+        pre.a  = (const float *) norm_a->src[0]->data;
+        pre.b  = (const float *) norm_b->src[0]->data;
+        pre.wa = (const float *) ggml_cuda_other_src(mul_a, norm_a)->data;
+        pre.wb = (const float *) ggml_cuda_other_src(mul_b, norm_b)->data;
+        memcpy(&pre.eps_a, norm_a->op_params, sizeof(float));
+        memcpy(&pre.eps_b, norm_b->op_params, sizeof(float));
+    }
 
     const int  ncols     = x->ne[0];
     const bool s_per_col = s != nullptr && ggml_nelements(s) > 1;
@@ -1387,7 +1480,8 @@ void ggml_cuda_op_rms_norm_add_rms_norm(ggml_backend_cuda_context & ctx, ggml_te
             const char * b0 = (const char *) b->data;
             return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
         };
-        for (const ggml_tensor * in : { x, r, s }) {
+        const ggml_tensor * ins[4] = { has_pre ? norm_a->src[0] : x, has_pre ? norm_b->src[0] : nullptr, r, s };
+        for (const ggml_tensor * in : ins) {
             if (in != nullptr && (overlaps(in, y) || overlaps(in, mul2))) {
                 flags = ctx.block_flags_get();
             }
@@ -1398,11 +1492,13 @@ void ggml_cuda_op_rms_norm_add_rms_norm(ggml_backend_cuda_context & ctx, ggml_te
         constexpr int nc = decltype(cols)::value;
         if constexpr (nc > 0) {
             constexpr int bs = decltype(block_size)::value;
-            const ggml_cuda_kernel_launch_params launch_params{grid, dim3(bs, 1, 1), 64 * sizeof(float), ctx.stream()};
-            ggml_cuda_kernel_launch(rms_norm_add_rms_norm_f32<bs, nc, decltype(has_scale)::value>, launch_params,
+            const ggml_cuda_kernel_launch_params launch_params{grid, dim3(bs, 1, 1), 128 * sizeof(float), ctx.stream()};
+            const auto kernel = has_pre ? rms_norm_add_rms_norm_f32<bs, nc, decltype(has_scale)::value, true> :
+                                          rms_norm_add_rms_norm_f32<bs, nc, decltype(has_scale)::value, false>;
+            ggml_cuda_kernel_launch(kernel, launch_params,
                 (const float *) x->data, (const float *) w1->data, (const float *) r->data,
                 s != nullptr ? (const float *) s->data : nullptr, (const float *) w2->data, (float *) y->data,
-                (float *) mul2->data, ncols, eps1, eps2, s_per_col, q8_d, nq8, flags);
+                (float *) mul2->data, ncols, eps1, eps2, s_per_col, q8_d, nq8, flags, pre);
         } else {
             GGML_ABORT("fatal error");
         }
