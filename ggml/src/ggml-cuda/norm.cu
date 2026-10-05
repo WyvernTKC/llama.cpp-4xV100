@@ -216,6 +216,76 @@ static __global__ void __launch_bounds__(block_size) rms_norm_f32(const float * 
     }
 }
 
+// rms_norm_f32<block_size, true, false, false, cols_per_thread> (dst = rms_norm(x) * mul, contiguous) that also writes the
+//   q8_1 copy of dst for the MMVQ matmul that reads all of it, one row after the other: a warp holds 32 consecutive
+//   columns of a register slot and quantizes them as one q8_1 block. The reduction and products are rms_norm_f32's and
+//   the quantization quantize_q8_1's, so both outputs are those of the ops apart. ncols % 32 == 0, so a warp is in the
+//   row or past it as a whole. The grouped norm of qwen4exp's hyper-connections, hc rows read as one by their matmul.
+template <int block_size, int cols_per_thread>
+static __global__ void __launch_bounds__(block_size) rms_norm_mul_q8_f32(const float * x, float * dst, const int ncols,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps,
+        const float * mul, const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
+        const uint3 mul_ncols_packed, const uint3 mul_nrows_packed, const uint3 mul_nchannels_packed,
+        const uint3 mul_nsamples_packed, block_q8_1 * q8_dst) {
+    ggml_cuda_pdl_lc();
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+
+    const int row     = blockIdx.x;
+    const int channel = blockIdx.y;
+    const int sample  = blockIdx.z;
+    const int tid     = threadIdx.x;
+
+    const int64_t row_flat = (int64_t(sample)*nchannels + channel)*nrows + row;
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    dst += row_flat*ncols;
+    block_q8_1 * q8 = q8_dst + row_flat*(ncols/QK8_1);
+
+    const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
+    const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
+    const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
+    mul += mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
+
+    float tmp = 0.0f;
+    extern __shared__ float s_sum[];
+
+    ggml_cuda_pdl_sync();
+    float xv[cols_per_thread];
+    float mv[cols_per_thread];
+#pragma unroll
+    for (int i = 0; i < cols_per_thread; ++i) {
+        const int col = tid + i*block_size;
+        xv[i] = col < ncols ? x[col] : 0.0f;
+    }
+#pragma unroll
+    for (int i = 0; i < cols_per_thread; ++i) {
+        const int col = tid + i*block_size;
+        mv[i] = col < ncols ? mul[fastmodulo(col, mul_ncols_packed)] : 0.0f;
+    }
+#pragma unroll
+    for (int i = 0; i < cols_per_thread; ++i) {
+        if (tid + i*block_size < ncols) {
+            tmp += xv[i] * xv[i];
+        }
+    }
+
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+#pragma unroll
+    for (int i = 0; i < cols_per_thread; ++i) {
+        const int col = tid + i*block_size;
+        if (col >= ncols) {
+            continue;
+        }
+        const float v = scale * xv[i] * mv[i];
+        dst[col] = v;
+        quantize_q8_1_lane(v, q8 + col/QK8_1, col % QK8_1);
+    }
+}
+
 // sum = a + b and dst = rms_norm(sum) * mul in one pass: a residual add and the norm that follows it, which also
 //   leaves the sum for the next residual. It reduces exactly like rms_norm_f32 with the same block size, so both
 //   results are those of the three ops apart. a, b, sum and dst are contiguous. cols_per_thread as in rms_norm_f32.
@@ -1018,6 +1088,41 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int mul_nrows     = mul_src->ne[1];
     const int mul_nchannels = mul_src->ne[2];
     const int mul_nsamples  = mul_src->ne[3];
+
+    // the q8_1 copy of the output for the MMVQ matmul that reads all of it, see ggml_cuda_q8_1_request; whole q8_1
+    //   blocks per row and no padding blocks past the last row
+    if (!scale_tensor && ctx.q8_1_emit == mul_tensor && ggml_is_contiguous(mul_tensor) && ne00 % QK8_1 == 0 &&
+            ne00 <= 8*1024 && ggml_nelements(mul_tensor) % MATRIX_ROW_PADDING == 0) {
+        int64_t ne_padded = 0;
+        block_q8_1 * q8 = (block_q8_1 *) ctx.q8_1_emit_alloc(mul_tensor, ne_padded);
+        if (q8 != nullptr) {
+            GGML_ASSERT(ne_padded == ggml_nelements(mul_tensor));
+            const dim3 blocks_num(ne01, ne02, ne03);
+            const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
+            const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
+            const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
+            const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
+            const auto launch = [&](auto block, auto cols) {
+                constexpr int bs = decltype(block)::value;
+                constexpr int nc = decltype(cols)::value;
+                if constexpr (nc > 0) {
+                    const dim3 block_dims(bs, 1, 1);
+                    const ggml_cuda_kernel_launch_params launch_params{blocks_num, block_dims, 32 * sizeof(float), stream};
+                    ggml_cuda_kernel_launch(rms_norm_mul_q8_f32<bs, nc>, launch_params, src0_d, dst_d, (int) ne00, s01, s02, s03,
+                        eps, mul_d, mul_s01, mul_s02, mul_s03, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed,
+                        mul_nsamples_packed, q8);
+                } else {
+                    GGML_ABORT("fatal error");
+                }
+            };
+            if (ne00 < 1024) {
+                rms_norm_launch_cols<256, 4>(ne00, [&](auto cols) { launch(std::integral_constant<int, 256>(), cols); });
+            } else {
+                rms_norm_launch_cols<1024, 8>(ne00, [&](auto cols) { launch(std::integral_constant<int, 1024>(), cols); });
+            }
+            return;
+        }
+    }
 
     if (scale_tensor) {
         rms_norm_mul_f32_cuda<true>(src0_d, mul_d, nullptr, dst_d,

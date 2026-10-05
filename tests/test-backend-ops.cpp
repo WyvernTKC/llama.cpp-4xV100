@@ -5088,6 +5088,46 @@ struct test_cont_unary_mul : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM + MUL over n_rows rows read as one row by a quantized matmul (qwen4exp's grouped hyper-connection
+//   norm: the norm writes the q8_1 copy the matmul reads)
+struct test_rms_norm_mul_mm : public test_case {
+    const int64_t n;
+    const int64_t n_rows;
+    const int64_t n_out;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_MM";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n, n_rows, n_out);
+    }
+
+    test_rms_norm_mul_mm(int64_t n = 2560, int64_t n_rows = 4, int64_t n_out = 320)
+        : n(n), n_rows(n_rows), n_out(n_out) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_rows);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_rows);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * xn = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        xn = ggml_reshape_2d(ctx, xn, n*n_rows, 1);
+
+        ggml_tensor * m = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n*n_rows, n_out);
+        ggml_set_name(m, "m");
+        ggml_tensor * out = ggml_mul_mat(ctx, m, xn);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SCALE + SILU (qwen4exp hyper-connection), optionally read by a quantized matmul (the q8_1 copy at one row)
 struct test_scale_silu : public test_case {
     const int64_t n;
@@ -11870,6 +11910,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_cont_unary_mul(256, 4, 3, op, 64));
     }
+    test_cases.emplace_back(new test_rms_norm_mul_mm(2560, 4, 320));
+    test_cases.emplace_back(new test_rms_norm_mul_mm(512, 1, 64));
+    test_cases.emplace_back(new test_rms_norm_mul_mm(4096, 1, 256));
+    test_cases.emplace_back(new test_rms_norm_mul_mm(768, 2, 64));
     for (bool with_mm : { false, true }) {
         test_cases.emplace_back(new test_scale_silu(320, 1, 0.25f, 0.0f, with_mm));
         test_cases.emplace_back(new test_scale_silu(320, 3, 0.25f, 0.0f, with_mm));
