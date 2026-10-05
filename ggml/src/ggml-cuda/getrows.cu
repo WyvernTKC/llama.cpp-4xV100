@@ -821,3 +821,129 @@ void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
     k_get_rows_back_float<<<block_nums, block_dims, 0, stream>>>(src0_d, src1_d, dst_d, ne00, ne10, ne1);
 }
+
+// GET_ROWS of float rows followed by an op of the gathered rows: a block row per gathered row, each element converted to
+//   f32 as GET_ROWS writes it and on as the next op takes it
+template <typename src_t>
+static __device__ __forceinline__ float get_rows_fused_load(const char * src, const int64_t row, const int64_t nb1, const int64_t c) {
+    return ggml_cuda_cast<float>(((const src_t *) (src + row*nb1))[c]);
+}
+
+template <typename src_t, typename dst_t, typename idx_t>
+static __global__ void k_get_rows_set_rows(const char * src, const int32_t * gidx, const idx_t * sidx, char * dst,
+        const int64_t ne0, const int64_t src_nb1, const int64_t dst_nb1) {
+    const int64_t k = blockIdx.y;
+    const int64_t c = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= ne0) {
+        return;
+    }
+    const float v = get_rows_fused_load<src_t>(src, gidx[k], src_nb1, c);
+    ((dst_t *) (dst + (int64_t) sidx[k]*dst_nb1))[c] = ggml_cuda_cast<dst_t>(v);
+}
+
+template <typename src_t>
+static __global__ void k_get_rows_add(const char * src, const int32_t * gidx, const float * a, float * dst,
+        const int64_t ne0, const int64_t src_nb1, const int64_t a_s1, const int64_t dst_s1) {
+    const int64_t r = blockIdx.y;
+    const int64_t c = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= ne0) {
+        return;
+    }
+    dst[r*dst_s1 + c] = a[r*a_s1 + c] + get_rows_fused_load<src_t>(src, gidx[r], src_nb1, c);
+}
+
+// rows of a float matrix gathered by i32 indices into an f32 matrix, two dimensions
+static bool ggml_cuda_get_rows_fusable(const ggml_tensor * get_rows) {
+    const ggml_tensor * src = get_rows->src[0];
+    const ggml_tensor * idx = get_rows->src[1];
+    return (src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_F16 || src->type == GGML_TYPE_BF16) &&
+        src->nb[0] == ggml_type_size(src->type) && src->ne[2] == 1 && src->ne[3] == 1 &&
+        idx->type == GGML_TYPE_I32 && ggml_is_contiguous(idx) && ggml_nelements(idx) == get_rows->ne[1] &&
+        get_rows->type == GGML_TYPE_F32 && get_rows->ne[2] == 1 && get_rows->ne[3] == 1 && get_rows->ne[1] <= 65535;
+}
+
+bool ggml_cuda_should_fuse_get_rows_set_rows(const ggml_tensor * get_rows, const ggml_tensor * set_rows) {
+    const ggml_tensor * sidx = set_rows->src[1];
+    const ggml_tensor * dst  = set_rows;
+    return ggml_cuda_get_rows_fusable(get_rows) && set_rows->src[0] == get_rows &&
+        (sidx->type == GGML_TYPE_I32 || sidx->type == GGML_TYPE_I64) && ggml_is_contiguous(sidx) &&
+        ggml_nelements(sidx) == get_rows->ne[1] &&
+        (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_BF16) &&
+        dst->nb[0] == ggml_type_size(dst->type) && dst->ne[0] == get_rows->ne[0] && dst->ne[2] == 1 && dst->ne[3] == 1 &&
+        !ggml_cuda_tensors_overlap(dst, get_rows->src[0]) && !ggml_cuda_tensors_overlap(dst, get_rows->src[1]) &&
+        !ggml_cuda_tensors_overlap(dst, sidx);
+}
+
+bool ggml_cuda_should_fuse_get_rows_add(const ggml_tensor * get_rows, const ggml_tensor * add) {
+    const ggml_tensor * a = add->src[0] == get_rows ? add->src[1] : add->src[0];
+    return ggml_cuda_get_rows_fusable(get_rows) && (add->src[0] == get_rows) != (add->src[1] == get_rows) &&
+        add->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32 && ggml_are_same_shape(add, get_rows) &&
+        ggml_are_same_shape(add, a) && a->nb[0] == sizeof(float) && add->nb[0] == sizeof(float) &&
+        ggml_cuda_same_or_disjoint(add, a) && !ggml_cuda_tensors_overlap(add, get_rows->src[0]) &&
+        !ggml_cuda_tensors_overlap(add, get_rows->src[1]);
+}
+
+template <typename src_t, typename dst_t>
+static void get_rows_set_rows_launch(const ggml_tensor * get_rows, ggml_tensor * set_rows, cudaStream_t stream) {
+    const ggml_tensor * src  = get_rows->src[0];
+    const ggml_tensor * gidx = get_rows->src[1];
+    const ggml_tensor * sidx = set_rows->src[1];
+    const int64_t ne0 = get_rows->ne[0];
+    const dim3 grid((unsigned) ((ne0 + CUDA_GET_ROWS_BLOCK_SIZE - 1)/CUDA_GET_ROWS_BLOCK_SIZE), (unsigned) get_rows->ne[1], 1);
+    if (sidx->type == GGML_TYPE_I64) {
+        k_get_rows_set_rows<src_t, dst_t, int64_t><<<grid, CUDA_GET_ROWS_BLOCK_SIZE, 0, stream>>>((const char *) src->data,
+            (const int32_t *) gidx->data, (const int64_t *) sidx->data, (char *) set_rows->data, ne0, src->nb[1], set_rows->nb[1]);
+    } else {
+        k_get_rows_set_rows<src_t, dst_t, int32_t><<<grid, CUDA_GET_ROWS_BLOCK_SIZE, 0, stream>>>((const char *) src->data,
+            (const int32_t *) gidx->data, (const int32_t *) sidx->data, (char *) set_rows->data, ne0, src->nb[1], set_rows->nb[1]);
+    }
+}
+
+template <typename src_t>
+static void get_rows_set_rows_dst(const ggml_tensor * get_rows, ggml_tensor * set_rows, cudaStream_t stream) {
+    switch (set_rows->type) {
+        case GGML_TYPE_F32:  get_rows_set_rows_launch<src_t, float>      (get_rows, set_rows, stream); break;
+        case GGML_TYPE_F16:  get_rows_set_rows_launch<src_t, half>       (get_rows, set_rows, stream); break;
+        case GGML_TYPE_BF16: get_rows_set_rows_launch<src_t, nv_bfloat16>(get_rows, set_rows, stream); break;
+        default: GGML_ABORT("unsupported type");
+    }
+}
+
+void ggml_cuda_op_get_rows_set_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * get_rows, ggml_tensor * set_rows) {
+    cudaStream_t stream = ctx.stream();
+    switch (get_rows->src[0]->type) {
+        case GGML_TYPE_F32:  get_rows_set_rows_dst<float>      (get_rows, set_rows, stream); break;
+        case GGML_TYPE_F16:  get_rows_set_rows_dst<half>       (get_rows, set_rows, stream); break;
+        case GGML_TYPE_BF16: get_rows_set_rows_dst<nv_bfloat16>(get_rows, set_rows, stream); break;
+        default: GGML_ABORT("unsupported type");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_op_get_rows_add(ggml_backend_cuda_context & ctx, const ggml_tensor * get_rows, ggml_tensor * add) {
+    const ggml_tensor * src  = get_rows->src[0];
+    const ggml_tensor * gidx = get_rows->src[1];
+    const ggml_tensor * a    = add->src[0] == get_rows ? add->src[1] : add->src[0];
+    const int64_t ne0 = get_rows->ne[0];
+    const dim3 grid((unsigned) ((ne0 + CUDA_GET_ROWS_BLOCK_SIZE - 1)/CUDA_GET_ROWS_BLOCK_SIZE), (unsigned) get_rows->ne[1], 1);
+    cudaStream_t stream = ctx.stream();
+    const int64_t a_s1   = a->nb[1]/sizeof(float);
+    const int64_t dst_s1 = add->nb[1]/sizeof(float);
+
+    switch (src->type) {
+        case GGML_TYPE_F32:
+            k_get_rows_add<float><<<grid, CUDA_GET_ROWS_BLOCK_SIZE, 0, stream>>>((const char *) src->data,
+                (const int32_t *) gidx->data, (const float *) a->data, (float *) add->data, ne0, src->nb[1], a_s1, dst_s1);
+            break;
+        case GGML_TYPE_F16:
+            k_get_rows_add<half><<<grid, CUDA_GET_ROWS_BLOCK_SIZE, 0, stream>>>((const char *) src->data,
+                (const int32_t *) gidx->data, (const float *) a->data, (float *) add->data, ne0, src->nb[1], a_s1, dst_s1);
+            break;
+        case GGML_TYPE_BF16:
+            k_get_rows_add<nv_bfloat16><<<grid, CUDA_GET_ROWS_BLOCK_SIZE, 0, stream>>>((const char *) src->data,
+                (const int32_t *) gidx->data, (const float *) a->data, (float *) add->data, ne0, src->nb[1], a_s1, dst_s1);
+            break;
+        default: GGML_ABORT("unsupported type");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}

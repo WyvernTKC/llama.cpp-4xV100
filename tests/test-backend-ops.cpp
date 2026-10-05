@@ -9148,6 +9148,89 @@ struct test_dsv4_compress : public test_case {
     }
 };
 
+// GET_ROWS of a float matrix followed by the SET_ROWS of the gathered rows into a state (DeepSeek-V4's persisted
+//   compressor rows) or by the ADD of them to a matrix (its position bias)
+struct test_get_rows_fused : public test_case {
+    const ggml_type type_src;
+    const ggml_type type_dst; // the SET_ROWS destination
+    const int64_t   n_cols;
+    const int64_t   n_src;    // rows of the source
+    const int64_t   n_k;      // rows gathered
+    const int64_t   n_dst;    // rows of the destination
+    const bool      add;
+    const bool      idx64;    // i64 SET_ROWS indices
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return add ? "GET_ROWS_ADD" : "GET_ROWS_SET_ROWS";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR8(type_src, type_dst, n_cols, n_src, n_k, n_dst, add, idx64);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_get_rows_fused(ggml_type type_src = GGML_TYPE_F32, ggml_type type_dst = GGML_TYPE_F32, int64_t n_cols = 1024,
+            int64_t n_src = 1, int64_t n_k = 1, int64_t n_dst = 8, bool add = false, bool idx64 = true)
+        : type_src(type_src), type_dst(type_dst), n_cols(n_cols), n_src(n_src), n_k(n_k), n_dst(n_dst), add(add),
+          idx64(idx64) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (strcmp(t->name, "gidx") == 0) {
+                std::vector<int32_t> v(ggml_nelements(t));
+                std::uniform_int_distribution<int32_t> dist(0, (int32_t) n_src - 1);
+                for (auto & x : v) {
+                    x = dist(rng);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "sidx") == 0) {
+                // distinct destination rows
+                std::vector<int64_t> perm(n_dst);
+                for (int64_t i = 0; i < n_dst; i++) {
+                    perm[i] = i;
+                }
+                std::shuffle(perm.begin(), perm.end(), rng);
+                if (t->type == GGML_TYPE_I64) {
+                    ggml_backend_tensor_set(t, perm.data(), 0, ggml_nbytes(t));
+                } else {
+                    std::vector<int32_t> v(perm.begin(), perm.begin() + n_k);
+                    ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * src  = ggml_new_tensor_2d(ctx, type_src, n_cols, n_src);
+        ggml_tensor * gidx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_k);
+        ggml_set_name(src,  "src");
+        ggml_set_name(gidx, "gidx");
+        ggml_tensor * rows = ggml_get_rows(ctx, src, gidx);
+        ggml_tensor * out;
+        if (add) {
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_cols, n_k);
+            ggml_set_name(a, "a");
+            out = ggml_add(ctx, a, rows);
+        } else {
+            ggml_tensor * dst  = ggml_new_tensor_2d(ctx, type_dst, n_cols, n_dst);
+            ggml_tensor * sidx = ggml_new_tensor_1d(ctx, idx64 ? GGML_TYPE_I64 : GGML_TYPE_I32, n_k);
+            ggml_set_name(dst,  "dst");
+            ggml_set_name(sidx, "sidx");
+            out = ggml_set_rows(ctx, dst, rows, sidx);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_moe_reduce : public test_case {
     const int64_t n_embd;
     const int64_t n_expert_used;
@@ -13963,6 +14046,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
     test_cases.emplace_back(new test_moe_reduce(63,  2, 17));
+    test_cases.emplace_back(new test_get_rows_fused(GGML_TYPE_F32,  GGML_TYPE_F32,  1024, 1,   1,  8));
+    test_cases.emplace_back(new test_get_rows_fused(GGML_TYPE_F32,  GGML_TYPE_F32,  512,  7,   5,  128, false, false));
+    test_cases.emplace_back(new test_get_rows_fused(GGML_TYPE_F16,  GGML_TYPE_F16,  300,  20,  9,  12));
+    test_cases.emplace_back(new test_get_rows_fused(GGML_TYPE_BF16, GGML_TYPE_F32,  256,  4,   4,  4));
+    test_cases.emplace_back(new test_get_rows_fused(GGML_TYPE_F32,  GGML_TYPE_F32,  1024, 128, 1,  1, true));
+    test_cases.emplace_back(new test_get_rows_fused(GGML_TYPE_F16,  GGML_TYPE_F32,  700,  50,  33, 1, true));
     test_cases.emplace_back(new test_dsv4_compress(true,  512, 4,   1,  8,   1));
     test_cases.emplace_back(new test_dsv4_compress(true,  128, 4,   1,  8,   1));
     test_cases.emplace_back(new test_dsv4_compress(true,  512, 4,   64, 8,   256));

@@ -17,3 +17,10 @@ bool ggml_cuda_get_rows_mean_supported(const ggml_tensor * op);
 void ggml_cuda_op_get_rows_mean(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// GET_ROWS of a float matrix (two dimensions, i32 indices, f32 rows) and the SET_ROWS of those rows into another, or the
+//   ADD of them to an f32 matrix of the same shape, in one launch each; the conversions are those of the ops apart
+bool ggml_cuda_should_fuse_get_rows_set_rows(const ggml_tensor * get_rows, const ggml_tensor * set_rows);
+bool ggml_cuda_should_fuse_get_rows_add(const ggml_tensor * get_rows, const ggml_tensor * add);
+void ggml_cuda_op_get_rows_set_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * get_rows, ggml_tensor * set_rows);
+void ggml_cuda_op_get_rows_add(ggml_backend_cuda_context & ctx, const ggml_tensor * get_rows, ggml_tensor * add);

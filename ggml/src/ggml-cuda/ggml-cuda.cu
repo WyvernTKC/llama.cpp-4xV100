@@ -5785,6 +5785,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // gathered rows added to a matrix (DeepSeek-V4's compressor position bias) or set into a state (its persisted rows)
+    static const bool no_get_rows_fusion = getenv("GGML_CUDA_NO_GET_ROWS_FUSION") != nullptr;
+    if (node->op == GGML_OP_GET_ROWS && !no_get_rows_fusion && (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+            ggml_node_get_use_count(cgraph, i) == 1) {
+        if (ggml_can_fuse(cgraph, i, { GGML_OP_GET_ROWS, GGML_OP_ADD }) &&
+                ggml_cuda_should_fuse_get_rows_add(node, cgraph->nodes[i + 1])) {
+            ggml_cuda_op_get_rows_add(*cuda_ctx, node, cgraph->nodes[i + 1]);
+            return 1;
+        }
+        int j = i + 1;
+        while (j < cgraph->n_nodes && j <= i + 4 && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            j++;
+        }
+        if (j < cgraph->n_nodes && j <= i + 4 && cgraph->nodes[j]->op == GGML_OP_SET_ROWS &&
+                ggml_cuda_should_fuse_get_rows_set_rows(node, cgraph->nodes[j])) {
+            ggml_cuda_op_get_rows_set_rows(*cuda_ctx, node, cgraph->nodes[j]);
+            return j - i;
+        }
+    }
+
     if (node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_ROPE || node->op == GGML_OP_MUL_MAT) {
         const int n_skip = ggml_cuda_try_fuse_attn_rot(cuda_ctx, cgraph, i);
         if (n_skip != 0) {
