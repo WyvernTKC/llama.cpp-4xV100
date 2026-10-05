@@ -1680,6 +1680,15 @@ struct ggml_backend_cuda_context {
         q8_1_emit_as = nullptr;
     }
 
+    // The remapped ids of expert-cache pools gathered ahead, with the first MUL_MAT_ID of the same ids in the subgraph
+    //   (see ggml_cuda_try_gather_expert_group); ggml_cuda_mul_mat_id takes them instead of gathering.
+    struct expert_cache_gathered {
+        const ggml_tensor * pool = nullptr;
+        const ggml_tensor * ids  = nullptr;
+        ggml_tensor         remap;
+    };
+    std::vector<expert_cache_gathered> expert_cache_ahead;
+
     // A one-token gate/up GLU deferred to the MUL_MAT_ID gate/up GLU of the same input that follows it (node target),
     //   which runs it as one more channel; see ggml_cuda_try_defer_glu. Launched on its own if that does not happen.
     struct deferred_glu {

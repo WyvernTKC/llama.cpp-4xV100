@@ -40,11 +40,22 @@ struct ggml_cuda_expert_cache {
     void *                     state = nullptr;
 };
 
+// The caches of one launch: the experts of a MoE layer routed by the same ids (gate, up, down), each with its own
+//   LRU, planned by a block each and copied by one grid.
+#define GGML_CUDA_EXPERT_CACHE_GROUP_MAX 3
+struct ggml_cuda_expert_cache_group {
+    ggml_cuda_expert_cache_dev d[GGML_CUDA_EXPERT_CACHE_GROUP_MAX];
+    char *                     pool[GGML_CUDA_EXPERT_CACHE_GROUP_MAX];
+    int                        align[GGML_CUDA_EXPERT_CACHE_GROUP_MAX];
+    int                        n;
+};
+
 // The scheduler and the LRU run in one block. Hits are marked in parallel, misses are then taken one by one
 // so the victim of one is never the slot another still needs: the argmin over last_used cannot return a
 // slot touched by this batch, its stamp is the newest. Same ids on every device give the same slots.
-static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_dev d, const int32_t * ids,
+static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_group g, const int32_t * ids,
         const int n_rows, const int n_per_row, const int row_stride) {
+    const ggml_cuda_expert_cache_dev & d = g.d[blockIdx.x];
     __shared__ int      s_n_miss;
     __shared__ uint32_t s_min_val[32];
     __shared__ int      s_min_idx[32];
@@ -139,11 +150,7 @@ static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_dev d, con
 // One row of blocks per possible miss; rows past n_miss leave at once. Threads copy consecutive units of T,
 // so a warp reads a contiguous span of host memory per instruction.
 template <typename T>
-static __global__ void expert_cache_copy(const ggml_cuda_expert_cache_dev d, char * pool) {
-    const int m = blockIdx.y;
-    if (m >= *d.n_miss) {
-        return;
-    }
+static __device__ __forceinline__ void expert_cache_copy_slot(const ggml_cuda_expert_cache_dev & d, char * pool, const int m) {
     const int    e     = d.miss_expert[m];
     const int    s     = d.miss_slot[m];
     const char * src_e = d.host + (size_t) e*d.expert_bytes + d.offset_dev;
@@ -155,6 +162,23 @@ static __global__ void expert_cache_copy(const ggml_cuda_expert_cache_dev d, cha
         const size_t c   = off / d.chunk_dev;
         const size_t w   = off - c*d.chunk_dev;
         ((T *) dst_s)[i] = *(const T *) (src_e + c*d.chunk_full + w);
+    }
+}
+
+// blockIdx.z is the cache of the group, each copied with the widest unit its addresses allow
+static __global__ void expert_cache_copy(const ggml_cuda_expert_cache_group g) {
+    const int z = blockIdx.z;
+    const ggml_cuda_expert_cache_dev & d = g.d[z];
+    const int m = blockIdx.y;
+    if (m >= *d.n_miss) {
+        return;
+    }
+    switch (g.align[z]) {
+        case 16: expert_cache_copy_slot<int4>   (d, g.pool[z], m); break;
+        case  8: expert_cache_copy_slot<int2>   (d, g.pool[z], m); break;
+        case  4: expert_cache_copy_slot<int32_t>(d, g.pool[z], m); break;
+        case  2: expert_cache_copy_slot<int16_t>(d, g.pool[z], m); break;
+        default: expert_cache_copy_slot<int8_t> (d, g.pool[z], m); break;
     }
 }
 
@@ -314,9 +338,9 @@ bool ggml_cuda_expert_cache_is(const ggml_tensor * pool) {
         ((const ggml_cuda_expert_cache *) pool->extra)->magic == GGML_CUDA_EXPERT_CACHE_MAGIC;
 }
 
-void ggml_cuda_expert_cache_gather(ggml_backend_cuda_context & ctx, const ggml_tensor * pool, const ggml_tensor * ids, ggml_tensor * ids_remap) {
-    const ggml_cuda_expert_cache * c = (const ggml_cuda_expert_cache *) pool->extra;
-    const ggml_cuda_expert_cache_dev & d = c->d;
+void ggml_cuda_expert_cache_gather_group(ggml_backend_cuda_context & ctx, const ggml_tensor * const * pools, const int n,
+        const ggml_tensor * ids, ggml_tensor * ids_remap) {
+    GGML_ASSERT(n >= 1 && n <= GGML_CUDA_EXPERT_CACHE_GROUP_MAX);
     cudaStream_t stream = ctx.stream();
 
     GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t));
@@ -324,33 +348,42 @@ void ggml_cuda_expert_cache_gather(ggml_backend_cuda_context & ctx, const ggml_t
     const int n_rows     = (int) (ids->ne[1]*ids->ne[2]*ids->ne[3]);
     const int row_stride = (int) (ids->nb[1]/sizeof(int32_t));
     GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1);
-    GGML_ASSERT(n_rows*n_per_row <= d.max_ids);
-    GGML_ASSERT(pool->nb[2] == d.slot_bytes);
-
-    expert_cache_plan<<<1, 512, 0, stream>>>(d, (const int32_t *) ids->data, n_rows, n_per_row, row_stride);
-    CUDA_CHECK(cudaGetLastError());
 
     // enough threads in flight to keep the link busy, bounded so short slices do not launch empty blocks
-    const int  nthreads = 256;
-    const int  nbx      = (int) std::min<size_t>(64, (d.slot_bytes/c->align + nthreads - 1)/nthreads);
-    const dim3 grid(nbx, n_rows*n_per_row);
-    char * pool_data = (char *) pool->data;
-    switch (c->align) {
-        case 16: expert_cache_copy<int4>   <<<grid, nthreads, 0, stream>>>(d, pool_data); break;
-        case  8: expert_cache_copy<int2>   <<<grid, nthreads, 0, stream>>>(d, pool_data); break;
-        case  4: expert_cache_copy<int32_t><<<grid, nthreads, 0, stream>>>(d, pool_data); break;
-        case  2: expert_cache_copy<int16_t><<<grid, nthreads, 0, stream>>>(d, pool_data); break;
-        default: expert_cache_copy<int8_t> <<<grid, nthreads, 0, stream>>>(d, pool_data); break;
+    const int nthreads = 256;
+    int       nbx      = 1;
+    ggml_cuda_expert_cache_group g = {};
+    g.n = n;
+    for (int k = 0; k < n; k++) {
+        const ggml_cuda_expert_cache * c = (const ggml_cuda_expert_cache *) pools[k]->extra;
+        GGML_ASSERT(n_rows*n_per_row <= c->d.max_ids);
+        GGML_ASSERT(pools[k]->nb[2] == c->d.slot_bytes);
+        g.d[k]     = c->d;
+        g.pool[k]  = (char *) pools[k]->data;
+        g.align[k] = c->align;
+        nbx = std::max(nbx, (int) std::min<size_t>(64, (c->d.slot_bytes/c->align + nthreads - 1)/nthreads));
     }
+
+    expert_cache_plan<<<n, 512, 0, stream>>>(g, (const int32_t *) ids->data, n_rows, n_per_row, row_stride);
     CUDA_CHECK(cudaGetLastError());
 
-    *ids_remap = *ids;
-    ids_remap->data  = d.remap;
-    ids_remap->nb[1] = (size_t) n_per_row*sizeof(int32_t);
-    ids_remap->nb[2] = ids_remap->nb[1]*ids->ne[1];
-    ids_remap->nb[3] = ids_remap->nb[2]*ids->ne[2];
-    ids_remap->view_src = nullptr;
-    ids_remap->extra    = nullptr;
+    expert_cache_copy<<<dim3(nbx, n_rows*n_per_row, n), nthreads, 0, stream>>>(g);
+    CUDA_CHECK(cudaGetLastError());
+
+    for (int k = 0; k < n; k++) {
+        ggml_tensor * r = &ids_remap[k];
+        *r = *ids;
+        r->data  = g.d[k].remap;
+        r->nb[1] = (size_t) n_per_row*sizeof(int32_t);
+        r->nb[2] = r->nb[1]*ids->ne[1];
+        r->nb[3] = r->nb[2]*ids->ne[2];
+        r->view_src = nullptr;
+        r->extra    = nullptr;
+    }
+}
+
+void ggml_cuda_expert_cache_gather(ggml_backend_cuda_context & ctx, const ggml_tensor * pool, const ggml_tensor * ids, ggml_tensor * ids_remap) {
+    ggml_cuda_expert_cache_gather_group(ctx, &pool, 1, ids, ids_remap);
 }
 
 bool ggml_cuda_expert_cache_read_slots(void * cache, int32_t * slot_of) {

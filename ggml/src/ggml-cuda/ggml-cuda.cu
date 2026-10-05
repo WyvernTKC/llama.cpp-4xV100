@@ -2236,10 +2236,22 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
-    // src0 is a pool of cached experts: bring in the routed ones and read the pool through remapped ids
+    // src0 is a pool of cached experts: bring in the routed ones and read the pool through remapped ids, unless an
+    //   earlier MUL_MAT_ID of the same ids has done that for it
     ggml_tensor ids_remap;
     if (ggml_cuda_expert_cache_is(src0)) {
-        ggml_cuda_expert_cache_gather(ctx, src0, ids, &ids_remap);
+        bool ahead = false;
+        for (size_t k = 0; k < ctx.expert_cache_ahead.size(); k++) {
+            if (ctx.expert_cache_ahead[k].pool == src0 && ctx.expert_cache_ahead[k].ids == ids) {
+                ids_remap = ctx.expert_cache_ahead[k].remap;
+                ctx.expert_cache_ahead.erase(ctx.expert_cache_ahead.begin() + k);
+                ahead = true;
+                break;
+            }
+        }
+        if (!ahead) {
+            ggml_cuda_expert_cache_gather(ctx, src0, ids, &ids_remap);
+        }
         ids = &ids_remap;
     }
 
@@ -5151,7 +5163,46 @@ static void ggml_cuda_flush_deferred_glu(ggml_backend_cuda_context * cuda_ctx) {
     d = {};
 }
 
+// The expert-cache pools of the MUL_MAT_IDs after node i that read the same ids (the up and down experts of the layer
+//   whose gate is i) are gathered with i's in one plan and one copy launch, two launches instead of six. Nothing between
+//   may write the ids; a pool's own MUL_MAT_ID is the only reader of its slots, so moving its copy ahead is safe.
+static void ggml_cuda_try_gather_expert_group(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_EXPERT_GROUP_GATHER") != nullptr;
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (disabled || node->op != GGML_OP_MUL_MAT_ID || !ggml_cuda_expert_cache_is(node->src[0])) {
+        return;
+    }
+    const ggml_tensor * ids = node->src[2];
+    for (const auto & a : cuda_ctx->expert_cache_ahead) {
+        if (a.pool == node->src[0] && a.ids == ids) {
+            return; // gathered with an earlier one
+        }
+    }
+    const ggml_tensor * pools[3] = { node->src[0], nullptr, nullptr };
+    int n = 1;
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 64 && n < 3; j++) {
+        const ggml_tensor * m = cgraph->nodes[j];
+        if (m->op == GGML_OP_MUL_MAT_ID && m->src[2] == ids && ggml_cuda_expert_cache_is(m->src[0]) &&
+                m->src[0] != pools[0] && m->src[0] != pools[1]) {
+            pools[n++] = m->src[0];
+            continue;
+        }
+        if (!ggml_cuda_is_view_or_noop(m) && ggml_cuda_tensors_overlap(m, ids)) {
+            break;
+        }
+    }
+    if (n < 2) {
+        return;
+    }
+    ggml_tensor remap[3];
+    ggml_cuda_expert_cache_gather_group(*cuda_ctx, pools, n, ids, remap);
+    for (int k = 0; k < n; k++) {
+        cuda_ctx->expert_cache_ahead.push_back({ pools[k], ids, remap[k] });
+    }
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    ggml_cuda_try_gather_expert_group(cuda_ctx, cgraph, i);
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (disable_fusion) {
@@ -6918,6 +6969,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     // every tensor is written again this pass, so no quantized or converted copy from the last one survives
     cuda_ctx->q8_1_input_reset();
     cuda_ctx->cublas_input_reset();
+    cuda_ctx->expert_cache_ahead.clear();
 
     // in a session the subgraph is one part of the session's graph, see ggml_backend_cuda_session_plan
     if (cuda_ctx->session_mode != ggml_backend_cuda_context::SESSION_OFF) {
