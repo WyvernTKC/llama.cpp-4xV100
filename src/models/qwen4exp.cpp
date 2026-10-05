@@ -1433,6 +1433,39 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
+    const bool has_shexp = model.layers[il].ffn_up_shexp != nullptr;
+
+    // the router and the shared expert gate read the same input: expanded back to back, a backend can run the
+    //   gate's one row in the router's launch (CUDA at one token, see ggml_cuda_try_fuse)
+    ggml_tensor * logits      = nullptr;
+    ggml_tensor * shared_gate = nullptr;
+    if (has_shexp) {
+        logits = build_lora_mm(model.layers[il].ffn_gate_inp, cur);
+        cb(logits, "ffn_moe_logits", il);
+        shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
+        cb(shared_gate, "shared_expert_gate", il);
+        ggml_build_forward_expand(gf, logits);
+        ggml_build_forward_expand(gf, shared_gate);
+    }
+
+    // the shared expert's activations (the input of its down projection) go first: at one token, CUDA runs its gate/up
+    //   with those of the routed experts and its down projection with theirs
+    ggml_tensor * ffn_shexp = nullptr;
+    if (has_shexp) {
+        ffn_shexp =
+            build_ffn(cur,
+                model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
+                model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
+                model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
+                NULL,
+                LLM_FFN_SILU, LLM_FFN_PAR, il);
+        ggml_tensor * down = ffn_shexp;
+        while (down->op != GGML_OP_MUL_MAT) {
+            down = down->src[0];
+        }
+        ggml_build_forward_expand(gf, down->src[1]);
+    }
+
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
@@ -1444,27 +1477,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             LLM_FFN_SILU, true,
             hparams.expert_weights_scale,
             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            nullptr, model.layers[il].ffn_gate_up_exps,
+            logits, model.layers[il].ffn_gate_up_exps,
             model.layers[il].ffn_up_exps_s,
             model.layers[il].ffn_gate_exps_s,
             model.layers[il].ffn_down_exps_s);
     cb(moe_out, "ffn_moe_out", il);
 
     // shared experts, as in the Qwen3Next reference
-    if (model.layers[il].ffn_up_shexp != nullptr) {
-        ggml_tensor * ffn_shexp =
-            build_ffn(cur,
-                model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
-                model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
-                model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
-                NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
+    if (has_shexp) {
+        // under -sm tensor the shared expert is split like the routed experts: its gated output added right after
+        //   theirs lets the meta backend reduce both in one all-reduce
+        ggml_build_forward_expand(gf, moe_out);
         cb(ffn_shexp, "ffn_shexp", il);
 
-        // shared expert has its own sigmoided gate (ffn_gate_inp_shexp, one value per token)
-        ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
-        cb(shared_gate, "shared_expert_gate", il);
-
+        // shared expert has its own sigmoided gate (ffn_gate_inp_shexp, one value per token), built with the router
         shared_gate = ggml_sigmoid(ctx0, shared_gate);
         cb(shared_gate, "shared_expert_gate_sigmoid", il);
 
