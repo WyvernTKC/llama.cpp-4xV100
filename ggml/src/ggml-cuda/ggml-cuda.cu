@@ -75,6 +75,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/dsv4-compress.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -5433,6 +5434,333 @@ static int ggml_cuda_try_fuse_qsa_topk_mask(ggml_backend_cuda_context * cuda_ctx
     return count - 1;
 }
 
+// The first node after `from` (up to `to`) that reads t, or -1.
+static int ggml_cuda_find_user(const ggml_cgraph * cgraph, const ggml_tensor * t, const int from, const int to) {
+    for (int j = from + 1; j < cgraph->n_nodes && j <= to; j++) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        for (int k = 0; k < GGML_MAX_SRC; k++) {
+            if (n->src[k] == t) {
+                return j;
+            }
+        }
+    }
+    return -1;
+}
+
+// One half of a DeepSeek-V4 compressor from its CONCAT(state, cur) at i_c1 to the CONT of the window transpose, see
+//   llama_model_deepseek4::graph::build_compressed_kv_from_state (rows -> GET_ROWS -> RESHAPE -> CONT(PERMUTE)) and
+//   build_overlap_compressed_kv_from_state (an extra row first: VIEW of row 0 -> SCALE -> RESHAPE -> CONCAT; then the
+//   first half of the first n_read rows and the second half of the next n_read, each VIEW -> CONT -> RESHAPE, CONCAT,
+//   CONT(PERMUTE)). Appends the chain's nodes to idxs.
+struct ggml_cuda_dsv4_half_match {
+    ggml_cuda_dsv4_compress_half h;
+    const ggml_tensor * t = nullptr;
+    int     i_c1 = -1; // the nodes that read the inputs
+    int     i_g  = -1;
+    bool    overlap = false;
+    int64_t hd = 0;
+    int64_t r  = 0;
+    int64_t nb = 0;
+};
+
+static bool ggml_cuda_dsv4_parse_half(const ggml_cgraph * cgraph, const int i_c1, const int to, ggml_cuda_dsv4_half_match & m,
+        std::vector<int> & idxs) {
+    const ggml_tensor * c1 = cgraph->nodes[i_c1];
+    if (c1->op != GGML_OP_CONCAT || ggml_get_op_params_i32(c1, 0) != 1 || c1->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const ggml_tensor * state = c1->src[0];
+    const ggml_tensor * cur   = c1->src[1];
+    const int64_t W = c1->ne[0];
+    for (const ggml_tensor * t : { state, cur, c1 }) {
+        if (t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float) || t->ne[0] != W || t->ne[2] != 1 || t->ne[3] != 1) {
+            return false;
+        }
+    }
+    m = {};
+    m.h.state = state;
+    m.h.cur   = cur;
+    m.i_c1    = i_c1;
+    idxs.push_back(i_c1);
+
+    const ggml_tensor * source = c1;
+    int j = ggml_cuda_find_user(cgraph, c1, i_c1, to);
+    if (j < 0) {
+        return false;
+    }
+    if (cgraph->nodes[j]->op == GGML_OP_VIEW) {
+        // the extra row: SCALE of row 0, appended
+        const ggml_tensor * v0 = cgraph->nodes[j];
+        if (v0->view_offs != 0 || ggml_nelements(v0) != W) {
+            return false;
+        }
+        idxs.push_back(j);
+        const int js = ggml_cuda_find_user(cgraph, v0, j, to);
+        if (js < 0 || cgraph->nodes[js]->op != GGML_OP_SCALE || cgraph->nodes[js]->type != GGML_TYPE_F32) {
+            return false;
+        }
+        const ggml_tensor * z = cgraph->nodes[js];
+        idxs.push_back(js);
+        const int jr = ggml_cuda_find_user(cgraph, z, js, to);
+        if (jr < 0 || cgraph->nodes[jr]->op != GGML_OP_RESHAPE) {
+            return false;
+        }
+        const ggml_tensor * zr = cgraph->nodes[jr];
+        idxs.push_back(jr);
+        const int jc = ggml_cuda_find_user(cgraph, zr, jr, to);
+        if (jc < 0) {
+            return false;
+        }
+        const ggml_tensor * c2 = cgraph->nodes[jc];
+        if (c2->op != GGML_OP_CONCAT || ggml_get_op_params_i32(c2, 0) != 1 || c2->src[0] != c1 || c2->src[1] != zr ||
+                c2->ne[1] != c1->ne[1] + 1) {
+            return false;
+        }
+        idxs.push_back(jc);
+        m.h.extra = z;
+        m.overlap = true;
+        source = c2;
+        j = jc;
+    } else {
+        j = i_c1; // the GET_ROWS is the first user
+    }
+    const int jg = ggml_cuda_find_user(cgraph, source, j, to);
+    if (jg < 0) {
+        return false;
+    }
+    const ggml_tensor * g = cgraph->nodes[jg];
+    if (g->op != GGML_OP_GET_ROWS || g->src[0] != source || g->type != GGML_TYPE_F32 || g->src[1]->type != GGML_TYPE_I32 ||
+            !ggml_is_contiguous(g->src[1]) || ggml_nelements(g->src[1]) != g->ne[1] || g->ne[2] != 1) {
+        return false;
+    }
+    m.h.idx = g->src[1];
+    m.i_g   = jg;
+    idxs.push_back(jg);
+
+    // the window [n, hd, nb] before its transpose
+    const ggml_tensor * window = nullptr;
+    int jw = jg;
+    if (m.overlap) {
+        if (W % 2 != 0 || g->ne[1] % 2 != 0) {
+            return false;
+        }
+        m.hd = W/2;
+        const int64_t n_read = g->ne[1]/2;
+        const ggml_tensor * half_r[2] = { nullptr, nullptr };
+        int jv = jg;
+        for (int k = 0; k < 2; k++) {
+            jv = ggml_cuda_find_user(cgraph, g, jv, to);
+            if (jv < 0) {
+                return false;
+            }
+            const ggml_tensor * v = cgraph->nodes[jv];
+            const size_t offs = k == 0 ? 0 : (size_t) n_read*g->nb[1] + m.hd*sizeof(float);
+            if (v->op != GGML_OP_VIEW || v->view_offs != offs || v->ne[0] != m.hd || v->ne[1] != n_read ||
+                    v->nb[1] != g->nb[1]) {
+                return false;
+            }
+            idxs.push_back(jv);
+            const int jcont = ggml_cuda_find_user(cgraph, v, jv, to);
+            if (jcont < 0 || cgraph->nodes[jcont]->op != GGML_OP_CONT) {
+                return false;
+            }
+            idxs.push_back(jcont);
+            const int jre = ggml_cuda_find_user(cgraph, cgraph->nodes[jcont], jcont, to);
+            if (jre < 0 || cgraph->nodes[jre]->op != GGML_OP_RESHAPE || cgraph->nodes[jre]->ne[0] != m.hd) {
+                return false;
+            }
+            idxs.push_back(jre);
+            half_r[k] = cgraph->nodes[jre];
+            jw = std::max(jw, jre);
+        }
+        const int jc3 = ggml_cuda_find_user(cgraph, half_r[0], jw, to);
+        if (jc3 < 0) {
+            return false;
+        }
+        const ggml_tensor * c3 = cgraph->nodes[jc3];
+        if (c3->op != GGML_OP_CONCAT || ggml_get_op_params_i32(c3, 0) != 1 || c3->src[0] != half_r[0] ||
+                c3->src[1] != half_r[1] || !ggml_are_same_shape(half_r[0], half_r[1])) {
+            return false;
+        }
+        m.r  = half_r[0]->ne[1];
+        m.nb = half_r[0]->ne[2];
+        if (m.r*m.nb != n_read) {
+            return false;
+        }
+        idxs.push_back(jc3);
+        window = c3;
+        jw = jc3;
+    } else {
+        const int jre = ggml_cuda_find_user(cgraph, g, jg, to);
+        if (jre < 0 || cgraph->nodes[jre]->op != GGML_OP_RESHAPE || cgraph->nodes[jre]->ne[0] != W) {
+            return false;
+        }
+        window = cgraph->nodes[jre];
+        m.hd = W;
+        m.r  = window->ne[1];
+        m.nb = window->ne[2];
+        if (m.r*m.nb != g->ne[1]) {
+            return false;
+        }
+        idxs.push_back(jre);
+        jw = jre;
+    }
+    const int jp = ggml_cuda_find_user(cgraph, window, jw, to);
+    if (jp < 0) {
+        return false;
+    }
+    const ggml_tensor * perm = cgraph->nodes[jp];
+    if (perm->op != GGML_OP_PERMUTE || perm->ne[0] != window->ne[1] || perm->ne[1] != window->ne[0] ||
+            perm->nb[0] != window->nb[1] || perm->nb[1] != window->nb[0]) {
+        return false;
+    }
+    idxs.push_back(jp);
+    const int jt = ggml_cuda_find_user(cgraph, perm, jp, to);
+    if (jt < 0 || cgraph->nodes[jt]->op != GGML_OP_CONT) {
+        return false;
+    }
+    m.t = cgraph->nodes[jt];
+    idxs.push_back(jt);
+    return true;
+}
+
+// The DeepSeek-V4 compressor: the values' half (from the CONCAT at i), the scores' half, SOFT_MAX of the scores, MUL of
+//   the values by them, SUM_ROWS. 19 launches for an overlap compressor (8 without), here one at the SUM_ROWS: the
+//   chain's nodes before it are skipped and the nodes in between that it does not own (the scores' matmul and position
+//   bias) run where they are.
+static bool ggml_cuda_dsv4_compress_match(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i,
+        ggml_cuda_dsv4_compress_fold & f) {
+    if (!cuda_ctx->stream_context().concurrent_events.empty()) {
+        return false;
+    }
+    const int to = std::min(cgraph->n_nodes - 1, i + 96);
+    std::vector<int> idxs;
+    ggml_cuda_dsv4_half_match kv;
+    if (!ggml_cuda_dsv4_parse_half(cgraph, i, to, kv, idxs)) {
+        return false;
+    }
+    const int jm = ggml_cuda_find_user(cgraph, kv.t, idxs.back(), to);
+    if (jm < 0) {
+        return false;
+    }
+    const ggml_tensor * mul = cgraph->nodes[jm];
+    if (mul->op != GGML_OP_MUL || mul->src[0] != kv.t || mul->src[1]->op != GGML_OP_SOFT_MAX ||
+            !ggml_are_same_shape(mul, kv.t)) {
+        return false;
+    }
+    const ggml_tensor * sm = mul->src[1];
+    float sm_scale;
+    float max_bias;
+    memcpy(&sm_scale, (const float *) sm->op_params + 0, sizeof(float));
+    memcpy(&max_bias, (const float *) sm->op_params + 1, sizeof(float));
+    if (sm->src[1] != nullptr || sm->src[2] != nullptr || max_bias != 0.0f || !ggml_are_same_shape(sm, kv.t)) {
+        return false;
+    }
+    // the scores' half: from the CONCAT its window transpose comes from
+    int i_sm = -1;
+    int i_c1 = -1;
+    for (int j = i + 1; j < jm; j++) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n == sm) {
+            i_sm = j;
+        }
+        if (i_c1 < 0 && n->op == GGML_OP_CONCAT && std::find(idxs.begin(), idxs.end(), j) == idxs.end()) {
+            i_c1 = j;
+        }
+    }
+    if (i_sm < 0 || i_c1 < 0) {
+        return false;
+    }
+    ggml_cuda_dsv4_half_match sc;
+    if (!ggml_cuda_dsv4_parse_half(cgraph, i_c1, to, sc, idxs) || sc.t != sm->src[0] || sc.overlap != kv.overlap ||
+            sc.hd != kv.hd || sc.r != kv.r || sc.nb != kv.nb) {
+        return false;
+    }
+    const int js = ggml_cuda_find_user(cgraph, mul, jm, to);
+    if (js < 0) {
+        return false;
+    }
+    const ggml_tensor * sr = cgraph->nodes[js];
+    if (sr->op != GGML_OP_SUM_ROWS || sr->src[0] != mul || sr->type != GGML_TYPE_F32 || !ggml_is_contiguous(sr) ||
+            ggml_nelements(sr) != kv.hd*kv.nb) {
+        return false;
+    }
+    const int64_t n = kv.overlap ? 2*kv.r : kv.r;
+    const int     nsm = ggml_cuda_info().devices[cuda_ctx->device].nsm;
+    // SUM_ROWS reduces a row of more than one warp in another order when its rows do not fill the GPU twice
+    if (n > GGML_CUDA_DSV4_COMPRESS_MAX || kv.nb > 65535 || (n > WARP_SIZE && kv.hd*kv.nb/nsm < 2)) {
+        return false;
+    }
+    idxs.push_back(i_sm);
+    idxs.push_back(jm);
+    idxs.push_back(js);
+    std::sort(idxs.begin(), idxs.end());
+    if (std::adjacent_find(idxs.begin(), idxs.end()) != idxs.end()) {
+        return false;
+    }
+    std::vector<ggml_op> ops(idxs.size());
+    for (size_t k = 0; k < idxs.size(); k++) {
+        ops[k] = cgraph->nodes[idxs[k]]->op;
+    }
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs.data(), (int) idxs.size(), ops.data(), &js, 1)) {
+        return false;
+    }
+    // the inputs are read at the SUM_ROWS: ggml-alloc keeps each alive up to the chain node that reads it, nothing after
+    //   that may write it (its memory may be reused once the chain is done with it), nor may the output cover it
+    const ggml_tensor * inputs[6]  = { kv.h.state, kv.h.cur, kv.h.idx, sc.h.state, sc.h.cur, sc.h.idx };
+    const int           readers[6] = { kv.i_c1,    kv.i_c1,  kv.i_g,   sc.i_c1,    sc.i_c1,  sc.i_g   };
+    for (int k = 0; k < 6; k++) {
+        for (int j = readers[k] + 1; j < js; j++) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            if (std::binary_search(idxs.begin(), idxs.end(), j) || ggml_cuda_is_view_or_noop(n)) {
+                continue;
+            }
+            if (ggml_cuda_tensors_overlap(n, inputs[k])) {
+                return false;
+            }
+        }
+        if (ggml_cuda_tensors_overlap(sr, inputs[k])) {
+            return false;
+        }
+    }
+
+    f.target   = js;
+    f.skip.assign(idxs.begin(), idxs.end() - 1);
+    f.kv       = kv.h;
+    f.score    = sc.h;
+    f.overlap  = kv.overlap;
+    f.hd       = kv.hd;
+    f.r        = kv.r;
+    f.nb       = kv.nb;
+    f.sm_scale = sm_scale;
+    return true;
+}
+
+// Node i of a folded compressor: true when it is handled here (skipped, or the compressor launched at its SUM_ROWS).
+static bool ggml_cuda_dsv4_compress_fold_step(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_DSV4_COMPRESS") != nullptr ||
+        (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION")));
+    if (disabled) {
+        return false;
+    }
+    ggml_cuda_dsv4_compress_fold & f = cuda_ctx->dsv4_fold;
+    if (f.target < 0) {
+        if (cgraph->nodes[i]->op != GGML_OP_CONCAT || !ggml_cuda_dsv4_compress_match(cuda_ctx, cgraph, i, f)) {
+            f = {};
+            return false;
+        }
+        return true; // i is the chain's first node
+    }
+    // a fusion of the nodes in between must not have run past it
+    GGML_ASSERT(i <= f.target);
+    if (i == f.target) {
+        ggml_cuda_dsv4_compress(*cuda_ctx, f, cgraph->nodes[i]);
+        f = {};
+        return true;
+    }
+    return std::binary_search(f.skip.begin(), f.skip.end(), i);
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     ggml_cuda_try_gather_expert_group(cuda_ctx, cgraph, i);
 
@@ -7107,6 +7435,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 cuda_ctx->q8_1_input_invalidate(node->data);
                 cuda_ctx->cublas_input_invalidate(node);
 
+                // a DeepSeek-V4 compressor launched at its row sum
+                if (ggml_cuda_dsv4_compress_fold_step(cuda_ctx, cgraph, i)) {
+                    continue;
+                }
+
                 // the state gather of a gated delta net or a convolution that reads the cache itself
                 if (node->op == GGML_OP_GET_ROWS && (ggml_cuda_gdn_gather_is_folded(cuda_ctx, cgraph, i) ||
                                                      ggml_cuda_ssm_conv_state_is_folded(cuda_ctx, cgraph, i))) {
@@ -7249,6 +7582,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cuda_ctx->q8_1_input_reset();
     cuda_ctx->cublas_input_reset();
     cuda_ctx->expert_cache_ahead.clear();
+    cuda_ctx->dsv4_fold = {};
 
     // in a session the subgraph is one part of the session's graph, see ggml_backend_cuda_session_plan
     if (cuda_ctx->session_mode != ggml_backend_cuda_context::SESSION_OFF) {

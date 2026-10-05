@@ -9051,6 +9051,103 @@ struct test_qsa_cell_scores : public test_case {
     }
 };
 
+// The DeepSeek-V4 compressor as llama_model_deepseek4::graph builds it from its state: the rows of CONCAT(state, cur)
+//   (the overlap form with a zero row for the values and a -inf row for the scores appended) gathered by index, each
+//   block's window transposed, SOFT_MAX of the scores weighting the values, SUM_ROWS. The scores' current rows come out
+//   of an ADD between the two halves, as the model's position bias does.
+struct test_dsv4_compress : public test_case {
+    const bool    overlap;
+    const int64_t hd;
+    const int64_t r;
+    const int64_t nb;
+    const int64_t ns; // state rows
+    const int64_t nt; // current rows
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_COMPRESS";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(overlap, hd, r, nb, ns, nt);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_dsv4_compress(bool overlap = true, int64_t hd = 512, int64_t r = 4, int64_t nb = 1, int64_t ns = 8, int64_t nt = 1)
+        : overlap(overlap), hd(hd), r(r), nb(nb), ns(ns), nt(nt) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (strncmp(t->name, "idx", 3) == 0) {
+                // any row of the concat, the appended one included
+                std::vector<int32_t> v(ggml_nelements(t));
+                std::uniform_int_distribution<int32_t> dist(0, (int32_t) (ns + nt - (overlap ? 0 : 1)));
+                for (auto & x : v) {
+                    x = dist(rng);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strncmp(t->name, "score", 5) == 0) {
+                init_tensor_uniform(t, -3.0f, 3.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    ggml_tensor * half(ggml_context * ctx, ggml_tensor * state, ggml_tensor * cur, ggml_tensor * idx, bool neg_inf) {
+        ggml_tensor * src = ggml_concat(ctx, state, cur, 1);
+        if (!overlap) {
+            ggml_tensor * rows = ggml_get_rows(ctx, src, idx);
+            rows = ggml_reshape_3d(ctx, rows, hd, r, nb);
+            return ggml_cont(ctx, ggml_permute(ctx, rows, 1, 0, 2, 3));
+        }
+        ggml_tensor * row = ggml_view_1d(ctx, src, src->ne[0], 0);
+        row = neg_inf ? ggml_scale_bias(ctx, row, 0.0f, -INFINITY) : ggml_scale(ctx, row, 0.0f);
+        row = ggml_reshape_2d(ctx, row, src->ne[0], 1);
+        src = ggml_concat(ctx, src, row, 1);
+
+        const int64_t n_read = r*nb;
+        ggml_tensor * rows = ggml_get_rows(ctx, src, idx);
+        ggml_tensor * prev = ggml_cont(ctx, ggml_view_2d(ctx, rows, hd, n_read, rows->nb[1], 0));
+        prev = ggml_reshape_3d(ctx, prev, hd, r, nb);
+        ggml_tensor * next = ggml_cont(ctx, ggml_view_2d(ctx, rows, hd, n_read, rows->nb[1],
+                n_read*rows->nb[1] + ggml_row_size(rows->type, hd)));
+        next = ggml_reshape_3d(ctx, next, hd, r, nb);
+        ggml_tensor * window = ggml_concat(ctx, prev, next, 1);
+        return ggml_cont(ctx, ggml_permute(ctx, window, 1, 0, 2, 3));
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t W = overlap ? 2*hd : hd;
+        const int64_t n_idx = overlap ? 2*r*nb : r*nb;
+
+        ggml_tensor * state_kv    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, W, ns);
+        ggml_tensor * cur_kv      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, W, nt);
+        ggml_tensor * state_score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, W, ns);
+        ggml_tensor * score_mm    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, W, nt);
+        ggml_tensor * score_ape   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, W, nt);
+        ggml_tensor * idx         = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_idx);
+        ggml_set_name(state_kv,    "state_kv");
+        ggml_set_name(cur_kv,      "cur_kv");
+        ggml_set_name(state_score, "score_state");
+        ggml_set_name(score_mm,    "score_mm");
+        ggml_set_name(score_ape,   "score_ape");
+        ggml_set_name(idx,         "idx");
+
+        ggml_tensor * values = half(ctx, state_kv, cur_kv, idx, false);
+        ggml_tensor * scores = half(ctx, state_score, ggml_add(ctx, score_mm, score_ape), idx, true);
+
+        ggml_tensor * out = ggml_sum_rows(ctx, ggml_mul(ctx, values, ggml_soft_max(ctx, scores)));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_moe_reduce : public test_case {
     const int64_t n_embd;
     const int64_t n_expert_used;
@@ -13866,6 +13963,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
     test_cases.emplace_back(new test_moe_reduce(63,  2, 17));
+    test_cases.emplace_back(new test_dsv4_compress(true,  512, 4,   1,  8,   1));
+    test_cases.emplace_back(new test_dsv4_compress(true,  128, 4,   1,  8,   1));
+    test_cases.emplace_back(new test_dsv4_compress(true,  512, 4,   64, 8,   256));
+    test_cases.emplace_back(new test_dsv4_compress(true,  96,  2,   5,  3,   7));
+    test_cases.emplace_back(new test_dsv4_compress(false, 512, 128, 1,  128, 1));
+    test_cases.emplace_back(new test_dsv4_compress(false, 512, 128, 4,  128, 512));
+    test_cases.emplace_back(new test_dsv4_compress(false, 64,  16,  3,  16,  33));
+    test_cases.emplace_back(new test_dsv4_compress(false, 64,  128, 1,  128, 1));
     test_cases.emplace_back(new test_qsa_cell_scores(64,   4, 1));
     test_cases.emplace_back(new test_qsa_cell_scores(64,   4, 1, 1, 4, true));
     test_cases.emplace_back(new test_qsa_cell_scores(64,   4, 1, 1, 4, false, true));

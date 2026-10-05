@@ -1504,6 +1504,27 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// A DeepSeek-V4 compressor (llama_model_deepseek4::graph::build_*compressed_kv_from_state) folded into one launch at
+//   its row sum, see ggml_cuda_dsv4_compress_fold_step. A half is the values or the scores: the rows of
+//   CONCAT(state, cur) (with extra, the SCALE of its row 0, appended as one more row) read through idx.
+struct ggml_cuda_dsv4_compress_half {
+    const ggml_tensor * state = nullptr;
+    const ggml_tensor * cur   = nullptr;
+    const ggml_tensor * extra = nullptr;
+    const ggml_tensor * idx   = nullptr;
+};
+struct ggml_cuda_dsv4_compress_fold {
+    int              target = -1; // the SUM_ROWS node
+    std::vector<int> skip;        // the chain's nodes before it
+    ggml_cuda_dsv4_compress_half kv;
+    ggml_cuda_dsv4_compress_half score;
+    bool    overlap  = false;     // the first r of 2r entries from the first half of a row, the rest from its second
+    int64_t hd       = 0;         // pooled values per block
+    int64_t r        = 0;         // rows per block
+    int64_t nb       = 0;         // blocks
+    float   sm_scale = 1.0f;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1697,6 +1718,8 @@ struct ggml_backend_cuda_context {
         ggml_tensor *       glu    = nullptr;
         int                 target = -1;
     } glu_deferred;
+
+    ggml_cuda_dsv4_compress_fold dsv4_fold;
 
     // A kernel can write the q8_1 copy of its output (one row) for the MMVQ matmul that reads it next, which then
     //   skips its quantize launch. ggml_cuda_q8_1_request names the output and the tensor the matmul reads it as (the
