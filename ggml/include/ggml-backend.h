@@ -373,6 +373,11 @@ extern "C" {
     //   source, and -1 when a backend could not follow, after which the graph must be split and allocated again.
     GGML_API int ggml_backend_sched_reshape(ggml_backend_sched_t sched, int n, struct ggml_tensor ** tensors, const int * dims, const int64_t * sizes);
 
+    // Give the next graph and its splits new ids, as if no graph was seen before. A graph that looks the same as the
+    //   last one keeps its ids, and backends keep what they derived from them; call this when a tensor a graph read was
+    //   freed and another one may have been allocated at its address since.
+    GGML_API void ggml_backend_sched_renew_uids(ggml_backend_sched_t sched);
+
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
     // The correct way to use this API is to discard the deallocated tensors and create new ones.

@@ -2693,6 +2693,12 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     return true;
 }
 
+void ggml_backend_sched_renew_uids(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    sched->prev_n_node_sig   = 0;
+    sched->prev_n_split_uids = 0;
+}
+
 int ggml_backend_sched_reshape(ggml_backend_sched_t sched, int n, struct ggml_tensor ** tensors, const int * dims, const int64_t * sizes) {
     GGML_ASSERT(sched);
     if (!sched->is_alloc) {

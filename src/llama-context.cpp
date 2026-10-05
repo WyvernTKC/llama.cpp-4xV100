@@ -1358,7 +1358,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampling.samplers[seq_id] = sampler;
 
-        sched_need_reserve = true;
+        samplers_changed();
 
         return true;
     }
@@ -1366,20 +1366,42 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (sampler && !can_offload) {
         LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d, cannot be offloaded to the backend\n", __func__, llama_sampler_name(sampler), seq_id);
 
-        if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
+        const bool changed = sampling.samplers.erase(seq_id) > 0;
+        if (changed) {
+            samplers_changed();
         }
-
-        sampling.samplers.erase(seq_id);
 
         return false;
     }
 
     sampling.samplers.erase(seq_id);
 
-    sched_need_reserve = true;
+    samplers_changed();
 
     return true;
+}
+
+// A backend sampler changes the graphs, not the buffers they need: rebuilding them is enough while they stay within
+//   the node budget of the last reserve. A reserve takes ~0.8 s with -sm tensor and drops the graph slots, and a server
+//   sets or clears the sampler of a slot for each request with a grammar or penalties, and for the one after it.
+void llama_context::samplers_changed() {
+    if (!sched_need_reserve && gf_res_reserve &&
+            (int64_t) graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch)) <= gf_res_reserve->get_max_nodes()) {
+        gf_res_prev_active = nullptr;
+        gf_slots_invalidate(false);
+
+        // the caller may free the old sampler and the next one land at its addresses: a graph a scheduler last built
+        //   with the old one would then look the same and keep what the backends derived for the freed tensors
+        ggml_backend_sched_renew_uids(sched.get());
+        for (auto & slot : gf_slots) {
+            if (slot.sched) {
+                ggml_backend_sched_renew_uids(slot.sched.get());
+            }
+        }
+        return;
+    }
+
+    sched_need_reserve = true;
 }
 
 void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
@@ -2508,10 +2530,14 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
             std::min(n_tokens, cparams.n_outputs_max),
             (uint64_t) cparams.n_seq_max * cparams.n_outputs_max_per_seq);
 
-    res += n_sampling_nodes;
+    uint32_t n_sampling_total = n_sampling_nodes;
     if (n_sampling_outputs_max > 1) {
-        res += (n_sampling_outputs_max - 1) * n_sampling_nodes_max;
+        n_sampling_total += (n_sampling_outputs_max - 1) * n_sampling_nodes_max;
     }
+
+    // room for a small backend sampler per sequence (a top-k is a few nodes) whether one is set or not: setting one
+    //   after the reserve then needs no new reserve, see samplers_changed
+    res += std::max(n_sampling_total, 32u*cparams.n_seq_max);
     return res;
 }
 

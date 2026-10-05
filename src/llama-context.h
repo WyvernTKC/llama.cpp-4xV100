@@ -378,6 +378,9 @@ private:
 
     bool sched_need_reserve = true;
 
+    // a backend sampler was set or cleared: rebuild the graphs, reserve only when they may outgrow the last reserve
+    void samplers_changed();
+
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
