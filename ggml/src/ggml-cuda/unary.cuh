@@ -106,6 +106,11 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
 bool ggml_cuda_should_fuse_cont_unary_mul(const ggml_tensor * cont, const ggml_tensor * unary, const ggml_tensor * mul);
 void ggml_cuda_op_cont_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * cont, ggml_tensor * unary, ggml_tensor * mul);
 
+// SCALE -> UNARY(SILU) of contiguous f32 as one launch (qwen4exp's hyper-connection down projection), with the q8_1 copy
+//   of a one-row output for the MMVQ matmul that reads it, see ggml_cuda_q8_1_request
+bool ggml_cuda_should_fuse_scale_unary(const ggml_tensor * scale, const ggml_tensor * unary);
+void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale, ggml_tensor * unary);
+
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
 // scale(sigmoid(x * m + a)) with m and a broadcast along the rows, the DeepSeek V4 hyper-connection coefficients

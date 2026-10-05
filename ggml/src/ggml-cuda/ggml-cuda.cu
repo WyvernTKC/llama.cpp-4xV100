@@ -6418,6 +6418,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    if (ggml_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY }) &&
+            ggml_cuda_should_fuse_scale_unary(node, cgraph->nodes[i + 1])) {
+        ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + 1);
+        ggml_cuda_op_scale_unary(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        return 1;
+    }
+
     return 0;
 }
 

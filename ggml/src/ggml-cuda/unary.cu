@@ -775,6 +775,68 @@ bool ggml_cuda_should_fuse_cont_unary_mul(const ggml_tensor * cont, const ggml_t
         !ggml_cuda_tensors_overlap(mul, v) && ggml_cuda_same_or_disjoint(mul, other);
 }
 
+// op(scale*x + bias), the form of the SCALE and UNARY kernels, so the result is bitwise theirs
+template <float (*op)(float), bool q8_copy>
+static __global__ void scale_unary_kernel(const float * x, float * dst, const float scale, const float bias, const int64_t k,
+        block_q8_1 * q8, const int64_t k_padded) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        if constexpr (q8_copy) {
+            // whole warps, k being a multiple of 32
+            if (i < k_padded) {
+                quantize_q8_1_lane(0.0f, q8 + i/QK8_1, i % QK8_1);
+            }
+        }
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    const float v = op(scale * x[i] + bias);
+    dst[i] = v;
+    if constexpr (q8_copy) {
+        quantize_q8_1_lane(v, q8 + i/QK8_1, i % QK8_1);
+    }
+}
+
+bool ggml_cuda_should_fuse_scale_unary(const ggml_tensor * scale, const ggml_tensor * unary) {
+    const ggml_tensor * x = scale->src[0];
+    return ggml_get_unary_op(unary) == GGML_UNARY_OP_SILU && unary->src[0] == scale &&
+        x->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 && unary->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(x) && ggml_is_contiguous(unary) && ggml_are_same_shape(x, unary) &&
+        ggml_cuda_same_or_disjoint(unary, x);
+}
+
+void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * unary) {
+    const ggml_tensor * x = scale_node->src[0];
+
+    float scale;
+    float bias;
+    memcpy(&scale, (const float *) scale_node->op_params + 0, sizeof(float));
+    memcpy(&bias,  (const float *) scale_node->op_params + 1, sizeof(float));
+
+    const int64_t k = ggml_nelements(unary);
+    const float * x_d = (const float *) x->data;
+    float *       d   = (float *) unary->data;
+
+    // one token: the q8_1 copy of the output for the MMVQ matmul that reads it
+    if (ggml_nrows(unary) == 1 && k % QK8_1 == 0) {
+        int64_t ne_padded = 0;
+        block_q8_1 * q8 = (block_q8_1 *) ctx.q8_1_emit_alloc(unary, ne_padded);
+        if (q8 != nullptr) {
+            const int64_t num_blocks = (ne_padded + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, ctx.stream());
+            ggml_cuda_kernel_launch(scale_unary_kernel<op_silu, true>, launch_params, x_d, d, scale, bias, k, q8, ne_padded);
+            return;
+        }
+    }
+
+    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(scale_unary_kernel<op_silu, false>, launch_params, x_d, d, scale, bias, k, nullptr, (int64_t) 0);
+}
+
 void ggml_cuda_op_cont_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * cont, ggml_tensor * unary, ggml_tensor * mul) {
     const ggml_tensor * v     = cont->src[0];
     const ggml_tensor * other = mul->src[0] == unary ? mul->src[1] : mul->src[0];

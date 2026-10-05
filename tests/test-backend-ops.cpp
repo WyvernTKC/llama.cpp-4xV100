@@ -5088,6 +5088,45 @@ struct test_cont_unary_mul : public test_case {
     }
 };
 
+// GGML_OP_SCALE + SILU (qwen4exp hyper-connection), optionally read by a quantized matmul (the q8_1 copy at one row)
+struct test_scale_silu : public test_case {
+    const int64_t n;
+    const int64_t n_rows;
+    const float   s;
+    const float   b;
+    const bool    with_mm;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SCALE_SILU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return with_mm ? 5e-4 : 1e-7; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(n, n_rows, s, b, with_mm);
+    }
+
+    test_scale_silu(int64_t n = 320, int64_t n_rows = 1, float s = 0.25f, float b = 0.0f, bool with_mm = false)
+        : n(n), n_rows(n_rows), s(s), b(b), with_mm(with_mm) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_rows);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * out = ggml_silu(ctx, ggml_scale_bias(ctx, x, s, b));
+        if (with_mm) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n, 256);
+            ggml_set_name(w, "w");
+            out = ggml_mul_mat(ctx, w, out);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_ADD (fused residual chain)
 struct test_add_add : public test_case {
     const ggml_type type;
@@ -11830,6 +11869,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_cont_unary_mul(128, 24, n_tokens, op));
         }
         test_cases.emplace_back(new test_cont_unary_mul(256, 4, 3, op, 64));
+    }
+    for (bool with_mm : { false, true }) {
+        test_cases.emplace_back(new test_scale_silu(320, 1, 0.25f, 0.0f, with_mm));
+        test_cases.emplace_back(new test_scale_silu(320, 3, 0.25f, 0.0f, with_mm));
+        test_cases.emplace_back(new test_scale_silu(1024, 1, 0.5f, 0.125f, with_mm));
+        test_cases.emplace_back(new test_scale_silu(96, 1, 2.0f, -0.5f, with_mm));
     }
     for (ggml_unary_op op : { GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID }) {
         test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 128, 12, 1, 1 }, op));
