@@ -101,7 +101,8 @@ static __global__ void dsv4_hc_comb_f32(
     }
 }
 
-template <bool gated>
+// q8_copy: one token, also the q8_1 copy of the output (padded to k_padded) for the MMVQ matmul that reads it
+template <bool gated, bool q8_copy>
 static __global__ void dsv4_hc_pre_f32(
         const float * x,
         const float * weights,
@@ -117,12 +118,20 @@ static __global__ void dsv4_hc_pre_f32(
         int64_t sw2,
         int64_t sd0,
         int64_t sd1,
-        float   scale) {
+        float   scale,
+        block_q8_1 * q8,
+        int64_t k_padded) {
     ggml_cuda_pdl_lc();
     const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t nr = n_embd * n_tokens;
 
     if (ir >= nr) {
+        if constexpr (q8_copy) {
+            // whole warps, nr being a multiple of 32
+            if (ir < k_padded) {
+                quantize_q8_1_lane(0.0f, q8 + ir/QK8_1, ir % QK8_1);
+            }
+        }
         return;
     }
 
@@ -143,7 +152,11 @@ static __global__ void dsv4_hc_pre_f32(
         sum += xv * wv;
     }
 
-    dst[i0*sd0 + it*sd1] = scale * sum;
+    const float v = scale * sum;
+    dst[i0*sd0 + it*sd1] = v;
+    if constexpr (q8_copy) {
+        quantize_q8_1_lane(v, q8 + ir/QK8_1, ir % QK8_1);
+    }
 }
 
 template <bool has_comb, bool gated>
@@ -262,18 +275,27 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     const int block_size = 256;
     const int64_t nr = n_embd * n_tokens;
+
+    // one token: the q8_1 copy of the output for the MMVQ matmul that reads it
+    int64_t      ne_padded = 0;
+    block_q8_1 * q8        = nullptr;
+    if (n_tokens == 1 && n_embd % QK8_1 == 0 && nbd0 == sizeof(float)) {
+        q8 = (block_q8_1 *) ctx.q8_1_emit_alloc(dst, ne_padded);
+    }
+
     const dim3 block_dims(block_size, 1, 1);
-    const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
+    const dim3 grid_dims((std::max(nr, ne_padded) + block_size - 1) / block_size, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
-    auto kernel = gated ? dsv4_hc_pre_f32<true> : dsv4_hc_pre_f32<false>;
+    auto kernel = q8 ? (gated ? dsv4_hc_pre_f32<true, true> : dsv4_hc_pre_f32<false, true>) :
+                       (gated ? dsv4_hc_pre_f32<true, false> : dsv4_hc_pre_f32<false, false>);
     ggml_cuda_kernel_launch(kernel, launch_params,
             (const float *) x->data, (const float *) weights->data, (float *) dst->data,
             n_embd, hc, n_tokens,
             nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
             nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float),
-            scale);
+            scale, q8, ne_padded);
 }
 
 static void ggml_cuda_op_dsv4_hc_post_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst,

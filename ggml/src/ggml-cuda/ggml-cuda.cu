@@ -6919,10 +6919,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
-                // one token: the combine of a split KV writes the q8_1 copy of the output, see launch_fattn
+                // one token: the combine of a split KV writes the q8_1 copy of the output, see launch_fattn; so does
+                //   the mix of the hyper-connection streams that a block reads without a norm (qwen4exp)
                 static const bool fattn_no_q8_1 = getenv("GGML_CUDA_NO_FATTN_Q8_1") != nullptr;
-                const bool fattn_q8_1 = node->op == GGML_OP_FLASH_ATTN_EXT && node->src[0]->ne[1] == 1 && !fattn_no_q8_1;
-                if (fattn_q8_1) {
+                const bool emit_q8_1 = (node->op == GGML_OP_FLASH_ATTN_EXT && node->src[0]->ne[1] == 1 && !fattn_no_q8_1) ||
+                    (node->op == GGML_OP_DSV4_HC_PRE && ggml_nrows(node) == 1);
+                if (emit_q8_1) {
                     ggml_cuda_q8_1_request(cuda_ctx, cgraph, i);
                 }
 
@@ -6932,7 +6934,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 GGML_ASSERT(ok);
 
-                if (fattn_q8_1) {
+                if (emit_q8_1) {
                     cuda_ctx->q8_1_commit_pending();
                 }
 
