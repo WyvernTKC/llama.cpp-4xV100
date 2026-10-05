@@ -270,6 +270,13 @@ llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
     return mem_idx.get();
 }
 
+// the indexer cache must match the attention cache cell for cell and the QSA inputs are sized by its n_kv: with an
+//   indexer, no graph is built for more cells than its ubatch needs (the attention cache alone did, and qwen4exp
+//   asserted at the first graph of a few tokens)
+void llama_memory_hybrid_idx::set_graph_reshape(bool enable) {
+    llama_memory_hybrid::set_graph_reshape(enable && mem_idx == nullptr);
+}
+
 void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
