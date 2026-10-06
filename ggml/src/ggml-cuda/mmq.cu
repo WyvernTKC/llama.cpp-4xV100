@@ -237,7 +237,7 @@ void ggml_cuda_mul_mat_q(
     GGML_ASSERT(ne1 == n_expert_used);
 
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
-        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne12) * sizeof(block_q8_1_mmq);
     const bool with_scale = src0->type == GGML_TYPE_NVFP4 && use_native_fp4;
 
     // the gate of an expert FFN may have made the expert lists and the quantized activations of its up projection. Only

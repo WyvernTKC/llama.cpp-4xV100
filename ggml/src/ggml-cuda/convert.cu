@@ -182,6 +182,19 @@ static void dequantize_block_kq_cuda(const void * vx, dst_t * y, const int64_t k
     dequantize_block_kq<dst_t, dequantize_kq><<<(nb + nsb - 1)/nsb, dim3(nth, nsb, 1), 0, stream>>>(vx, y, nb);
 }
 
+// an IQ4_NL row is a multiple of QK4_NL only, so the sub-blocks past its end are skipped
+template<typename dst_t>
+static __global__ void dequantize_block_iq4_nl(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb32) {
+    const int64_t i = blockIdx.x;
+
+    const int64_t ib = 8*i + threadIdx.x%8;
+    if (ib >= nb32) {
+        return;
+    }
+
+    dequantize_iq4_nl(vx, i, yy + i*QK_K, threadIdx.x);
+}
+
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static void dequantize_block_cuda(const void * vx, dst_t * y,
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
@@ -290,7 +303,9 @@ static void dequantize_row_iq1_s_cuda(const void * vx, dst_t * y, const int64_t 
 
 template<typename dst_t>
 static void dequantize_row_iq4_nl_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
-    dequantize_block_kq_cuda<32, dst_t, dequantize_iq4_nl<dst_t>>(vx, y, k, stream);
+    const int nb32 = k / QK4_NL;
+    const int nb = (k + QK_K - 1) / QK_K;
+    dequantize_block_iq4_nl<<<nb, 32, 0, stream>>>(vx, y, nb32);
 }
 
 template<typename dst_t>
