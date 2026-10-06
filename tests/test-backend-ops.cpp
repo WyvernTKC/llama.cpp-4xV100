@@ -13876,6 +13876,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 8192, 66, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 16384, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 1024));
+    // the same tile for 6 q heads on 1 kv head (Qwen QSA split across 4 devices), padded to 8 heads
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        for (int nb : { 5, 64, 66 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, { 6, 1}, nb <= 8 ? 16384 : 8192, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false, 512));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, { 6, 1}, 32768, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2051));
 
     // sparse attn (qwen4 shape - gqa 12)
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
@@ -14509,6 +14516,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
         test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,   512));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
+    }
+    // Qwen QSA prefill on one of 4 devices: 6 q heads on 1 kv head, ubatch 1024, q8_0 cache
+    for (int64_t kv : {16384, 24576, 32768, 65536, 131072}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, { 6, 1}, kv, 1024, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2051));
     }
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

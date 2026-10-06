@@ -259,8 +259,13 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
-        // a GQA ratio of 5-7 at a few tokens is padded to 8 heads, see ggml_cuda_get_best_fattn_kernel
-        if (use_gqa_opt && (gqa_ratio % 8 == 0 || (gqa_ratio > 4 && gqa_ratio < 8 && Q->ne[1] <= 8))) {
+        // a GQA ratio of 5-7 at a few tokens is padded to 8 heads, see ggml_cuda_get_best_fattn_kernel, and so is a
+        //   sparse batch of any size: the sparse tile reads only the union of its 4 queries' keys (Qwen QSA prefill)
+        bool pad_gqa = Q->ne[1] <= 8;
+        if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, GGML_CUDA_VOLTA_SPARSE_NCOLS1, 8)) {
+            pad_gqa = pad_gqa || ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, GGML_CUDA_VOLTA_SPARSE_NCOLS1, 8);
+        }
+        if (use_gqa_opt && (gqa_ratio % 8 == 0 || (gqa_ratio > 4 && gqa_ratio < 8 && pad_gqa))) {
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
             return;
         }
