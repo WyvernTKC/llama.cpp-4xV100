@@ -5941,6 +5941,52 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
         }
 
+        // DeepSeek V4 before a block: the stream weights (the chain below) computed inside the DSV4_HC_PRE that mixes the
+        //   streams with them, see ggml_cuda_op_dsv4_hc_pre_coef. Every column recomputes them, so only small batches
+        //   (a prefill ubatch was 0.3% slower).
+        static const bool no_hc_pre_coef = getenv("GGML_CUDA_NO_HC_PRE_COEF") != nullptr;
+        for (const bool with_view : { true, false }) {
+            if (no_hc_pre_coef) {
+                break;
+            }
+            const int n_ops = with_view ? 5 : 4;
+            const int i_pre = i + n_ops;
+            const bool ops_match = with_view ?
+                ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE,
+                    GGML_OP_DSV4_HC_PRE }, { i_pre }) :
+                ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE,
+                    GGML_OP_DSV4_HC_PRE }, { i_pre });
+            if (!ops_match) {
+                continue;
+            }
+            ggml_tensor * add   = cgraph->nodes[i + n_ops - 3];
+            ggml_tensor * sig   = cgraph->nodes[i + n_ops - 2];
+            ggml_tensor * scale = cgraph->nodes[i + n_ops - 1];
+            ggml_tensor * pre   = cgraph->nodes[i_pre];
+            const ggml_tensor * mixes = node->src[0];
+            const ggml_tensor * m     = node->src[1];
+            const ggml_tensor * a     = add->src[1];
+            const ggml_tensor * x     = pre->src[0];
+            const int64_t hc = x->ne[1];
+            const bool ok = add->src[0] == node && sig->src[0] == add && scale->src[0] == sig &&
+                (!with_view || a == cgraph->nodes[i + 1]) && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID &&
+                pre->src[1] == scale && ggml_get_op_params_i32(pre, 1) == 0 &&
+                mixes->type == GGML_TYPE_F32 && m->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32 &&
+                mixes->ne[0] == hc && mixes->nb[0] == sizeof(float) && ggml_nrows(mixes) == mixes->ne[1] &&
+                ggml_is_contiguous(m) && ggml_nrows(m) == 1 && hc % m->ne[0] == 0 &&
+                ggml_is_contiguous(a) && ggml_nrows(a) == 1 && hc % a->ne[0] == 0 &&
+                ggml_are_same_shape(node, mixes) && ggml_are_same_shape(add, node) && ggml_are_same_shape(scale, node) &&
+                hc <= 4 && x->type == GGML_TYPE_F32 && x->ne[2] <= 8 && scale->ne[1] == x->ne[2] && pre->type == GGML_TYPE_F32 &&
+                !ggml_cuda_tensors_overlap(pre, x) && !ggml_cuda_tensors_overlap(pre, mixes) &&
+                !ggml_cuda_tensors_overlap(pre, m) && !ggml_cuda_tensors_overlap(pre, a);
+            if (!ok) {
+                continue;
+            }
+            ggml_cuda_q8_1_request(cuda_ctx, cgraph, i_pre);
+            ggml_cuda_op_dsv4_hc_pre_coef(*cuda_ctx, node, add, scale, pre);
+            return i_pre - i;
+        }
+
         // DeepSeek V4 hyper-connection coefficients: 172 of these four-kernel chains per token. The add's
         //   bias is a view of a weight, and that view sits between the mul and the add in node order.
         for (const bool with_view : { true, false }) {

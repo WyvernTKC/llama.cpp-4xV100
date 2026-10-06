@@ -5405,6 +5405,11 @@ struct test_mul_add_sigmoid_scale : public test_case {
     const int64_t off; // first mixes column of the slice, -1 for the head (whole mixes, no views)
     const float s;
     const float b;
+    const int64_t n_embd; // > 0: the block after it, DSV4_HC_PRE of streams of n_embd with these weights, RMS_NORM, MUL
+    const int     mm;     // 1: and a q8_0 matmul of the norm
+
+    ggml_tensor * pre  = nullptr;
+    ggml_tensor * norm = nullptr;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5417,11 +5422,30 @@ struct test_mul_add_sigmoid_scale : public test_case {
     bool use_weight_context() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR4(n_tokens, off, s, b);
+        std::string str = VARS_TO_STR4(n_tokens, off, s, b);
+        if (n_embd > 0) {
+            str += "," + VARS_TO_STR2(n_embd, mm);
+        }
+        return str;
     }
 
-    test_mul_add_sigmoid_scale(int64_t n_tokens = 1, int64_t off = 0, float s = 1.0f, float b = 0.0f)
-        : n_tokens(n_tokens), off(off), s(s), b(b) {}
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (n_embd <= 0) {
+            return {};
+        }
+        if (mm) {
+            return { pre, norm, out_node };
+        }
+        return { pre, out_node };
+    }
+
+    double max_nmse_err() override { return mm ? 5e-4 : 1e-7; }
+
+    ggml_tensor * out_node = nullptr;
+
+    test_mul_add_sigmoid_scale(int64_t n_tokens = 1, int64_t off = 0, float s = 1.0f, float b = 0.0f, int64_t n_embd = 0,
+            int mm = 0)
+        : n_tokens(n_tokens), off(off), s(s), b(b), n_embd(n_embd), mm(mm) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         GGML_ASSERT(!use_weight_context());
@@ -5459,8 +5483,31 @@ struct test_mul_add_sigmoid_scale : public test_case {
         out = ggml_sigmoid(ctx, out);
         out = ggml_scale_bias(ctx, out, s, b);
         ggml_set_name(out, "out");
+        out_node = out;
+        if (n_embd <= 0) {
+            return out;
+        }
 
-        return out;
+        // the block after it: the streams mixed with these weights, the block norm
+        ggml_tensor * streams = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_tensor * w_norm  = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, n_embd);
+        ggml_set_name(streams, "streams");
+        ggml_set_name(w_norm,  "w_norm");
+        pre = ggml_dsv4_hc_pre(ctx, streams, out);
+        ggml_set_name(pre, "pre");
+        ggml_set_output(pre);
+        norm = ggml_mul(ctx, ggml_rms_norm(ctx, pre, 1e-6f), w_norm);
+        ggml_set_name(norm, "norm");
+        out_node = norm;
+        if (!mm) {
+            return norm;
+        }
+        ggml_set_output(norm);
+        ggml_tensor * wq = ggml_new_tensor_2d(ctx_weights, GGML_TYPE_Q8_0, n_embd, 64);
+        ggml_set_name(wq, "wq");
+        out_node = ggml_mul_mat(ctx, wq, norm);
+        ggml_set_name(out_node, "mm");
+        return out_node;
     }
 };
 
@@ -11500,7 +11547,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_add_sigmoid_scale(n_tokens,  0, 1.0f, 1e-6f));
         test_cases.emplace_back(new test_mul_add_sigmoid_scale(n_tokens,  4, 2.0f, 0.0f));
         test_cases.emplace_back(new test_mul_add_sigmoid_scale(n_tokens, -1, 1.0f, 1e-6f));
+        test_cases.emplace_back(new test_mul_add_sigmoid_scale(n_tokens,  0, 1.0f, 1e-6f, 4096));
+        test_cases.emplace_back(new test_mul_add_sigmoid_scale(n_tokens,  0, 1.0f, 1e-6f, 4096, 1));
+        test_cases.emplace_back(new test_mul_add_sigmoid_scale(n_tokens, -1, 1.0f, 1e-6f, 512));
+        test_cases.emplace_back(new test_mul_add_sigmoid_scale(n_tokens,  0, 1.0f, 1e-6f, 1000));
     }
+    test_cases.emplace_back(new test_mul_add_sigmoid_scale(33, 0, 1.0f, 1e-6f, 4096));
 
     // fused unary + mul (gated activations that are not expressed as GGML_OP_GLU)
     for (ggml_unary_op op : { GGML_UNARY_OP_GELU, GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SOFTPLUS }) {

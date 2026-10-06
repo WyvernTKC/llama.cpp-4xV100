@@ -159,6 +159,48 @@ static __global__ void dsv4_hc_pre_f32(
     }
 }
 
+// DSV4_HC_PRE (not gated) with its weights computed in place from the mixes: MUL, ADD, SIGMOID, SCALE rounded as
+//   mul_add_sigmoid_scale_f32 does, then the sum as dsv4_hc_pre_f32 forms it. hc <= 4.
+template <bool q8_copy>
+static __global__ void dsv4_hc_pre_coef_f32(
+        const float * x, const float * mixes, const float * m, const float * a, float * dst, const int64_t n_embd,
+        const int hc, const int64_t n_tokens, const int64_t sx0, const int64_t sx1, const int64_t sx2,
+        const int64_t smix1, const int ne_m, const int ne_a, const float ws, const float wb, const int64_t sd0,
+        const int64_t sd1, const float scale, block_q8_1 * q8, const int64_t k_padded) {
+    ggml_cuda_pdl_lc();
+    const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t nr = n_embd * n_tokens;
+
+    if (ir >= nr) {
+        if constexpr (q8_copy) {
+            // whole warps, nr being a multiple of 32
+            if (ir < k_padded) {
+                quantize_q8_1_lane(0.0f, q8 + ir/QK8_1, ir % QK8_1);
+            }
+        }
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+
+    const int64_t i0 = ir % n_embd;
+    const int64_t it = ir / n_embd;
+
+    float sum = 0.0f;
+    for (int ih = 0; ih < hc; ++ih) {
+        const float xv = x[i0*sx0 + ih*sx1 + it*sx2];
+        const float sv = ggml_cuda_op_sigmoid_single(__fadd_rn(__fmul_rn(mixes[it*smix1 + ih], m[ih % ne_m]), a[ih % ne_a]));
+        const float wv = ws * sv + wb;
+        sum += xv * wv;
+    }
+
+    const float v = scale * sum;
+    dst[i0*sd0 + it*sd1] = v;
+    if constexpr (q8_copy) {
+        quantize_q8_1_lane(v, q8 + ir/QK8_1, ir % QK8_1);
+    }
+}
+
 template <bool has_comb, bool gated>
 static __global__ void dsv4_hc_post_f32(
         const float * x,
@@ -296,6 +338,45 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float),
             scale, q8, ne_padded);
+}
+
+void ggml_cuda_op_dsv4_hc_pre_coef(ggml_backend_cuda_context & ctx, const ggml_tensor * mul_w, const ggml_tensor * add_w,
+                                   const ggml_tensor * scale_w, ggml_tensor * dst) {
+    const ggml_tensor * x     = dst->src[0];
+    const ggml_tensor * mixes = mul_w->src[0];
+    const ggml_tensor * m     = mul_w->src[1];
+    const ggml_tensor * a     = add_w->src[1];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && mixes->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->ne[1] <= 4 && mixes->ne[0] == x->ne[1] && mixes->nb[0] == sizeof(float));
+
+    float ws = 1.0f;
+    float wb = 0.0f;
+    memcpy(&ws, (const float *) scale_w->op_params + 0, sizeof(float));
+    memcpy(&wb, (const float *) scale_w->op_params + 1, sizeof(float));
+    const float scale = ggml_get_op_params_f32(dst, 0);
+
+    const int64_t n_embd   = x->ne[0];
+    const int     hc       = (int) x->ne[1];
+    const int64_t n_tokens = x->ne[2];
+    const int64_t nr       = n_embd * n_tokens;
+
+    // one token: the q8_1 copy of the output for the MMVQ matmul that reads it
+    int64_t      ne_padded = 0;
+    block_q8_1 * q8        = nullptr;
+    if (n_tokens == 1 && n_embd % QK8_1 == 0 && dst->nb[0] == sizeof(float)) {
+        q8 = (block_q8_1 *) ctx.q8_1_emit_alloc(dst, ne_padded);
+    }
+
+    const int block_size = 256;
+    const dim3 grid_dims((std::max(nr, ne_padded) + block_size - 1) / block_size, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, dim3(block_size, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(q8 ? dsv4_hc_pre_coef_f32<true> : dsv4_hc_pre_coef_f32<false>, launch_params,
+        (const float *) x->data, (const float *) mixes->data, (const float *) m->data, (const float *) a->data,
+        (float *) dst->data, n_embd, hc, n_tokens,
+        (int64_t) (x->nb[0]/sizeof(float)), (int64_t) (x->nb[1]/sizeof(float)), (int64_t) (x->nb[2]/sizeof(float)),
+        (int64_t) (mixes->nb[1]/sizeof(float)), (int) m->ne[0], (int) a->ne[0], ws, wb,
+        (int64_t) (dst->nb[0]/sizeof(float)), (int64_t) (dst->nb[1]/sizeof(float)), scale, q8, ne_padded);
 }
 
 static void ggml_cuda_op_dsv4_hc_post_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
