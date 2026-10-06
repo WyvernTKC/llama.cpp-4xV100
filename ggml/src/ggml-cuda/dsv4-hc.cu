@@ -442,3 +442,149 @@ void ggml_cuda_op_dsv4_hc_post_gated(ggml_backend_cuda_context & ctx, ggml_tenso
         const ggml_tensor * scale_in, const ggml_tensor * scale_out) {
     ggml_cuda_op_dsv4_hc_post_impl(ctx, dst, scale_in, scale_out);
 }
+
+// qwen4exp, one token: SCALE -> SILU of the low-rank mix, its up projection (q8_0) and the gated DSV4_HC_PRE that reads
+//   it in one launch. A block owns 32 columns of all hc streams: their rows go to shared memory with coalesced loads, a
+//   lane sums one row, and warp 0 writes the 32 mixed values and their q8_1 block. The SILU input is quantized as
+//   scale_unary_kernel does it, the mix is formed as in dsv4_hc_pre_f32; a row sums its blocks in order, which is not
+//   the order of mul_mat_vec_q, so the result is not bitwise that of the three launches.
+template <int hc, int k_blocks>
+__launch_bounds__(WARP_SIZE*hc, 1)
+static __global__ void dsv4_hc_up_pre_q8_0(
+        const float * lo, const char * w_up, const float * x, float * dst, block_q8_1 * q8, const float lo_scale,
+        const float lo_bias, const int n_embd, const int64_t sx1, const float scale) {
+    static_assert(k_blocks % 2 == 0, "a row must be whole ints");
+    constexpr int row_ints   = k_blocks*sizeof(block_q8_0)/sizeof(int);
+    constexpr int chunk_int4 = WARP_SIZE*row_ints/4; // the 32 rows of one stream
+    static_assert((WARP_SIZE*row_ints) % 4 == 0, "32 rows must be whole int4");
+
+    __shared__ int4       rows_s4[hc*chunk_int4];
+    __shared__ block_q8_1 y_s[k_blocks];
+    __shared__ float      g_s[hc][WARP_SIZE];
+
+    ggml_cuda_pdl_lc();
+    const int lane = threadIdx.x;
+    const int s    = threadIdx.y;
+    const int j0   = blockIdx.x*WARP_SIZE;
+
+    if (j0 >= n_embd) {
+        // the padding blocks of the q8_1 copy
+        if (q8 && s == 0) {
+            quantize_q8_1_lane(0.0f, q8 + blockIdx.x, lane);
+        }
+        return;
+    }
+
+    // the weights are not written by an earlier kernel, so they load before the dependency wait
+    for (int i = s*WARP_SIZE + lane; i < hc*chunk_int4; i += hc*WARP_SIZE) {
+        const int is = i / chunk_int4;
+        const int4 * src = (const int4 *) (w_up + ((int64_t) is*n_embd + j0)*row_ints*sizeof(int));
+        rows_s4[i] = src[i % chunk_int4];
+    }
+
+    ggml_cuda_pdl_sync();
+    for (int b = s; b < k_blocks; b += hc) {
+        const float v = ggml_cuda_op_silu_single(lo_scale*lo[b*QK8_1 + lane] + lo_bias);
+        quantize_q8_1_lane(v, y_s + b, lane);
+    }
+    __syncthreads();
+
+    // a row starts on a word; a block of 34 bytes starts on one when its index is even
+    const int * row = (const int *) rows_s4 + (s*WARP_SIZE + lane)*row_ints;
+    float acc = 0.0f;
+#pragma unroll
+    for (int b = 0; b < k_blocks; ++b) {
+        const int w0 = b*(int) sizeof(block_q8_0)/(int) sizeof(int);
+        int   q[QI8_0];
+        float d;
+        if (b % 2 == 0) {
+            d = __half2float(__ushort_as_half((unsigned short) (row[w0] & 0xFFFF)));
+#pragma unroll
+            for (int i = 0; i < QI8_0; ++i) {
+                q[i] = __funnelshift_r(row[w0 + i], row[w0 + i + 1], 16);
+            }
+        } else {
+            d = __half2float(__ushort_as_half((unsigned short) ((unsigned int) row[w0] >> 16)));
+#pragma unroll
+            for (int i = 0; i < QI8_0; ++i) {
+                q[i] = row[w0 + 1 + i];
+            }
+        }
+        const int * u = (const int *) y_s[b].qs;
+        int sumi = 0;
+#pragma unroll
+        for (int i = 0; i < QI8_0; ++i) {
+            sumi = ggml_cuda_dp4a(q[i], u[i], sumi);
+        }
+        acc += d*__low2float(y_s[b].ds) * (float) sumi;
+    }
+    g_s[s][lane] = acc;
+    __syncthreads();
+
+    if (s == 0) {
+        const int j = j0 + lane;
+        float sum = 0.0f;
+#pragma unroll
+        for (int ih = 0; ih < hc; ++ih) {
+            const float xv = x[j + ih*sx1];
+            const float wv = 1.0f / (1.0f + expf(-g_s[ih][lane]));
+            sum += xv * wv;
+        }
+        const float v = scale * sum;
+        dst[j] = v;
+        if (q8) {
+            quantize_q8_1_lane(v, q8 + blockIdx.x, lane);
+        }
+    }
+}
+
+static constexpr int DSV4_HC_UP_PRE_HC       = 4;
+static constexpr int DSV4_HC_UP_PRE_K_BLOCKS = 10;
+
+bool ggml_cuda_should_fuse_dsv4_hc_up_pre(const ggml_tensor * scale, const ggml_tensor * silu, const ggml_tensor * mm,
+        const ggml_tensor * pre) {
+    if (scale->op != GGML_OP_SCALE || silu->op != GGML_OP_UNARY || ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU ||
+            mm->op != GGML_OP_MUL_MAT || pre->op != GGML_OP_DSV4_HC_PRE || silu->src[0] != scale || mm->src[1] != silu ||
+            ggml_get_op_params_i32(pre, 1) == 0) {
+        return false;
+    }
+    const ggml_tensor * lo = scale->src[0];
+    const ggml_tensor * w  = mm->src[0];
+    const ggml_tensor * x  = pre->src[0];
+    const ggml_tensor * g  = pre->src[1];
+    const int64_t n_embd = x->ne[0];
+
+    // the gate is the matmul output read as n_embd x hc; the rows of 32 columns of a stream load as whole int4
+    return (g == mm || (g->view_src == mm && g->view_offs == 0)) && ggml_is_contiguous(g) && ggml_is_contiguous(mm) &&
+        lo->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 && silu->type == GGML_TYPE_F32 &&
+        mm->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && pre->type == GGML_TYPE_F32 &&
+        w->type == GGML_TYPE_Q8_0 && w->ne[0] == DSV4_HC_UP_PRE_K_BLOCKS*QK8_0 && ggml_is_contiguous(w) &&
+        x->ne[1] == DSV4_HC_UP_PRE_HC && x->ne[2] == 1 && x->ne[3] == 1 && w->ne[1] == n_embd*DSV4_HC_UP_PRE_HC &&
+        mm->ne[1] == 1 && ggml_is_contiguous(lo) && ggml_nelements(lo) == w->ne[0] &&
+        x->nb[0] == sizeof(float) && pre->nb[0] == sizeof(float) && n_embd % WARP_SIZE == 0 && n_embd <= INT_MAX &&
+        (uintptr_t) w->data % 16 == 0 && (n_embd*w->nb[1]) % 16 == 0 && (WARP_SIZE*w->nb[1]) % 16 == 0 &&
+        !ggml_cuda_tensors_overlap(pre, lo) && !ggml_cuda_tensors_overlap(pre, x) && !ggml_cuda_tensors_overlap(pre, w);
+}
+
+void ggml_cuda_op_dsv4_hc_up_pre(ggml_backend_cuda_context & ctx, const ggml_tensor * scale, const ggml_tensor * mm,
+        ggml_tensor * pre) {
+    const ggml_tensor * lo = scale->src[0];
+    const ggml_tensor * w  = mm->src[0];
+    const ggml_tensor * x  = pre->src[0];
+    const int n_embd = (int) x->ne[0];
+
+    float lo_scale;
+    float lo_bias;
+    memcpy(&lo_scale, (const float *) scale->op_params + 0, sizeof(float));
+    memcpy(&lo_bias,  (const float *) scale->op_params + 1, sizeof(float));
+
+    int64_t      ne_padded = 0;
+    block_q8_1 * q8        = (block_q8_1 *) ctx.q8_1_emit_alloc(pre, ne_padded);
+
+    const dim3 block_dims(WARP_SIZE, DSV4_HC_UP_PRE_HC, 1);
+    const dim3 grid_dims(std::max<int64_t>(n_embd, ne_padded)/WARP_SIZE, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
+    ggml_cuda_kernel_launch(dsv4_hc_up_pre_q8_0<DSV4_HC_UP_PRE_HC, DSV4_HC_UP_PRE_K_BLOCKS>, launch_params,
+            (const float *) lo->data, (const char *) w->data, (const float *) x->data, (float *) pre->data, q8,
+            lo_scale, lo_bias, n_embd, (int64_t) (x->nb[1] / sizeof(float)), ggml_get_op_params_f32(pre, 0));
+}

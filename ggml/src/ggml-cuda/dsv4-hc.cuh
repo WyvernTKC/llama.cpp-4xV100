@@ -34,3 +34,10 @@ void ggml_cuda_op_dsv4_hc_post_gated(ggml_backend_cuda_context & ctx, ggml_tenso
 //   one launch, each step rounded as its own kernel would; dst is the DSV4_HC_PRE node
 void ggml_cuda_op_dsv4_hc_pre_coef(ggml_backend_cuda_context & ctx, const ggml_tensor * mul_w, const ggml_tensor * add_w,
                                    const ggml_tensor * scale_w, ggml_tensor * dst);
+
+// qwen4exp, one token: SCALE -> SILU -> MUL_MAT (the q8_0 up projection of a hyper-connection mix) and the gated
+//   DSV4_HC_PRE that reads it as one launch; pre is the DSV4_HC_PRE node, the views between are not computed
+bool ggml_cuda_should_fuse_dsv4_hc_up_pre(const ggml_tensor * scale, const ggml_tensor * silu, const ggml_tensor * mm,
+        const ggml_tensor * pre);
+void ggml_cuda_op_dsv4_hc_up_pre(ggml_backend_cuda_context & ctx, const ggml_tensor * scale, const ggml_tensor * mm,
+        ggml_tensor * pre);

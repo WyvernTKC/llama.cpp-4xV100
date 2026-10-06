@@ -5822,6 +5822,7 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     const int64_t n_tokens;
     const bool    gated;
     const bool    with_mm; // and a q8_0 matmul that reads the output, as a qwen4exp block does
+    const int64_t up_k;    // the gate made by SCALE -> SILU -> a q8_0 up projection of a mix this wide, as qwen4exp does
 
     ggml_tensor * mm = nullptr;
 
@@ -5835,29 +5836,46 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
         if (with_mm) {
             s += "," + VARS_TO_STR1(with_mm);
         }
+        if (up_k > 0) {
+            s += "," + VARS_TO_STR1(up_k);
+        }
         return s;
     }
 
-    bool run_whole_graph() override { return with_mm; }
+    bool run_whole_graph() override { return with_mm || up_k > 0; }
 
     std::vector<ggml_tensor *> fusion_test_nodes() override {
-        if (!with_mm) {
+        if (!with_mm && up_k == 0) {
             return {};
+        }
+        if (!with_mm) {
+            return { out };
         }
         return { out, mm };
     }
 
-    double max_nmse_err() override { return with_mm ? 5e-4 : 1e-7; }
+    double max_nmse_err() override { return with_mm || up_k > 0 ? 5e-4 : 1e-7; }
 
-    test_dsv4_hc_pre(int64_t n_embd = 31, int64_t n_hc = 4, int64_t n_tokens = 17, bool gated = false, bool with_mm = false)
-        : n_embd(n_embd), n_hc(n_hc), n_tokens(n_tokens), gated(gated), with_mm(with_mm) {}
+    test_dsv4_hc_pre(int64_t n_embd = 31, int64_t n_hc = 4, int64_t n_tokens = 17, bool gated = false, bool with_mm = false,
+                     int64_t up_k = 0)
+        : n_embd(n_embd), n_hc(n_hc), n_tokens(n_tokens), gated(gated), with_mm(with_mm), up_k(up_k) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, n_tokens);
         ggml_set_name(x, "x");
 
         if (gated) {
-            ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, n_tokens);
+            ggml_tensor * gate = nullptr;
+            if (up_k > 0) {
+                ggml_tensor * lo = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, up_k, n_tokens);
+                ggml_set_name(lo, "lo");
+                ggml_tensor * wu = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, up_k, n_embd*n_hc);
+                ggml_set_name(wu, "wu");
+                gate = ggml_mul_mat(ctx, wu, ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f/n_hc)));
+                gate = ggml_reshape_3d(ctx, gate, n_embd, n_hc, n_tokens);
+            } else {
+                gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, n_tokens);
+            }
             ggml_set_name(gate, "gate");
 
             out = ggml_dsv4_hc_pre_gated(ctx, x, gate, 1.0f/n_hc);
@@ -11608,6 +11626,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 1, true,  true));
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 1, false, true));
     test_cases.emplace_back(new test_dsv4_hc_pre(640,  4, 1, true,  true));
+    // the gate from the up projection of the low-rank mix (qwen4exp), in one launch at one token
+    test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 1, true,  true,  320));
+    test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 1, true,  false, 320));
+    test_cases.emplace_back(new test_dsv4_hc_pre(640,  4, 1, true,  true,  320));
+    test_cases.emplace_back(new test_dsv4_hc_pre(640,  4, 2, true,  true,  320));
     test_cases.emplace_back(new test_dsv4_hc_pre(96,   4, 3, true,  true));
     for (int64_t n_hc : {1, 2, 3, 5, 8, 65}) {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17));

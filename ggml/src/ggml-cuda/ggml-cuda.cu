@@ -7359,6 +7359,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // qwen4exp, one token: SCALE -> SILU of a hyper-connection mix, its up projection and the gated DSV4_HC_PRE that reads
+    //   it (past the reshape views) in one launch, two launches less per mix
+    if (node->op == GGML_OP_SCALE && i + 4 < cgraph->n_nodes) {
+        static const bool disabled = getenv("GGML_CUDA_NO_HC_UP_PRE") != nullptr;
+        int j = i + 3;
+        while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            j++;
+        }
+        bool ok = !disabled && j < cgraph->n_nodes && (cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_COMPUTE);
+        for (int k = i; ok && k < i + 3; k++) {
+            ok = ggml_node_has_n_uses(cgraph, k, 1) && (cgraph->nodes[k]->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                !(cgraph->nodes[k]->flags & GGML_TENSOR_FLAG_OUTPUT);
+        }
+        if (ok && ggml_cuda_should_fuse_dsv4_hc_up_pre(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[j])) {
+            ggml_cuda_q8_1_request(cuda_ctx, cgraph, j);
+            ggml_cuda_op_dsv4_hc_up_pre(*cuda_ctx, node, cgraph->nodes[i + 2], cgraph->nodes[j]);
+            return j - i;
+        }
+    }
+
     if (ggml_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY }) &&
             ggml_cuda_should_fuse_scale_unary(node, cgraph->nodes[i + 1])) {
         ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + 1);
