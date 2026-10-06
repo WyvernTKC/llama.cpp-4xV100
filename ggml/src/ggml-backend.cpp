@@ -986,6 +986,8 @@ struct ggml_backend_sched {
     int debug_realloc;
     int debug_graph_size;
     int debug_prev_graph_size;
+    // a reserve sized the buffers for the graphs to come; a scheduler that is never reserved grows with its graphs
+    bool reserved;
 
     // Graph identity across evals, so consumers can cache what they derive from a graph.
     // ggml_graph_next_uid() is a global counter, so stamping the graph and every split on each eval
@@ -1911,7 +1913,8 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         if (sched->debug_realloc > 0) {
             // we are interested only in situations where the graph was reallocated even though its size remained the same [GGML_SCHED_DEBUG_REALLOC]
             // example: https://github.com/ggml-org/llama.cpp/pull/17143
-            const bool unexpected = !backend_ids_changed && sched->debug_prev_graph_size == sched->debug_graph_size;
+            // a scheduler that was never reserved (llama's graph slots) sizes its buffers by its graphs, so it grows
+            const bool unexpected = sched->reserved && !backend_ids_changed && sched->debug_prev_graph_size == sched->debug_graph_size;
 
             if (unexpected || sched->debug_realloc > 1) {
                 GGML_ABORT("%s: unexpected graph reallocation (graph size = %d, nodes = %d, leafs = %d), debug_realloc = %d\n", __func__,
@@ -2829,6 +2832,7 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     }
 
     ggml_backend_sched_reset(sched);
+    sched->reserved = true;
 
     return true;
 }
