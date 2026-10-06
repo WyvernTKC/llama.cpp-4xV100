@@ -4960,7 +4960,7 @@ static bool ggml_cuda_topk_moe_launch(ggml_backend_cuda_context * cuda_ctx, cons
     return true;
 }
 
-// Name t (the node at i_out, one row) for its kernel to write the q8_1 copy of, see q8_1_emit_alloc, if the first MMVQ
+// Name t (the node at i_out) for its kernel to write the q8_1 copy of, see q8_1_emit_alloc, if the first MMVQ
 //   matmul that reads t, or a view of all of it, comes before any node writes t again
 static void ggml_cuda_q8_1_request(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i_out) {
     const ggml_tensor * t = cgraph->nodes[i_out];
@@ -4979,7 +4979,12 @@ static void ggml_cuda_q8_1_request(ggml_backend_cuda_context * cuda_ctx, const g
                 ggml_cuda_mul_mat_choose(*cuda_ctx, n->src[0], y, n) == GGML_CUDA_MUL_MAT_PATH_MMVQ && !ggml_cuda_op_mul_mat_use_fwht(n) :
                 ggml_is_quantized(n->src[0]->type) && n->ne[2] <= get_mmvq_mmid_max_batch(n->src[0]->type, cc);
             if (mmvq) {
-                if (ggml_is_contiguous(y) && ggml_nelements(y) == y->ne[0] && y->ne[0] == ggml_nelements(t)) {
+                // all of t as one row, or its rows as the tokens of a batch when a row needs no q8_1 padding (an MMVQ
+                //   batch reads its rows at the padded stride)
+                const bool one_row = ggml_nelements(y) == y->ne[0] && y->ne[0] == ggml_nelements(t);
+                const bool rows    = y->ne[0] == t->ne[0] && ggml_nelements(y) == ggml_nelements(t) &&
+                    y->ne[0] % MATRIX_ROW_PADDING == 0;
+                if (ggml_is_contiguous(y) && (one_row || rows)) {
                     cuda_ctx->q8_1_emit    = t;
                     cuda_ctx->q8_1_emit_as = y;
                 }

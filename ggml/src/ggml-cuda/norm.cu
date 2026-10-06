@@ -1314,9 +1314,10 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if (!scale_tensor && ctx.q8_1_emit == mul_tensor && ggml_is_contiguous(mul_tensor) && ne00 % QK8_1 == 0 &&
             ne00 <= 8*1024 && q8_padded) {
         int64_t ne_padded = 0;
-        block_q8_1 * q8 = (block_q8_1 *) ctx.q8_1_emit_alloc(mul_tensor, ne_padded);
+        block_q8_1 * q8 = (block_q8_1 *) ctx.q8_1_emit_alloc(mul_tensor, ne_padded, ggml_nrows(mul_tensor));
         if (q8 != nullptr) {
-            GGML_ASSERT(ne_padded == ne_q8);
+            // the rows read as one row (the grouped norm of qwen4exp), or as the rows of a batch of whole q8_1 rows
+            GGML_ASSERT(ne_padded == ne_q8 || ne_padded*ggml_nrows(mul_tensor) == ne_q8);
             const dim3 blocks_num(ne01, ne02, ne03);
             const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
             const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);

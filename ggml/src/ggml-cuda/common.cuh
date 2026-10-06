@@ -1737,7 +1737,7 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_dsv4_compress_fold dsv4_fold;
 
-    // A kernel can write the q8_1 copy of its output (one row) for the MMVQ matmul that reads it next, which then
+    // A kernel can write the q8_1 copy of its output for the MMVQ matmul that reads it next, which then
     //   skips its quantize launch. ggml_cuda_q8_1_request names the output and the tensor the matmul reads it as (the
     //   output or a view of all of it); the launcher takes the buffer with q8_1_emit_alloc. The copy waits in
     //   q8_1_pending until the evaluate loop has invalidated the copies of the nodes the kernel replaced.
@@ -1745,17 +1745,21 @@ struct ggml_backend_cuda_context {
     const ggml_tensor * q8_1_emit_as = nullptr;
     std::vector<std::pair<const void *, q8_1_input>> q8_1_pending;
 
-    // the buffer for the q8_1 copy of t if t is the named output, else nullptr; ne_padded is the padded row length
-    void * q8_1_emit_alloc(const ggml_tensor * t, int64_t & ne_padded) {
+    // the buffer for the q8_1 copy of t if t is the named output, else nullptr; ne_padded is the padded row length, the
+    //   rows follow each other at that stride. A kernel that writes only one row passes max_rows 1.
+    void * q8_1_emit_alloc(const ggml_tensor * t, int64_t & ne_padded, const int64_t max_rows = 1) {
         if (q8_1_emit == nullptr || q8_1_emit != t) {
             return nullptr;
         }
         const ggml_tensor * y = q8_1_emit_as;
         q8_1_emit    = nullptr;
         q8_1_emit_as = nullptr;
+        if (ggml_nrows(y) > max_rows) {
+            return nullptr;
+        }
         ne_padded = GGML_PAD(y->ne[0], MATRIX_ROW_PADDING);
         q8_1_input entry;
-        entry.buf       = std::make_unique<ggml_cuda_pool_alloc<char>>(pool(), ne_padded*sizeof(block_q8_1)/QK8_1);
+        entry.buf       = std::make_unique<ggml_cuda_pool_alloc<char>>(pool(), ggml_nrows(y)*ne_padded*sizeof(block_q8_1)/QK8_1);
         entry.src1      = y->view_src ? y->view_src : y;
         entry.ne_padded = ne_padded;
         entry.stream_no = curr_stream_no;
