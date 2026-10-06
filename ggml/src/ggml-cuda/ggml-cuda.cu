@@ -4302,6 +4302,11 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     return true;
 }
 
+// an elementwise kernel writes element i right after it read element i, so its output may share an input's memory
+//   only element for element: same address and strides, or no overlap at all
+static bool ggml_cuda_elementwise_out_ok(const ggml_tensor * dst, const ggml_tensor * src) {
+    return !ggml_cuda_tensors_overlap(dst, src) || (dst->data == src->data && ggml_are_same_stride(dst, src));
+}
 
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
@@ -4589,6 +4594,10 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             return false;
         }
 
+        if (!ggml_cuda_elementwise_out_ok(mul, unary->src[0]) || !ggml_cuda_elementwise_out_ok(mul, other)) {
+            return false;
+        }
+
         return true;
     }
 
@@ -4609,7 +4618,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             return false;
         }
 
-        if (!ggml_is_contiguous(unary->src[0])) {
+        if (!ggml_is_contiguous(unary->src[0]) || !ggml_cuda_elementwise_out_ok(sqr, unary->src[0])) {
             return false;
         }
 
@@ -4631,6 +4640,11 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
         // Check for bias
         if (ggml_get_op_params_f32(scale, 1) != 0.0f || ggml_get_op_params_f32(scale2, 1) != 0.0f) {
+            return false;
+        }
+
+        // the kernel indexes the input as one flat array
+        if (!ggml_is_contiguous(scale->src[0]) || !ggml_cuda_elementwise_out_ok(scale2, scale->src[0])) {
             return false;
         }
 
@@ -7205,7 +7219,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_CONCAT) {
         ggml_cuda_ssm_conv_state_fusion f;
         if (ggml_cuda_ssm_conv_state_fusion_match(cuda_ctx, cgraph, i, f)) {
-            cuda_ctx->q8_1_input_invalidate(f.silu->data);
+            cuda_ctx->q8_1_input_invalidate(f.silu);
             cuda_ctx->cublas_input_invalidate(f.silu);
             ggml_tensor states = *f.states; // the row from the state of this convolution
             states.data = (char *) f.states->data + f.state_offs;
@@ -7315,6 +7329,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (i + 5 < cgraph->n_nodes && ggml_node_has_n_uses(cgraph, i + 4, 1) &&
                     (cgraph->nodes[i + 4]->flags & GGML_TENSOR_FLAG_COMPUTE) && (cgraph->nodes[i + 5]->flags & GGML_TENSOR_FLAG_COMPUTE) &&
                     !(cgraph->nodes[i + 4]->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                    !ggml_cuda_tensors_overlap(cgraph->nodes[i + 5], raw) &&
                     ggml_cuda_should_fuse_dsv4_hc_post_rms_norm(post, cgraph->nodes[i + 4], cgraph->nodes[i + 5])) {
                 ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + 5);
                 ggml_cuda_op_dsv4_hc_post_rms_norm(*cuda_ctx, post, node, sc2, cgraph->nodes[i + 4], cgraph->nodes[i + 5]);
@@ -7498,7 +7513,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                cuda_ctx->q8_1_input_invalidate(node->data);
+                cuda_ctx->q8_1_input_invalidate(node);
                 cuda_ctx->cublas_input_invalidate(node);
 
                 // a DeepSeek-V4 compressor launched at its row sum
@@ -7516,7 +7531,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 if (nodes_to_skip != 0) {
                     for (int j = i; j <= i + nodes_to_skip; j++) {
-                        cuda_ctx->q8_1_input_invalidate(cgraph->nodes[j]->data);
+                        cuda_ctx->q8_1_input_invalidate(cgraph->nodes[j]);
                         cuda_ctx->cublas_input_invalidate(cgraph->nodes[j]);
                     }
                     // a q8_1 copy the fused kernel wrote of its output, see ggml_cuda_q8_1_request

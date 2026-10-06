@@ -1688,9 +1688,25 @@ struct ggml_backend_cuda_context {
     std::unordered_map<const void *, q8_1_input> q8_1_inputs;
 
     // a node is about to overwrite this buffer, so any quantized copy of it is stale
-    void q8_1_input_invalidate(const void * data) {
-        if (!q8_1_inputs.empty()) {
-            q8_1_inputs.erase(data);
+    void q8_1_input_invalidate(const ggml_tensor * node) {
+        if (q8_1_inputs.empty()) {
+            return;
+        }
+        q8_1_inputs.erase(node->data);
+        // a node that writes in place into part of a live tensor (a view at an offset) changes bytes of a copy that
+        //   is keyed at another address; other nodes only reuse memory of tensors nothing reads again
+        if (node->view_src == nullptr) {
+            return;
+        }
+        const char * a0 = (const char *) node->data;
+        const char * a1 = a0 + ggml_nbytes(node);
+        for (auto it = q8_1_inputs.begin(); it != q8_1_inputs.end();) {
+            const char * b0 = (const char *) it->first;
+            int64_t nbytes = it->second.nb[0];
+            for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                nbytes += (it->second.ne[i] - 1)*it->second.nb[i];
+            }
+            it = a0 < b0 + nbytes && b0 < a1 ? q8_1_inputs.erase(it) : std::next(it);
         }
     }
 
