@@ -12594,6 +12594,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_mm(512, 1, 64));
     test_cases.emplace_back(new test_rms_norm_mul_mm(4096, 1, 256));
     test_cases.emplace_back(new test_rms_norm_mul_mm(768, 2, 64));
+    // one row short of the matmul's padded length: the norm writes the padding blocks too (1280: DeepSeek-V4.1's q_a)
+    test_cases.emplace_back(new test_rms_norm_mul_mm(1280, 1, 256));
+    test_cases.emplace_back(new test_rms_norm_mul_mm(5376, 1, 64));
+    test_cases.emplace_back(new test_rms_norm_mul_mm(800, 1, 64));
     for (bool with_mm : { false, true }) {
         test_cases.emplace_back(new test_scale_silu(320, 1, 0.25f, 0.0f, with_mm));
         if (!with_mm) {

@@ -222,12 +222,14 @@ static __global__ void __launch_bounds__(block_size) rms_norm_f32(const float * 
 //   columns of a register slot and quantizes them as one q8_1 block. The reduction and products are rms_norm_f32's and
 //   the quantization quantize_q8_1's, so both outputs are those of the ops apart. ncols % 32 == 0, so a warp is in the
 //   row or past it as a whole. The grouped norm of qwen4exp's hyper-connections, hc rows read as one by their matmul.
+//   One row may end short of the matmul's padded length: the columns up to ncols_padded (a multiple of 32 within the
+//   block's slots) get zero blocks, as quantize_q8_1 writes them.
 template <int block_size, int cols_per_thread>
 static __global__ void __launch_bounds__(block_size) rms_norm_mul_q8_f32(const float * x, float * dst, const int ncols,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps,
         const float * mul, const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
         const uint3 mul_ncols_packed, const uint3 mul_nrows_packed, const uint3 mul_nchannels_packed,
-        const uint3 mul_nsamples_packed, block_q8_1 * q8_dst) {
+        const uint3 mul_nsamples_packed, block_q8_1 * q8_dst, const int ncols_padded) {
     ggml_cuda_pdl_lc();
     const int nrows     = gridDim.x;
     const int nchannels = gridDim.y;
@@ -279,6 +281,9 @@ static __global__ void __launch_bounds__(block_size) rms_norm_mul_q8_f32(const f
     for (int i = 0; i < cols_per_thread; ++i) {
         const int col = tid + i*block_size;
         if (col >= ncols) {
+            if (col < ncols_padded) {
+                quantize_q8_1_lane(0.0f, q8 + col/QK8_1, col % QK8_1);
+            }
             continue;
         }
         const float v = scale * xv[i] * mv[i];
@@ -1301,13 +1306,17 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int mul_nsamples  = mul_src->ne[3];
 
     // the q8_1 copy of the output for the MMVQ matmul that reads all of it, see ggml_cuda_q8_1_request; whole q8_1
-    //   blocks per row and no padding blocks past the last row
+    //   blocks per row, and padding blocks past the row only for one row whose block slots reach them
+    const int64_t ne_q8      = GGML_PAD(ggml_nelements(mul_tensor), MATRIX_ROW_PADDING);
+    const int     norm_block = ne00 < 1024 ? 256 : 1024;
+    const bool    q8_padded  = ne_q8 == ggml_nelements(mul_tensor) ||
+        (ggml_nrows(mul_tensor) == 1 && ne_q8 <= (int64_t) norm_block*((ne00 + norm_block - 1)/norm_block));
     if (!scale_tensor && ctx.q8_1_emit == mul_tensor && ggml_is_contiguous(mul_tensor) && ne00 % QK8_1 == 0 &&
-            ne00 <= 8*1024 && ggml_nelements(mul_tensor) % MATRIX_ROW_PADDING == 0) {
+            ne00 <= 8*1024 && q8_padded) {
         int64_t ne_padded = 0;
         block_q8_1 * q8 = (block_q8_1 *) ctx.q8_1_emit_alloc(mul_tensor, ne_padded);
         if (q8 != nullptr) {
-            GGML_ASSERT(ne_padded == ggml_nelements(mul_tensor));
+            GGML_ASSERT(ne_padded == ne_q8);
             const dim3 blocks_num(ne01, ne02, ne03);
             const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
             const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
@@ -1321,7 +1330,7 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     const ggml_cuda_kernel_launch_params launch_params{blocks_num, block_dims, 32 * sizeof(float), stream};
                     ggml_cuda_kernel_launch(rms_norm_mul_q8_f32<bs, nc>, launch_params, src0_d, dst_d, (int) ne00, s01, s02, s03,
                         eps, mul_d, mul_s01, mul_s02, mul_s03, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed,
-                        mul_nsamples_packed, q8);
+                        mul_nsamples_packed, q8, (int) (ggml_nrows(mul_tensor) == 1 ? ne_padded : ne00));
                 } else {
                     GGML_ABORT("fatal error");
                 }
