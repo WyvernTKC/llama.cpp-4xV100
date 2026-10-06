@@ -3476,25 +3476,35 @@ static int ggml_cuda_gdn_gather_fusion(
         }
     }
 
-    // the cpy of the start state to its rollback slot, if any, is the first real node after the snapshot cpy
+    // the cpy of the start state to its rollback slot, if any, is the first real node after the snapshot cpy. It reads s
+    //   whole, directly or through a view of no offset, and has no rows when the net wrote every slot
     gather = {};
-    int extra = 0;
+    int extra     = 0;
+    int s_readers = 1; // the net
     for (int j = gdn_idx + skip_cache + 1; j < cgraph->n_nodes; ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
+        const ggml_tensor * n_src = n->src[0];
+        const bool pre_cpy = n->op == GGML_OP_CPY && !(n->flags & GGML_TENSOR_FLAG_OUTPUT) && (n_src == s ||
+            (n_src->op == GGML_OP_VIEW && n_src->src[0] == s && n_src->view_offs == 0 && ggml_cuda_graph_use_count(cgraph, n_src) == 1));
+        if (pre_cpy) {
+            s_readers++;
+            if (!ggml_is_empty(n)) {
+                const ggml_tensor * pre = n->src[1];
+                if (ggml_nelements(n_src) != D || pre->type != GGML_TYPE_F32 || ggml_nelements(pre) != D ||
+                        !ggml_is_contiguous(pre) || pre->data == nullptr) {
+                    return -1;
+                }
+                gather.pre = (float *) pre->data;
+                extra      = j - (gdn_idx + skip_cache);
+            }
+            break;
+        }
         if (ggml_cuda_is_view_or_noop(n)) {
             continue;
         }
-        if (n->op == GGML_OP_CPY && n->src[0] == s && !(n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
-            const ggml_tensor * pre = n->src[1];
-            if (pre->type != GGML_TYPE_F32 || ggml_nelements(pre) != D || !ggml_is_contiguous(pre) || pre->data == nullptr) {
-                return -1;
-            }
-            gather.pre = (float *) pre->data;
-            extra      = j - (gdn_idx + skip_cache);
-        }
         break;
     }
-    if (ggml_cuda_graph_use_count(cgraph, s) != (gather.pre ? 2 : 1)) {
+    if (ggml_cuda_graph_use_count(cgraph, s) != s_readers) {
         return -1;
     }
 

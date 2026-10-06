@@ -609,15 +609,19 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
 
     // the op only emits post-token states, so a batch shorter than K leaves the slot that rolls
-    // back past its first token unwritten. that slot is the state this batch started from
-    if (n_seq_tokens < K) {
-        ggml_tensor * dst_pre = ggml_view_2d(ctx0, ssm_states_all,
-            D, n_seqs,
-            ssm_states_all->nb[1],
-            ((size_t) n_seq_tokens * mem_size + kv_head) * row_size);
+    // back past its first token unwritten. that slot is the state this batch started from.
+    // the copy is built for every batch, with no rows when the op wrote all K slots, so that every ubatch has
+    // the graph shape of the reserve (a shape that changes forces the scheduler to reallocate)
+    GGML_ASSERT(ggml_is_contiguous(s));
+    const int64_t n_pre = n_seq_tokens < K ? n_seqs : 0;
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, s, dst_pre));
-    }
+    ggml_tensor * src_pre = ggml_view_2d(ctx0, s, D, n_pre, ggml_row_size(s->type, D), 0);
+    ggml_tensor * dst_pre = ggml_view_2d(ctx0, ssm_states_all,
+        D, n_pre,
+        ssm_states_all->nb[1],
+        ((size_t) std::min<int64_t>(n_seq_tokens, K - 1) * mem_size + kv_head) * row_size);
+
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, src_pre, dst_pre));
 
     return output;
 }
