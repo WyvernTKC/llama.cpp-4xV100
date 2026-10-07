@@ -327,17 +327,47 @@ static __global__ void ggml_cuda_p2p_ar_ll_moe_reduce_kernel(const ggml_cuda_p2p
     if (i < a.nvec) {
         float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         if ((a.contrib_mask >> a.rank) & 1u) {
-            for (int e = 0; e < n_used; ++e) {
-                const float4 x = ((const float4 *) (experts + e*n_embd))[i];
-                const float  w = weights[e];
-                const float4 p = make_float4(__fmul_rn(x.x, w), __fmul_rn(x.y, w), __fmul_rn(x.z, w), __fmul_rn(x.w, w));
-                v = e == 0 ? p : make_float4(__fadd_rn(v.x, p.x), __fadd_rn(v.y, p.y), __fadd_rn(v.z, p.z), __fadd_rn(v.w, p.w));
+            // every load is issued before the first sum: one round trip instead of one per 4 experts and the shared expert
+            constexpr int ne_pf = 8;
+            float4 xs[ne_pf];
+            float  ws[ne_pf];
+#pragma unroll
+            for (int e = 0; e < ne_pf; ++e) {
+                if (e < n_used) {
+                    xs[e] = ((const float4 *) (experts + e*n_embd))[i];
+                    ws[e] = weights[e];
+                }
+            }
+            float4 xa = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            float  ga = 0.0f;
+            if (add_x != nullptr) {
+                xa = ((const float4 *) add_x)[i];
+                ga = *add_g;
+            }
+            for (int e0 = 0; e0 < n_used; e0 += ne_pf) {
+                if (e0 > 0) {
+#pragma unroll
+                    for (int e = 0; e < ne_pf; ++e) {
+                        if (e0 + e < n_used) {
+                            xs[e] = ((const float4 *) (experts + (e0 + e)*n_embd))[i];
+                            ws[e] = weights[e0 + e];
+                        }
+                    }
+                }
+#pragma unroll
+                for (int e = 0; e < ne_pf; ++e) {
+                    if (e0 + e < n_used) {
+                        const float4 x = xs[e];
+                        const float  w = ws[e];
+                        const float4 p = make_float4(__fmul_rn(x.x, w), __fmul_rn(x.y, w), __fmul_rn(x.z, w), __fmul_rn(x.w, w));
+                        v = e0 + e == 0 ? p : make_float4(__fadd_rn(v.x, p.x), __fadd_rn(v.y, p.y), __fadd_rn(v.z, p.z), __fadd_rn(v.w, p.w));
+                    }
+                }
             }
             if (add_x != nullptr) {
-                const float  sig = ggml_cuda_op_sigmoid_single(*add_g);
-                const float4 x   = ((const float4 *) add_x)[i];
-                v = make_float4(__fadd_rn(v.x, __fmul_rn(x.x, sig)), __fadd_rn(v.y, __fmul_rn(x.y, sig)),
-                                __fadd_rn(v.z, __fmul_rn(x.z, sig)), __fadd_rn(v.w, __fmul_rn(x.w, sig)));
+                const float sig = ggml_cuda_op_sigmoid_single(ga);
+                v = make_float4(__fadd_rn(v.x, __fmul_rn(xa.x, sig)), __fadd_rn(v.y, __fmul_rn(xa.y, sig)),
+                                __fadd_rn(v.z, __fmul_rn(xa.z, sig)), __fadd_rn(v.w, __fmul_rn(xa.w, sig)));
             }
         }
         a.dst[i] = ggml_cuda_p2p_ar_ll_exchange<n_devs, payload>(a, v, i, flag, slot_base);
