@@ -811,7 +811,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
         std::vector<uint32_t> v_heads_old; // old positions of the heads, before placing the ubatch
 
-        std::vector<llama_kv_cells> v_cells; // copy of the old cells, before placing the ubatch
+        std::vector<llama_kv_cells::backup> v_cells; // copy of the old cells, before placing the ubatch
     };
 
     // remember the old state of the cells so we can restore it in the end
@@ -1829,7 +1829,10 @@ skip:
     for (const deferred_row & d : deferred) {
         work += n_kv + stream_idxs[d.s].at(ubatch->seq_id[d.i][0]).size();
     }
-    const size_t n_threads = std::min<size_t>({ (size_t) 16, std::max<size_t>(1, std::thread::hardware_concurrency()/2),
+    // once: on Windows hardware_concurrency is a GetLogicalProcessorInformationEx system call, ~1/6 of the mask's host
+    //     time for each decoded token
+    static const size_t n_threads_max = std::max<size_t>(1, std::thread::hardware_concurrency()/2);
+    const size_t n_threads = std::min<size_t>({ (size_t) 16, n_threads_max,
         std::max<size_t>(1, work / (1u << 20)), deferred.size() });
     if (n_threads <= 1) {
         patch_rows(0, deferred.size());

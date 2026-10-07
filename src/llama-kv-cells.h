@@ -123,10 +123,25 @@ public:
     //}
 
     // copy the state of cells [i, i + n) (used for save/restore the state of the cells)
-    llama_kv_cells cp(uint32_t i, uint32_t n) const {
+    // the state of some cells, for llama_kv_cache::prepare to restore after it placed the ubatches: a llama_kv_cells
+    //   would construct (and with MSVC allocate) the head node of a std::set for each of the LLAMA_MAX_SEQ sequences
+    //   and the used cells, ~1000 allocations a decoded token
+    struct backup {
+        std::vector<llama_pos>         pos;
+        std::vector<llama_kv_cell_ext> ext;
+        std::vector<seq_set_t>         seq;
+
+        void resize(uint32_t n) {
+            pos.resize(n);
+            ext.resize(n);
+            seq.resize(n);
+        }
+    };
+
+    backup cp(uint32_t i, uint32_t n) const {
         assert(i + n <= pos.size());
 
-        llama_kv_cells res;
+        backup res;
 
         res.resize(n);
 
@@ -144,8 +159,8 @@ public:
     }
 
     // copy the state of cells [idxs[0], idxs[1], ..., idxs[idxs.size() - 1])
-    llama_kv_cells cp(const std::vector<uint32_t> & idxs) const {
-        llama_kv_cells res;
+    backup cp(const std::vector<uint32_t> & idxs) const {
+        backup res;
 
         res.resize(idxs.size());
 
@@ -163,7 +178,7 @@ public:
     }
 
     // set the state of cells [i, i + other.pos.size()) (used for save/restore the state of the cells)
-    void set(uint32_t i, const llama_kv_cells & other) {
+    void set(uint32_t i, const backup & other) {
         assert(i + other.pos.size() <= pos.size());
 
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
@@ -194,7 +209,7 @@ public:
     }
 
     // set the state of cells [idxs[0], idxs[1], ..., idxs[idxs.size() - 1])
-    void set(const std::vector<uint32_t> & idxs, const llama_kv_cells & other) {
+    void set(const std::vector<uint32_t> & idxs, const backup & other) {
         assert(idxs.size() == other.pos.size());
 
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
