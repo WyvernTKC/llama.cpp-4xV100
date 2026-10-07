@@ -526,7 +526,8 @@ template <int block_size, int cols_per_thread, bool has_scale, bool has_pre = fa
 static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
         const float * x, const float * w1, const float * r, const float * s, const float * w2, float * y_out, float * dst,
         const int ncols, const float eps1, const float eps2, const bool s_per_col,
-        block_q8_1 * q8_dst = nullptr, const int nq8 = 0, unsigned int * flags = nullptr, const rms_norm_pre_pair pre = {}) {
+        block_q8_1 * q8_dst = nullptr, const int nq8 = 0, unsigned int * flags = nullptr, const rms_norm_pre_pair pre = {},
+        const float out_scale = 1.0f) {
     ggml_cuda_pdl_lc();
     // the q8_1 copy of dst as in rms_norm_pre_add_f32: blocks after the first, one row
     const bool emitter  = q8_dst != nullptr && blockIdx.x > 0;
@@ -677,7 +678,7 @@ static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
 #pragma unroll
         for (int i = 0; i < cols_per_thread; ++i) {
             if (i == slot && tid + i*block_size < ncols) {
-                v = scale2 * xv[i] * w2v[i];
+                v = (out_scale * (scale2 * xv[i])) * w2v[i];
             }
         }
         if (ib < nq8) {
@@ -689,8 +690,9 @@ static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
 #pragma unroll
     for (int i = 0; i < cols_per_thread; ++i) {
         const int col = tid + i*block_size;
+        // out_scale: a SCALE between the second norm and its weight, applied as rms_norm_f32 does (exact at 1)
         if (col < ncols) {
-            dst[col] = scale2 * xv[i] * w2v[i];
+            dst[col] = (out_scale * (scale2 * xv[i])) * w2v[i];
         }
     }
 }
@@ -1544,19 +1546,26 @@ static const ggml_tensor * ggml_cuda_other_src(const ggml_tensor * op, const ggm
 }
 
 bool ggml_cuda_should_fuse_rms_norm_add_rms_norm(const ggml_tensor * norm1, const ggml_tensor * mul1, const ggml_tensor * add,
-                                                 const ggml_tensor * scale, const ggml_tensor * norm2, const ggml_tensor * mul2) {
+                                                 const ggml_tensor * scale, const ggml_tensor * norm2, const ggml_tensor * mul2,
+                                                 const ggml_tensor * scale2) {
     if (norm1->op != GGML_OP_RMS_NORM || mul1->op != GGML_OP_MUL || add->op != GGML_OP_ADD ||
             (scale != nullptr && scale->op != GGML_OP_MUL) || norm2->op != GGML_OP_RMS_NORM || mul2->op != GGML_OP_MUL) {
         return false;
     }
+    // the router input of a gemma4 MoE block, rms_norm(y) * s * w: a scalar SCALE without bias between norm and weight
+    if (scale2 != nullptr && (scale2->op != GGML_OP_SCALE || scale2->src[0] != norm2 || scale2->type != GGML_TYPE_F32 ||
+            ggml_get_op_params_f32(scale2, 1) != 0.0f || !ggml_are_same_shape(scale2, norm2))) {
+        return false;
+    }
+    const ggml_tensor * norm2_out = scale2 != nullptr ? scale2 : norm2;
     const ggml_tensor * y  = scale != nullptr ? scale : add;
     const ggml_tensor * x  = norm1->src[0];
     const ggml_tensor * w1 = ggml_cuda_other_src(mul1, norm1);
     const ggml_tensor * r  = ggml_cuda_other_src(add, mul1);
     const ggml_tensor * s  = scale != nullptr ? ggml_cuda_other_src(scale, add) : nullptr;
-    const ggml_tensor * w2 = ggml_cuda_other_src(mul2, norm2);
+    const ggml_tensor * w2 = ggml_cuda_other_src(mul2, norm2_out);
     if (w1 == nullptr || w1 == norm1 || r == nullptr || r == mul1 || (scale != nullptr && (s == nullptr || s == add)) ||
-            norm2->src[0] != y || w2 == nullptr || w2 == norm2) {
+            norm2->src[0] != y || w2 == nullptr || w2 == norm2_out) {
         return false;
     }
     for (const ggml_tensor * t : { x, w1, r, w2, norm1, mul1, add, norm2, mul2 }) {
@@ -1615,12 +1624,14 @@ bool ggml_cuda_should_fuse_rms_norm_pair_add(const ggml_tensor * norm_a, const g
 void ggml_cuda_op_rms_norm_add_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * norm1, ggml_tensor * mul1, ggml_tensor * add,
                                         ggml_tensor * scale, ggml_tensor * norm2, ggml_tensor * mul2,
                                         const ggml_tensor * norm_a, const ggml_tensor * mul_a,
-                                        const ggml_tensor * norm_b, const ggml_tensor * mul_b) {
+                                        const ggml_tensor * norm_b, const ggml_tensor * mul_b,
+                                        const ggml_tensor * scale2) {
     const ggml_tensor * x  = norm1->src[0];
     const ggml_tensor * w1 = ggml_cuda_other_src(mul1, norm1);
     const ggml_tensor * r  = ggml_cuda_other_src(add, mul1);
     const ggml_tensor * s  = scale != nullptr ? ggml_cuda_other_src(scale, add) : nullptr;
-    const ggml_tensor * w2 = ggml_cuda_other_src(mul2, norm2);
+    const ggml_tensor * w2 = ggml_cuda_other_src(mul2, scale2 != nullptr ? scale2 : norm2);
+    const float out_scale  = scale2 != nullptr ? ggml_get_op_params_f32(scale2, 0) : 1.0f;
     ggml_tensor       * y  = scale != nullptr ? scale : add;
 
     float eps1 = 0.0f;
@@ -1678,7 +1689,7 @@ void ggml_cuda_op_rms_norm_add_rms_norm(ggml_backend_cuda_context & ctx, ggml_te
             ggml_cuda_kernel_launch(kernel, launch_params,
                 (const float *) x->data, (const float *) w1->data, (const float *) r->data,
                 s != nullptr ? (const float *) s->data : nullptr, (const float *) w2->data, (float *) y->data,
-                (float *) mul2->data, ncols, eps1, eps2, s_per_col, q8_d, nq8, flags, pre);
+                (float *) mul2->data, ncols, eps1, eps2, s_per_col, q8_d, nq8, flags, pre, out_scale);
         } else {
             GGML_ABORT("fatal error");
         }

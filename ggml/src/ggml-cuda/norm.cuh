@@ -26,7 +26,8 @@ void ggml_cuda_op_rms_norm_pre_add_gated(ggml_backend_cuda_context & ctx, ggml_t
 // y = rms_norm(x) * w1 + r (* s when scale is set) and mul2 = rms_norm(y) * w2: gemma's post-norm, residual add and the
 //   next pre-norm of one row; y is the output of add or of scale
 bool ggml_cuda_should_fuse_rms_norm_add_rms_norm(const ggml_tensor * norm1, const ggml_tensor * mul1, const ggml_tensor * add,
-                                                 const ggml_tensor * scale, const ggml_tensor * norm2, const ggml_tensor * mul2);
+                                                 const ggml_tensor * scale, const ggml_tensor * norm2, const ggml_tensor * mul2,
+                                                 const ggml_tensor * scale2 = nullptr);
 // an identity-comb DSV4_HC_POST (its post weights made by SCALE -> SIGMOID -> SCALE when scale_in is set) and the
 //   RMS_NORM -> MUL of each of its streams that follows, qwen4exp's hyper-connection combine and the next grouped norm
 bool ggml_cuda_should_fuse_dsv4_hc_post_rms_norm(const ggml_tensor * post, const ggml_tensor * rms_norm, const ggml_tensor * mul);
@@ -40,7 +41,8 @@ bool ggml_cuda_should_fuse_rms_norm_pair_add(const ggml_tensor * norm_a, const g
 void ggml_cuda_op_rms_norm_add_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * norm1, ggml_tensor * mul1, ggml_tensor * add,
                                         ggml_tensor * scale, ggml_tensor * norm2, ggml_tensor * mul2,
                                         const ggml_tensor * norm_a = nullptr, const ggml_tensor * mul_a = nullptr,
-                                        const ggml_tensor * norm_b = nullptr, const ggml_tensor * mul_b = nullptr);
+                                        const ggml_tensor * norm_b = nullptr, const ggml_tensor * mul_b = nullptr,
+                                        const ggml_tensor * scale2 = nullptr);
 
 // rms_norm(x) * w * op(z) with op silu or sigmoid, the gated output norm of a gated delta net layer
 bool ggml_cuda_should_fuse_rms_norm_gated(const ggml_tensor * rms_norm, const ggml_tensor * mul, const ggml_tensor * unary,

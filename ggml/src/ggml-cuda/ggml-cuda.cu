@@ -7163,6 +7163,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // the attention post-norm of a gemma4 MoE layer, its residual add and the router input, rms_norm(y) * s * w: the
+    //   router norm in the launch of the post-norm, one launch less per layer and token
+    if (node->op == GGML_OP_RMS_NORM && i + 5 < cgraph->n_nodes && cgraph->nodes[i + 3]->op == GGML_OP_RMS_NORM &&
+            cgraph->nodes[i + 4]->op == GGML_OP_SCALE &&
+            ggml_cuda_should_fuse_rms_norm_add_rms_norm(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr,
+                cgraph->nodes[i + 3], cgraph->nodes[i + 5], cgraph->nodes[i + 4])) {
+        const int outputs[2] = { i + 2, i + 5 };
+        const enum ggml_op ops[6] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_SCALE, GGML_OP_MUL };
+        if (ggml_can_fuse_subgraph(cgraph, i, 6, ops, outputs, 2)) {
+            ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + 5);
+            ggml_cuda_op_rms_norm_add_rms_norm(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr,
+                cgraph->nodes[i + 3], cgraph->nodes[i + 5], nullptr, nullptr, nullptr, nullptr, cgraph->nodes[i + 4]);
+            return 5;
+        }
+    }
+
     // the sandwich norms of gemma: a block's post-norm, the residual add (and the layer output scale) and the next block's
     //   pre-norm of the same row, two or three launches per block
     if (node->op == GGML_OP_RMS_NORM && i + 4 < cgraph->n_nodes) {

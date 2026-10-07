@@ -4479,6 +4479,7 @@ struct test_rms_norm_add_rms_norm : public test_case {
     const float eps2;
     const int64_t mm_rows; // > 0: a q8_0 matmul reads the second norm
     const bool pre;        // x is the sum of two norms (the post-norms of a gemma4 MoE block)
+    const float scale2;    // != 0: rms_norm(y) * scale2 * w2, the router input of a gemma4 MoE block
 
     ggml_tensor * y  = nullptr;
     ggml_tensor * n2 = nullptr;
@@ -4502,6 +4503,9 @@ struct test_rms_norm_add_rms_norm : public test_case {
         if (pre) {
             v += "," + VARS_TO_STR1(pre);
         }
+        if (scale2 != 0.0f) {
+            v += "," + VARS_TO_STR1(scale2);
+        }
         return v;
     }
 
@@ -4510,8 +4514,8 @@ struct test_rms_norm_add_rms_norm : public test_case {
     }
 
     test_rms_norm_add_rms_norm(std::array<int64_t, 4> ne = {64, 5, 4, 3}, int scale = 0, float eps1 = 1e-6f, float eps2 = 1e-6f,
-            int64_t mm_rows = 0, bool pre = false)
-        : ne(ne), scale(scale), eps1(eps1), eps2(eps2), mm_rows(mm_rows), pre(pre) {}
+            int64_t mm_rows = 0, bool pre = false, float scale2 = 0.0f)
+        : ne(ne), scale(scale), eps1(eps1), eps2(eps2), mm_rows(mm_rows), pre(pre), scale2(scale2) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x;
@@ -4543,7 +4547,11 @@ struct test_rms_norm_add_rms_norm : public test_case {
             y = ggml_mul(ctx, y, s);
         }
         ggml_set_name(y, "y");
-        n2 = ggml_mul(ctx, ggml_rms_norm(ctx, y, eps2), w2);
+        ggml_tensor * n2_in = ggml_rms_norm(ctx, y, eps2);
+        if (scale2 != 0.0f) {
+            n2_in = ggml_scale(ctx, n2_in, scale2);
+        }
+        n2 = ggml_mul(ctx, n2_in, w2);
         ggml_set_name(n2, "n2");
         // both are compared, so no other fusion may elide them
         ggml_set_output(y);
@@ -12815,6 +12823,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_rms_norm_add_rms_norm({2816, 3, 1, 1}, scale, 1e-6f, 1e-6f, 0, true));
         test_cases.emplace_back(new test_rms_norm_add_rms_norm({1000, 2, 2, 1}, scale, 1e-6f, 1e-5f, 0, true));
         test_cases.emplace_back(new test_rms_norm_add_rms_norm({2816, 1, 1, 1}, scale, 1e-6f, 1e-6f, 256, true));
+        // the router input of a gemma4 MoE block, rms_norm(y) / sqrt(n_embd) * w, after the attention post-norm (no layer
+        //   scale there)
+        if (scale == 0) {
+            for (int64_t n : {700, 2816, 5376}) {
+                test_cases.emplace_back(new test_rms_norm_add_rms_norm({n, 1, 1, 1}, 0, 1e-6f, 1e-6f, 0, false, 1.0f/sqrtf((float) n)));
+                test_cases.emplace_back(new test_rms_norm_add_rms_norm({n, 3, 1, 1}, 0, 1e-6f, 1e-6f, 0, false, 1.0f/sqrtf((float) n)));
+            }
+        }
         // one row writes the q8_1 copy for the matmul that reads the second norm, two rows do not
         for (int64_t n : {768, 2816, 5376}) {
             test_cases.emplace_back(new test_rms_norm_add_rms_norm({n, 1, 1, 1}, scale, 1e-6f, 1e-6f, 256));
