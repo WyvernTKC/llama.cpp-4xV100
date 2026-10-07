@@ -186,7 +186,11 @@ static void llama_token_data_array_partial_sort(const llama_token_data_array & c
         ptr += histo[j];
         ndone += histo[j];
     }
-    std::partial_sort(ptr, ptr + npartial - ndone, ptr + histo[ib], comp);
+    if (npartial - ndone == histo[ib]) {
+        std::sort(ptr, ptr + histo[ib], comp); // the whole bucket: a heap sort of all of it is several times slower
+    } else {
+        std::partial_sort(ptr, ptr + npartial - ndone, ptr + histo[ib], comp);
+    }
 }
 
 // reduces the size of cur_p to npartial, keeping only the top npartial elements
@@ -290,6 +294,69 @@ static void llama_sampler_temp_impl(llama_token_data_array * cur_p, float temp) 
     }
 }
 
+// The passes of a softmax over a whole vocab vectorize only without strict float semantics: with gemma-4's 262k tokens
+//   a scalar expf per token and one running float sum cost ~2.5 ms per sampled token, which every request without a
+//   top-k paid. The sums are float lanes per chunk added in double, more accurate than the running float sum was (4e-4
+//   off over 262k tokens).
+#if defined(_MSC_VER) && !defined(__clang__)
+#pragma float_control(precise, off, push)
+#endif
+static float llama_token_data_max_logit(const llama_token_data * data, size_t n) {
+    float max_l = data[0].logit;
+    for (size_t i = 1; i < n; ++i) {
+        max_l = data[i].logit > max_l ? data[i].logit : max_l;
+    }
+    return max_l;
+}
+
+// p = exp(logit - max_l) for each token, returns their sum: float lanes over chunks, the chunks added in double (a
+//   double sum per token does not vectorize as well)
+static double llama_token_data_exp(llama_token_data * data, size_t n, float max_l) {
+    constexpr size_t chunk = 1024;
+    double sum = 0.0;
+    for (size_t i0 = 0; i0 < n; i0 += chunk) {
+        const size_t i1 = std::min(n, i0 + chunk);
+        float sum_chunk = 0.0f;
+        for (size_t i = i0; i < i1; ++i) {
+            const float p = expf(data[i].logit - max_l);
+            data[i].p = p;
+            sum_chunk += p;
+        }
+        sum += sum_chunk;
+    }
+    return sum;
+}
+
+static void llama_token_data_scale_p(llama_token_data * data, size_t n, float scale) {
+    for (size_t i = 0; i < n; ++i) {
+        data[i].p *= scale;
+    }
+}
+
+// the probability and the count of the tokens with a logit of at least thr
+static double llama_token_data_mass_above(const llama_token_data * data, size_t n, float thr, size_t & count) {
+    constexpr size_t chunk = 1024;
+    double mass = 0.0;
+    size_t cnt  = 0;
+    for (size_t i0 = 0; i0 < n; i0 += chunk) {
+        const size_t i1 = std::min(n, i0 + chunk);
+        float mass_chunk = 0.0f;
+        int   cnt_chunk  = 0;
+        for (size_t i = i0; i < i1; ++i) {
+            const bool in = data[i].logit >= thr;
+            mass_chunk += in ? data[i].p : 0.0f;
+            cnt_chunk  += in ? 1 : 0;
+        }
+        mass += mass_chunk;
+        cnt  += cnt_chunk;
+    }
+    count = cnt;
+    return mass;
+}
+#if defined(_MSC_VER) && !defined(__clang__)
+#pragma float_control(pop)
+#endif
+
 static void llama_sampler_softmax_impl(llama_token_data_array * cur_p, bool do_sort) {
     GGML_ASSERT(cur_p->size > 0);
 
@@ -298,24 +365,11 @@ static void llama_sampler_softmax_impl(llama_token_data_array * cur_p, bool do_s
         llama_token_data_array_partial_sort_inplace(cur_p, cur_p->size);
     }
 
-    float max_l = cur_p->data[0].logit;
-    if (!cur_p->sorted) {
-        for (size_t i = 1; i < cur_p->size; ++i) {
-            max_l = std::max(max_l, cur_p->data[i].logit);
-        }
-    }
+    const float max_l = cur_p->sorted ? cur_p->data[0].logit : llama_token_data_max_logit(cur_p->data, cur_p->size);
 
-    float cum_sum = 0.0f;
+    const double cum_sum = llama_token_data_exp(cur_p->data, cur_p->size, max_l);
 
-    for (size_t i = 0; i < cur_p->size; ++i) {
-        float p = expf(cur_p->data[i].logit - max_l);
-        cur_p->data[i].p = p;
-        cum_sum += p;
-    }
-
-    for (size_t i = 0; i < cur_p->size; ++i) {
-        cur_p->data[i].p /= cum_sum;
-    }
+    llama_token_data_scale_p(cur_p->data, cur_p->size, (float) (1.0/cum_sum));
 }
 
 static void llama_sampler_top_k_impl(llama_token_data_array * cur_p, int32_t k) {
@@ -1168,25 +1222,13 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
     }
 
     // max logit for numerical stability
-    float max_l = cur_p->data[0].logit;
-    if (!cur_p->sorted) {
-        for (size_t i = 1; i < cur_p->size; ++i) {
-            max_l = std::max(max_l, cur_p->data[i].logit);
-        }
-    }
+    const float max_l = cur_p->sorted ? cur_p->data[0].logit : llama_token_data_max_logit(cur_p->data, cur_p->size);
 
     // apply softmax to obtain the probabilities
-    double sum_cum = 0.0f;
-    for (size_t i = 0; i < cur_p->size; ++i) {
-        float p = expf(cur_p->data[i].logit - max_l);
-        cur_p->data[i].p = p;
-        sum_cum += p;
-    }
+    const double sum_cum = llama_token_data_exp(cur_p->data, cur_p->size, max_l);
 
 #if 1
-    // sample from the obtained probabilities and normalize the probs in a single pass
-    // this is ~3x faster on Mac with full gpt-oss vocab than the version below
-    //
+    // sample from the obtained probabilities, then normalize them
     const double rnd = dist(ctx->rng);
 
           double sum_run = 0.0f;
@@ -1194,24 +1236,25 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
 
     bool found = false;
     for (size_t i = 0; i < cur_p->size; ++i) {
-        if (!found) {
-            // accumulate probs until we reach the target sum
-            sum_run += cur_p->data[i].p;
-            if (sum_run >= sum_tgt) {
-                cur_p->selected = i;
-                found = true;
-            }
+        // accumulate probs until we reach the target sum
+        sum_run += cur_p->data[i].p;
+        if (sum_run >= sum_tgt) {
+            cur_p->selected = i;
+            found = true;
+            break;
         }
-
-        // normalize probs
-        cur_p->data[i].p /= sum_cum;
     }
 
-    // fallback to the last token (don't think this can happen)
-    assert(found);
+    // sum_cum adds in vector lanes, this sum in order: a draw within rounding of 1 can pass the end, then take the
+    //   last token that has a probability (never one a grammar or a bias masked out)
     if (!found) {
         cur_p->selected = cur_p->size - 1;
+        while (cur_p->selected > 0 && cur_p->data[cur_p->selected].p == 0.0f) {
+            cur_p->selected--;
+        }
     }
+
+    llama_token_data_scale_p(cur_p->data, cur_p->size, (float) (1.0/sum_cum));
 #else
     // for clarity, this is the same as above but does one pass for normalization and one extra pass for sampling
     for (size_t i = 0; i < cur_p->size; ++i) {
@@ -1539,7 +1582,113 @@ struct llama_sampler_top_p : public llama_sampler_backend {
     const size_t min_keep;
 
     std::vector<llama_token_data> buf_sort;
+    std::vector<uint8_t>          buf_bucket;
 };
+
+// sorts the candidates and finds the nucleus in them with the running sum of the sort of the whole vocab; it can fall
+//   short of p where a sum in another order did not
+static bool llama_sampler_top_p_cut(llama_sampler_top_p * ctx, size_t & last_idx) {
+    auto & buf_sort = ctx->buf_sort;
+    std::sort(buf_sort.begin(), buf_sort.end(), [](const llama_token_data & a, const llama_token_data & b) {
+        return a.logit > b.logit;
+    });
+    float cum_sum = 0.0f;
+    for (size_t i = 0; i < buf_sort.size(); ++i) {
+        cum_sum += buf_sort[i].p;
+        if (cum_sum >= ctx->p && i + 1 >= ctx->min_keep) {
+            last_idx = i + 1;
+            return true;
+        }
+    }
+    return false;
+}
+
+// A nucleus over most of the logit range: one pass sums the probabilities into buckets of the logit below the maximum,
+//   the top buckets that hold p (and one more, for the order of the sums) are the candidates.
+static bool llama_sampler_top_p_bucketed(llama_sampler_top_p * ctx, llama_token_data_array * cur_p, float max_l, size_t & last_idx) {
+    constexpr int   nbuckets = 256;
+    constexpr float range    = 32.0f; // logits more than this below the maximum share the last bucket
+    constexpr float scale    = nbuckets / range;
+
+    const size_t n = cur_p->size;
+    const llama_token_data * data = cur_p->data;
+
+    auto & bucket = ctx->buf_bucket;
+    bucket.resize(n);
+    std::array<float, nbuckets> mass = {};
+    std::array<size_t, nbuckets> count = {};
+    for (size_t i = 0; i < n; ++i) {
+        const float d  = (max_l - data[i].logit) * scale;
+        const int   ib = d < (float) (nbuckets - 1) ? (int) d : nbuckets - 1; // also a NaN or -inf logit
+        bucket[i] = (uint8_t) ib;
+        if (ib < nbuckets - 1) { // the last bucket is never a candidate: most of the vocab, one long chain of adds
+            mass[ib] += data[i].p;
+            count[ib]++;
+        }
+    }
+
+    float  acc    = 0.0f;
+    size_t n_cand = 0;
+    int    ib_cut = 0;
+    for (; ib_cut < nbuckets - 1; ++ib_cut) {
+        acc    += mass[ib_cut];
+        n_cand += count[ib_cut];
+        if (acc >= ctx->p && n_cand >= ctx->min_keep) {
+            break;
+        }
+    }
+    if (ib_cut >= nbuckets - 2) {
+        return false;
+    }
+    ib_cut++; // the margin
+    n_cand += count[ib_cut];
+    if (n_cand > n/2) {
+        return false;
+    }
+
+    auto & buf_sort = ctx->buf_sort;
+    buf_sort.resize(n_cand);
+    size_t j = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (bucket[i] <= ib_cut) {
+            buf_sort[j++] = data[i];
+        }
+    }
+    return llama_sampler_top_p_cut(ctx, last_idx);
+}
+
+// The nucleus of a large unsorted vocab without sorting it: the tokens with a logit within delta of the maximum are a
+//   prefix of the sorted order; once their probability reaches p, only they are sorted, and the running sum over them
+//   is the one of the sort of the whole vocab (llama_sampler_top_p_apply tries 8 first, then this 16, then buckets).
+//   With 262k tokens the fallback below sorted all of them whenever the nucleus passed 256 tokens. Returns false,
+//   changing nothing, when no prefix up to half the vocab reaches p and min_keep.
+static bool llama_sampler_top_p_prefix(llama_sampler_top_p * ctx, llama_token_data_array * cur_p, float max_l, size_t & last_idx) {
+    const size_t n = cur_p->size;
+    const llama_token_data * data = cur_p->data;
+
+    auto & buf_sort = ctx->buf_sort;
+    {
+        const float thr = max_l - 16.0f; // the caller tried 8
+
+        size_t n_cand = 0;
+        const double mass = llama_token_data_mass_above(data, n, thr, n_cand);
+        if (n_cand > n/8 || mass < ctx->p || n_cand < ctx->min_keep) {
+            return llama_sampler_top_p_bucketed(ctx, cur_p, max_l, last_idx);
+        }
+
+        buf_sort.resize(n_cand);
+        size_t j = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (data[i].logit >= thr) {
+                buf_sort[j++] = data[i];
+            }
+        }
+        if (llama_sampler_top_p_cut(ctx, last_idx)) {
+            return true;
+        }
+    }
+    return llama_sampler_top_p_bucketed(ctx, cur_p, max_l, last_idx);
+}
 
 static const char * llama_sampler_top_p_name(const struct llama_sampler * smpl) {
     auto * sctx = (llama_sampler_top_p *) smpl->ctx;
@@ -1553,12 +1702,56 @@ static void llama_sampler_top_p_apply(struct llama_sampler * smpl, llama_token_d
         return;
     }
 
-    llama_sampler_softmax_impl(cur_p, false);
+    auto & buf_sort = ctx->buf_sort;
+
+    // llama_sampler_softmax_impl(cur_p, false), keeping the maximum
+    const bool   large = !cur_p->sorted && cur_p->size > 4096;
+    const float  max_l = cur_p->sorted ? cur_p->data[0].logit : llama_token_data_max_logit(cur_p->data, cur_p->size);
+    const float  scale = (float) (1.0/llama_token_data_exp(cur_p->data, cur_p->size, max_l));
+
+    if (large) {
+        // the tokens within 8 of the maximum usually hold the nucleus (a few dozen of gemma-4's 262k): then only they
+        //   are normalized, by the same multiplication, in the pass that picks them
+        const float  thr = max_l - 8.0f;
+        const size_t cap = cur_p->size/8;
+        buf_sort.clear();
+        float mass = 0.0f;
+        bool  over = false;
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            if (cur_p->data[i].logit >= thr) {
+                if (buf_sort.size() == cap) {
+                    over = true;
+                    break;
+                }
+                llama_token_data td = cur_p->data[i];
+                td.p *= scale;
+                mass += td.p;
+                buf_sort.push_back(td);
+            }
+        }
+        size_t last_idx = 0;
+        if (!over && mass >= ctx->p && buf_sort.size() >= ctx->min_keep && llama_sampler_top_p_cut(ctx, last_idx)) {
+            std::copy(buf_sort.data(), buf_sort.data() + last_idx, cur_p->data);
+            cur_p->sorted = true;
+            cur_p->size   = last_idx;
+            return;
+        }
+    }
+
+    llama_token_data_scale_p(cur_p->data, cur_p->size, scale);
 
     size_t k = cur_p->size;
     auto * pdata = cur_p->data;
 
-    auto & buf_sort = ctx->buf_sort;
+    if (large) {
+        size_t last_idx = 0;
+        if (llama_sampler_top_p_prefix(ctx, cur_p, max_l, last_idx)) {
+            std::copy(buf_sort.data(), buf_sort.data() + last_idx, cur_p->data);
+            cur_p->sorted = true;
+            cur_p->size   = last_idx;
+            return;
+        }
+    }
 
     // if not sorted, try adaptive top-k sorting
     if (!cur_p->sorted && cur_p->size > 1024) {
@@ -1759,10 +1952,7 @@ static void llama_sampler_min_p_apply(struct llama_sampler * smpl, llama_token_d
     if (!cur_p->sorted) {
         std::vector<llama_token_data> filtered_tokens;
 
-        float max_logit = -FLT_MAX;
-        for (size_t i = 0; i < cur_p->size; ++i) {
-            max_logit = std::max(max_logit, cur_p->data[i].logit);
-        }
+        const float max_logit = std::max(-FLT_MAX, llama_token_data_max_logit(cur_p->data, cur_p->size));
         const float min_logit = max_logit + logf(ctx->p); // min logit for p_i >= p * p_max
 
         for (size_t i = 0; i < cur_p->size; ++i) {

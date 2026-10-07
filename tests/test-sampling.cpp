@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -297,6 +298,73 @@ static void test_sampler_queue(const size_t n_vocab, const std::string & sampler
            samplers_sequence.c_str(), n_vocab, top_k, top_p, min_p);
 }
 
+// top-p over a vocab the size of gemma-4's against a full sort: the bucketed nucleus and its fallback must keep the
+//   same tokens in the same order with the same probabilities
+static std::vector<llama_token_data> large_vocab_logits(std::mt19937 & rng, int kind, size_t n) {
+    std::normal_distribution<float>       normal(0.0f, 1.0f);
+    std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+    std::vector<llama_token_data> data(n);
+    for (size_t i = 0; i < n; i++) {
+        float logit = 0.0f;
+        switch (kind) {
+            case 0: logit = 30.0f*tanhf(4.0f*normal(rng)/30.0f);  break; // soft-capped, broad
+            case 1: logit = 30.0f*tanhf(10.0f*normal(rng)/30.0f); break; // soft-capped, peaked tail
+            case 2: logit = 0.01f*uniform(rng);                   break; // flat: a nucleus of most of the vocab
+            case 3: logit = normal(rng) + (i % 997 == 0 ? 12.0f : 0.0f); break; // a few hundred spikes
+        }
+        data[i] = llama_token_data{ (llama_token) i, logit, 0.0f };
+    }
+    return data;
+}
+
+static void test_top_p_large_vocab() {
+    std::mt19937 rng(1234);
+    const size_t n = 262144;
+    for (int kind = 0; kind < 4; kind++) {
+        const std::vector<llama_token_data> data = large_vocab_logits(rng, kind, n);
+
+        // the reference: min_keep = n keeps the whole vocab, sorted, with the probabilities of the same softmax
+        std::vector<llama_token_data> ref = data;
+        {
+            llama_token_data_array ref_p = { ref.data(), ref.size(), -1, false };
+            llama_sampler * smpl = llama_sampler_init_top_p(0.5f, n);
+            llama_sampler_apply(smpl, &ref_p);
+            llama_sampler_free(smpl);
+            GGML_ASSERT(ref_p.size == n);
+            for (size_t i = 1; i < n; i++) {
+                GGML_ASSERT(ref[i - 1].logit >= ref[i].logit);
+            }
+        }
+
+        for (const float p : { 0.5f, 0.9f, 0.95f, 0.99f }) {
+            for (const size_t min_keep : { (size_t) 1, (size_t) 300, (size_t) 5000 }) {
+                size_t last = n;
+                float cum_sum = 0.0f;
+                for (size_t i = 0; i < n; i++) {
+                    cum_sum += ref[i].p;
+                    if (cum_sum >= p && i + 1 >= min_keep) {
+                        last = i + 1;
+                        break;
+                    }
+                }
+
+                std::vector<llama_token_data> cur = data;
+                llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+                llama_sampler * smpl = llama_sampler_init_top_p(p, min_keep);
+                llama_sampler_apply(smpl, &cur_p);
+                llama_sampler_free(smpl);
+
+                GGML_ASSERT(cur_p.size == last);
+                for (size_t i = 0; i < last; i++) {
+                    GGML_ASSERT(cur_p.data[i].logit == ref[i].logit);
+                    GGML_ASSERT(cur_p.data[i].p     == ref[i].p);
+                }
+                printf("top_p %.2f min_keep %4zu over %zu tokens (kind %d): %zu kept, OK\n", p, min_keep, n, kind, last);
+            }
+        }
+    }
+}
+
 static void bench(llama_sampler * cnstr, const char * cnstr_name, const std::vector<llama_token_data> & data, int n_iter) {
     std::vector<llama_token_data> cur(data.size());
     std::copy(data.begin(), data.end(), cur.begin());
@@ -333,6 +401,15 @@ static void test_perf() {
     BENCH(llama_sampler_init_min_p  (0.2f, 1),                data, 32);
     BENCH(llama_sampler_init_typical(0.5f, 1),                data, 32);
     BENCH(llama_sampler_init_xtc    (1.0f, 0.1f, 1, 1),       data, 32);
+
+    std::mt19937 rng(42);
+    for (int kind = 0; kind < 4; kind++) {
+        const std::vector<llama_token_data> large = large_vocab_logits(rng, kind, 262144);
+        printf("262144 tokens, logits of kind %d:\n", kind);
+        BENCH(llama_sampler_init_top_p  (0.95f, 1),               large, 16);
+        BENCH(llama_sampler_init_min_p  (0.05f, 1),               large, 16);
+        BENCH(llama_sampler_init_dist   (42),                     large, 16);
+    }
 }
 
 int main(void) {
@@ -355,6 +432,7 @@ int main(void) {
     test_top_p({0.1f, 0.2f, 0.3f, 0.4f}, {0.571429f, 0.428571f}, 0.7f);
     test_top_p({0.1f, 0.2f, 0.3f, 0.4f}, {0.44444f, 0.33333f, 0.22222f}, 0.8f);
     test_top_p({0.1f, 0.2f, 0.3f, 0.4f}, {0.1f, 0.2f, 0.3f, 0.4f}, 1.0f);
+    test_top_p_large_vocab();
 
     test_min_p({0.1f, 0.2f, 0.3f, 0.4f}, {0.1f/1.0f, 0.2f/1.0f, 0.3f/1.0f, 0.4f/1.0f}, 0.00f);
     test_min_p({0.1f, 0.2f, 0.3f, 0.4f}, {0.1f/1.0f, 0.2f/1.0f, 0.3f/1.0f, 0.4f/1.0f}, 0.24f);
