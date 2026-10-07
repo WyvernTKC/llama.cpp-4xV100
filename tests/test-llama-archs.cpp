@@ -132,7 +132,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_embd = 128;
         n_head = 2;
         n_ff   = 192;
-        n_layer = 5; // need at least 5 for swa_pattern (every 5th is full_attention)
+        n_layer = 10; // two rounds of the swa pattern, the second one reuses the KV cache of the first
     } else if (arch == LLM_ARCH_GEMMA3N) {
         // head size 64 with more than one head, so that the per-head split of tensor parallelism is
         //   exercised - a single head leaves nothing to distribute and q falls back to an axis 0 split
@@ -294,12 +294,23 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
 
     if (arch == LLM_ARCH_GEMMA4) {
         ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,      n_embd/2);
-        ms.add_kv(LLM_KV_ATTENTION_SHARED_KV_LAYERS,      uint32_t(0));
+        // like E2B/E4B: the last layers reuse the KV cache of the last SWA and full attention layer before them
+        ms.add_kv(LLM_KV_ATTENTION_SHARED_KV_LAYERS,      n_layer/2);
+        // the full attention layers have twice the head size of the SWA layers, like all Gemma 4 models
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,            2*n_embd_head);
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,          2*n_embd_head);
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,            2*n_embd_head);
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_SWA,        n_embd_head);
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,      n_embd_head);
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT_SWA,        n_embd_head);
         ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA,              10000.0f);
-        // SWA pattern: every 5th layer is full attention (matches E2B layer_types)
-        ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(5));
+        // SWA pattern: every 5th layer is full attention (matches E2B layer_types), Gemma 4 reads it only as an array
+        std::vector<uint32_t> pattern;
+        pattern.reserve(n_layer);
+        for (uint32_t il = 0; il < n_layer; il++) {
+            pattern.push_back(il % 5 < 4);
+        }
+        ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, pattern);
     } else if (arch == LLM_ARCH_COHERE2MOE || arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_SPARK2_5 ||
             arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_GRANITE_SWA || arch == LLM_ARCH_DOTS3NOTE ||
             arch == LLM_ARCH_MAPLE) {
@@ -832,7 +843,7 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_WAVTOKENIZER_DEC) {
         return false; // FIXME CUDA backend crashes.
     }
-    if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+    if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
         return false; // FIXME @ngxson
     }
     if (arch == LLM_ARCH_GRANITE_SWITCH) {
@@ -909,7 +920,7 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
         if (!arch_matches(arch_filter, arch)) {
             continue;
         }
-        if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+        if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
             continue; // FIXME: ISWA KV cache initialization needs more fixture params
         }
         if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
@@ -1027,7 +1038,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         if (!arch_matches(arch_filter, arch)) {
             continue;
         }
-        if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+        if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
             continue; // FIXME: ISWA KV cache initialization needs more fixture params
         }
         if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {

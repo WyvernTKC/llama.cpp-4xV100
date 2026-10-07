@@ -221,6 +221,7 @@ void llama_model_saver::add_kv_from_model() {
     if (hparams.n_embd_out_impl > 0) {
         add_kv(LLM_KV_EMBEDDING_LENGTH_OUT,          hparams.n_embd_out_impl);
     }
+    add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,        hparams.n_embd_per_layer);
     add_kv(LLM_KV_BLOCK_COUNT,                       hparams.n_layer_all);
     add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT,         hparams.n_layer_dense_lead);
     add_kv(LLM_KV_FEED_FORWARD_LENGTH,               hparams.n_ff_arr, true);
@@ -290,6 +291,9 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT,  hparams.n_rel_attn_bkts);
     add_kv(LLM_KV_ATTENTION_ROPE_PATTERN,            hparams.rope_pattern, true);
     add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW,          hparams.n_swa);
+    if (hparams.n_layer_kv_from_start >= 0) {
+        add_kv(LLM_KV_ATTENTION_SHARED_KV_LAYERS,    uint32_t(hparams.n_layer_all - hparams.n_layer_kv_from_start));
+    }
     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
         // never collapsed to a scalar: the loaders read a scalar as a period
         add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, std::vector<uint32_t>(
@@ -498,6 +502,8 @@ void llama_model_saver::add_tensors_from_model() {
     add_tensor(model->hc_head_base);
     add_tensor(model->hc_head_scale);
     add_tensor(model->per_layer_tok_embd);
+    add_tensor(model->per_layer_model_proj);
+    add_tensor(model->per_layer_proj_norm);
     add_tensor(model->hc_head_norm);
     add_tensor(model->hc_head_down);
     add_tensor(model->hc_head_up);
