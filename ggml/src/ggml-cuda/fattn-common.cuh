@@ -1295,6 +1295,7 @@ void launch_fattn(
         return env != nullptr ? (int64_t) atoll(env) : (int64_t) 4096;
     }();
     const bool scan_range = !stream_k && range_min_kv > 0 && K->ne[1] >= range_min_kv;
+    int * KV_range = nullptr; // the scan of the vec and tile kernels, KV_max or a cached copy
     const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 &&
         (Q->ne[1] >= 1024 || Q->ne[3] > 1 || scan_range);
     if (scan_mask && !stream_k) {
@@ -1308,12 +1309,50 @@ void launch_fattn(
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
         const size_t nbytes_shared_KV_range = ((iter_k + 31)/32)*sizeof(uint32_t);
 
-        KV_max.alloc(3*ne_KV_range);
-        ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
-            blocks_num_KV_range, block_dim_KV_range, nbytes_shared_KV_range, main_stream);
-        ggml_cuda_kernel_launch(flash_attn_mask_to_KV_range<ncols1>, launch_params,
-            (const half2 *) mask->data, KV_max.ptr, iter_k, (int) mask->ne[1], (int) mask->ne[3], s31, s33);
-        CUDA_CHECK(cudaGetLastError());
+        // the ranges of an earlier FA over the same mask, unless a node wrote the mask since (cublas_input_invalidate);
+        //     only the memory of graph tensors is followed by the invalidation
+        const char * mask_base = mask->buffer ? (const char *) ggml_backend_buffer_get_base(mask->buffer) : nullptr;
+        const bool keep = !ggml_cuda_info().devices[ctx.device].vmm && mask_base != nullptr &&
+            (const char *) mask->data >= mask_base &&
+            (const char *) mask->data + ggml_nbytes(mask) <= mask_base + ggml_backend_buffer_get_size(mask->buffer);
+        for (int e = 0; keep && e < ggml_backend_cuda_context::FATTN_RANGE_ENTRIES; ++e) {
+            const ggml_backend_cuda_context::fattn_range_input & cached = ctx.fattn_range[e];
+            if (cached.buf && cached.data == mask->data && cached.n_kv == K->ne[1] && cached.ncols1 == ncols1 &&
+                    cached.ntiles_x == ntiles_x && cached.n_seq == Q->ne[3] && cached.stream_no == ctx.curr_stream_no &&
+                    std::equal(mask->ne, mask->ne + GGML_MAX_DIMS, cached.ne) &&
+                    std::equal(mask->nb, mask->nb + GGML_MAX_DIMS, cached.nb)) {
+                KV_range = cached.buf->get();
+                break;
+            }
+        }
+        if (KV_range == nullptr) {
+            if (keep) {
+                ggml_backend_cuda_context::fattn_range_input & cached = ctx.fattn_range[ctx.fattn_range_next];
+                ctx.fattn_range_next = (ctx.fattn_range_next + 1) % ggml_backend_cuda_context::FATTN_RANGE_ENTRIES;
+                cached.buf = std::make_unique<ggml_cuda_pool_alloc<int>>(pool, 3*ne_KV_range);
+                cached.data   = mask->data;
+                cached.nbytes = mask->nb[0];
+                for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                    cached.nbytes += (mask->ne[i] - 1)*mask->nb[i];
+                }
+                std::copy_n(mask->ne, GGML_MAX_DIMS, cached.ne);
+                std::copy_n(mask->nb, GGML_MAX_DIMS, cached.nb);
+                cached.n_kv      = K->ne[1];
+                cached.ncols1    = ncols1;
+                cached.ntiles_x  = ntiles_x;
+                cached.n_seq     = Q->ne[3];
+                cached.stream_no = ctx.curr_stream_no;
+                KV_range = cached.buf->get();
+            } else {
+                KV_max.alloc(3*ne_KV_range);
+                KV_range = KV_max.ptr;
+            }
+            ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
+                blocks_num_KV_range, block_dim_KV_range, nbytes_shared_KV_range, main_stream);
+            ggml_cuda_kernel_launch(flash_attn_mask_to_KV_range<ncols1>, launch_params,
+                (const half2 *) mask->data, KV_range, iter_k, (int) mask->ne[1], (int) mask->ne[3], s31, s33);
+            CUDA_CHECK(cudaGetLastError());
+        }
     } else if (scan_mask) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
@@ -1458,7 +1497,7 @@ void launch_fattn(
         V_data,
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
-        KV_max.ptr,
+        KV_range ? KV_range : KV_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],

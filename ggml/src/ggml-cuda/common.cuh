@@ -1830,6 +1830,27 @@ struct ggml_backend_cuda_context {
 
     mmq_ids_input mmq_ids;
 
+    // The KV ranges that the vec and tile FA kernels read from a mask scan (see flash_attn_mask_to_KV_range), kept for
+    // the next FA with the same mask and Q tiling: the layers of a model share one mask per cache, so it is scanned
+    // once per graph instead of once per layer. A few entries, for models that interleave sliding-window and global
+    // layers, replaced in turn; on a pool that frees in any order, as above.
+    struct fattn_range_input {
+        const void * data   = nullptr;
+        size_t       nbytes = 0;
+        int64_t      ne[GGML_MAX_DIMS] = {0};
+        size_t       nb[GGML_MAX_DIMS] = {0};
+        int64_t      n_kv      = 0;
+        int          ncols1    = 0;
+        int          ntiles_x  = 0;
+        int64_t      n_seq     = 0;
+        int          stream_no = -1;
+        std::unique_ptr<ggml_cuda_pool_alloc<int>> buf;
+    };
+
+    static constexpr int FATTN_RANGE_ENTRIES = 4;
+    fattn_range_input fattn_range[FATTN_RANGE_ENTRIES];
+    int fattn_range_next = 0;
+
     // a node is about to write its memory
     void cublas_input_invalidate(const ggml_tensor * node) {
         const auto overlaps = [node](const void * data, const size_t nbytes) {
@@ -1843,11 +1864,19 @@ struct ggml_backend_cuda_context {
         if (mmq_ids.q8_1 && (overlaps(mmq_ids.src1_data, mmq_ids.src1_nbytes) || overlaps(mmq_ids.ids_data, mmq_ids.ids_nbytes))) {
             mmq_ids.reset();
         }
+        for (fattn_range_input & e : fattn_range) {
+            if (e.buf && overlaps(e.data, e.nbytes)) {
+                e.buf.reset();
+            }
+        }
     }
 
     void cublas_input_reset() {
         cublas_src1.buf.reset();
         mmq_ids.reset();
+        for (fattn_range_input & e : fattn_range) {
+            e.buf.reset();
+        }
     }
 };
 
