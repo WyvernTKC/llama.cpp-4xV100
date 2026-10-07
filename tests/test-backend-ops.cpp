@@ -10645,15 +10645,29 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
 struct test_flash_attn_ext_window : public test_flash_attn_ext {
     const int64_t window;
     const int64_t offset;
+    const bool    ranges;        // give the KV ranges of the mask rows (ggml_flash_attn_ext_set_kv_ranges)
+    const int32_t n_visible_max; // with this bound on the cells a row sees
 
     std::string vars() override {
-        return test_flash_attn_ext::vars() + ",window=" + std::to_string(window) + ",offset=" + std::to_string(offset);
+        return test_flash_attn_ext::vars() + ",window=" + std::to_string(window) + ",offset=" + std::to_string(offset) +
+            (ranges ? ",ranges=1,n_visible_max=" + std::to_string(n_visible_max) : "");
     }
 
     test_flash_attn_ext_window(int64_t hsk, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb,
-                               int64_t window, int64_t offset, ggml_type type_KV = GGML_TYPE_F16)
+                               int64_t window, int64_t offset, ggml_type type_KV = GGML_TYPE_F16,
+                               bool ranges = false, int32_t n_visible_max = 0)
         : test_flash_attn_ext(hsk, hsv, nh, nr23, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV),
-          window(window), offset(offset) {}
+          window(window), offset(offset), ranges(ranges), n_visible_max(n_visible_max) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_flash_attn_ext::build_graph(ctx);
+        if (ranges) {
+            ggml_tensor * r = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 3, nb, 1, nr23[1]);
+            ggml_set_name(r, "r");
+            ggml_flash_attn_ext_set_kv_ranges(out, r, n_visible_max);
+        }
+        return out;
+    }
 
     void initialize_tensors(ggml_context * ctx) override {
         test_flash_attn_ext::initialize_tensors(ctx);
@@ -10673,6 +10687,39 @@ struct test_flash_attn_ext_window : public test_flash_attn_ext {
         }
         ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), data_f16.size());
         ggml_backend_tensor_set(m, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+
+        if (!ranges) {
+            return;
+        }
+
+        // the exact ranges of each row, at the chunk granularity of the hint: the end after the last chunk with a
+        //     finite value, the longest run of chunks below it without one
+        const int64_t chunk    = GGML_KQ_RANGE_CHUNK;
+        const int64_t n_chunks = (m->ne[0] + chunk - 1)/chunk;
+        std::vector<int32_t> r_data(3*m->ne[1]*m->ne[3]);
+        for (int64_t row = 0; row < m->ne[1]*m->ne[3]; ++row) {
+            const float * mr = data_f32.data() + row*m->ne[0];
+            int64_t last = -1, run_0 = 0, best_0 = 0, best_len = 0;
+            for (int64_t c = 0; c < n_chunks; ++c) {
+                bool seen = false;
+                for (int64_t i = c*chunk; i < std::min<int64_t>((c + 1)*chunk, m->ne[0]); ++i) {
+                    seen = seen || std::isfinite(mr[i]);
+                }
+                if (!seen) {
+                    continue;
+                }
+                if (c - run_0 > best_len) {
+                    best_0   = run_0;
+                    best_len = c - run_0;
+                }
+                run_0 = c + 1;
+                last  = c;
+            }
+            r_data[3*row + 0] = (int32_t) std::min<int64_t>(m->ne[0], (last + 1)*chunk);
+            r_data[3*row + 1] = (int32_t) (best_0*chunk);
+            r_data[3*row + 2] = (int32_t) ((best_0 + best_len)*chunk);
+        }
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "r"), r_data.data(), 0, r_data.size()*sizeof(int32_t));
     }
 };
 
@@ -14211,8 +14258,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 16384, 1, 1024, offset, GGML_TYPE_Q8_0));
         test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 2}, 16384, 1, 1024, offset));
+        // the same with the ranges of the mask rows from the graph, with and without the window bound
+        for (int32_t n_visible_max : { 0, 1024 }) {
+            for (int64_t nb : { 1, 3 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 16384, nb, 1024, offset, GGML_TYPE_F16, true, n_visible_max));
+                test_cases.emplace_back(new test_flash_attn_ext_window(128, 128, 1, {16, 1}, 16384, nb, 2048, offset, GGML_TYPE_F16, true, n_visible_max ? 2048 : 0));
+            }
+            test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 16384, 1, 1024, offset, GGML_TYPE_Q8_0, true, n_visible_max));
+            test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 2}, 16384, 1, 1024, offset, GGML_TYPE_F16, true, n_visible_max));
+        }
     }
     test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 8192, 64, 1024, 6000));
+    test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 8192, 64, 1024, 6000, GGML_TYPE_F16, true, 1024));
+    // a window narrower than one chunk and a bound that undercounts it: the split shrinks, the kernels still walk all
+    test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 16384, 1, 100, 9000, GGML_TYPE_F16, true, 100));
+    test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 16384, 1, 4000, 14000, GGML_TYPE_F16, true, 64));
+    // prefill shapes (MMA): the tiles of the ranges skip the hole, with stream-k at few tiles and whole tiles at many
+    for (int64_t offset : { 7001, 15000 }) {
+        for (int64_t nb : { 32, 64, 256 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 16384, nb, 1024, offset, GGML_TYPE_F16, true, 1024));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_window(128, 128, 1, {16, 1}, 16384, 64, 2048, offset, GGML_TYPE_F16, true, 2048));
+        test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 16384, 64, 1024, offset, GGML_TYPE_Q8_0, true, 1024));
+        test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 2}, 16384, 64, 1024, offset, GGML_TYPE_F16, true, 1024));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 8192, 512, 1024, 3000, GGML_TYPE_F16, true, 1024));
 
     // Sparse mask hint: supported decode/prefill layouts and dense fallbacks.
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
@@ -14921,8 +14991,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
         test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 16384, 1, 1024, offset, GGML_TYPE_Q8_0));
         test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 2}, 16384, 1, 1024, offset));
+        // the same with the ranges of the mask rows from the graph, with and without the window bound
+        for (int32_t n_visible_max : { 0, 1024 }) {
+            for (int64_t nb : { 1, 3 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 16384, nb, 1024, offset, GGML_TYPE_F16, true, n_visible_max));
+                test_cases.emplace_back(new test_flash_attn_ext_window(128, 128, 1, {16, 1}, 16384, nb, 2048, offset, GGML_TYPE_F16, true, n_visible_max ? 2048 : 0));
+            }
+            test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 16384, 1, 1024, offset, GGML_TYPE_Q8_0, true, n_visible_max));
+            test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 2}, 16384, 1, 1024, offset, GGML_TYPE_F16, true, n_visible_max));
+        }
     }
     test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 8192, 64, 1024, 6000));
+    test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 8192, 64, 1024, 6000, GGML_TYPE_F16, true, 1024));
+    // a window narrower than one chunk and a bound that undercounts it: the split shrinks, the kernels still walk all
+    test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 16384, 1, 100, 9000, GGML_TYPE_F16, true, 100));
+    test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 16384, 1, 4000, 14000, GGML_TYPE_F16, true, 64));
+    // prefill shapes (MMA): the tiles of the ranges skip the hole, with stream-k at few tiles and whole tiles at many
+    for (int64_t offset : { 7001, 15000 }) {
+        for (int64_t nb : { 32, 64, 256 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 16384, nb, 1024, offset, GGML_TYPE_F16, true, 1024));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_window(128, 128, 1, {16, 1}, 16384, 64, 2048, offset, GGML_TYPE_F16, true, 2048));
+        test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 16384, 64, 1024, offset, GGML_TYPE_Q8_0, true, 1024));
+        test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 2}, 16384, 64, 1024, offset, GGML_TYPE_F16, true, 1024));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 8192, 512, 1024, 3000, GGML_TYPE_F16, true, 1024));
 
     // sparse decode at long context
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 49152, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,    0));

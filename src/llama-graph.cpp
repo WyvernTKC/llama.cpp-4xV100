@@ -71,6 +71,41 @@ static bool can_reuse_kq_mask(
     return res;
 }
 
+// The KV ranges of the rows of a flash attention mask (ggml_flash_attn_ext_set_kv_ranges), filled from the cache by
+//   llama_kv_cache::set_input_kq_ranges, so that the backend can skip the cells a row cannot see without scanning the
+//   mask. LLAMA_KQ_RANGES=0 leaves them out, =2 gives no bound on the cells a row sees: the backend then splits the
+//   work as without ranges, and its results are bitwise those of a scan of the mask.
+static int llama_kq_ranges_mode() {
+    static const int mode = getenv("LLAMA_KQ_RANGES") == nullptr ? 1 : atoi(getenv("LLAMA_KQ_RANGES"));
+    return mode;
+}
+
+static ggml_tensor * build_attn_inp_kq_ranges(ggml_context * ctx, const ggml_tensor * kq_mask, const llama_cparams & cparams) {
+    if (llama_kq_ranges_mode() == 0 || !cparams.flash_attn || kq_mask == nullptr || kq_mask->type != GGML_TYPE_F16) {
+        return nullptr;
+    }
+
+    ggml_tensor * res = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 3, kq_mask->ne[1], 1, kq_mask->ne[3]);
+    ggml_set_input(res);
+    ggml_set_name(res, "attn_inp_kq_ranges");
+
+    return res;
+}
+
+// the bound on the cells a row of a sliding-window mask sees
+static int32_t kq_ranges_n_visible_max(const llama_hparams & hparams) {
+    if (llama_kq_ranges_mode() == 2) {
+        return 0;
+    }
+    switch (hparams.swa_type) {
+        case LLAMA_SWA_TYPE_STANDARD:
+        case LLAMA_SWA_TYPE_CHUNKED:   return (int32_t) hparams.n_swa;
+        case LLAMA_SWA_TYPE_SYMMETRIC: return (int32_t) hparams.n_swa + 1;
+        case LLAMA_SWA_TYPE_NONE:      return 0;
+    }
+    return 0;
+}
+
 // impl
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
@@ -519,6 +554,10 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     // (e.g. DFlash's KV-injection pass)
     if (self_kq_mask && self_kq_mask->buffer) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+
+        if (self_kq_ranges && self_kq_ranges->buffer) {
+            mctx->set_input_kq_ranges(self_kq_ranges, ubatch, cparams.causal_attn, self_kq_mask->ne[0]);
+        }
     }
 
     if (self_k_rot && self_k_rot->buffer) {
@@ -665,6 +704,10 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     // the kq mask guards on its own buffer: shared cells leave idxs unbacked while the mask stays live
     if (self_kq_mask && self_kq_mask->buffer) {
         mctx->get_base()->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+
+        if (self_kq_ranges && self_kq_ranges->buffer) {
+            mctx->get_base()->set_input_kq_ranges(self_kq_ranges, ubatch, cparams.causal_attn, self_kq_mask->ne[0]);
+        }
     }
 
     // swa tensors may not be allocated if there are no SWA attention layers
@@ -677,6 +720,10 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
 
     if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
         mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn);
+
+        if (self_kq_ranges_swa && self_kq_ranges_swa->buffer) {
+            mctx->get_swa()->set_input_kq_ranges(self_kq_ranges_swa, ubatch, cparams.causal_attn, self_kq_mask_swa->ne[0]);
+        }
     }
 
     if (self_k_rot && self_k_rot->buffer) {
@@ -1380,6 +1427,7 @@ void llm_graph_result::reset() {
 
     inputs.clear();
     fused_nodes.clear();
+    kq_ranges.clear();
 
     reshape_groups.clear();
     reshape_ok = true;
@@ -2751,6 +2799,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
         ggml_prec_set_acc(cur, GGML_PREC_F32);
 
+        // the KV ranges of the mask rows, when the mask is the input of a cache that fills them
+        if (kq_mask != nullptr) {
+            const auto it = res->kq_ranges.find(kq_mask);
+            if (it != res->kq_ranges.end()) {
+                ggml_flash_attn_ext_set_kv_ranges(cur, it->second.ranges, it->second.n_visible_max);
+            }
+        }
+
         if (v_mla) {
 #if 0
             // v_mla can be applied as a matrix-vector multiplication with broadcasting across dimension 3 == n_tokens.
@@ -2946,6 +3002,11 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+
+    inp->self_kq_ranges = build_attn_inp_kq_ranges(ctx0, inp->self_kq_mask, cparams);
+    if (inp->self_kq_ranges) {
+        res->kq_ranges[inp->self_kq_mask_cnv] = { inp->self_kq_ranges, 0 };
+    }
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
@@ -3525,6 +3586,15 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
         inp->self_kq_mask_swa = build_attn_inp_kq_mask(ctx0, mctx_cur->get_swa(), ubatch, cparams);
         inp->self_kq_mask_swa_cnv = inp->self_kq_mask_swa;
+    }
+
+    inp->self_kq_ranges     = build_attn_inp_kq_ranges(ctx0, inp->self_kq_mask,     cparams);
+    inp->self_kq_ranges_swa = build_attn_inp_kq_ranges(ctx0, inp->self_kq_mask_swa, cparams);
+    if (inp->self_kq_ranges) {
+        res->kq_ranges[inp->self_kq_mask_cnv] = { inp->self_kq_ranges, 0 };
+    }
+    if (inp->self_kq_ranges_swa) {
+        res->kq_ranges[inp->self_kq_mask_swa_cnv] = { inp->self_kq_ranges_swa, kq_ranges_n_visible_max(hparams) };
     }
 
     inp->self_k_rot = mctx_cur->get_base()->build_input_k_rot(ctx0);

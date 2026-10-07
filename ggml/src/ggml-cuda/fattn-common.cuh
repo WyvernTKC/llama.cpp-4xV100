@@ -25,6 +25,7 @@ typedef void (* fattn_kernel_t)(
         const char * __restrict__ mask,
         const char * __restrict__ sinks,
         const int  * __restrict__ KV_max,
+        const int  * __restrict__ KV_ranges,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
         const float scale,
@@ -733,6 +734,38 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
     }
 }
 
+// The KV range of the Q tile of rows [row0, row0 + nrows) from the per-row ranges of ggml_flash_attn_ext_set_kv_ranges
+//     ({end, hole_begin, hole_end} per mask row of stream seq): the union of what the rows see, so the largest end and
+//     the overlap of the holes. Rows past the mask are the last row again.
+static __device__ __forceinline__ void ggml_cuda_fattn_tile_range(
+        const int * KV_ranges, const int seq, const int row0, const int nrows, const int ne31, const int ne11,
+        int & kv_end, int & hole_lo, int & hole_hi) {
+    int end = 0;
+    int lo  = 0;
+    int hi  = INT_MAX;
+    for (int j = 0; j < nrows; ++j) {
+        const int   row = min(row0 + j, ne31 - 1);
+        const int * r   = KV_ranges + 3*(int64_t(seq)*ne31 + row);
+        end = max(end, r[0]);
+        lo  = max(lo,  r[1]);
+        hi  = min(hi,  r[2]);
+    }
+    kv_end  = min(end, ne11);
+    hole_lo = lo < hi ? lo : 0;
+    hole_hi = lo < hi ? hi : 0;
+}
+
+// The same for the MMA kernel in units of its KV blocks of nbatch_fa: the end bounds kb0_stop, the hole rounds inwards.
+static __device__ __forceinline__ void ggml_cuda_fattn_mma_tile_range(
+        const int * KV_ranges, const int seq, const int row0, const int nrows, const int ne31, const int ne11,
+        const int nbatch_fa, int & kb0_stop, int & kb0_hole_lo, int & kb0_hole_hi) {
+    int kv_end, hole_lo, hole_hi;
+    ggml_cuda_fattn_tile_range(KV_ranges, seq, row0, nrows, ne31, ne11, kv_end, hole_lo, hole_hi);
+    kb0_stop    = min(kb0_stop, (kv_end + nbatch_fa - 1) / nbatch_fa);
+    kb0_hole_lo = (hole_lo + nbatch_fa - 1) / nbatch_fa;
+    kb0_hole_hi = hole_hi / nbatch_fa;
+}
+
 template <int ncols1>
 __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
 static __global__ void flash_attn_mask_to_KV_max(
@@ -1304,7 +1337,17 @@ void launch_fattn(
         (int64_t) (ggml_row_size(K->type, K->ne[0]) + (V_is_K_view ? 0 : ggml_row_size(V->type, V->ne[0])));
     const bool scan_range = !stream_k && range_min_kv > 0 && K->ne[1] >= range_min_kv && kv_bytes >= range_min_bytes;
     int * KV_range = nullptr; // the scan of the vec and tile kernels, KV_max or a cached copy
-    const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+
+    // The KV ranges of the mask rows when the graph gives them (ggml_flash_attn_ext_set_kv_ranges): then no scan runs,
+    //     and a bound on the cells a row sees (a sliding window) sizes the KV split of the vec and tile kernels to the
+    //     window instead of the cache. LLAMA_KQ_RANGES=0 leaves them out of the graph.
+    const ggml_tensor * ranges = KQV->src[5];
+    const bool use_ranges = ranges != nullptr && mask != nullptr && !use_sparse &&
+        K->ne[1] % FATTN_KQ_STRIDE == 0 && ranges->ne[1] == mask->ne[1] && ranges->ne[3] == mask->ne[3];
+    const int * KV_ranges_dev = use_ranges ? (const int *) ranges->data : nullptr;
+    const int32_t n_visible_max = use_ranges && !stream_k ? ggml_get_op_params_i32(KQV, 5) : 0;
+
+    const bool scan_mask = !use_ranges && !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 &&
         (Q->ne[1] >= 1024 || Q->ne[3] > 1 || scan_range);
     if (scan_mask && !stream_k) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
@@ -1385,7 +1428,14 @@ void launch_fattn(
     int parallel_blocks = max_blocks_per_sm;
 
     const int64_t n_kv = use_sparse ? n_kv_max : K->ne[1];
-    const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
+    int64_t n_kv_split = n_kv;
+    if (n_visible_max > 0) {
+        // the chunks a tile can see: the window of each row plus the rows of the tile, at the 256-cell granularity of
+        //     the ranges; only the split is sized by it, the kernels walk the whole range whatever the split
+        const int64_t span = GGML_PAD(int64_t(n_visible_max) + ncols1, FATTN_KQ_STRIDE) + FATTN_KQ_STRIDE;
+        n_kv_split = std::min<int64_t>(n_kv, span);
+    }
+    const int ntiles_KV = (n_kv_split + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
 
     dim3 blocks_num;
     if (stream_k) {
@@ -1506,6 +1556,7 @@ void launch_fattn(
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_range ? KV_range : KV_max.ptr,
+        KV_ranges_dev,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],

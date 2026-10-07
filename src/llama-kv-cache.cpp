@@ -1934,6 +1934,106 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
+// The KV ranges of the KQ mask rows, see ggml_flash_attn_ext_set_kv_ranges: per row {end, hole_begin, hole_end} in cells,
+//   at a granularity of GGML_KQ_RANGE_CHUNK cells. A chunk can be seen by a row if a cell of the row's sequence in it
+//   lies in the row's window of positions, from the smallest and largest position of those cells - an overestimate
+//   where a chunk holds cells on both sides of the window, which only skips less. The end follows the last chunk a
+//   row can see, the hole is the longest run of chunks below it that the row cannot. A sliding-window layer reads
+//   the window of its ring instead of the ring, without scanning the mask; O(n_kv) per sequence, O(n_kv/256) per row.
+void llama_kv_cache::set_input_kq_ranges(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, int64_t n_kv) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_I32 && dst->ne[0] == 3 && ggml_is_contiguous(dst));
+
+    const int64_t n_stream = dst->ne[3];
+    const int64_t n_tps    = dst->ne[1];
+    GGML_ASSERT(n_tps*n_stream == (int64_t) ubatch->n_tokens);
+
+    // as in set_input_kq_mask
+    if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
+        causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
+    }
+    // a non-causal row sees its whole sequence from the start of the batch on (LLAMA_NON_CAUSAL_TYPE_SWA_FULL), so the
+    //   window bounds only causal rows
+    const bool windowed = swa_type != LLAMA_SWA_TYPE_NONE && causal_attn;
+
+    constexpr int64_t chunk    = GGML_KQ_RANGE_CHUNK;
+    const     int64_t n_chunks = (n_kv + chunk - 1)/chunk;
+
+    // the smallest and largest position of the cells of a sequence in each chunk, per (cells stream, sequence)
+    struct chunk_pos {
+        llama_pos lo = std::numeric_limits<llama_pos>::max();
+        llama_pos hi = std::numeric_limits<llama_pos>::min();
+    };
+    std::map<std::pair<uint32_t, llama_seq_id>, std::vector<chunk_pos>> seq_chunks;
+
+    int32_t * data = (int32_t *) dst->data;
+
+    for (int64_t i = 0; i < (int64_t) ubatch->n_tokens; ++i) {
+        const llama_seq_id seq_id = ubatch->seq_id[i][0];
+        const uint32_t     strm   = seq_to_stream[seq_id];
+
+        std::vector<chunk_pos> & chunks = seq_chunks[{strm, seq_id}];
+        if (chunks.empty()) {
+            chunks.resize(n_chunks);
+            const auto & cells   = v_cells[strm];
+            const bool   seq_all = cells.seq_has_all(seq_id);
+            const int64_t n_cells = std::min<int64_t>(n_kv, cells.size());
+            for (int64_t j = 0; j < n_cells; ++j) {
+                if (cells.is_empty(j) || (!seq_all && !cells.seq_has(j, seq_id))) {
+                    continue;
+                }
+                const llama_pos p0 = cells.pos_get(j);
+                chunk_pos & c = chunks[j/chunk];
+                c.lo = std::min(c.lo, p0);
+                c.hi = std::max(c.hi, p0);
+            }
+        }
+
+        // the positions the row can see
+        const llama_pos p1 = ubatch->pos[i];
+        llama_pos w_lo = std::numeric_limits<llama_pos>::min();
+        llama_pos w_hi = causal_attn ? p1 : std::numeric_limits<llama_pos>::max();
+        if (windowed) {
+            switch (swa_type) {
+                case LLAMA_SWA_TYPE_STANDARD:  w_lo = p1 - (llama_pos) n_swa + 1;          break;
+                case LLAMA_SWA_TYPE_CHUNKED:   w_lo = (p1 / (llama_pos) n_swa) * (llama_pos) n_swa; break;
+                case LLAMA_SWA_TYPE_SYMMETRIC: w_lo = p1 - (llama_pos) n_swa/2;
+                                               w_hi = std::min(w_hi, p1 + (llama_pos) n_swa/2); break;
+                case LLAMA_SWA_TYPE_NONE:                                                   break;
+            }
+        }
+
+        int64_t last     = -1;
+        int64_t run_0    = 0; // the current run of chunks the row cannot see
+        int64_t best_0   = 0;
+        int64_t best_len = 0;
+        for (int64_t c = 0; c < n_chunks; ++c) {
+            const bool seen = chunks[c].lo <= w_hi && chunks[c].hi >= w_lo;
+            if (!seen) {
+                continue;
+            }
+            if (c - run_0 > best_len) {
+                best_0   = run_0;
+                best_len = c - run_0;
+            }
+            run_0 = c + 1;
+            last  = c;
+        }
+
+        int32_t * r = data + 3*i; // row ii of stream s is i = s*n_tps + ii, as in the mask
+        if (last < 0) {
+            // nothing visible: leave the row to the mask
+            r[0] = (int32_t) n_kv;
+            r[1] = 0;
+            r[2] = 0;
+            continue;
+        }
+        r[0] = (int32_t) std::min<int64_t>(n_kv, (last + 1)*chunk);
+        r[1] = (int32_t) (best_0*chunk);
+        r[2] = (int32_t) ((best_0 + best_len)*chunk);
+    }
+}
+
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -3105,6 +3205,10 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+void llama_kv_cache_context::set_input_kq_ranges(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, int64_t n_kv) const {
+    kv->set_input_kq_ranges(dst, ubatch, causal_attn, n_kv);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

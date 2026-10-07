@@ -5629,6 +5629,29 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+void ggml_flash_attn_ext_set_kv_ranges(
+        struct ggml_tensor * a,
+        struct ggml_tensor * ranges,
+        int32_t              n_visible_max) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(n_visible_max >= 0);
+
+    if (!ranges) {
+        a->src[5] = NULL;
+        ggml_set_op_params_i32(a, 5, 0);
+        return;
+    }
+
+    const struct ggml_tensor * mask = a->src[3];
+    GGML_ASSERT(mask != NULL);
+    GGML_ASSERT(ranges->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(ranges));
+    GGML_ASSERT(ranges->ne[0] == 3 && ranges->ne[1] == mask->ne[1] && ranges->ne[2] == 1 && ranges->ne[3] == mask->ne[3]);
+
+    a->src[5] = ranges;
+    ggml_set_op_params_i32(a, 5, n_visible_max);
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(

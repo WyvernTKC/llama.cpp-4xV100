@@ -12,6 +12,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <unordered_map>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -352,6 +353,7 @@ public:
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_ranges   = nullptr; // I32 [3, n_batch/n_stream, 1, n_stream], see ggml_flash_attn_ext_set_kv_ranges
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -522,6 +524,8 @@ public:
     ggml_tensor * self_kq_mask_cnv     = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_ranges       = nullptr; // I32 [3, n_batch/n_stream, 1, n_stream], see ggml_flash_attn_ext_set_kv_ranges
+    ggml_tensor * self_kq_ranges_swa   = nullptr; // I32 [3, n_batch/n_stream, 1, n_stream]
 
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
@@ -966,6 +970,14 @@ public:
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
+
+    // the KV ranges input of a KQ mask, with the bound on the cells a row sees (0 if unknown), for the flash
+    //   attentions that read the mask, see ggml_flash_attn_ext_set_kv_ranges
+    struct kq_ranges_entry {
+        ggml_tensor * ranges;
+        int32_t       n_visible_max;
+    };
+    std::unordered_map<const ggml_tensor *, kq_ranges_entry> kq_ranges;
 
     std::vector<llama_graph_reshape_group> reshape_groups;
     bool reshape_ok = true; // false once a reshape found something it cannot follow: the graph keeps its size

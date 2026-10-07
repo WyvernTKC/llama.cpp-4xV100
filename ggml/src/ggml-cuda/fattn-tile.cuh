@@ -913,6 +913,7 @@ static __global__ void flash_attn_tile(
         const char * mask_ptr,
         const char * sinks_ptr,
         const int  * KV_max_ptr,
+        const int  * KV_ranges_ptr,
         float      * dst_ptr,
         float2     * dst_meta_ptr,
         const float scale,
@@ -935,6 +936,7 @@ static __global__ void flash_attn_tile(
     const char * GGML_CUDA_RESTRICT mask     = mask_ptr;
     const char * GGML_CUDA_RESTRICT sinks    = sinks_ptr;
     const int  * GGML_CUDA_RESTRICT KV_max   = KV_max_ptr;
+    const int  * GGML_CUDA_RESTRICT KV_ranges = KV_ranges_ptr;
     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
 
@@ -942,7 +944,7 @@ static __global__ void flash_attn_tile(
 
     if ((use_logit_softcap && !(DV == 128 || DV == 256 || DV == 512)) ||
             (type_KV != GGML_TYPE_F16 && !ggml_cuda_fattn_tile_kv_type_direct(type_KV, DKQ, DV))) {
-        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
+        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, KV_ranges, dst, dst_meta, scale,
             max_bias, m0, m1, n_head_log2, logit_softcap,
             ne00, ne01, ne02, ne03,
                   nb01, nb02, nb03,
@@ -1026,6 +1028,22 @@ static __global__ void flash_attn_tile(
 
     ggml_cuda_pdl_sync();
 
+    // The KV range of this Q tile: its end, then a fully masked hole [lo, hi) to skip. KV_ranges holds it per mask row
+    //     (from the graph, see ggml_flash_attn_ext_set_kv_ranges), KV_max per tile (from a scan of the mask).
+    //     Read before Q so that the loads overlap.
+    int k_VKQ_max = ne11;
+    int k_hole_lo = 0;
+    int k_hole_hi = 0;
+    if (KV_ranges) {
+        ggml_cuda_fattn_tile_range(KV_ranges, sequence % ne33, col_Q_0, ncols1, ne31, ne11, k_VKQ_max, k_hole_lo, k_hole_hi);
+    } else if (KV_max) {
+        const int i_KV = sequence*gridDim.x + blockIdx.x;
+        const int n_KV = ne03*gridDim.x;
+        k_VKQ_max = KV_max[i_KV];
+        k_hole_lo = KV_max[1*n_KV + i_KV];
+        k_hole_hi = KV_max[2*n_KV + i_KV];
+    }
+
     // Load Q data, convert to FP16 if fast:
 #pragma unroll
     for (int jc0 = 0; jc0 < cpw; ++jc0) {
@@ -1077,17 +1095,6 @@ static __global__ void flash_attn_tile(
     __syncthreads();
 
     // Main loop over KV cache:
-    // KV_max holds the KV range of each Q tile: its end, then a fully masked hole [lo, hi) to skip.
-    int k_VKQ_max = ne11;
-    int k_hole_lo = 0;
-    int k_hole_hi = 0;
-    if (KV_max) {
-        const int i_KV = sequence*gridDim.x + blockIdx.x;
-        const int n_KV = ne03*gridDim.x;
-        k_VKQ_max = KV_max[i_KV];
-        k_hole_lo = KV_max[1*n_KV + i_KV];
-        k_hole_hi = KV_max[2*n_KV + i_KV];
-    }
     const auto skip_hole = [&](const int k) {
         if (k < k_hole_lo || k >= k_hole_hi) {
             return k;
@@ -1281,7 +1288,7 @@ static __global__ void flash_attn_tile(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_ranges_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,

@@ -2528,6 +2528,17 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // A hint of which K/V cells each mask row can see, so that a backend may skip the cells it cannot:
+    //   ranges: I32 [3, mask->ne[1], 1, mask->ne[3]], per mask row {end, hole_begin, hole_end} in cells, multiples of
+    //   GGML_KQ_RANGE_CHUNK (end may be n_kv): every mask value of the row at a cell >= end or in [hole_begin,
+    //   hole_end) is -INF. The ranges must describe the mask exactly in that sense; backends may ignore them.
+    //   n_visible_max bounds the cells a row sees (e.g. a sliding window), 0 if unknown.
+    #define GGML_KQ_RANGE_CHUNK 256
+    GGML_API void ggml_flash_attn_ext_set_kv_ranges(
+            struct ggml_tensor * a,
+            struct ggml_tensor * ranges,
+            int32_t              n_visible_max);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
