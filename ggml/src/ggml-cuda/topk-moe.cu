@@ -181,11 +181,17 @@ __global__ void topk_moe_cuda(const float *         logits,
         wt[i] = -INFINITY;
     }
 
+    // the bias never aliases the outputs: read with the logits, not after the barrier
+    [[maybe_unused]] float bias_v[has_bias ? experts_per_thread : 1];
+
     ggml_cuda_pdl_sync();
 #pragma unroll
     for (int i = 0; i < n_experts; i += WARP_SIZE) {
         const int expert  = i + threadIdx.x;
         wt[i / WARP_SIZE] = (n_experts % WARP_SIZE == 0 || expert < n_experts) ? logits[expert] : -INFINITY;
+        if constexpr (has_bias) {
+            bias_v[i / WARP_SIZE] = (n_experts % WARP_SIZE == 0 || expert < n_experts) ? bias[expert] : 0.0f;
+        }
     }
 
     // Weights and IDs can alias logits, so wait until every row in the block reads its logits.
@@ -226,7 +232,7 @@ __global__ void topk_moe_cuda(const float *         logits,
         for (int i = 0; i < n_experts; i += WARP_SIZE) {
             const int expert = i + threadIdx.x;
             selection_wt[i / WARP_SIZE] =
-                (n_experts % WARP_SIZE == 0 || expert < n_experts) ? wt[i / WARP_SIZE] + bias[expert] : -INFINITY;
+                (n_experts % WARP_SIZE == 0 || expert < n_experts) ? wt[i / WARP_SIZE] + bias_v[i / WARP_SIZE] : -INFINITY;
         }
         if constexpr (grouped) {
             topk_moe_mask_groups<experts_per_thread>(selection_wt, config.n_groups, config.n_group_used, threadIdx.x);
