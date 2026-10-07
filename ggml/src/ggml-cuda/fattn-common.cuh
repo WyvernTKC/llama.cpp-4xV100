@@ -790,6 +790,103 @@ static __global__ void flash_attn_mask_to_KV_max(
     KV_max[sequence*ne31 + jt] = KV_max_sj;
 }
 
+// The KV range of a Q tile for the vec and tile kernels: KV_max as above, plus a hole [lo, hi) of fully masked
+//     FATTN_KQ_STRIDE chunks that the kernels skip - the masked run right below the topmost visible run.
+//     A sliding-window layer reads the window of its ring cache (the hole is what lies below it, or between the
+//     two halves of a window that wraps around the end of the ring) instead of every cell of the ring.
+// Output: KV_max_ptr[0*n + i] = KV_max, [1*n + i] = lo, [2*n + i] = hi, with n = tiles*sequences.
+#define FATTN_KV_RANGE_NTHREADS 1024
+
+template <int ncols1>
+__launch_bounds__(FATTN_KV_RANGE_NTHREADS, 1)
+static __global__ void flash_attn_mask_to_KV_range(
+        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int ne31, const int ne33, const int64_t s31, const int64_t s33) {
+    const half2 * GGML_CUDA_RESTRICT mask   = mask_ptr;
+    int         * GGML_CUDA_RESTRICT KV_out = KV_max_ptr;
+
+    // at a few tokens this is one block per call: enough warps that each walks only a few chunks
+    constexpr int nwarps = FATTN_KV_RANGE_NTHREADS/WARP_SIZE;
+
+    const int sequence = blockIdx.y;
+    const int jt       = blockIdx.x;
+    const int lane     = threadIdx.x % WARP_SIZE;
+    const int warp     = threadIdx.x / WARP_SIZE;
+    const int nwords   = (ne30 + 31) / 32;
+
+    extern __shared__ uint32_t visible[]; // bit c: chunk c holds a finite mask value in one of the tile's rows
+    __shared__ int top;  // last visible chunk
+    __shared__ int gap;  // last masked chunk below it
+    __shared__ int low;  // last visible chunk below that
+
+    mask += (sequence % ne33)*s33;
+
+    for (int w = threadIdx.x; w < nwords; w += blockDim.x) {
+        visible[w] = 0;
+    }
+    if (threadIdx.x == 0) {
+        top = -1;
+        gap = -1;
+        low = -1;
+    }
+    ggml_cuda_pdl_sync();
+    __syncthreads();
+
+    for (int c = warp; c < ne30; c += nwarps) {
+        int all_inf = 1;
+#pragma unroll
+        for (int j = 0; j < ncols1; ++j) {
+            const int row = min(jt*ncols1 + j, ne31 - 1); // the last tile's padding rows repeat its last row
+#pragma unroll
+            for (int i = 0; i < FATTN_KQ_STRIDE/2; i += WARP_SIZE) {
+                const float2 tmp = __half22float2(mask[row*s31 + c*(FATTN_KQ_STRIDE/2) + i + lane]);
+                all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
+            }
+        }
+        all_inf = warp_reduce_all(all_inf);
+        if (lane == 0 && !all_inf) {
+            atomicOr(&visible[c/32], 1u << (c % 32));
+        }
+    }
+    __syncthreads();
+
+    for (int w = threadIdx.x; w < nwords; w += blockDim.x) {
+        if (visible[w]) {
+            atomicMax(&top, w*32 + 31 - __clz(visible[w]));
+        }
+    }
+    __syncthreads();
+
+    const int c_top = top;
+    for (int w = threadIdx.x; w*32 < c_top; w += blockDim.x) {
+        const int      n_below = min(32, c_top - w*32);
+        const uint32_t masked  = ~visible[w] & (n_below == 32 ? 0xFFFFFFFFu : (1u << n_below) - 1u);
+        if (masked) {
+            atomicMax(&gap, w*32 + 31 - __clz(masked));
+        }
+    }
+    __syncthreads();
+
+    const int c_gap = gap;
+    for (int w = threadIdx.x; w*32 < c_gap; w += blockDim.x) {
+        const int      n_below = min(32, c_gap - w*32);
+        const uint32_t vis     = visible[w] & (n_below == 32 ? 0xFFFFFFFFu : (1u << n_below) - 1u);
+        if (vis) {
+            atomicMax(&low, w*32 + 31 - __clz(vis));
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    const int n = gridDim.x*gridDim.y;
+    const int i = sequence*gridDim.x + jt;
+    KV_out[0*n + i] = (c_top + 1)*FATTN_KQ_STRIDE;
+    KV_out[1*n + i] = c_gap >= 0 ? (low + 1)*FATTN_KQ_STRIDE : 0;
+    KV_out[2*n + i] = c_gap >= 0 ? (c_gap + 1)*FATTN_KQ_STRIDE : 0;
+}
+
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
@@ -1190,8 +1287,34 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
-    if (scan_mask) {
+    // The vec and tile kernels (no stream-k) also skip the fully masked hole below the last visible run: at a few
+    //     tokens that pays from a few thousand cells, e.g. a sliding-window layer reading its window of a ring cache
+    //     sized for a large ubatch. GGML_CUDA_FATTN_RANGE_MIN_KV sets the threshold, 0 turns the scan off.
+    static const int64_t range_min_kv = [] {
+        const char * env = getenv("GGML_CUDA_FATTN_RANGE_MIN_KV");
+        return env != nullptr ? (int64_t) atoll(env) : (int64_t) 4096;
+    }();
+    const bool scan_range = !stream_k && range_min_kv > 0 && K->ne[1] >= range_min_kv;
+    const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+        (Q->ne[1] >= 1024 || Q->ne[3] > 1 || scan_range);
+    if (scan_mask && !stream_k) {
+        const int64_t s31 = mask->nb[1] / sizeof(half2);
+        const int64_t s33 = mask->nb[3] / sizeof(half2);
+
+        const dim3 blocks_num_KV_range(ntiles_x, Q->ne[3], 1);
+        const dim3 block_dim_KV_range(FATTN_KV_RANGE_NTHREADS, 1, 1);
+
+        const int ne_KV_range = blocks_num_KV_range.x*blocks_num_KV_range.y;
+        const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
+        const size_t nbytes_shared_KV_range = ((iter_k + 31)/32)*sizeof(uint32_t);
+
+        KV_max.alloc(3*ne_KV_range);
+        ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
+            blocks_num_KV_range, block_dim_KV_range, nbytes_shared_KV_range, main_stream);
+        ggml_cuda_kernel_launch(flash_attn_mask_to_KV_range<ncols1>, launch_params,
+            (const half2 *) mask->data, KV_max.ptr, iter_k, (int) mask->ne[1], (int) mask->ne[3], s31, s33);
+        CUDA_CHECK(cudaGetLastError());
+    } else if (scan_mask) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 

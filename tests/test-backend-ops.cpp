@@ -10640,6 +10640,42 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     }
 };
 
+// a sliding window in a ring cache: query j of sequence s sees the window cells (offset + 997*s + j + t) % kv,
+//     t < window, which can wrap around the end of the ring; everything else is -INF
+struct test_flash_attn_ext_window : public test_flash_attn_ext {
+    const int64_t window;
+    const int64_t offset;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",window=" + std::to_string(window) + ",offset=" + std::to_string(offset);
+    }
+
+    test_flash_attn_ext_window(int64_t hsk, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb,
+                               int64_t window, int64_t offset, ggml_type type_KV = GGML_TYPE_F16)
+        : test_flash_attn_ext(hsk, hsv, nh, nr23, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV),
+          window(window), offset(offset) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+
+        ggml_tensor * m = ggml_get_tensor(ctx, "m");
+        std::vector<float> data_f32(ggml_nelements(m), -INFINITY);
+        std::vector<ggml_fp16_t> data_f16(ggml_nelements(m));
+        std::mt19937 gen(0x5EED);
+        std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+        for (int64_t s = 0; s < m->ne[3]; ++s) {
+            for (int64_t j = 0; j < m->ne[1]; ++j) {
+                float * row = data_f32.data() + (s*m->ne[1] + j)*m->ne[0];
+                for (int64_t t = 0; t < window; ++t) {
+                    row[(offset + 997*s + j + t) % m->ne[0]] = dis(gen);
+                }
+            }
+        }
+        ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), data_f16.size());
+        ggml_backend_tensor_set(m, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -14166,6 +14202,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 1024,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
 
+    // sliding window in a ring cache (gemma-4 SWA: D 256, gqa 2; muse-glimmer SWA: D 128, gqa 16): the vec and tile
+    //     kernels skip the masked hole - window at the top, in the middle at an unaligned offset, wrapped, at 0
+    for (int64_t offset : { 15360, 7001, 16000, 0 }) {
+        for (int64_t nb : { 1, 3 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 16384, nb, 1024, offset));
+            test_cases.emplace_back(new test_flash_attn_ext_window(128, 128, 1, {16, 1}, 16384, nb, 2048, offset));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 16384, 1, 1024, offset, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 2}, 16384, 1, 1024, offset));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 8192, 64, 1024, 6000));
+
     // Sparse mask hint: supported decode/prefill layouts and dense fallbacks.
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 2}, 4096, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  768));
@@ -14863,6 +14911,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+
+    // sliding window in a ring cache (gemma-4 SWA: D 256, gqa 2; muse-glimmer SWA: D 128, gqa 16): the vec and tile
+    //     kernels skip the masked hole - window at the top, in the middle at an unaligned offset, wrapped, at 0
+    for (int64_t offset : { 15360, 7001, 16000, 0 }) {
+        for (int64_t nb : { 1, 3 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 16384, nb, 1024, offset));
+            test_cases.emplace_back(new test_flash_attn_ext_window(128, 128, 1, {16, 1}, 16384, nb, 2048, offset));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 16384, 1, 1024, offset, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 2}, 16384, 1, 1024, offset));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_window(256, 256, 4, { 2, 1}, 8192, 64, 1024, 6000));
 
     // sparse decode at long context
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 49152, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,    0));

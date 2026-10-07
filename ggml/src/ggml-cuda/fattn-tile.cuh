@@ -1077,16 +1077,33 @@ static __global__ void flash_attn_tile(
     __syncthreads();
 
     // Main loop over KV cache:
-    const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+    // KV_max holds the KV range of each Q tile: its end, then a fully masked hole [lo, hi) to skip.
+    int k_VKQ_max = ne11;
+    int k_hole_lo = 0;
+    int k_hole_hi = 0;
+    if (KV_max) {
+        const int i_KV = sequence*gridDim.x + blockIdx.x;
+        const int n_KV = ne03*gridDim.x;
+        k_VKQ_max = KV_max[i_KV];
+        k_hole_lo = KV_max[1*n_KV + i_KV];
+        k_hole_hi = KV_max[2*n_KV + i_KV];
+    }
+    const auto skip_hole = [&](const int k) {
+        if (k < k_hole_lo || k >= k_hole_hi) {
+            return k;
+        }
+        const int stride = gridDim.y*nbatch_fa;
+        return k + (k_hole_hi - k + stride - 1) / stride * stride;
+    };
     if (ncols2 == 1) {
         // Branch with out-of-bounds checks.
-        int k_VKQ_0 = blockIdx.y*nbatch_fa;
+        int k_VKQ_0 = skip_hole(blockIdx.y*nbatch_fa);
         while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
                 stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
-            k_VKQ_0 += gridDim.y*nbatch_fa;
+            k_VKQ_0 = skip_hole(k_VKQ_0 + gridDim.y*nbatch_fa);
         }
         if (k_VKQ_0 < k_VKQ_max) {
             constexpr bool oob_check = true;
@@ -1096,7 +1113,7 @@ static __global__ void flash_attn_tile(
         }
     } else {
         // Branch without out-of-bounds checks.
-        for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
+        for (int k_VKQ_0 = skip_hole(blockIdx.y*nbatch_fa); k_VKQ_0 < k_VKQ_max; k_VKQ_0 = skip_hole(k_VKQ_0 + gridDim.y*nbatch_fa)) {
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,

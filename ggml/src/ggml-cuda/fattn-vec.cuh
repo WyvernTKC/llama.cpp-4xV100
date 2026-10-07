@@ -253,13 +253,35 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
     }
 
-    const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+    // KV_max holds the KV range of each Q tile: its end, then a fully masked hole [lo, hi) to skip.
+    int k_VKQ_max = ne11;
+    int k_hole_lo = 0;
+    int k_hole_hi = 0;
+    if (KV_max) {
+        const int i_KV = sequence*gridDim.x + blockIdx.x;
+        const int n_KV = ne03*gridDim.x;
+        k_VKQ_max = KV_max[i_KV];
+        k_hole_lo = KV_max[1*n_KV + i_KV];
+        k_hole_hi = KV_max[2*n_KV + i_KV];
+    }
     K     += blockIdx.y*nthreads * nb11;
     V     += blockIdx.y*nthreads * nb21;
     maskh += blockIdx.y*nthreads;
     for (int k_VKQ_0 = blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
              // Increment pointers after each loop:
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
+
+        if (k_VKQ_0 >= k_hole_lo && k_VKQ_0 < k_hole_hi) {
+            const int     stride = gridDim.y*nthreads;
+            const int64_t n_skip = (k_hole_hi - k_VKQ_0 + stride - 1) / stride;
+            k_VKQ_0 += n_skip*stride;
+            K       += n_skip*stride*nb11;
+            V       += n_skip*stride*nb21;
+            maskh   += n_skip*stride;
+            if (k_VKQ_0 >= k_VKQ_max) {
+                break;
+            }
+        }
 
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
