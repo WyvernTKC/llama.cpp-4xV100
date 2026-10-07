@@ -5140,13 +5140,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     //   with the peers (3 GPUs hung that way, every device ran eagerly and the threads drifted ~50 all-reduces apart).
     //   So only replayed graphs go out without a barrier; a captured graph goes out with the round after its capture,
     //   and subgraphs that run eagerly get a round each, as below.
-    bool session_done = false;
+    // The session covers the subgraphs up to the first boundary that is not such an all-reduce (n_sess of them), and the
+    //   loop after it does that boundary and the rest: a backend sampler gathers the logits, and the all-gather before
+    //   it made every subgraph of a decode run eagerly - 92 graph launches and 90 eager all-reduce kernels a token on
+    //   Goetia, ~0.4 ms of idle GPU between them.
+    bool   session_done = false;
+    size_t n_sess       = 0; // > 0: the first n_sess subgraphs ran in a session, without the communication after the last
     if (backend_ctx->session_plan != nullptr && backend_ctx->lpool && n_backends > 1 && D->n_subgraphs > 1 &&
-            backend_ctx->stage_pending.empty() && backend_ctx->expert_pools_pending.empty() &&
-            D->subgraph_comm[D->n_subgraphs - 1] != ggml_backend_meta_context::SUBGRAPH_COMM_ALLGATHER) {
+            backend_ctx->stage_pending.empty() && backend_ctx->expert_pools_pending.empty()) {
         std::vector<ggml_tensor *> & ar_nodes = backend_ctx->session_ar_nodes;
         ar_nodes.resize((D->n_subgraphs - 1)*n_backends);
-        bool session_ok = true;
+        bool   session_ok = true;
+        size_t n_ok       = 0; // subgraphs a session can run
         for (size_t i = 0; i < D->n_subgraphs && session_ok; i++) {
             for (size_t j = 0; j < n_backends && session_ok; j++) {
                 const ggml_cgraph * cgraph_ij = D->graphs[j].cgraphs[i].cgraph_main;
@@ -5155,11 +5160,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     ar_nodes[i*n_backends + j] = cgraph_ij->nodes[cgraph_ij->n_nodes - 1];
                 }
             }
-            if (session_ok && i + 1 < D->n_subgraphs) {
-                session_ok = D->subgraph_comm[i] == ggml_backend_meta_context::SUBGRAPH_COMM_ALLREDUCE &&
-                    backend_ctx->session_allreduce_supported(backend_ctx->comm_ctx, &ar_nodes[i*n_backends]);
+            if (!session_ok) {
+                break;
+            }
+            n_ok = i + 1;
+            if (i + 1 < D->n_subgraphs &&
+                    !(D->subgraph_comm[i] == ggml_backend_meta_context::SUBGRAPH_COMM_ALLREDUCE &&
+                      backend_ctx->session_allreduce_supported(backend_ctx->comm_ctx, &ar_nodes[i*n_backends]))) {
+                break; // the communication after subgraph i is for the loop below
             }
         }
+        n_sess     = n_ok;
+        session_ok = n_sess > 1;
 
         if (session_ok) {
             const int64_t t_launch_start_us = stats_enabled ? ggml_time_us() : 0;
@@ -5168,13 +5180,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             //   GGML_META_SESSION_CHUNK sets it
             static const size_t chunk = getenv("GGML_META_SESSION_CHUNK") ?
                 (size_t) std::max(1, atoi(getenv("GGML_META_SESSION_CHUNK"))) : 8;
-            const size_t n_chunks = (D->n_subgraphs + chunk - 1) / chunk;
+            const size_t n_chunks = (n_sess + chunk - 1) / chunk;
             std::vector<int> & modes = backend_ctx->session_modes;
             modes.resize(n_backends*n_chunks);
 
             auto plan = [&](size_t j, size_t c) {
                 const size_t i0 = c*chunk;
-                const size_t i1 = std::min(D->n_subgraphs, i0 + chunk);
+                const size_t i1 = std::min(n_sess, i0 + chunk);
                 modes[j*n_chunks + c] = backend_ctx->session_plan(backend_ctx->backend_configs[j].backend,
                     D->graphs[j].session_cgraphs.data() + i0, (int) (i1 - i0));
             };
@@ -5188,8 +5200,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             // the first chunk is planned alone and launched while the others are planned: the GPUs wait for one plan
             backend_ctx->lpool->run(n_backends, [&](size_t j) {
                 std::vector<ggml_cgraph *> & cgraphs_j = D->graphs[j].session_cgraphs;
-                cgraphs_j.resize(D->n_subgraphs);
-                for (size_t i = 0; i < D->n_subgraphs; i++) {
+                cgraphs_j.resize(n_sess);
+                for (size_t i = 0; i < n_sess; i++) {
                     cgraphs_j[i] = D->graphs[j].cgraphs[i].cgraph_main;
                 }
                 plan(j, 0);
@@ -5218,7 +5230,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (status[j] == GGML_STATUS_SUCCESS) {
                     status[j] = ggml_backend_graph_compute_async(backend_j, D->graphs[j].session_cgraphs[i]);
                 }
-                if (status[j] == GGML_STATUS_SUCCESS && i + 1 < D->n_subgraphs) {
+                if (status[j] == GGML_STATUS_SUCCESS && i + 1 < n_sess) {
                     backend_ctx->session_allreduce(backend_ctx->comm_ctx, &ar_nodes[i*n_backends], j);
                 }
             };
@@ -5232,7 +5244,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 const int    next = c_end < n_chunks ? modes[c_end] : -1;
                 const size_t i0   = c_end*chunk;
-                const size_t i1   = std::min(D->n_subgraphs, i0 + chunk);
+                const size_t i1   = std::min(n_sess, i0 + chunk);
 
                 // launches, then a capture or the first eager subgraph
                 backend_ctx->lpool->run(n_backends, [&](size_t j) {
@@ -5279,12 +5291,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     return status[j];
                 }
             }
-            session_done = true;
+            // an all-gather after the last subgraph is left to the loop below as well
+            session_done = n_sess == D->n_subgraphs &&
+                D->subgraph_comm[D->n_subgraphs - 1] != ggml_backend_meta_context::SUBGRAPH_COMM_ALLGATHER;
+        } else {
+            n_sess = 0;
         }
     }
 
-    for (size_t i = 0; i < D->n_subgraphs && !session_done; i++) {
+    for (size_t i = n_sess > 0 ? n_sess - 1 : 0; i < D->n_subgraphs && !session_done; i++) {
         const int64_t t_launch_start_us = stats_enabled ? ggml_time_us() : 0;
+
+        // the last subgraph of a session ran in it, only the communication after it is left
+        const bool computed = n_sess > 0 && i + 1 == n_sess;
 
         bool allreduce_done = false;
         if (backend_ctx->lpool) {
@@ -5305,7 +5324,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             ggml_status status[GGML_BACKEND_META_MAX_DEVICES];
             backend_ctx->lpool->run(n_backends, [&](size_t j) {
                 auto & bcj = backend_ctx->backend_configs[j];
-                status[j] = ggml_backend_graph_compute_async(bcj.backend, D->graphs[j].cgraphs[i].cgraph_main);
+                status[j] = computed ? GGML_STATUS_SUCCESS :
+                    ggml_backend_graph_compute_async(bcj.backend, D->graphs[j].cgraphs[i].cgraph_main);
                 if (ar_pending && status[j] == GGML_STATUS_SUCCESS) {
                     backend_ctx->comm_allreduce_launch(backend_ctx->comm_ctx, ar_nodes, j);
                 }
@@ -5318,7 +5338,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
         } else {
-            for (size_t j = 0; j < n_backends; j++) {
+            for (size_t j = 0; j < n_backends && !computed; j++) {
                 auto & bcj = backend_ctx->backend_configs[j];
                 const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, D->graphs[j].cgraphs[i].cgraph_main);
                 if (status != GGML_STATUS_SUCCESS) {
