@@ -259,6 +259,8 @@ int main() {
             { GGML_TYPE_Q8_0,  512, 256, 64, 8, 24, 3, false },
             { GGML_TYPE_Q8_0,  512, 256, 64, 8, 24, 3, true  },
             { GGML_TYPE_Q8_0,  512, 128, 64, 8, 24, 1, true  }, // short rows: the shared expert in the down launch
+            { GGML_TYPE_Q8_0,  512, 256, 128, 8, 80, 2, false }, // the plan of one warp over more slots than lanes
+            { GGML_TYPE_Q8_0,  512, 256, 128, 10, 80, 8, true }, // 80 ids = cap: more than one warp plans, the block loop
             { GGML_TYPE_MXFP4, 512, 256, 64, 6, 16, 1, false },
             { GGML_TYPE_MXFP4, 512, 256, 64, 6, 16, 1, true  },
             { GGML_TYPE_MXFP4, 512, 256, 64, 6, 16, 2, false },

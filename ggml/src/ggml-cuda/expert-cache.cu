@@ -50,23 +50,48 @@ struct ggml_cuda_expert_cache_group {
     int                        n;
 };
 
+// fast: at most this many ids, and no more than the capacity of any cache of the group, see expert_cache_plan
+#define GGML_CUDA_EXPERT_CACHE_PLAN_FAST_IDS 64
+#define GGML_CUDA_EXPERT_CACHE_PLAN_FAST_CAP 4096
+
 // The scheduler and the LRU run in one block. Hits are marked in parallel, misses are then taken one by one
 // so the victim of one is never the slot another still needs: the argmin over last_used cannot return a
 // slot touched by this batch, its stamp is the newest. Same ids on every device give the same slots.
+// fast (a few ids, decode): the same loop by warp 0 alone on a shared copy of last_used and expert_of, with the misses
+//   so far in shared memory instead of slot_of: no block barrier and no global round trip per miss, same victims.
 static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_group g, const int32_t * ids,
-        const int n_rows, const int n_per_row, const int row_stride) {
+        const int n_rows, const int n_per_row, const int row_stride, const bool fast) {
     const ggml_cuda_expert_cache_dev & d = g.d[blockIdx.x];
     __shared__ int      s_n_miss;
     __shared__ uint32_t s_min_val[32];
     __shared__ int      s_min_idx[32];
+    __shared__ int      s_remap[GGML_CUDA_EXPERT_CACHE_PLAN_FAST_IDS];
+    __shared__ int      s_id[GGML_CUDA_EXPERT_CACHE_PLAN_FAST_IDS];
+    __shared__ int      s_miss_expert[GGML_CUDA_EXPERT_CACHE_PLAN_FAST_IDS];
+    __shared__ int      s_miss_slot[GGML_CUDA_EXPERT_CACHE_PLAN_FAST_IDS];
+    extern __shared__ uint32_t s_lru[]; // fast: last_used [cap], then expert_of [cap]
 
     const int      n_ids = n_rows*n_per_row;
     const uint32_t clock = *d.clock;
+
+    uint32_t * s_last = s_lru;
+    int32_t  * s_exp  = (int32_t *) (s_lru + d.cap);
+    if (fast) {
+        // it does not depend on the ids, so its round trip overlaps theirs and that of slot_of
+        for (int s = threadIdx.x; s < d.cap; s += blockDim.x) {
+            s_last[s] = d.last_used[s];
+            s_exp[s]  = d.expert_of[s];
+        }
+    }
 
     for (int i = threadIdx.x; i < n_ids; i += blockDim.x) {
         const int id = ids[(i / n_per_row)*row_stride + (i % n_per_row)];
         const int sl = d.slot_of[id];
         d.remap[i] = sl;
+        if (fast) {
+            s_remap[i] = sl;
+            s_id[i]    = id;
+        }
         if (sl >= 0) {
             // several tokens of one ubatch may route to the same expert; max keeps the stamp deterministic
             atomicMax(&d.last_used[sl], clock + 1 + i);
@@ -76,6 +101,81 @@ static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_group g, c
         s_n_miss = 0;
     }
     __syncthreads();
+
+    if (fast) {
+        // the stamps of the hits, as in last_used: the copy may or may not have seen some of them, max is the same
+        for (int i = threadIdx.x; i < n_ids; i += blockDim.x) {
+            if (s_remap[i] >= 0) {
+                atomicMax(&s_last[s_remap[i]], clock + 1 + i);
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x >= WARP_SIZE) {
+            return;
+        }
+        const int lane   = threadIdx.x;
+        int       n_miss = 0;
+        for (int i = 0; i < n_ids; i++) {
+            if (s_remap[i] >= 0) {
+                continue;
+            }
+            const int id = s_id[i];
+            int sl_now = -1; // a second occurrence of a miss handled earlier in this loop
+            for (int k = 0; k < n_miss; k++) {
+                sl_now = s_miss_expert[k] == id ? s_miss_slot[k] : sl_now;
+            }
+            if (sl_now >= 0) {
+                if (lane == 0) {
+                    d.remap[i] = sl_now;
+                }
+                continue;
+            }
+
+            uint32_t best   = 0xffffffffu;
+            int      best_i = 0x7fffffff;
+            for (int s = lane; s < d.cap; s += WARP_SIZE) {
+                const uint32_t v = s_last[s];
+                if (v < best) {
+                    best   = v;
+                    best_i = s;
+                }
+            }
+            for (int off = 16; off > 0; off >>= 1) {
+                const uint32_t ob = __shfl_xor_sync(0xffffffff, best,   off);
+                const int      oi = __shfl_xor_sync(0xffffffff, best_i, off);
+                if (ob < best || (ob == best && oi < best_i)) {
+                    best   = ob;
+                    best_i = oi;
+                }
+            }
+            if (lane == 0) {
+                const int victim = best_i;
+                const int old    = s_exp[victim];
+                if (old >= 0) {
+                    d.slot_of[old] = -1;
+                }
+                s_exp[victim]       = id;
+                d.expert_of[victim] = id;
+                d.slot_of[id]       = victim;
+                s_last[victim]      = clock + 1 + i;
+                d.last_used[victim] = clock + 1 + i;
+                d.remap[i]          = victim;
+                d.miss_expert[n_miss] = id;
+                d.miss_slot[n_miss]   = victim;
+                s_miss_expert[n_miss] = id;
+                s_miss_slot[n_miss]   = victim;
+            }
+            n_miss++;
+            __syncwarp();
+        }
+        if (lane == 0) {
+            *d.n_miss = n_miss;
+            *d.clock  = clock + 1 + n_ids;
+            d.stats[0] += 1;
+            d.stats[1] += n_miss;
+        }
+        return;
+    }
 
     for (int i = 0; i < n_ids; i++) {
         if (d.remap[i] >= 0) {
@@ -364,7 +464,17 @@ void ggml_cuda_expert_cache_gather_group(ggml_backend_cuda_context & ctx, const 
         nbx = std::max(nbx, (int) std::min<size_t>(64, (c->d.slot_bytes/c->align + nthreads - 1)/nthreads));
     }
 
-    expert_cache_plan<<<n, 512, 0, stream>>>(g, (const int32_t *) ids->data, n_rows, n_per_row, row_stride);
+    int cap_min = INT_MAX;
+    int cap_max = 0;
+    for (int k = 0; k < n; k++) {
+        cap_min = std::min(cap_min, g.d[k].cap);
+        cap_max = std::max(cap_max, g.d[k].cap);
+    }
+    const int    n_ids = n_rows*n_per_row;
+    const bool   fast  = n_ids <= GGML_CUDA_EXPERT_CACHE_PLAN_FAST_IDS && n_ids <= cap_min &&
+                         cap_max <= GGML_CUDA_EXPERT_CACHE_PLAN_FAST_CAP;
+    const size_t smem  = fast ? 2*(size_t) cap_max*sizeof(uint32_t) : 0;
+    expert_cache_plan<<<n, 512, smem, stream>>>(g, (const int32_t *) ids->data, n_rows, n_per_row, row_stride, fast);
     CUDA_CHECK(cudaGetLastError());
 
     expert_cache_copy<<<dim3(nbx, n_rows*n_per_row, n), nthreads, 0, stream>>>(g);
