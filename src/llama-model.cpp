@@ -1067,7 +1067,72 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         return {{tensor->ne[axis], 1}};
     };
 
-    auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments) -> std::vector<int64_t> {
+    // The FFN splits n_ff in granules of lcm(blck_size, 128). Where n_ff is not a whole number of granules per device, the
+    //   dither balances the totals but every layer still gives some device a whole granule more, and each layer waits
+    //   for its slowest device: Goetia's experts, 704 = 5.5 x 128, put 256 rows on a device against 176 on average, its
+    //   dense FFN 2112 put 640 against 528, Qwen3.8-Flash's 640 put 256 against 160. A multiple of 64 or of 32 is taken
+    //   where it lowers the largest per-layer load; the others keep 128. Offloaded experts keep it too: their copies
+    //   move the rows of the slice, and a narrower row loses the wide copy units (34 bytes of q8_0 are 2-byte aligned).
+    auto get_ffn_granularity = [&](int64_t blck_size, int64_t ne, bool offloaded) -> int64_t {
+        const int64_t g_perf = std::lcm(blck_size, (int64_t) 128);
+        const int64_t n      = (int64_t) ud->n_devices;
+        if (offloaded || n < 2) {
+            return g_perf;
+        }
+        const float * tensor_split = ud->model->tensor_split();
+        double split_sum = 0.0;
+        for (int64_t j = 0; j < n; j++) {
+            split_sum += tensor_split == nullptr ? 0.0 : tensor_split[j];
+        }
+        // the largest load of a device in any layer, as a multiple of its share: every rotation, and the rounding
+        //   of each boundary up for its fraction of the layers (the dither)
+        auto max_load = [&](int64_t g) {
+            double worst = 0.0;
+            constexpr int n_u = 64;
+            for (int64_t rot = 0; rot < n; rot++) {
+                std::vector<double> share(n);
+                for (int64_t j = 0; j < n; j++) {
+                    share[j] = split_sum == 0.0 ? 1.0/n : tensor_split[(j + rot) % n] / split_sum;
+                }
+                for (int iu = 0; iu < n_u; iu++) {
+                    const double u   = (iu + 0.5) / n_u;
+                    double       acc = 0.0;
+                    int64_t      low = 0;
+                    for (int64_t j = 0; j < n; j++) {
+                        int64_t high = ne;
+                        if (j < n - 1) {
+                            acc += share[j];
+                            const double  b  = (double) ne * acc;
+                            const int64_t k0 = (int64_t) (b / g);
+                            high = std::min<int64_t>(ne, (k0 + (u < (b - k0 * g) / g ? 1 : 0)) * g);
+                        }
+                        if (share[j] > 0.0) {
+                            worst = std::max(worst, (double) (high - low) / (share[j] * ne));
+                        }
+                        low = high;
+                    }
+                }
+            }
+            return worst;
+        };
+        int64_t g_best = g_perf;
+        double  m_best = max_load(g_perf);
+        for (const int64_t gmin : {(int64_t) 64, (int64_t) 32}) {
+            const int64_t g = std::lcm(blck_size, gmin);
+            if (g >= g_best) {
+                continue;
+            }
+            const double m = max_load(g);
+            if (m < 0.98 * m_best) {
+                g_best = g;
+                m_best = m;
+            }
+        }
+        return g_best;
+    };
+
+    auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments,
+            bool offloaded) -> std::vector<int64_t> {
         // for better performance it may make sense to round up blck_size to a higher power of 2 so that more efficient kernels can be used
         {
             // per-head graph inputs are shared by all layers, they need the head granularity of the recurrent layers
@@ -1335,9 +1400,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
-            const int64_t blck_size_perf = std::lcm(blck_size, 128);
             GGML_ASSERT(segments.size() == 1);
-            return {blck_size_perf};
+            return {get_ffn_granularity(blck_size, segments[0].first, offloaded)};
         }
 
         // everything else
@@ -1376,12 +1440,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         int64_t d_rank  = 0;
         int64_t d_count = 0; // 0 disables the dither and floors the split point, as it was done before
         double  d_u     = -1.0; // >= 0: the dither position of an offloaded anchor in [0, 1), instead of d_rank / d_count
+        const bool offloaded = ud->model->tensor_split_offloaded.count(tc.tensor_axis_0) != 0;
         if (ud->model->arch != LLM_ARCH_MINIMAX_01) {
             const std::string anchor_name = ggml_get_name(tc.tensor_axis_0);
             if (anchor_name.compare(0, 4, "blk.") == 0) {
                 const size_t dot = anchor_name.find('.', 4);
                 GGML_ASSERT(dot != std::string::npos);
-                const bool offloaded = ud->model->tensor_split_offloaded.count(tc.tensor_axis_0) != 0;
                 const auto & lists   = offloaded ? ud->model->tensor_split_offloaded_layers_by_suffix : ud->model->tensor_split_layers_by_suffix;
                 const auto it_layers = lists.find(anchor_name.substr(dot + 1));
                 if (it_layers != lists.end()) {
@@ -1412,7 +1476,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
         }
         const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
-        const std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments);
+        const std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments, offloaded);
         for (size_t is = 0; is < segments.size(); is++) {
             const int64_t  ne_s = segments[is].first;
             const uint32_t nr_s = segments[is].second;
