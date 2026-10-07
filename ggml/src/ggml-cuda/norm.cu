@@ -546,6 +546,11 @@ static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
     [[maybe_unused]] float sv[cols_per_thread];
     [[maybe_unused]] float av[cols_per_thread];
     [[maybe_unused]] float bv[cols_per_thread];
+    // the post-norm weights of has_pre are read before the reductions too, up to the width where they still fit the
+    //   registers of 1024 threads
+    constexpr bool pre_w_early = cols_per_thread <= 6;
+    [[maybe_unused]] float wav[cols_per_thread];
+    [[maybe_unused]] float wbv[cols_per_thread];
 
     ggml_cuda_pdl_sync();
     if constexpr (has_pre) {
@@ -554,6 +559,10 @@ static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
             const int col = tid + i*block_size;
             av[i] = col < ncols ? pre.a[offset + col] : 0.0f;
             bv[i] = col < ncols ? pre.b[offset + col] : 0.0f;
+            if constexpr (pre_w_early) {
+                wav[i] = col < ncols ? pre.wa[col] : 0.0f;
+                wbv[i] = col < ncols ? pre.wb[col] : 0.0f;
+            }
         }
     } else {
         x += offset;
@@ -607,15 +616,15 @@ static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
                 tb += bv[i] * bv[i];
             }
         }
-        ta = block_reduce<block_reduce_method::SUM, block_size>(ta, s_sum + 64);
-        tb = block_reduce<block_reduce_method::SUM, block_size>(tb, s_sum + 96);
-        const float scale_a = rsqrtf(ta / ncols + pre.eps_a);
-        const float scale_b = rsqrtf(tb / ncols + pre.eps_b);
+        // both sums in one reduction, each with the shuffle tree of its own
+        const float2 tab = block_reduce<block_reduce_method::SUM, block_size>(make_float2(ta, tb), (float2 *) (s_sum + 64));
+        const float scale_a = rsqrtf(tab.x / ncols + pre.eps_a);
+        const float scale_b = rsqrtf(tab.y / ncols + pre.eps_b);
 #pragma unroll
         for (int i = 0; i < cols_per_thread; ++i) {
             const int   col = tid + i*block_size;
-            const float wa  = col < ncols ? pre.wa[col] : 0.0f;
-            const float wb  = col < ncols ? pre.wb[col] : 0.0f;
+            const float wa  = pre_w_early ? wav[i] : (col < ncols ? pre.wa[col] : 0.0f);
+            const float wb  = pre_w_early ? wbv[i] : (col < ncols ? pre.wb[col] : 0.0f);
             const float ya  = __fmul_rn(__fmul_rn(scale_a, av[i]), wa);
             xv[i] = col < ncols ? scale_b * bv[i] * wb + ya : 0.0f;
         }
