@@ -444,8 +444,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, n_ff / 2);  // distinct from n_ff so a saver key-clobber surfaces on reload
         ms.add_kv(LLM_KV_EXPERT_LATENT_LENGTH,       n_ff);
         ms.add_kv(LLM_KV_INTERLEAVE_MOE_LAYER_STEP,  uint32_t(2));
-        ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(2));
-        ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          uint32_t(2));
+        // all experts are used: with a random router the top-k has near-ties, and a flip between two kernels fails the NMSE check.
+        //   gemma4 uses 8 like its real models, for their 8-way reduction.
+        const uint32_t n_expert = arch == LLM_ARCH_GEMMA4 ? 8 : 2;
+        ms.add_kv(LLM_KV_EXPERT_COUNT,               n_expert);
+        ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          n_expert);
         ms.add_kv(LLM_KV_EXPERT_SHARED_COUNT,        uint32_t(1));
         ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         arch == LLM_ARCH_DEEPSEEK4 ? uint32_t(4) : uint32_t(2)); // sqrtsoftplus : sigmoid
         ms.add_kv(LLM_KV_EXPERT_GROUP_SCALE,         1.0f);
@@ -825,6 +828,7 @@ static bool moe_implemented(const llm_arch arch) {
         case LLM_ARCH_GRANITE:
         case LLM_ARCH_GRANITE_MOE:
         case LLM_ARCH_GRANITE_HYBRID:
+        case LLM_ARCH_GEMMA4:
         case LLM_ARCH_MISTRAL3:
         case LLM_ARCH_LLAMA_EMBED:
             return true;
