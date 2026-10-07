@@ -101,6 +101,12 @@ static __global__ void dsv4_hc_comb_f32(
     }
 }
 
+// the fast division by d of the indices of nr elements, or none (z == 0) when they do not fit 31 bits: a 64-bit division
+//   is a long software routine
+static uint3 dsv4_hc_fastdiv(const int64_t nr, const int64_t d) {
+    return nr <= INT_MAX ? init_fastdiv_values((uint64_t) d) : make_uint3(0, 0, 0);
+}
+
 // q8_copy: one token, also the q8_1 copy of the output (padded to k_padded) for the MMVQ matmul that reads it
 template <bool gated, bool q8_copy>
 static __global__ void dsv4_hc_pre_f32(
@@ -108,6 +114,7 @@ static __global__ void dsv4_hc_pre_f32(
         const float * weights,
         float * dst,
         int64_t n_embd,
+        const uint3 n_embd_fd,
         int64_t hc,
         int64_t n_tokens,
         int64_t sx0,
@@ -137,8 +144,16 @@ static __global__ void dsv4_hc_pre_f32(
 
     ggml_cuda_pdl_sync();
 
-    const int64_t i0 = ir % n_embd;
-    const int64_t it = ir / n_embd;
+    int64_t i0;
+    int64_t it;
+    if (n_embd_fd.z != 0) {
+        const uint2 qr = fast_div_modulo((uint32_t) ir, n_embd_fd);
+        it = qr.x;
+        i0 = qr.y;
+    } else {
+        i0 = ir % n_embd;
+        it = ir / n_embd;
+    }
 
     float sum = 0.0f;
     for (int64_t ih = 0; ih < hc; ++ih) {
@@ -164,7 +179,7 @@ static __global__ void dsv4_hc_pre_f32(
 template <bool q8_copy>
 static __global__ void dsv4_hc_pre_coef_f32(
         const float * x, const float * mixes, const float * m, const float * a, float * dst, const int64_t n_embd,
-        const int hc, const int64_t n_tokens, const int64_t sx0, const int64_t sx1, const int64_t sx2,
+        const uint3 n_embd_fd, const int hc, const int64_t n_tokens, const int64_t sx0, const int64_t sx1, const int64_t sx2,
         const int64_t smix1, const int ne_m, const int ne_a, const float ws, const float wb, const int64_t sd0,
         const int64_t sd1, const float scale, block_q8_1 * q8, const int64_t k_padded) {
     ggml_cuda_pdl_lc();
@@ -183,8 +198,16 @@ static __global__ void dsv4_hc_pre_coef_f32(
 
     ggml_cuda_pdl_sync();
 
-    const int64_t i0 = ir % n_embd;
-    const int64_t it = ir / n_embd;
+    int64_t i0;
+    int64_t it;
+    if (n_embd_fd.z != 0) {
+        const uint2 qr = fast_div_modulo((uint32_t) ir, n_embd_fd);
+        it = qr.x;
+        i0 = qr.y;
+    } else {
+        i0 = ir % n_embd;
+        it = ir / n_embd;
+    }
 
     float sum = 0.0f;
     for (int ih = 0; ih < hc; ++ih) {
@@ -209,7 +232,9 @@ static __global__ void dsv4_hc_post_f32(
         const float * comb,
         float * dst,
         int64_t n_embd,
+        const uint3 n_embd_fd,
         int64_t hc,
+        const uint3 hc_fd,
         int64_t n_tokens,
         int64_t sx0,
         int64_t sx1,
@@ -235,9 +260,20 @@ static __global__ void dsv4_hc_post_f32(
 
     ggml_cuda_pdl_sync();
 
-    const int64_t i0   = ir % n_embd;
-    const int64_t idst = (ir / n_embd) % hc;
-    const int64_t it   = ir / (n_embd * hc);
+    int64_t i0;
+    int64_t idst;
+    int64_t it;
+    if (n_embd_fd.z != 0) {
+        const uint2 qr0 = fast_div_modulo((uint32_t) ir, n_embd_fd);
+        const uint2 qr1 = fast_div_modulo(qr0.x, hc_fd);
+        i0   = qr0.y;
+        idst = qr1.y;
+        it   = qr1.x;
+    } else {
+        i0   = ir % n_embd;
+        idst = (ir / n_embd) % hc;
+        it   = ir / (n_embd * hc);
+    }
 
     const float p = dsv4_hc_post_weight<gated>(post[idst*sp0 + it*sp1], ps_in, pb_in, ps_out, pb_out);
     float sum;
@@ -333,7 +369,7 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                        (gated ? dsv4_hc_pre_f32<true, false> : dsv4_hc_pre_f32<false, false>);
     ggml_cuda_kernel_launch(kernel, launch_params,
             (const float *) x->data, (const float *) weights->data, (float *) dst->data,
-            n_embd, hc, n_tokens,
+            n_embd, dsv4_hc_fastdiv(std::max(nr, ne_padded), n_embd), hc, n_tokens,
             nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
             nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float),
@@ -373,7 +409,7 @@ void ggml_cuda_op_dsv4_hc_pre_coef(ggml_backend_cuda_context & ctx, const ggml_t
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, dim3(block_size, 1, 1), 0, ctx.stream());
     ggml_cuda_kernel_launch(q8 ? dsv4_hc_pre_coef_f32<true> : dsv4_hc_pre_coef_f32<false>, launch_params,
         (const float *) x->data, (const float *) mixes->data, (const float *) m->data, (const float *) a->data,
-        (float *) dst->data, n_embd, hc, n_tokens,
+        (float *) dst->data, n_embd, dsv4_hc_fastdiv(std::max(nr, ne_padded), n_embd), hc, n_tokens,
         (int64_t) (x->nb[0]/sizeof(float)), (int64_t) (x->nb[1]/sizeof(float)), (int64_t) (x->nb[2]/sizeof(float)),
         (int64_t) (mixes->nb[1]/sizeof(float)), (int) m->ne[0], (int) a->ne[0], ws, wb,
         (int64_t) (dst->nb[0]/sizeof(float)), (int64_t) (dst->nb[1]/sizeof(float)), scale, q8, ne_padded);
@@ -425,7 +461,7 @@ static void ggml_cuda_op_dsv4_hc_post_impl(ggml_backend_cuda_context & ctx, ggml
     ggml_cuda_kernel_launch(kernel, launch_params,
             (const float *) x->data, (const float *) residual->data,
             (const float *) post->data, comb ? (const float *) comb->data : nullptr, (float *) dst->data,
-            n_embd, hc, n_tokens,
+            n_embd, dsv4_hc_fastdiv(nr, n_embd), hc, dsv4_hc_fastdiv(nr, hc), n_tokens,
             nbx0 / sizeof(float), nbx1 / sizeof(float),
             nbr0 / sizeof(float), nbr1 / sizeof(float), nbr2 / sizeof(float),
             nbp0 / sizeof(float), nbp1 / sizeof(float),

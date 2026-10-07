@@ -262,9 +262,14 @@ void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 // f16_copy also writes the output as f16 to dst_f16, the input a cuBLAS matmul after it would convert; q8_copy the q8_1
 //   copy of one row (k a multiple of 32) to q8 for an MMVQ matmul, with zero blocks up to k_padded
+// the fast division by n of the indices of k elements, or none (z == 0) when they do not fit 31 bits
+static uint3 unary_gated_n_fastdiv(const int64_t k, const int64_t n) {
+    return k <= INT_MAX ? init_fastdiv_values((uint64_t) n) : make_uint3(0, 0, 0);
+}
+
 template <float (*op)(float), typename T, bool f16_copy = false, bool q8_copy = false>
-static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, half * dst_f16, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1,
-        block_q8_1 * q8, const int64_t k_padded) {
+static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, half * dst_f16, const int64_t k, const int64_t n,
+        const uint3 n_fd, const int64_t o0, const int64_t o1, block_q8_1 * q8, const int64_t k_padded) {
     ggml_cuda_pdl_lc();
     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
 
@@ -278,9 +283,20 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, 
         return;
     }
 
-    // perform base op and multiply with gate (either offset in same tensor or a separate one)
-    const int64_t j0 = (i / n) * o0 + (i % n);
-    const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
+    // perform base op and multiply with gate (either offset in same tensor or a separate one); a 64-bit division is a long
+    //   software routine, so the row and column come from a 32-bit fast division where they fit
+    int64_t row;
+    int64_t col;
+    if (n_fd.z != 0) {
+        const uint2 rc = fast_div_modulo((uint32_t) i, n_fd);
+        row = rc.x;
+        col = rc.y;
+    } else {
+        row = i / n;
+        col = i % n;
+    }
+    const int64_t j0 = row * o0 + col;
+    const int64_t j1 = o0 == o1 ? j0 : row * o1 + col;
 
     ggml_cuda_pdl_sync();
     const T v = ggml_cuda_cast<T>(op(ggml_cuda_cast<float>(x[j0])) * ggml_cuda_cast<float>(g[j1]));
@@ -297,14 +313,15 @@ template <float (*op)(float), typename T>
 static void unary_gated_cuda(const T * x, const T * g, T * dst, half * dst_f16, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream) {
     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
+    const uint3 n_fd = unary_gated_n_fastdiv(k, n);
     if constexpr (std::is_same_v<T, float>) {
         if (dst_f16 != nullptr) {
-            ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T, true>, launch_params, x, g, dst, dst_f16, k, n, o0, o1, nullptr, 0);
+            ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T, true>, launch_params, x, g, dst, dst_f16, k, n, n_fd, o0, o1, nullptr, 0);
             return;
         }
     }
     GGML_ASSERT(dst_f16 == nullptr);
-    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, dst_f16, k, n, o0, o1, nullptr, 0);
+    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, dst_f16, k, n, n_fd, o0, o1, nullptr, 0);
 }
 
 template <float (*op)(float)>
@@ -870,7 +887,7 @@ void ggml_cuda_op_cont_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * 
             const int64_t num_blocks = (ne_padded + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, ctx.stream());
             ggml_cuda_kernel_launch(unary_gated_op_kernel<op_sigmoid, float, false, true>, launch_params,
-                x, g, d, nullptr, k, nc, o0, nc, q8, ne_padded);
+                x, g, d, nullptr, k, nc, unary_gated_n_fastdiv(ne_padded, nc), o0, nc, q8, ne_padded);
             return;
         }
     }
@@ -1019,7 +1036,7 @@ void ggml_cuda_op_mul_add_sigmoid_scale(ggml_backend_cuda_context & ctx, ggml_te
 
 // dst = base + x * sigmoid(g[row]), each step rounded like its own kernel
 static __global__ void sigmoid_mul_add_f32(const float * g, const float * x, const float * base, float * dst,
-        const int ncols, const int64_t k) {
+        const int ncols, const uint3 ncols_fd, const int64_t k) {
     ggml_cuda_pdl_lc();
     const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
 
@@ -1027,8 +1044,11 @@ static __global__ void sigmoid_mul_add_f32(const float * g, const float * x, con
         return;
     }
 
+    // the row without a 64-bit division where the indices fit 31 bits, see unary_gated_op_kernel
+    const int64_t row = ncols_fd.z != 0 ? (int64_t) fastdiv((uint32_t) i, ncols_fd) : i / ncols;
+
     ggml_cuda_pdl_sync();
-    const float sg = op_sigmoid(g[i / ncols]);
+    const float sg = op_sigmoid(g[row]);
     dst[i] = __fadd_rn(base[i], __fmul_rn(x[i], sg));
 }
 
@@ -1063,7 +1083,8 @@ void ggml_cuda_op_sigmoid_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor *
     const int64_t num_blocks = (k + CUDA_SIGMOID_BLOCK_SIZE - 1) / CUDA_SIGMOID_BLOCK_SIZE;
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3) num_blocks, CUDA_SIGMOID_BLOCK_SIZE, 0, ctx.stream());
     ggml_cuda_kernel_launch(sigmoid_mul_add_f32, launch_params,
-        (const float *) g->data, (const float *) x->data, (const float *) base->data, (float *) add->data, (int) x->ne[0], k);
+        (const float *) g->data, (const float *) x->data, (const float *) base->data, (float *) add->data, (int) x->ne[0],
+        unary_gated_n_fastdiv(k, x->ne[0]), k);
 }
 
 /* fused mul + sigmoid + scale */
