@@ -5911,6 +5911,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
         if (j < cgraph->n_nodes && j <= i + 4 && cgraph->nodes[j]->op == GGML_OP_SET_ROWS &&
                 ggml_cuda_should_fuse_get_rows_set_rows(node, cgraph->nodes[j])) {
+            // a second pair with the same indices right after it (the kv and score rows a DeepSeek-V4 compressor
+            //   persists) goes into the same launch
+            int i1 = j + 1;
+            while (i1 < cgraph->n_nodes && i1 <= j + 4 && ggml_cuda_is_view_or_noop(cgraph->nodes[i1])) {
+                i1++;
+            }
+            if (i1 < cgraph->n_nodes && i1 <= j + 4 && cgraph->nodes[i1]->op == GGML_OP_GET_ROWS &&
+                    (cgraph->nodes[i1]->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && ggml_node_get_use_count(cgraph, i1) == 1) {
+                int j1 = i1 + 1;
+                while (j1 < cgraph->n_nodes && j1 <= i1 + 4 && ggml_cuda_is_view_or_noop(cgraph->nodes[j1])) {
+                    j1++;
+                }
+                if (j1 < cgraph->n_nodes && j1 <= i1 + 4 && cgraph->nodes[j1]->op == GGML_OP_SET_ROWS &&
+                        ggml_cuda_should_fuse_get_rows_set_rows(cgraph->nodes[i1], cgraph->nodes[j1]) &&
+                        ggml_cuda_can_pair_get_rows_set_rows(node, cgraph->nodes[j], cgraph->nodes[i1], cgraph->nodes[j1])) {
+                    ggml_cuda_op_get_rows_set_rows(*cuda_ctx, node, cgraph->nodes[j], cgraph->nodes[i1], cgraph->nodes[j1]);
+                    return j1 - i;
+                }
+            }
             ggml_cuda_op_get_rows_set_rows(*cuda_ctx, node, cgraph->nodes[j]);
             return j - i;
         }

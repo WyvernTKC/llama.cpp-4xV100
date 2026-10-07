@@ -9319,7 +9319,8 @@ struct test_dsv4_compress : public test_case {
 };
 
 // GET_ROWS of a float matrix followed by the SET_ROWS of the gathered rows into a state (DeepSeek-V4's persisted
-//   compressor rows) or by the ADD of them to a matrix (its position bias)
+//   compressor rows) or by the ADD of them to a matrix (its position bias). n_cols2 > 0: a second GET_ROWS -> SET_ROWS
+//   pair of that width with the same indices, as the compressor persists its kv and score rows, both results compared.
 struct test_get_rows_fused : public test_case {
     const ggml_type type_src;
     const ggml_type type_dst; // the SET_ROWS destination
@@ -9329,6 +9330,7 @@ struct test_get_rows_fused : public test_case {
     const int64_t   n_dst;    // rows of the destination
     const bool      add;
     const bool      idx64;    // i64 SET_ROWS indices
+    const int64_t   n_cols2;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -9336,15 +9338,15 @@ struct test_get_rows_fused : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR8(type_src, type_dst, n_cols, n_src, n_k, n_dst, add, idx64);
+        return VARS_TO_STR9(type_src, type_dst, n_cols, n_src, n_k, n_dst, add, idx64, n_cols2);
     }
 
     bool run_whole_graph() override { return true; }
 
     test_get_rows_fused(ggml_type type_src = GGML_TYPE_F32, ggml_type type_dst = GGML_TYPE_F32, int64_t n_cols = 1024,
-            int64_t n_src = 1, int64_t n_k = 1, int64_t n_dst = 8, bool add = false, bool idx64 = true)
+            int64_t n_src = 1, int64_t n_k = 1, int64_t n_dst = 8, bool add = false, bool idx64 = true, int64_t n_cols2 = 0)
         : type_src(type_src), type_dst(type_dst), n_cols(n_cols), n_src(n_src), n_k(n_k), n_dst(n_dst), add(add),
-          idx64(idx64) {}
+          idx64(idx64), n_cols2(n_cols2) {}
 
     void initialize_tensors(ggml_context * ctx) override {
         std::mt19937 rng(1234);
@@ -9395,6 +9397,15 @@ struct test_get_rows_fused : public test_case {
             ggml_set_name(dst,  "dst");
             ggml_set_name(sidx, "sidx");
             out = ggml_set_rows(ctx, dst, rows, sidx);
+            if (n_cols2 > 0) {
+                ggml_tensor * src2 = ggml_new_tensor_2d(ctx, type_src, n_cols2, n_src);
+                ggml_tensor * dst2 = ggml_new_tensor_2d(ctx, type_dst, n_cols2, n_dst);
+                ggml_set_name(src2, "src2");
+                ggml_set_name(dst2, "dst2");
+                ggml_tensor * out2 = ggml_set_rows(ctx, dst2, ggml_get_rows(ctx, src2, gidx), sidx);
+                // f32 destinations, no op between the two pairs
+                out = ggml_concat(ctx, out, out2, 0);
+            }
         }
         ggml_set_name(out, "out");
         return out;
@@ -14564,6 +14575,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_get_rows_fused(GGML_TYPE_F32,  GGML_TYPE_F32,  512,  7,   5,  128, false, false));
     test_cases.emplace_back(new test_get_rows_fused(GGML_TYPE_F16,  GGML_TYPE_F16,  300,  20,  9,  12));
     test_cases.emplace_back(new test_get_rows_fused(GGML_TYPE_BF16, GGML_TYPE_F32,  256,  4,   4,  4));
+    test_cases.emplace_back(new test_get_rows_fused(GGML_TYPE_F32,  GGML_TYPE_F32,  512,  7,   5,  128, false, true,  512));
+    test_cases.emplace_back(new test_get_rows_fused(GGML_TYPE_F32,  GGML_TYPE_F32,  512,  7,   5,  128, false, false, 1024));
+    test_cases.emplace_back(new test_get_rows_fused(GGML_TYPE_F16,  GGML_TYPE_F32,  300,  20,  9,  12,  false, true,  100));
     test_cases.emplace_back(new test_get_rows_fused(GGML_TYPE_F32,  GGML_TYPE_F32,  1024, 128, 1,  1, true));
     test_cases.emplace_back(new test_get_rows_fused(GGML_TYPE_F16,  GGML_TYPE_F32,  700,  50,  33, 1, true));
     test_cases.emplace_back(new test_dsv4_compress(true,  512, 4,   1,  8,   1));

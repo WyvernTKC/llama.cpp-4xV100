@@ -22,5 +22,11 @@ void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
 //   ADD of them to an f32 matrix of the same shape, in one launch each; the conversions are those of the ops apart
 bool ggml_cuda_should_fuse_get_rows_set_rows(const ggml_tensor * get_rows, const ggml_tensor * set_rows);
 bool ggml_cuda_should_fuse_get_rows_add(const ggml_tensor * get_rows, const ggml_tensor * add);
-void ggml_cuda_op_get_rows_set_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * get_rows, ggml_tensor * set_rows);
+// a second pair (get_rows1, set_rows1) with the same indices runs in the same launch, see ggml_cuda_can_pair_get_rows_set_rows
+void ggml_cuda_op_get_rows_set_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * get_rows, ggml_tensor * set_rows,
+        const ggml_tensor * get_rows1 = nullptr, ggml_tensor * set_rows1 = nullptr);
 void ggml_cuda_op_get_rows_add(ggml_backend_cuda_context & ctx, const ggml_tensor * get_rows, ggml_tensor * add);
+
+// whether two fusable GET_ROWS -> SET_ROWS pairs share their indices, types and row count and neither writes what the other reads
+bool ggml_cuda_can_pair_get_rows_set_rows(const ggml_tensor * get_rows0, const ggml_tensor * set_rows0,
+        const ggml_tensor * get_rows1, const ggml_tensor * set_rows1);
