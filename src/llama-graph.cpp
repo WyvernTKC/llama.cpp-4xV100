@@ -1183,6 +1183,10 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
+    if (inp_attn->self_kq_ranges && inp_attn->self_kq_ranges->buffer) {
+        mctx->get_attn()->set_input_kq_ranges(inp_attn->self_kq_ranges, ubatch, cparams.causal_attn, inp_attn->self_kq_mask->ne[0]);
+    }
+
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
     }
@@ -1279,6 +1283,10 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
 
     if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
         attn_ctx->get_base()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+
+        if (inp_attn->self_kq_ranges && inp_attn->self_kq_ranges->buffer) {
+            attn_ctx->get_base()->set_input_kq_ranges(inp_attn->self_kq_ranges, ubatch, cparams.causal_attn, inp_attn->self_kq_mask->ne[0]);
+        }
     }
 
     // swa tensors may not be allocated if there are no SWA attention layers
@@ -1289,6 +1297,10 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
 
     if (inp_attn->self_kq_mask_swa && inp_attn->self_kq_mask_swa->buffer) {
         attn_ctx->get_swa()->set_input_kq_mask(inp_attn->self_kq_mask_swa, ubatch, cparams.causal_attn);
+
+        if (inp_attn->self_kq_ranges_swa && inp_attn->self_kq_ranges_swa->buffer) {
+            attn_ctx->get_swa()->set_input_kq_ranges(inp_attn->self_kq_ranges_swa, ubatch, cparams.causal_attn, inp_attn->self_kq_mask_swa->ne[0]);
+        }
     }
 
     if (inp_attn->self_k_rot) {
@@ -3799,6 +3811,11 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
     auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
 
+    inp_attn->self_kq_ranges = build_attn_inp_kq_ranges(ctx0, inp_attn->self_kq_mask, cparams);
+    if (inp_attn->self_kq_ranges) {
+        res->kq_ranges[inp_attn->self_kq_mask_cnv] = { inp_attn->self_kq_ranges, 0 };
+    }
+
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 
     return (llm_graph_input_mem_hybrid *) res->add_input(std::move(inp));
@@ -3839,6 +3856,15 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
 
         inp_attn->self_kq_mask_swa = build_attn_inp_kq_mask(ctx0, attn_ctx->get_swa(), ubatch, cparams);
         inp_attn->self_kq_mask_swa_cnv = inp_attn->self_kq_mask_swa;
+    }
+
+    inp_attn->self_kq_ranges     = build_attn_inp_kq_ranges(ctx0, inp_attn->self_kq_mask,     cparams);
+    inp_attn->self_kq_ranges_swa = build_attn_inp_kq_ranges(ctx0, inp_attn->self_kq_mask_swa, cparams);
+    if (inp_attn->self_kq_ranges) {
+        res->kq_ranges[inp_attn->self_kq_mask_cnv] = { inp_attn->self_kq_ranges, 0 };
+    }
+    if (inp_attn->self_kq_ranges_swa) {
+        res->kq_ranges[inp_attn->self_kq_mask_swa_cnv] = { inp_attn->self_kq_ranges_swa, kq_ranges_n_visible_max(hparams) };
     }
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
