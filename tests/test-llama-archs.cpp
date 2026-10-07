@@ -1151,6 +1151,10 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                             }
                         }
                     }
+                    // the CRT limits the open streams (512 on Windows), a leaked file skips the roundtrip of every later config
+                    if (file != nullptr) {
+                        fclose(file);
+                    }
                 }
 
                 if (test_executed) {
