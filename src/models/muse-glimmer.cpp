@@ -102,6 +102,13 @@ llama_model_muse_glimmer::graph::graph(const llama_model & model, const llm_grap
             ggml_tensor * gate = build_lora_mm(model.layers[il].wqkv_gate, attn_inp);
             cb(gate, "attn_gate_proj", il);
 
+            // the four projections of attn_inp next to each other in the graph, ahead of the norms of Q and K that
+            //   would otherwise sit between them: a backend can run neighbouring matmuls of one input as one launch
+            ggml_build_forward_expand(gf, Qcur);
+            ggml_build_forward_expand(gf, Kcur);
+            ggml_build_forward_expand(gf, Vcur);
+            ggml_build_forward_expand(gf, gate);
+
             // QK-norm. attn_q_norm weight was synthesized at conversion to broadcast
             // qk_scale_factor across head_dim; attn_k_norm is identity (ones).
             Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, NULL, LLM_NORM_RMS, il);
