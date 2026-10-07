@@ -1289,12 +1289,20 @@ void launch_fattn(
     //     multiple sequences of possibly different lengths.
     // The vec and tile kernels (no stream-k) also skip the fully masked hole below the last visible run: at a few
     //     tokens that pays from a few thousand cells, e.g. a sliding-window layer reading its window of a ring cache
-    //     sized for a large ubatch. GGML_CUDA_FATTN_RANGE_MIN_KV sets the threshold, 0 turns the scan off.
+    //     sized for a large ubatch. GGML_CUDA_FATTN_RANGE_MIN_KV sets the threshold, 0 turns the scan off. The scan
+    //     (~4 us) also needs enough K and V bytes to skip: muse-glimmer's 512 B of KV per cell lost 1.2% at 5k cells,
+    //     gemma-4-31B's 4 KiB gained 3.6%; GGML_CUDA_FATTN_RANGE_MIN_MIB sets that threshold.
     static const int64_t range_min_kv = [] {
         const char * env = getenv("GGML_CUDA_FATTN_RANGE_MIN_KV");
         return env != nullptr ? (int64_t) atoll(env) : (int64_t) 4096;
     }();
-    const bool scan_range = !stream_k && range_min_kv > 0 && K->ne[1] >= range_min_kv;
+    static const int64_t range_min_bytes = [] {
+        const char * env = getenv("GGML_CUDA_FATTN_RANGE_MIN_MIB");
+        return (env != nullptr ? (int64_t) atoll(env) : (int64_t) 8) << 20;
+    }();
+    const int64_t kv_bytes = K->ne[1]*K->ne[2]*K->ne[3]*
+        (int64_t) (ggml_row_size(K->type, K->ne[0]) + (V_is_K_view ? 0 : ggml_row_size(V->type, V->ne[0])));
+    const bool scan_range = !stream_k && range_min_kv > 0 && K->ne[1] >= range_min_kv && kv_bytes >= range_min_bytes;
     int * KV_range = nullptr; // the scan of the vec and tile kernels, KV_max or a cached copy
     const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 &&
         (Q->ne[1] >= 1024 || Q->ne[3] > 1 || scan_range);
