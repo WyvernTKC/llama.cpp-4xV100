@@ -482,6 +482,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         const ggml_tensor * tensor_axis_0;
 
         uint32_t il;
+        uint32_t il_split; // the layer whose rotation and dither rank the split uses, see get_tensor_config_impl
         size_t   rotation; // when assigning tensor slices, rotate how the rounding is done for more even allocation
         bool     even_split; // ignore the tensor split weights and give every device the same slice
     };
@@ -532,36 +533,20 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return ret;
         };
 
-        // a layer that reads another layer's kv cache has to put its q heads on the devices that hold
-        //   those kv heads, so it takes the rotation of the layer it borrows from rather than its own
-        auto get_rotation = [&](const uint32_t il) {
-            const int32_t il_kv = hparams.kv_reuse_layer(il);
-            return get_il_eff(il_kv < 0 ? il : (uint32_t) il_kv) % ud->n_devices;
-        };
-
         uint32_t il;
         std::string prefix;
-        size_t rotation;
         if (tensor_name.substr(0, 4) == "blk.") {
             const size_t length_prefix = tensor_name.find('.', 4);
             GGML_ASSERT(length_prefix != std::string::npos);
             prefix = tensor_name.substr(0, length_prefix + 1);
             il = std::stoull(tensor_name.substr(4, length_prefix));
-            rotation = get_rotation(il);
         } else if (tensor_name.substr(0, 6) == "cache_") {
             const size_t layer_index_start = tensor_name.find("_l", 6);
             GGML_ASSERT(layer_index_start != std::string::npos);
             il = std::stoull(tensor_name.substr(layer_index_start + 2));
             prefix = "blk." + std::to_string(il) + ".";
-            rotation = get_rotation(il);
         } else {
             il = 0;
-            rotation = hparams.n_layer() % ud->n_devices;
-        }
-        if (ud->model->arch == LLM_ARCH_MINIMAX_01) {
-            // the lightning attention decay rates and slopes are graph inputs shared by all layers,
-            //   so every layer has to split its heads in the same way for them to line up
-            rotation = 0;
         }
         const ggml_tensor * tensor_axis_0 = suffix.empty() ? tensor : ud->model->get_tensor((prefix + suffix).c_str());
         if (tensor_axis_0 == nullptr) {
@@ -569,9 +554,22 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             tensor_axis_0 = ud->model->get_tensor((prefix + suffix_fallback).c_str());
         }
         GGML_ASSERT(tensor_axis_0 != nullptr);
+        const bool is_attn = std::regex_match(ggml_get_name(tensor_axis_0), pattern_attn_out_weight);
+
+        // the attention of a layer that reads another layer's kv cache has to put its q heads on the devices that
+        //   hold those kv heads, so it is split like the layer it borrows from: same rotation and same dither rank
+        const int32_t  il_kv    = prefix.empty() || !is_attn ? -1 : hparams.kv_reuse_layer(il);
+        const uint32_t il_split = il_kv < 0 ? il : (uint32_t) il_kv;
+
+        size_t rotation = prefix.empty() ? hparams.n_layer() % ud->n_devices : get_il_eff(il_split) % ud->n_devices;
+        if (ud->model->arch == LLM_ARCH_MINIMAX_01) {
+            // the lightning attention decay rates and slopes are graph inputs shared by all layers,
+            //   so every layer has to split its heads in the same way for them to line up
+            rotation = 0;
+        }
         // the per-device q heads have to stay inside one kv head, which only the even split guarantees
-        const bool even_split = q_subgroup_split(il) && std::regex_match(ggml_get_name(tensor_axis_0), pattern_attn_out_weight);
-        return {axis, tensor_axis_0, il, rotation, even_split};
+        const bool even_split = q_subgroup_split(il) && is_attn;
+        return {axis, tensor_axis_0, il, il_split, rotation, even_split};
     };
 
     // Mamba-2 keeps z, x, B, C and dt in one fused in projection, and x, B, C in one fused conv.
@@ -1389,7 +1387,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 if (it_layers != lists.end()) {
                     const std::vector<uint32_t> & layers = it_layers->second;
                     d_count = 1 + (int64_t) layers.size();
-                    d_rank  = (int64_t) (std::lower_bound(layers.begin(), layers.end(), tc.il) - layers.begin());
+                    d_rank  = (int64_t) (std::lower_bound(layers.begin(), layers.end(), tc.il_split) - layers.begin());
                     if (offloaded) {
                         tc.rotation = 0;
                         d_u = 0.0;
