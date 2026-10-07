@@ -14984,6 +14984,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2048));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0));
     }
+    // dense decode of a full attention layer of head size 512 on one of 4 devices: gemma-4-31B (8 q heads on 1 kv head),
+    //     Goetia-26B-A4B (4 on 1)
+    for (int64_t kv : {256, 4096, 16384}) {
+        for (int64_t gqa : {8, 4}) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {gqa, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
     // Qwen QSA prefill on one of 4 devices: 6 q heads on 1 kv head, ubatch 1024, q8_0 cache
     for (int64_t kv : {16384, 24576, 32768, 65536, 131072}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, { 6, 1}, kv, 1024, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2051));

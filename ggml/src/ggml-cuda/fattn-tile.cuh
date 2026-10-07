@@ -716,7 +716,10 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 
     // KQ = K @ Q matrix multiplication:
     constexpr int nbatch_K_last = DKQ % nbatch_K;
-#pragma unroll
+    // a head size of 512 unrolled over all of its chunks no longer fits the instruction cache: with the few blocks of a
+    //     decode most stalls were instruction fetches, so its chunk loops stay rolled
+    constexpr int unroll_chunks = DKQ >= 512 ? 1 : 64;
+#pragma unroll unroll_chunks
     for (int k_KQ_0 = 0; k_KQ_0 < DKQ - nbatch_K_last; k_KQ_0 += nbatch_K) {
         flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>(
             Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
@@ -827,7 +830,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     constexpr int nbatch_V = (DV % nbatch_K == 0 ? nbatch_K : nbatch_K*2/3) * nbatch_fa / DV; // Number of V columns that fit in SRAM for K.
     static_assert(nbatch_fa % nbatch_V == 0, "bad nbatch_V");
     static_assert(nbatch_V % np == 0, "bad nbatch_V");
-#pragma unroll
+#pragma unroll unroll_chunks
     for (int k0 = 0; k0 < nbatch_fa; k0 += nbatch_V) {
         if constexpr (type_KV == GGML_TYPE_F16) {
             flash_attn_tile_load_tile<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
