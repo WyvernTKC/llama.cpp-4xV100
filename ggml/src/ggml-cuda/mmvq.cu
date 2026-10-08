@@ -1504,13 +1504,13 @@ static void mul_mat_vec_q_moe_launch(
 // each row still sums in the same order. It only loses once the grid drops below ~8 blocks per SM
 // (measured, one token: q4_K 17408x5120 -17%, MoE mxfp4 512x4096 x6 -17%, q8_0 256x4096 +15%).
 static bool mmvq_volta_multi_row(const int cc, const int nwarps, const int64_t nrows_x, const int64_t nchannels_dst,
-        const int64_t nsamples_dst) {
+        const int64_t nsamples_dst, const int min_blocks_per_sm = 8) {
     const bool is_nvidia_volta = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA && cc < GGML_CUDA_CC_TURING;
     if (!is_nvidia_volta || nwarps <= 1) {
         return false;
     }
     const int64_t nblocks = int64_t((nrows_x + nwarps - 1) / nwarps) * nchannels_dst * nsamples_dst;
-    return nblocks >= 8*ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    return nblocks >= min_blocks_per_sm*ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
 }
 
 // Where several rows in a block are slower, by type and arch.
@@ -1597,6 +1597,10 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return mmvq_wide(type, table_id, c_ncols_dst) && blocks_per_row_x > calc_nwarps(type, c_ncols_dst, table_id) * blocks_per_iter_1warp;
     };
 
+    // the rows of the launch: those of the siblings run in the same blocks
+    const int64_t nrows_launch = nrows_x + (has_ids ? 0 :
+        (fusion.sib_x ? fusion.sib_nrows : 0) + (fusion.sib2_x ? fusion.sib2_nrows : 0) + (fusion.gdn_x ? fusion.gdn_nrows : 0));
+
     // Whether the plain kernel puts several rows in a block.
     const auto multi_row = [&](int c_ncols_dst) {
         // When K is small, increase rows_per_block to match nwarps so each warp has more work to do
@@ -1605,7 +1609,10 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int  bpi    = use_wide(c_ncols_dst) ? get_vdr_mmvq_wide(type) * warp_size / qi : blocks_per_iter_1warp;
         bool       use    = nwarps > 1 && blocks_per_row_x < nwarps * bpi;
 
-        if (c_ncols_dst == 1 && mmvq_volta_multi_row(cc, nwarps, nrows_x, nchannels_dst, nsamples_dst)) {
+        // a row of one K iteration loads too little per block alone, which pays down to 4 blocks per SM (q8_0 2048x1024,
+        //   Ornith's ssm_out and attn_output per device: 7.0 -> 5.8 us in situ)
+        const int min_blocks_per_sm = blocks_per_row_x <= nwarps * bpi ? 4 : 8;
+        if (c_ncols_dst == 1 && mmvq_volta_multi_row(cc, nwarps, nrows_launch, nchannels_dst, nsamples_dst, min_blocks_per_sm)) {
             use = true;
         }
 
