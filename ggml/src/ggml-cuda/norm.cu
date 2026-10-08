@@ -506,6 +506,57 @@ static __global__ void __launch_bounds__(block_size) rms_norm_pre_add_f32(const 
     }
 }
 
+// The sum of a row split over the blocks of a launch (gridDim.x blocks of blockDim.x threads), in the order block_reduce
+//   sums the row with one block of all those threads: the shuffle tree of each warp, then the tree over the warp sums in
+//   warp order. Each warp stores its sum with the launch's tag in one 8-byte store per value (slots: one uint4 per warp
+//   of the row), and lane l of every warp polls the slot of warp l until it holds the tag, so no block waits on a
+//   counter. Every block must be resident at once.
+static __device__ __forceinline__ void row_split_put(uint4 * slot, const float2 v, const unsigned int tag) {
+    asm volatile("st.volatile.global.v4.u32 [%0], {%1, %2, %3, %4};" ::
+        "l"(slot), "r"(__float_as_uint(v.x)), "r"(tag), "r"(__float_as_uint(v.y)), "r"(tag) : "memory");
+}
+
+static __device__ __forceinline__ float2 row_split_get(const uint4 * slot, const unsigned int tag) {
+    unsigned int x, tx, y, ty;
+    do {
+        asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];" :
+            "=r"(x), "=r"(tx), "=r"(y), "=r"(ty) : "l"(slot) : "memory");
+    } while (tx != tag || ty != tag);
+    return make_float2(__uint_as_float(x), __uint_as_float(y));
+}
+
+template <typename T>
+static __device__ __forceinline__ T row_split_reduce(T val, uint4 * slots, const unsigned int tag, const int nwarps_row) {
+    static_assert(std::is_same_v<T, float> || std::is_same_v<T, float2>, "float or float2");
+    val = warp_reduce_sum(val);
+    const int lane = threadIdx.x % WARP_SIZE;
+    if (lane == 0) {
+        float2 v;
+        if constexpr (std::is_same_v<T, float>) {
+            v = make_float2(val, 0.0f);
+        } else {
+            v = val;
+        }
+        row_split_put(slots + (blockIdx.x*blockDim.x + threadIdx.x) / WARP_SIZE, v, tag);
+    }
+    val = T{};
+    if (lane < nwarps_row) {
+        const float2 v = row_split_get(slots + lane, tag);
+        if constexpr (std::is_same_v<T, float>) {
+            val = v.x;
+        } else {
+            val = v;
+        }
+    }
+    return warp_reduce_sum(val);
+}
+
+// In block_flags: the epoch of row_split_reduce at ROW_SPLIT_EPOCH (a launch tags its sums with epoch + 1, and block 0
+//   moves the epoch on once every block has stored its first sum, i.e. read the epoch), its slots from ROW_SPLIT_SLOTS
+//   on: 32 uint4 for each of the (up to three) reductions of a launch.
+#define ROW_SPLIT_EPOCH 4
+#define ROW_SPLIT_SLOTS 8
+
 // y = rms_norm(x) * w1 + r, with has_scale y *= s (one value or one per column), and dst = rms_norm(y) * w2: the
 //   post-norm of a gemma attention or FFN block, its residual add (and the layer output scale) and the pre-norm of the
 //   next block on the same row in one launch. Both norms reduce like rms_norm_f32 with the same block size and the y
@@ -513,6 +564,9 @@ static __global__ void __launch_bounds__(block_size) rms_norm_pre_add_f32(const 
 //   first reduction, so an output may sit exactly on an input; the second reduction has its own shared slots.
 // has_pre: x is not read but made as rms_norm(a) * wa + rms_norm(b) * wb, the two post-norms of a gemma4 MoE block (the
 //   dense MLP and the experts) summed, rounded like the RMS_NORM -> MUL and RMS_NORM -> MUL -> ADD kernels apart.
+// nsplit > 1: one row over nsplit blocks of block_size threads, each thread with the columns it would have in one block
+//   of nsplit*block_size threads, and the sums of row_split_reduce in the same order: the same results. All inputs are
+//   read before the first reduction, which every block waits for, so the outputs may still sit on them. No q8_1 copy.
 struct rms_norm_pre_pair {
     const float * a  = nullptr;
     const float * wa = nullptr;
@@ -522,23 +576,32 @@ struct rms_norm_pre_pair {
     float eps_b = 0.0f;
 };
 
-template <int block_size, int cols_per_thread, bool has_scale, bool has_pre = false>
+template <int block_size, int cols_per_thread, bool has_scale, bool has_pre = false, int nsplit = 1>
 static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
         const float * x, const float * w1, const float * r, const float * s, const float * w2, float * y_out, float * dst,
         const int ncols, const float eps1, const float eps2, const bool s_per_col,
         block_q8_1 * q8_dst = nullptr, const int nq8 = 0, unsigned int * flags = nullptr, const rms_norm_pre_pair pre = {},
         const float out_scale = 1.0f) {
     ggml_cuda_pdl_lc();
+    constexpr int row_threads = block_size*nsplit; // the threads of the row, whose order the sums keep
     // the q8_1 copy of dst as in rms_norm_pre_add_f32: blocks after the first, one row
     const bool emitter  = q8_dst != nullptr && blockIdx.x > 0;
     const int nrows     = q8_dst != nullptr ? 1 : gridDim.x;
     const int nchannels = gridDim.y;
-    const int tid       = threadIdx.x;
+    const int tid       = (nsplit > 1 ? blockIdx.x*block_size : 0) + threadIdx.x;
 
-    const int64_t offset = q8_dst != nullptr ? 0 : ((int64_t(blockIdx.z)*nchannels + blockIdx.y)*nrows + blockIdx.x)*ncols;
+    const int64_t offset = q8_dst != nullptr || nsplit > 1 ? 0 : ((int64_t(blockIdx.z)*nchannels + blockIdx.y)*nrows + blockIdx.x)*ncols;
     r     += offset;
     y_out += offset;
     dst   += offset;
+
+    // nsplit > 1: the slots and the tag of row_split_reduce
+    [[maybe_unused]] uint4 *      slots = nullptr;
+    [[maybe_unused]] unsigned int tag   = 0;
+    if constexpr (nsplit > 1) {
+        slots = (uint4 *) (flags + ROW_SPLIT_SLOTS);
+        tag   = *(volatile unsigned int *) (flags + ROW_SPLIT_EPOCH) + 1;
+    }
 
     float xv[cols_per_thread];
     float w1v[cols_per_thread];
@@ -557,7 +620,7 @@ static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
     if constexpr (has_pre) {
 #pragma unroll
         for (int i = 0; i < cols_per_thread; ++i) {
-            const int col = tid + i*block_size;
+            const int col = tid + i*row_threads;
             av[i] = col < ncols ? pre.a[offset + col] : 0.0f;
             bv[i] = col < ncols ? pre.b[offset + col] : 0.0f;
             if constexpr (pre_w_early) {
@@ -569,13 +632,13 @@ static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
         x += offset;
 #pragma unroll
         for (int i = 0; i < cols_per_thread; ++i) {
-            const int col = tid + i*block_size;
+            const int col = tid + i*row_threads;
             xv[i] = col < ncols ? x[col] : 0.0f;
         }
     }
 #pragma unroll
     for (int i = 0; i < cols_per_thread; ++i) {
-        const int col = tid + i*block_size;
+        const int col = tid + i*row_threads;
         w1v[i] = col < ncols ? w1[col] : 0.0f;
         rv[i]  = col < ncols ? r[col]  : 0.0f;
         w2v[i] = col < ncols ? w2[col] : 0.0f;
@@ -612,18 +675,23 @@ static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
         float tb = 0.0f;
 #pragma unroll
         for (int i = 0; i < cols_per_thread; ++i) {
-            if (tid + i*block_size < ncols) {
+            if (tid + i*row_threads < ncols) {
                 ta += av[i] * av[i];
                 tb += bv[i] * bv[i];
             }
         }
         // both sums in one reduction, each with the shuffle tree of its own
-        const float2 tab = block_reduce<block_reduce_method::SUM, block_size>(make_float2(ta, tb), (float2 *) (s_sum + 64));
+        float2 tab;
+        if constexpr (nsplit > 1) {
+            tab = row_split_reduce(make_float2(ta, tb), slots + 64, tag, row_threads/WARP_SIZE);
+        } else {
+            tab = block_reduce<block_reduce_method::SUM, block_size>(make_float2(ta, tb), (float2 *) (s_sum + 64));
+        }
         const float scale_a = rsqrtf(tab.x / ncols + pre.eps_a);
         const float scale_b = rsqrtf(tab.y / ncols + pre.eps_b);
 #pragma unroll
         for (int i = 0; i < cols_per_thread; ++i) {
-            const int   col = tid + i*block_size;
+            const int   col = tid + i*row_threads;
             const float wa  = pre_w_early ? wav[i] : (col < ncols ? pre.wa[col] : 0.0f);
             const float wb  = pre_w_early ? wbv[i] : (col < ncols ? pre.wb[col] : 0.0f);
             const float ya  = __fmul_rn(__fmul_rn(scale_a, av[i]), wa);
@@ -634,11 +702,19 @@ static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
     float tmp = 0.0f;
 #pragma unroll
     for (int i = 0; i < cols_per_thread; ++i) {
-        if (tid + i*block_size < ncols) {
+        if (tid + i*row_threads < ncols) {
             tmp += xv[i] * xv[i];
         }
     }
-    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    if constexpr (nsplit > 1) {
+        tmp = row_split_reduce(tmp, slots, tag, row_threads/WARP_SIZE);
+        // every block has read the epoch
+        if (blockIdx.x == 0 && threadIdx.x == 0) {
+            *(volatile unsigned int *) (flags + ROW_SPLIT_EPOCH) = tag;
+        }
+    } else {
+        tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    }
     const float scale1 = rsqrtf(tmp / ncols + eps1);
 
     // the other blocks have read the inputs; lower the flag for the next launch
@@ -654,7 +730,7 @@ static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
     float tmp2 = 0.0f;
 #pragma unroll
     for (int i = 0; i < cols_per_thread; ++i) {
-        const int col = tid + i*block_size;
+        const int col = tid + i*row_threads;
         if (col >= ncols) {
             continue;
         }
@@ -668,7 +744,11 @@ static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
         xv[i] = y;
         tmp2 += y * y;
     }
-    tmp2 = block_reduce<block_reduce_method::SUM, block_size>(tmp2, s_sum + 32);
+    if constexpr (nsplit > 1) {
+        tmp2 = row_split_reduce(tmp2, slots + 32, tag, row_threads/WARP_SIZE);
+    } else {
+        tmp2 = block_reduce<block_reduce_method::SUM, block_size>(tmp2, s_sum + 32);
+    }
     const float scale2 = rsqrtf(tmp2 / ncols + eps2);
 
     if (emitter) {
@@ -689,7 +769,7 @@ static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
 
 #pragma unroll
     for (int i = 0; i < cols_per_thread; ++i) {
-        const int col = tid + i*block_size;
+        const int col = tid + i*row_threads;
         // out_scale: a SCALE between the second norm and its weight, applied as rms_norm_f32 does (exact at 1)
         if (col < ncols) {
             dst[col] = (out_scale * (scale2 * xv[i])) * w2v[i];
@@ -1679,17 +1759,36 @@ void ggml_cuda_op_rms_norm_add_rms_norm(ggml_backend_cuda_context & ctx, ggml_te
         }
     }
 
+    // one row of the 1024-thread kernel over 8 blocks (see rms_norm_add_rms_norm_f32) for rows of more than 4 columns per
+    //   thread: Muse-Glimmer (6656 columns) 8.0 -> 6.3 us in situ under CUDA graphs. Not with the q8_1 copy, whose
+    //   blocks of 32 each warp would then quantize in turn (gemma-4-31B 7.9 -> 9.1 us), nor for rows of 3 columns per
+    //   thread (Goetia's 2816: 4.3 -> 6.0 us). GGML_CUDA_NO_NORM_SPLIT=1 turns it off.
+    static const bool no_split = getenv("GGML_CUDA_NO_NORM_SPLIT") != nullptr;
+    const int nsplit = !no_split && ggml_nrows(x) == 1 && block_size == 1024 && ncols > 4*1024 && q8_d == nullptr ? 8 : 1;
+    if (nsplit > 1) {
+        grid  = dim3(nsplit, 1, 1);
+        flags = ctx.block_flags_get();
+    }
+
     const auto launch = [&](auto has_scale, auto block_size, auto cols) {
         constexpr int nc = decltype(cols)::value;
         if constexpr (nc > 0) {
             constexpr int bs = decltype(block_size)::value;
-            const ggml_cuda_kernel_launch_params launch_params{grid, dim3(bs, 1, 1), 128 * sizeof(float), ctx.stream()};
-            const auto kernel = has_pre ? rms_norm_add_rms_norm_f32<bs, nc, decltype(has_scale)::value, true> :
-                                          rms_norm_add_rms_norm_f32<bs, nc, decltype(has_scale)::value, false>;
-            ggml_cuda_kernel_launch(kernel, launch_params,
-                (const float *) x->data, (const float *) w1->data, (const float *) r->data,
-                s != nullptr ? (const float *) s->data : nullptr, (const float *) w2->data, (float *) y->data,
-                (float *) mul2->data, ncols, eps1, eps2, s_per_col, q8_d, nq8, flags, pre, out_scale);
+            constexpr bool hs = decltype(has_scale)::value;
+            const auto run = [&](auto kernel, const int threads) {
+                const ggml_cuda_kernel_launch_params launch_params{grid, dim3(threads, 1, 1), 128 * sizeof(float), ctx.stream()};
+                ggml_cuda_kernel_launch(kernel, launch_params,
+                    (const float *) x->data, (const float *) w1->data, (const float *) r->data,
+                    s != nullptr ? (const float *) s->data : nullptr, (const float *) w2->data, (float *) y->data,
+                    (float *) mul2->data, ncols, eps1, eps2, s_per_col, q8_d, nq8, flags, pre, out_scale);
+            };
+            if constexpr (bs == 1024 && nc > 4) {
+                if (nsplit == 8) {
+                    run(has_pre ? rms_norm_add_rms_norm_f32<128, nc, hs, true, 8> : rms_norm_add_rms_norm_f32<128, nc, hs, false, 8>, 128);
+                    return;
+                }
+            }
+            run(has_pre ? rms_norm_add_rms_norm_f32<bs, nc, hs, true> : rms_norm_add_rms_norm_f32<bs, nc, hs, false>, bs);
         } else {
             GGML_ABORT("fatal error");
         }

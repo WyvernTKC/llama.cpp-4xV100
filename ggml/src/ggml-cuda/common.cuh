@@ -1655,14 +1655,15 @@ struct ggml_backend_cuda_context {
     }
 
     // two flags for a kernel whose blocks wait on its first block (see rms_norm_emit_q8_1), then the ticket of the
-    //   topk_moe in a router's launch (ggml_cuda_topk_moe_fold); all zero between launches
+    //   topk_moe in a router's launch (ggml_cuda_topk_moe_fold), all zero between launches; then the epoch and the
+    //   tagged slots of a row split over blocks (row_split_reduce in norm.cu)
     unsigned int * block_flags[GGML_CUDA_MAX_DEVICES] = { nullptr };
 
     unsigned int * block_flags_get() {
         if (block_flags[device] == nullptr) {
             ggml_cuda_set_device(device);
-            CUDA_CHECK(cudaMalloc(&block_flags[device], 4*sizeof(unsigned int)));
-            CUDA_CHECK(cudaMemset(block_flags[device], 0, 4*sizeof(unsigned int)));
+            CUDA_CHECK(cudaMalloc(&block_flags[device], 512*sizeof(unsigned int)));
+            CUDA_CHECK(cudaMemset(block_flags[device], 0, 512*sizeof(unsigned int)));
         }
         return block_flags[device];
     }

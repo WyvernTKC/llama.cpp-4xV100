@@ -13138,10 +13138,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
         }
     }
-    // every columns-per-thread count of both block sizes, gemma-4-31B (5376) and its MoE sibling (2816), and a row past
-    //   the register path, which stays apart
+    // every columns-per-thread count of both block sizes, gemma-4-31B (5376), its MoE sibling (2816) and Muse-Glimmer
+    //   (6656), and a row past the register path, which stays apart; one row runs over several blocks
     for (int scale : {0, 1, 2}) {
-        for (int64_t n : {64, 700, 1000, 1025, 2816, 5376, 8192, 9000}) {
+        for (int64_t n : {64, 700, 1000, 1025, 2816, 5376, 6656, 8192, 9000}) {
             test_cases.emplace_back(new test_rms_norm_add_rms_norm({n, 1, 1, 1}, scale));
             test_cases.emplace_back(new test_rms_norm_add_rms_norm({n, 6, 1, 1}, scale, 1e-6f, 1e-5f));
         }
@@ -13151,16 +13151,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_rms_norm_add_rms_norm({2816, 3, 1, 1}, scale, 1e-6f, 1e-6f, 0, true));
         test_cases.emplace_back(new test_rms_norm_add_rms_norm({1000, 2, 2, 1}, scale, 1e-6f, 1e-5f, 0, true));
         test_cases.emplace_back(new test_rms_norm_add_rms_norm({2816, 1, 1, 1}, scale, 1e-6f, 1e-6f, 256, true));
+        test_cases.emplace_back(new test_rms_norm_add_rms_norm({6656, 1, 1, 1}, scale, 1e-6f, 1e-6f, 0, true));
         // the router input of a gemma4 MoE block, rms_norm(y) / sqrt(n_embd) * w, after the attention post-norm (no layer
         //   scale there)
         if (scale == 0) {
-            for (int64_t n : {700, 2816, 5376}) {
+            for (int64_t n : {700, 2816, 5376, 6656}) {
                 test_cases.emplace_back(new test_rms_norm_add_rms_norm({n, 1, 1, 1}, 0, 1e-6f, 1e-6f, 0, false, 1.0f/sqrtf((float) n)));
                 test_cases.emplace_back(new test_rms_norm_add_rms_norm({n, 3, 1, 1}, 0, 1e-6f, 1e-6f, 0, false, 1.0f/sqrtf((float) n)));
             }
         }
         // one row writes the q8_1 copy for the matmul that reads the second norm, two rows do not
-        for (int64_t n : {768, 2816, 5376}) {
+        for (int64_t n : {768, 2816, 5376, 6656}) {
             test_cases.emplace_back(new test_rms_norm_add_rms_norm({n, 1, 1, 1}, scale, 1e-6f, 1e-6f, 256));
             test_cases.emplace_back(new test_rms_norm_add_rms_norm({n, 2, 1, 1}, scale, 1e-6f, 1e-6f, 256));
         }
