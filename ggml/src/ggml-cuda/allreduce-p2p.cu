@@ -411,8 +411,10 @@ ggml_cuda_p2p_ar * ggml_cuda_p2p_ar_init(const int * devices, size_t n_devices) 
     }
     max_bytes = GGML_PAD(max_bytes, sizeof(float4));
 
-    // Batch-1 decode sizes (n_embd x 4 B). The LL kernel wins below ~32 KB and loses above ~48 KB.
-    size_t ll_max_bytes = 32*1024;
+    // Decode and speculative verify sizes (tokens x n_embd x 4 B). In the model the LL kernel wins up to 128 KB (4x V100,
+    //   -sm tensor, 4096 cells: Qwen3.8-27B 2/4 tokens = 40/80 KB +4.3%/+2.0%, Ornith 8 tokens = 64 KB +3.2%) and ties at
+    //   160 KB; a lock-step harness of the older kernel had it losing above ~48 KB.
+    size_t ll_max_bytes = 128*1024;
     if (const char * env = getenv("GGML_CUDA_P2P_AR_LL_MAX_BYTES")) {
         ll_max_bytes = (size_t) atoll(env);
     }
