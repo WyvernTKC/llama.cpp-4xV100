@@ -2460,9 +2460,12 @@ const slot_info_vec_t *   sinfos_in) {
 void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const {
     const auto & cells = v_cells[cr.strm];
 
+    // one list for every cell: a long context has 100k+ of them, each would allocate its own
+    std::vector<llama_seq_id> seq_ids;
+
     for (const auto & range : cr.data) {
         for (uint32_t i = range.first; i < range.second; ++i) {
-            std::vector<llama_seq_id> seq_ids;
+            seq_ids.clear();
 
             for (llama_seq_id cur = 0; cur < (int) n_seq_max; ++cur) {
                 if (cur == seq_id || seq_id == -1) {
