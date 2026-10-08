@@ -5,6 +5,8 @@
 #include "log.h"
 #include "reasoning-budget.h"
 
+#include "../src/llama-ext.h" // staging API: llama_set_sampler_raw_logits / llama_get_raw_logits_ith
+
 #include "ggml.h"
 
 #include <algorithm>
@@ -143,7 +145,20 @@ struct common_sampler {
 
         const int n_vocab = llama_vocab_n_tokens(vocab);
 
-        if (sampled_probs) {
+        // a backend top-k cut the output, but a lazy grammar that has triggered constrains the whole vocab: the raw
+        //   logits, copied as common_sampler_needs_raw_logits asks
+        const float * raw_logits = nullptr;
+        if ((sampled_probs || sampled_logits) && grmr && llama_sampler_grammar_constrains(grmr)) {
+            raw_logits = llama_get_raw_logits_ith(ctx, idx);
+            GGML_ASSERT(raw_logits != nullptr && "a grammar constrains an output cut by the backend without its raw logits");
+        }
+
+        if (raw_logits) {
+            cur.resize(n_vocab);
+            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+                cur[token_id] = llama_token_data{token_id, raw_logits[token_id], 0.0f};
+            }
+        } else if (sampled_probs) {
             const uint32_t sampled_probs_count = llama_get_sampled_probs_count_ith(ctx, idx);
             cur.resize(sampled_probs_count);
             for (uint32_t i = 0; i < sampled_probs_count; ++i) {
@@ -535,7 +550,7 @@ struct common_sampler * common_sampler_init(
         /* .rbudget     = */ rbudget,
         /* .chain       = */ chain,
         /* .prev        = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
-        /* .prefilter_k = */ grmr || n_bias_lower < 0 ? 0 : common_sampler_compute_prefilter_k(params, n_bias_lower),
+        /* .prefilter_k = */ (grmr && llama_sampler_grammar_constrains(grmr)) || n_bias_lower < 0 ? 0 : common_sampler_compute_prefilter_k(params, n_bias_lower),
         /* .cur         = */ {},
         /* .cur_p       = */ {},
         // mix it, the chain and the draft are seeded from this one too
@@ -707,6 +722,22 @@ int32_t common_sampler_prefilter_k(const struct common_sampler * gsmpl) {
     return gsmpl ? gsmpl->prefilter_k : 0;
 }
 
+bool common_sampler_needs_raw_logits(const struct common_sampler * gsmpl, bool replay) {
+    if (!gsmpl || !gsmpl->grmr || gsmpl->prefilter_k == 0) {
+        return false;
+    }
+    return replay || llama_sampler_grammar_constrains(gsmpl->grmr);
+}
+
+// The next output of a draft batch cannot be sampled: a lazy grammar triggered on a token of this batch, so it
+//   constrains the whole vocab now, and the backend top-k cut the output without its raw logits. The draft stops
+//   there, and the next batch has them (common_sampler_needs_raw_logits).
+static bool common_sampler_cut_under_grammar(const struct common_sampler * gsmpl, struct llama_context * ctx, int idx) {
+    return gsmpl->grmr && gsmpl->prefilter_k > 0 && llama_sampler_grammar_constrains(gsmpl->grmr) &&
+        (llama_get_sampled_logits_ith(ctx, idx) != nullptr || llama_get_sampled_probs_ith(ctx, idx) != nullptr) &&
+        llama_get_raw_logits_ith(ctx, idx) == nullptr;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -812,6 +843,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         if (draft[i] != id || (llama_vocab_is_eog(vocab, id) && i + 1 < draft.size())) {
             break;
         }
+
+        if (common_sampler_cut_under_grammar(gsmpl, ctx, idxs[i + 1])) {
+            break;
+        }
     }
 
     if (i == draft.size()) {
@@ -899,6 +934,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
             common_sampler_accept(gsmpl, draft[i], true);
             result.push_back(draft[i]);
+            if (common_sampler_cut_under_grammar(gsmpl, ctx, idxs[i + 1])) {
+                break;
+            }
             continue;
         }
 

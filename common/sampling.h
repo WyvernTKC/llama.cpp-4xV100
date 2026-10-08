@@ -57,8 +57,14 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 
 // the number of top logits that the chain can ever select from, so a backend top-k of this size in front of it
 //   changes nothing; 0 if the chain needs every logit (grammar, positive biases, samplers ahead of top-k that
-//   look at the whole distribution, ...). A reasoning budget does not: the token it forces is added to the cut
+//   look at the whole distribution, ...). A reasoning budget does not: the token it forces is added to the cut.
+//   Neither does a lazy grammar until it triggers: from then on the chain needs the raw logits as well
 int32_t common_sampler_prefilter_k(const struct common_sampler * gsmpl);
+
+// whether the next outputs need their raw logits copied besides the backend top-k (llama_set_sampler_raw_logits):
+//   a lazy grammar has triggered, or a replay of accepted draft tokens (after a checkpoint restore) may trigger it
+//   before its last output
+bool common_sampler_needs_raw_logits(const struct common_sampler * gsmpl, bool replay);
 
 // extended sampling implementation:
 //

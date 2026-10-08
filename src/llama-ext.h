@@ -130,6 +130,19 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+// With a sampler attached to seq_id (llama_set_sampler), also copy the raw logits of its outputs to the host, as
+//   without one. The sampling graph stays the same: a backend top-k ahead of a CPU chain keeps its cut, and the
+//   CPU chain can read the whole vocab when it needs it (a lazy grammar that has triggered).
+LLAMA_API void llama_set_sampler_raw_logits(struct llama_context * ctx, llama_seq_id seq_id, bool raw);
+
+// The raw logits of output i (as llama_get_logits_ith without a sampler), NULL when the last decode did not copy
+//   them: a sampler attached to its sequence and no llama_set_sampler_raw_logits.
+LLAMA_API float * llama_get_raw_logits_ith(struct llama_context * ctx, int32_t i);
+
+// Whether a grammar sampler (llama_sampler_init_grammar*) constrains the next token: false while a lazy grammar
+//   waits for its trigger or the grammar is empty, true otherwise and for any sampler that is not a grammar.
+LLAMA_API bool llama_sampler_grammar_constrains(const struct llama_sampler * smpl);
+
 //
 // model/context data extraction
 //

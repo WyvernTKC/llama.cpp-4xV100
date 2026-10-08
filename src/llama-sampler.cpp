@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-vocab.h"
 #include "llama-grammar.h"
+#include "llama-ext.h"
 
 #include "ggml-cpp.h"
 
@@ -2952,6 +2953,16 @@ static struct llama_sampler_i llama_sampler_grammar_i = {
     /* .backend_reset     = */ nullptr,
     /* .copy_state        = */ nullptr,
 };
+
+bool llama_sampler_grammar_constrains(const struct llama_sampler * smpl) {
+    if (smpl == nullptr || smpl->iface != &llama_sampler_grammar_i) {
+        return smpl != nullptr;
+    }
+
+    const auto * ctx = (const llama_sampler_grammar *) smpl->ctx;
+
+    return ctx->grammar != nullptr && !ctx->grammar->awaiting_trigger;
+}
 
 static struct llama_sampler * llama_sampler_init_grammar_impl(
         const struct llama_vocab * vocab,

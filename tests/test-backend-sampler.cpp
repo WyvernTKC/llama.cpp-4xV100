@@ -3,6 +3,8 @@
 #include "llama-cpp.h"
 #include "common.h"
 
+#include "../src/llama-ext.h" // llama_set_sampler_raw_logits, llama_get_raw_logits_ith
+
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
@@ -1971,6 +1973,73 @@ static void test_backend_multi_output_cpu_suffix(const test_params & params) {
     printf("backend multi-output CPU suffix test PASSED\n");
 }
 
+// llama_set_sampler_raw_logits: with a backend top-k attached, the raw logits of the outputs are copied only when
+//   asked for, the same as without a sampler, for every output of the batch, and the cut stays
+static void test_backend_raw_logits(const test_params & params) {
+    const llama_seq_id seq_id = 0;
+    const int32_t k = 8;
+    const llama_vocab * vocab = llama_model_get_vocab(params.model.get());
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+
+    std::vector<llama_token> tokens(32);
+    const std::string prompt = "The capital of France is";
+    tokens.resize(llama_tokenize(vocab, prompt.c_str(), prompt.length(), tokens.data(), tokens.size(), true, false));
+    GGML_ASSERT(tokens.size() >= 3);
+
+    // the last two tokens are outputs
+    const auto decode = [&](llama_context * ctx) {
+        llama_memory_clear(llama_get_memory(ctx), true);
+        common_batch batch(ctx);
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            batch.add(tokens[i], i, seq_id, i + 2 >= tokens.size());
+        }
+        GGML_ASSERT(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0);
+    };
+    const int32_t outs[2] = { (int32_t) tokens.size() - 2, (int32_t) tokens.size() - 1 };
+
+    std::vector<std::vector<float>> ref;
+    {
+        std::vector<llama_sampler_seq_config> configs;
+        test_context test_ctx(params, configs, 1, 2, 0, 0);
+        decode(test_ctx.ctx.get());
+        for (const int32_t i : outs) {
+            const float * logits = llama_get_logits_ith(test_ctx.ctx.get(), i);
+            GGML_ASSERT(logits != nullptr && llama_get_raw_logits_ith(test_ctx.ctx.get(), i) == logits);
+            ref.emplace_back(logits, logits + n_vocab);
+        }
+    }
+
+    llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(k));
+    std::vector<llama_sampler_seq_config> configs = {{ seq_id, chain.get() }};
+    test_context test_ctx(params, configs, 1, 2, 0, 0);
+    llama_context * ctx = test_ctx.ctx.get();
+
+    for (const bool raw : { false, true, false }) {
+        llama_set_sampler_raw_logits(ctx, seq_id, raw);
+        decode(ctx);
+        for (int o = 0; o < 2; ++o) {
+            GGML_ASSERT(llama_get_sampled_logits_count_ith(ctx, outs[o]) == (uint32_t) k);
+            const float * logits = llama_get_raw_logits_ith(ctx, outs[o]);
+            if (!raw) {
+                GGML_ASSERT(logits == nullptr);
+                continue;
+            }
+            GGML_ASSERT(logits != nullptr);
+            float max_err = 0.0f;
+            float max_abs = 0.0f;
+            for (int t = 0; t < n_vocab; ++t) {
+                max_err = std::max(max_err, std::fabs(logits[t] - ref[o][t]));
+                max_abs = std::max(max_abs, std::fabs(ref[o][t]));
+            }
+            printf("raw logits of output %d: max error %g (max |logit| %g)\n", outs[o], max_err, max_abs);
+            GGML_ASSERT(max_err <= 1e-3f*std::max(1.0f, max_abs));
+        }
+    }
+
+    printf("backend raw logits test PASSED\n");
+}
+
 struct backend_test_case {
     std::string name;
     void (*fn)(const test_params &);
@@ -1993,6 +2062,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "multi_output_dist_transaction", test_backend_multi_output_dist_transaction, true },
     { "multi_output_sampling_chain", test_backend_multi_output_sampling_chain, true },
     { "multi_output_cpu",      test_backend_multi_output_cpu_suffix, true },
+    { "raw_logits",            test_backend_raw_logits,              true },
     { "mixed",           test_backend_mixed_sampling,          true  },
     { "min_p",           test_backend_min_p_sampling,          true  },
     { "cpu_mixed",       test_backend_cpu_mixed_batch,         true  },

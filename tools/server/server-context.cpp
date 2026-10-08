@@ -18,6 +18,8 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include "../../src/llama-ext.h" // staging API: llama_set_sampler_raw_logits
+
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
@@ -412,6 +414,18 @@ struct server_slot {
     common_sampler_ptr smpl;
     llama_sampler_ptr  smpl_prefilter;       // backend top-k ahead of smpl, see common_sampler_prefilter_k
     int32_t            smpl_prefilter_k = 0; // its k
+    bool               smpl_raw_logits  = false; // the raw logits are copied too, see update_raw_logits
+
+    // A lazy grammar that has triggered constrains the whole vocab, so from then on the outputs need their raw logits
+    //   besides the prefilter's cut, and a replay of accepted draft tokens may trigger it again. The prefilter stays:
+    //   setting another sampler makes the context reserve its graphs again (about a second with -sm tensor).
+    void update_raw_logits() {
+        const bool raw = smpl && smpl_prefilter && common_sampler_needs_raw_logits(smpl.get(), spec_is_replay);
+        if (raw != smpl_raw_logits) {
+            llama_set_sampler_raw_logits(ctx_tgt, id, raw);
+            smpl_raw_logits = raw;
+        }
+    }
 
     llama_token sampled; // in speculative mode, this is the last accepted token
 
@@ -2080,6 +2094,8 @@ private:
                 slot.smpl_prefilter.reset();
                 slot.smpl_prefilter_k = 0;
             }
+
+            slot.update_raw_logits();
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
@@ -4496,6 +4512,7 @@ private:
             slot.i_batch = -1;
 
             common_sampler_accept(slot.smpl.get(), id, true);
+            slot.update_raw_logits();
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
@@ -4586,6 +4603,7 @@ private:
 
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
+                        slot.update_raw_logits();
                         slot.spec_draft = std::move(accepted);
 
                         const auto & ckpt = slot.spec_ckpt;
@@ -4623,6 +4641,7 @@ private:
                 n_accepted--;
             }
             slot.spec_is_replay = false;
+            slot.update_raw_logits();
 
             slot.stats.update_gen_last();
 

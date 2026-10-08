@@ -13,6 +13,7 @@
 
 #include <array>
 #include <map>
+#include <set>
 #include <vector>
 
 struct llama_model;
@@ -85,6 +86,7 @@ struct llama_context {
 
     float * get_logits();
     float * get_logits_ith(int32_t i);
+    float * get_raw_logits_ith(int32_t i);
 
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
@@ -267,6 +269,8 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    void set_sampler_raw_logits(llama_seq_id seq_id, bool raw);
+
 private:
     llm_graph_result * get_gf_res_prev();
 
@@ -316,6 +320,9 @@ private:
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
 
+    // the output rows of the last decode whose logits were not copied (a sampler attached, see needs_raw_logits)
+    std::vector<uint8_t> logits_skipped;
+
     // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
     buffer_view<float> embd = {nullptr, 0};
@@ -333,6 +340,9 @@ private:
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
+
+        // sequences with a sampler whose raw logits are copied too (llama_set_sampler_raw_logits)
+        std::set<llama_seq_id> raw_logits;
 
         buffer_view<float>       logits     = {nullptr, 0};
         buffer_view<llama_token> sampled    = {nullptr, 0};
