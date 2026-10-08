@@ -6,8 +6,12 @@
 
 #include "../src/llama-grammar.h"
 
+#include <bitset>
 #include <cassert>
+#include <cstdio>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 int main()
 {
@@ -401,6 +405,122 @@ int main()
     }
 
     llama_grammar_free_impl(grammar);
+
+    // The trigger patterns of a lazy grammar: a word escaped by regex_escape is searched as text, from where a match
+    //   could end in the piece just appended; a pattern that says which bytes a match starts with is matched at those
+    //   offsets only; everything else with the regex over the whole buffer. All find the leftmost match of the regex.
+    //   Pieces are appended one at a time as llama_grammar_accept_impl does, and the buffer starts over at a match.
+    {
+        const char * patterns[] = {
+            "<\\|tool_call>",          // "<|tool_call>" escaped
+            "\\[TOOL_CALLS\\]",       // "[TOOL_CALLS]" escaped
+            "<tool_call>",              // nothing to escape
+            "[\\s\\S]*?(<tool_call>)", // starts with a class: the regex path
+            "^\\s*\\{\"name\"",        // a line start
+            // muse-glimmer: a line start or '<', lookaheads after it
+            "(?:^|<\\|start\\|>assistant)( to=(?!self<\\|message\\|>)(?!user<\\|message\\|>)[^<]*?<\\|message\\|>)",
+            "<\\|start\\|>assistant(\\s+to)", // gpt-oss
+            "(?:x?(?:\"|y+?)|z*)\\{",      // optional terms before the first byte that must be there
+            "(?:a|b*)c?[d]",            // a class after optional terms: the regex path
+            "(?:T|m|t|@|<|\\||_|c|>|\\{)(?:o|h)", // many bytes: every offset looked at
+            "(?:^|\\{)\\{",              // '{' after a line end found twice
+        };
+        const size_t n_patterns = sizeof(patterns)/sizeof(patterns[0]);
+        llama_grammar * lazy = llama_grammar_init_impl(nullptr, "root ::= \"a\"", "root", true, patterns, n_patterns, nullptr, 0);
+        assert(lazy != nullptr);
+        assert(lazy->trigger_patterns.size() == n_patterns);
+        assert(lazy->trigger_patterns[0].literal == "<|tool_call>");
+        assert(lazy->trigger_patterns[1].literal == "[TOOL_CALLS]");
+        assert(lazy->trigger_patterns[2].literal == "<tool_call>");
+        for (size_t ip = 3; ip < n_patterns; ++ip) {
+            assert(lazy->trigger_patterns[ip].literal.empty());
+        }
+        const auto first = [&](size_t ip, const std::string & bytes, const std::string & bol_bytes) {
+            const llama_grammar_trigger_pattern & pat = lazy->trigger_patterns[ip];
+            std::bitset<256> expected;
+            std::bitset<256> expected_bol;
+            for (const char c : bytes) {
+                expected.set((unsigned char) c);
+            }
+            for (const char c : bol_bytes) {
+                expected_bol.set((unsigned char) c);
+            }
+            assert(pat.first_known && !pat.first_bol_any && pat.first_bytes == expected && pat.first_bol_bytes == expected_bol);
+        };
+        assert(!lazy->trigger_patterns[3].first_known);
+        first(4, "", std::string("\t\n\v\f\r {") + (char) 0x85 + (char) 0xa0);
+        first(5, "<", " ");
+        first(6, "<", "");
+        first(7, "x\"yz{", "");
+        assert(!lazy->trigger_patterns[8].first_known);
+        first(9, "Tmt@<|_c>{", "");
+        first(10, "{", "{");
+
+        const std::vector<std::string> pieces = {
+            "The ", "model ", "thinks", ". ", "<", "|", "tool", "_call", ">", " {\"name\"", "[TOOL", "_CALLS", "]",
+            "<tool_", "call>", "<|tool_c", "all>", "tool_call>", "<", "<|", "\n", " ", "{", "\"name\"", "x",
+            "<|start|>", "assistant", " to=", "self", "user", "functions.f", "<|message|>", "<|eom|>", "\r\n", "\t", "y",
+            "z", "\"", "a", "b", "c", " to=user<|message|>", "\n to=f<|message|>", "\n{",
+        };
+        size_t n_checked = 0;
+        size_t n_matched = 0;
+        for (size_t ip = 0; ip < n_patterns; ++ip) {
+            const llama_grammar_trigger_pattern & pat = lazy->trigger_patterns[ip];
+            llama_grammar_trigger_pattern by_regex = pat;
+            by_regex.literal.clear();
+            by_regex.first_known = false;
+            uint32_t rng = 12345 + (uint32_t) ip;
+            std::string buffer;
+            for (int step = 0; step < 1500; ++step) {
+                rng = rng*1664525u + 1013904223u;
+                const size_t searched = buffer.size();
+                buffer += pieces[(rng >> 8) % pieces.size()];
+                const size_t expected = by_regex.find(buffer);
+                const size_t got      = pat.find(buffer, searched);
+                if (expected != got) {
+                    fprintf(stderr, "trigger pattern %zu step %d: expected %zu, got %zu in '%s'\n", ip, step, expected, got, buffer.c_str());
+                    assert(false);
+                }
+                n_checked++;
+                if (expected != std::string::npos) {
+                    n_matched++;
+                    buffer.clear();
+                } else if (buffer.size() > 256) {
+                    buffer.clear(); // a new grammar: the regex the result is checked against is slow on long text
+                }
+            }
+        }
+        assert(n_matched >= 20);
+
+        // a match at the start of the input through the ^ alone
+        for (const auto & [ip, input] : std::vector<std::pair<size_t, std::string>> {
+                 { 4, " {\"name\"" }, { 5, " to=functions.f<|message|>" }, { 5, "x\n to=functions.f<|message|>" } }) {
+            llama_grammar_trigger_pattern by_regex = lazy->trigger_patterns[ip];
+            by_regex.first_known = false;
+            const size_t expected = by_regex.find(input);
+            assert(expected != std::string::npos);
+            assert(lazy->trigger_patterns[ip].find(input) == expected);
+        }
+
+        // past a budget of anchored tries the search takes the rest
+        {
+            const llama_grammar_trigger_pattern & pat = lazy->trigger_patterns[5];
+            llama_grammar_trigger_pattern by_regex = pat;
+            by_regex.first_known = false;
+            std::string buffer;
+            for (int k = 0; k < 64; ++k) {
+                buffer += "a <b ";
+            }
+            assert(pat.find(buffer) == std::string::npos && by_regex.find(buffer) == std::string::npos);
+            const std::string call = "<|start|>assistant to=functions.f<|message|>";
+            buffer += call;
+            const size_t expected = buffer.size() - call.size() + std::string("<|start|>assistant").size();
+            assert(by_regex.find(buffer) == expected);
+            assert(pat.find(buffer) == expected);
+        }
+        fprintf(stderr, "trigger patterns: %zu searches, %zu matches, the regex search agrees\n", n_checked, n_matched);
+        llama_grammar_free_impl(lazy);
+    }
 
     return 0;
 }

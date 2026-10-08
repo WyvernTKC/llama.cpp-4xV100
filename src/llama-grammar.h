@@ -2,6 +2,7 @@
 
 #include "llama.h"
 
+#include <bitset>
 #include <map>
 #include <regex>
 #include <string>
@@ -119,8 +120,18 @@ struct llama_grammar_parser {
 struct llama_grammar_trigger_pattern {
     std::string pattern;
     std::regex  regex;
+    std::string literal; // the text of a pattern that only escapes it (a trigger word), else empty
 
-    size_t find(const std::string & input) const;
+    // where a match can start when the pattern says (first_known): at a byte in first_bytes, or where a line starts at
+    //   a byte in first_bol_bytes, or at any line start with first_bol_any
+    bool             first_known   = false;
+    bool             first_bol_any = false;
+    std::bitset<256> first_bytes;
+    std::bitset<256> first_bol_bytes;
+
+    // the start of the first match in input, std::string::npos if none; with no match in input[0, from) the search
+    //   of a literal starts where a match could end at from or later
+    size_t find(const std::string & input, size_t from = 0) const;
 };
 
 struct llama_grammar {

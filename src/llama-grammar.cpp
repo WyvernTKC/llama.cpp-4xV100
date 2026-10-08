@@ -7,6 +7,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <set>
 #include <stdexcept>
 
@@ -379,7 +380,200 @@ static void print_rule(
 // Regex utilities
 //
 
-size_t llama_grammar_trigger_pattern::find(const std::string & input) const {
+// The text of a pattern that is a literal escaped as regex_escape does it (a trigger word), false for anything else.
+static bool llama_grammar_regex_literal(const std::string & pattern, std::string & literal) {
+    static const std::string special = ".^$|()*+?[]{}\\";
+    literal.clear();
+    for (size_t i = 0; i < pattern.size(); ++i) {
+        const char c = pattern[i];
+        if (c == '\\') {
+            if (i + 1 >= pattern.size() || special.find(pattern[i + 1]) == std::string::npos) {
+                return false; // a class or other escape, \s, \d, ...
+            }
+            literal += pattern[++i];
+        } else if (special.find(c) != std::string::npos) {
+            return false;
+        } else {
+            literal += c;
+        }
+    }
+    return !literal.empty();
+}
+
+// Where a match of a pattern can start: at a byte in bytes, or where a line starts (after a ^) at a byte in bol_bytes,
+//   or at any line start with bol_any (what follows the ^ can match empty). False when the pattern does not say: it can
+//   match empty, or a term a match can start with is a class, a ., a $, an escape of a letter or digit other than \s
+//   and \d, a lookahead or a quantifier in braces.
+namespace {
+struct llama_grammar_regex_first {
+    // the states of a match with nothing consumed yet: it started anywhere, or where a line starts (it passed a ^)
+    static constexpr uint8_t ANY = 1;
+    static constexpr uint8_t BOL = 2;
+
+    const std::string & s;
+    std::bitset<256>    bytes;
+    std::bitset<256>    bol_bytes;
+
+    explicit llama_grammar_regex_first(const std::string & s) : s(s) {}
+
+    // the '|' or ')' ending the alternative at i, or the end; npos for a class that starts with ']'
+    size_t alternative_end(size_t i) const {
+        int depth = 0;
+        while (i < s.size()) {
+            const char c = s[i];
+            if (c == '\\') {
+                i += 2;
+            } else if (c == '[') {
+                i++;
+                if (i < s.size() && s[i] == '^') {
+                    i++;
+                }
+                if (i < s.size() && s[i] == ']') {
+                    return std::string::npos; // [] and [^]: not a class with a ']' in it
+                }
+                while (i < s.size() && s[i] != ']') {
+                    i += s[i] == '\\' ? 2 : 1;
+                }
+                i++;
+            } else if (c == '(') {
+                depth++;
+                i++;
+            } else if (c == ')' || c == '|') {
+                if (depth == 0) {
+                    return i;
+                }
+                depth -= c == ')';
+                i++;
+            } else {
+                i++;
+            }
+        }
+        return std::min(i, s.size());
+    }
+
+    // the alternatives at i up to a ')' or the end, entered in the states m; out: the states after them
+    bool alternatives(size_t & i, uint8_t m, uint8_t & out) {
+        out = 0;
+        while (true) {
+            uint8_t cur = m;
+            while (i < s.size() && s[i] != '|' && s[i] != ')') {
+                if (cur == 0) {
+                    i = alternative_end(i); // a byte was consumed: a match does not start in the rest
+                    if (i == std::string::npos) {
+                        return false;
+                    }
+                    break;
+                }
+                if (!term(i, cur)) {
+                    return false;
+                }
+            }
+            out |= cur;
+            if (i < s.size() && s[i] == '|') {
+                i++;
+                continue;
+            }
+            return true;
+        }
+    }
+
+    // a term at i and its quantifier, entered in the states m; m becomes the states after it
+    bool term(size_t & i, uint8_t & m) {
+        const unsigned char c = s[i];
+        uint8_t out = 0;
+        if (c == '^') {
+            i++;
+            out = BOL;
+        } else if (c == '(') {
+            if (s.compare(i, 3, "(?:") == 0) {
+                i += 3;
+            } else if (i + 1 < s.size() && s[i + 1] == '?') {
+                return false; // a lookahead
+            } else {
+                i += 1;
+            }
+            if (!alternatives(i, m, out) || i >= s.size() || s[i] != ')') {
+                return false;
+            }
+            i++;
+        } else {
+            std::bitset<256> b;
+            if (c == '\\') {
+                if (i + 1 >= s.size()) {
+                    return false;
+                }
+                const unsigned char e = s[i + 1];
+                if (e == 's') {
+                    for (const unsigned char x : { '\t', '\n', '\v', '\f', '\r', ' ', (char) 0x85, (char) 0xa0 }) {
+                        b.set(x); // with the spaces of a single-byte locale
+                    }
+                } else if (e == 'd') {
+                    for (unsigned char x = '0'; x <= '9'; ++x) {
+                        b.set(x);
+                    }
+                } else if ((e >= '0' && e <= '9') || (e >= 'a' && e <= 'z') || (e >= 'A' && e <= 'Z') || e >= 0x80) {
+                    return false; // a class, a boundary, a control character or a back-reference
+                } else {
+                    b.set(e);
+                }
+                i += 2;
+            } else if (c == 0 || std::strchr("[.$*+?{}]", c) != nullptr) {
+                return false;
+            } else {
+                b.set(c);
+                i++;
+            }
+            if (m & ANY) {
+                bytes |= b;
+            }
+            if (m & BOL) {
+                bol_bytes |= b;
+            }
+        }
+        if (i < s.size()) {
+            const char q = s[i];
+            if (q == '{' || (c == '^' && (q == '*' || q == '?' || q == '+'))) {
+                return false;
+            }
+            if (q == '*' || q == '?' || q == '+') {
+                if (q != '+') {
+                    out |= m;
+                }
+                i++;
+                if (i < s.size() && s[i] == '?') {
+                    i++; // lazy
+                }
+            }
+        }
+        m = out;
+        return true;
+    }
+};
+} // namespace
+
+static bool llama_grammar_regex_first_bytes(const std::string & pattern, llama_grammar_trigger_pattern & trigger) {
+    llama_grammar_regex_first first(pattern);
+    size_t i = 0;
+    uint8_t out = 0;
+    if (!first.alternatives(i, llama_grammar_regex_first::ANY, out) || i != pattern.size() ||
+            (out & llama_grammar_regex_first::ANY)) {
+        return false;
+    }
+    trigger.first_bytes     = first.bytes;
+    trigger.first_bol_bytes = first.bol_bytes;
+    trigger.first_bol_any   = (out & llama_grammar_regex_first::BOL) != 0;
+    return true;
+}
+
+size_t llama_grammar_trigger_pattern::find(const std::string & input, size_t from) const {
+    // A trigger word: std::regex_search of MSVC takes time quadratic in the input for a word with an escaped
+    //   metacharacter (<\|tool_call>: 16k characters ~50-70 ms) and ~6 ns a character for others, and the trigger
+    //   buffer is all the text generated so far, searched again after every token while the grammar waits. The
+    //   leftmost occurrence is the regex match.
+    if (!literal.empty()) {
+        return input.find(literal, from >= literal.size() ? from - literal.size() + 1 : 0);
+    }
+
     auto find_start_pos = [](const std::smatch & match) {
         // get from the first matched capturing group to the end of the string
         size_t start = std::string::npos;
@@ -400,6 +594,99 @@ size_t llama_grammar_trigger_pattern::find(const std::string & input) const {
         std::smatch match;
         if (std::regex_match(input, match, regex)) {
             return find_start_pos(match);
+        }
+    }
+
+    if (first_known) {
+        // The regex anchored at each offset a match can start at. A search of MSVC with a pattern that starts with an
+        //   alternation takes time quadratic in the length of the lines (the muse-glimmer tool trigger over 12.8k
+        //   characters a token: in one line ~31 ms, in 62 lines ~2.5 ms), an anchored try ~2.5 us; past a budget of
+        //   tries the search takes the rest. The first offset that matches is where the search would have found the
+        //   match, with the same alternatives taken there.
+        const size_t n         = input.size();
+        const size_t max_tries = 16 + n/128;
+        size_t       tries     = 0;
+        size_t       result    = std::string::npos;
+
+        const auto candidate = [&](size_t p) {
+            const bool line = p == 0 || input[p - 1] == '\n' || input[p - 1] == '\r';
+            return p < n ? first_bytes[(uint8_t) input[p]] || (line && (first_bol_any || first_bol_bytes[(uint8_t) input[p]]))
+                         : line && first_bol_any;
+        };
+        // true when the search is over, with the match in result
+        const auto try_at = [&](size_t p) {
+            const auto flags = p == 0 ? std::regex_constants::match_default : std::regex_constants::match_prev_avail;
+            std::smatch match;
+            if (++tries > max_tries) {
+                if (std::regex_search(input.cbegin() + p, input.cend(), match, regex, flags)) {
+                    result = p + find_start_pos(match);
+                }
+                return true;
+            }
+            if (std::regex_search(input.cbegin() + p, input.cend(), match, regex, flags | std::regex_constants::match_continuous)) {
+                result = p + find_start_pos(match);
+                return true;
+            }
+            return false;
+        };
+
+        // the offsets to look at, in order: each byte a match can start with and each line end found with memchr (a
+        //   byte at a time ~5 ns a character in the server), or every offset when the bytes are many
+        const bool lines   = first_bol_any || first_bol_bytes.any();
+        const int  n_bytes = (int) first_bytes.count();
+        if (n_bytes + (lines ? 2 : 0) > 8) {
+            for (size_t p = 0; p <= n; ++p) {
+                if (candidate(p) && try_at(p)) {
+                    return result;
+                }
+            }
+            return std::string::npos;
+        }
+        char   needles[8];
+        size_t next[8];
+        int    n_needles = 0;
+        for (int c = 0; c < 256; ++c) {
+            if (first_bytes[c]) {
+                needles[n_needles++] = (char) c;
+            }
+        }
+        if (lines) {
+            needles[n_needles++] = '\n';
+            needles[n_needles++] = '\r';
+        }
+        const auto find_byte = [&](char c, size_t from) {
+            const void * q = from < n ? std::memchr(input.data() + from, c, n - from) : nullptr;
+            return q != nullptr ? (size_t) ((const char *) q - input.data()) : std::string::npos;
+        };
+        for (int j = 0; j < n_needles; ++j) {
+            next[j] = find_byte(needles[j], 0);
+        }
+        size_t last = std::string::npos;
+        bool   zero = lines; // the input starts a line
+        while (true) {
+            size_t p = 0;
+            if (!zero) {
+                int jmin = -1;
+                p = std::string::npos;
+                for (int j = 0; j < n_needles; ++j) {
+                    if (next[j] != std::string::npos && next[j] + (j >= n_bytes) < p) {
+                        p    = next[j] + (j >= n_bytes); // the line starts after a line end
+                        jmin = j;
+                    }
+                }
+                if (jmin < 0) {
+                    return std::string::npos;
+                }
+                next[jmin] = find_byte(needles[jmin], next[jmin] + 1);
+            }
+            zero = false;
+            if (p == last) {
+                continue;
+            }
+            last = p;
+            if (candidate(p) && try_at(p)) {
+                return result;
+            }
         }
     }
 
@@ -1299,6 +1586,10 @@ struct llama_grammar * llama_grammar_init_impl(
         auto & trigger = vec_trigger_patterns.emplace_back();
         trigger.pattern = trigger_patterns[i];
         trigger.regex = std::regex(trigger.pattern);
+        if (!llama_grammar_regex_literal(trigger.pattern, trigger.literal)) {
+            trigger.literal.clear();
+            trigger.first_known = llama_grammar_regex_first_bytes(trigger.pattern, trigger);
+        }
     }
 
     // Important: vec_rules has to be moved here, not copied, because stacks contains
@@ -1414,10 +1705,11 @@ void llama_grammar_accept_impl(struct llama_grammar & grammar, llama_token token
         } else {
             auto position = std::make_pair(grammar.trigger_buffer.size(), grammar.trigger_buffer.size() + piece.size());
             grammar.trigger_buffer_positions.push_back(std::make_pair(token, position));
+            const size_t searched = grammar.trigger_buffer.size(); // held no match, or the grammar would have triggered
             grammar.trigger_buffer += piece;
 
             for (const auto & trigger_pattern : grammar.trigger_patterns) {
-                auto start = trigger_pattern.find(grammar.trigger_buffer);
+                auto start = trigger_pattern.find(grammar.trigger_buffer, searched);
                 if (start != std::string::npos) {
                     grammar.awaiting_trigger = false;
 
