@@ -259,9 +259,16 @@ public:
         return item;
     }
 
+    // empty, keeping the storage
+    void clear() {
+        this->c.clear();
+    }
+
     void pop() =  delete;
 };
 
+// A bigram is stale when either side has been merged with another symbol since: the sides only ever grow (a symbol
+//   takes in its right neighbour) and their texts never move, so the sizes tell, without comparing the texts.
 struct llm_bigram_bpe {
     struct comparator {
         bool operator()(const llm_bigram_bpe & l, const llm_bigram_bpe & r) const {
@@ -273,9 +280,68 @@ struct llm_bigram_bpe {
     using queue = llama_priority_queue<llm_bigram_bpe, queue_storage, comparator>;
     llm_symbol::index left;
     llm_symbol::index right;
-    std::string text;
     int rank;
     size_t size;
+    llama_token merged; // the token of the merged text, LLAMA_TOKEN_NULL if not known
+};
+
+// Open addressing from a 64-bit key to two 32-bit values, built once; the first insert of a key wins.
+struct llm_u64_table {
+    struct entry {
+        uint64_t key;
+        int32_t  a;
+        int32_t  b;
+    };
+
+    static constexpr uint64_t EMPTY = UINT64_MAX;
+
+    std::vector<entry> slots;
+    uint64_t           mask = 0;
+
+    void reserve(size_t n) {
+        size_t cap = 16;
+        while (cap < 2*n) {
+            cap <<= 1;
+        }
+        slots.assign(cap, { EMPTY, 0, 0 });
+        mask = cap - 1;
+    }
+
+    static uint64_t hash(uint64_t k) {
+        k ^= k >> 33;
+        k *= 0xff51afd7ed558ccdULL;
+        k ^= k >> 33;
+        k *= 0xc4ceb9fe1a85ec53ULL;
+        k ^= k >> 33;
+        return k;
+    }
+
+    // the entry of key, inserted with (a, b) if it was not there
+    entry & insert(uint64_t key, int32_t a, int32_t b) {
+        for (uint64_t i = hash(key) & mask;; i = (i + 1) & mask) {
+            if (slots[i].key == key) {
+                return slots[i];
+            }
+            if (slots[i].key == EMPTY) {
+                slots[i] = { key, a, b };
+                return slots[i];
+            }
+        }
+    }
+
+    const entry * find(uint64_t key) const {
+        if (slots.empty()) {
+            return nullptr;
+        }
+        for (uint64_t i = hash(key) & mask;; i = (i + 1) & mask) {
+            if (slots[i].key == key) {
+                return &slots[i];
+            }
+            if (slots[i].key == EMPTY) {
+                return nullptr;
+            }
+        }
+    }
 };
 
 struct llm_tokenizer_bpe : llm_tokenizer {
@@ -576,10 +642,162 @@ struct llm_tokenizer_bpe : llm_tokenizer {
                 };
                 break;
         }
+
+        build_merge_tables(vocab);
     }
 
     std::vector<std::string> regex_exprs;
     bool byte_encode = true; // GPT-2 byte encoding; false for SPM-style BPE (raw UTF-8)
+
+    // The merges by the tokens of their two sides, and the token of each text of 1-4 bytes, so that the merge loop
+    //   tracks the token of each symbol and looks merges up by two integers: by strings it built and hashed a
+    //   std::pair<std::string, std::string> per candidate pair (~4 us a token with MSVC). A text whose token is
+    //   shared with another text (text_to_token is not injective there) and a pair whose sides are not both tokens
+    //   go by the strings as before.
+    static constexpr int32_t MERGE_BY_TEXT = -2;
+
+    llm_u64_table merges_by_token; // (left << 32 | right) -> rank (or MERGE_BY_TEXT), the token of the merged text
+    llm_u64_table short_texts;     // (size << 32 | bytes) -> token of a text of 1-4 bytes
+
+    static uint64_t pair_key(llama_token left, llama_token right) {
+        return (uint64_t) (uint32_t) left << 32 | (uint32_t) right;
+    }
+
+    static uint64_t short_key(const char * text, size_t n) {
+        uint32_t bytes = 0;
+        memcpy(&bytes, text, n);
+        return (uint64_t) n << 32 | bytes;
+    }
+
+    // text_to_token of a symbol's text, LLAMA_TOKEN_NULL also for a token another text shares
+    llama_token symbol_token(const llama_vocab & vocab, const char * text, size_t n) const {
+        llama_token token = LLAMA_TOKEN_NULL;
+        if (n <= 4) {
+            const auto * e = short_texts.find(short_key(text, n));
+            token = e ? e->a : LLAMA_TOKEN_NULL;
+        } else {
+            token = vocab.text_to_token(std::string(text, n));
+        }
+        return token != LLAMA_TOKEN_NULL && shared_token[token] ? LLAMA_TOKEN_NULL : token;
+    }
+
+    std::vector<uint8_t> shared_token; // tokens text_to_token gives for more than one text
+
+    void build_merge_tables(const llama_vocab & vocab) {
+        shared_token.assign(vocab.n_tokens(), 0);
+        std::vector<uint8_t> seen(vocab.n_tokens(), 0);
+        size_t n_short = 0;
+        vocab.foreach_text_token([&](const std::string & text, llama_token token) {
+            if (token < 0 || (size_t) token >= seen.size()) {
+                return;
+            }
+            shared_token[token] |= seen[token];
+            seen[token] = 1;
+            n_short += !text.empty() && text.size() <= 4;
+        });
+        short_texts.reserve(n_short);
+        vocab.foreach_text_token([&](const std::string & text, llama_token token) {
+            if (!text.empty() && text.size() <= 4) {
+                short_texts.insert(short_key(text.data(), text.size()), token, 0);
+            }
+        });
+
+        size_t n_merges = 0;
+        vocab.foreach_bpe_merge([&](const std::string &, const std::string &, int) { n_merges++; });
+        merges_by_token.reserve(n_merges);
+        vocab.foreach_bpe_merge([&](const std::string & first, const std::string & second, int rank) {
+            const llama_token left  = vocab.text_to_token(first);
+            const llama_token right = vocab.text_to_token(second);
+            if (left == LLAMA_TOKEN_NULL || right == LLAMA_TOKEN_NULL || shared_token[left] || shared_token[right]) {
+                return; // a side that is not a symbol_token: its pairs go by the strings
+            }
+            llama_token merged = vocab.text_to_token(first + second);
+            if (merged != LLAMA_TOKEN_NULL && shared_token[merged]) {
+                merged = LLAMA_TOKEN_NULL;
+            }
+            auto & e = merges_by_token.insert(pair_key(left, right), rank, merged);
+            if (e.a != rank) {
+                e.a = MERGE_BY_TEXT; // two merges for one pair of tokens: cannot happen with one text per token
+            }
+        });
+    }
+};
+
+// The tokens of the words seen in one tokenize call: open addressing on a 64-bit hash of the word, the words kept in
+//   one string and their tokens in one vector (a std::unordered_map<std::string, ...> cost more than the BPE of a
+//   short word with MSVC).
+struct llm_word_cache {
+    struct slot {
+        uint64_t hash; // 0: empty
+        uint32_t text_off;
+        uint32_t text_len;
+        uint32_t tok_off;
+        uint32_t tok_len;
+    };
+
+    std::vector<slot>        slots;
+    std::string              text;
+    std::vector<llama_token> tokens;
+    uint64_t                 mask  = 0;
+    size_t                   count = 0;
+
+    void reset(size_t n_words) {
+        size_t cap = 64;
+        while (cap < 2*std::min<size_t>(n_words, 1 << 20)) {
+            cap <<= 1;
+        }
+        slots.assign(cap, slot{});
+        mask  = cap - 1;
+        count = 0;
+        text.clear();
+        tokens.clear();
+    }
+
+    static uint64_t hash_of(const std::string & word) {
+        uint64_t h = 0x9e3779b97f4a7c15ULL ^ word.size();
+        size_t i = 0;
+        for (; i + 8 <= word.size(); i += 8) {
+            uint64_t v;
+            memcpy(&v, word.data() + i, 8);
+            h = (h ^ v) * 0xff51afd7ed558ccdULL;
+            h ^= h >> 32;
+        }
+        if (i < word.size()) {
+            uint64_t v = 0;
+            memcpy(&v, word.data() + i, word.size() - i);
+            h = (h ^ v) * 0xc4ceb9fe1a85ec53ULL;
+            h ^= h >> 29;
+        }
+        return h | 1;
+    }
+
+    // the slot of word: hash != 0 if it is there, else the empty slot to insert it into (nullptr when full)
+    slot * find(const std::string & word) {
+        if (2*count >= slots.size()) {
+            return nullptr;
+        }
+        const uint64_t h = hash_of(word);
+        for (uint64_t i = h & mask;; i = (i + 1) & mask) {
+            slot & s = slots[i];
+            if (s.hash == 0) {
+                return &s;
+            }
+            if (s.hash == h && s.text_len == word.size() && memcmp(text.data() + s.text_off, word.data(), word.size()) == 0) {
+                return &s;
+            }
+        }
+    }
+
+    void insert(slot * s, const std::string & word, const llama_token * toks, size_t n) {
+        s->hash     = hash_of(word);
+        s->text_off = (uint32_t) text.size();
+        s->text_len = (uint32_t) word.size();
+        s->tok_off  = (uint32_t) tokens.size();
+        s->tok_len  = (uint32_t) n;
+        text.append(word);
+        tokens.insert(tokens.end(), toks, toks + n);
+        count++;
+    }
 };
 
 struct llm_tokenizer_bpe_session {
@@ -625,10 +843,10 @@ struct llm_tokenizer_bpe_session {
     }
 
     virtual void tokenize(const std::string & text, std::vector<llama_token> & output) {
-        int final_prev_index = -1;
         auto word_collection = unicode_regex_split(text, tokenizer.regex_exprs, tokenizer.byte_encode);
 
-        symbols_final.clear();
+        // a word's tokens depend on its text only, and most words of a text come again
+        word_cache.reset(word_collection.size());
         auto tok_pre = vocab.get_pre_type();
 
         if (tok_pre == LLAMA_VOCAB_PRE_TYPE_MMBERT) {
@@ -655,21 +873,37 @@ struct llm_tokenizer_bpe_session {
         }
 
         for (const auto & word : word_collection) {
-            work_queue = llm_bigram_bpe::queue();
+            const bool cacheable = word.size() <= 64;
+            llm_word_cache::slot * cached = nullptr;
+            if (cacheable) {
+                cached = word_cache.find(word);
+                if (cached != nullptr && cached->hash != 0) {
+                    output.insert(output.end(), word_cache.tokens.begin() + cached->tok_off,
+                                                word_cache.tokens.begin() + cached->tok_off + cached->tok_len);
+                    continue;
+                }
+            }
+            const size_t word_start = output.size();
+
+            work_queue.clear();
             symbols.clear();
+            symbol_tokens.clear();
 
             int index = 0;
             size_t offset = 0;
 
             //if (vocab.tokenizer_ignore_merges && vocab.token_to_id.find(word) != vocab.token_to_id.end()) {
-            if (vocab.get_ignore_merges() && vocab.text_to_token(word) != LLAMA_TOKEN_NULL) {
+            llama_token word_token = LLAMA_TOKEN_NULL;
+            if (vocab.get_ignore_merges() && (word_token = vocab.text_to_token(word)) != LLAMA_TOKEN_NULL) {
                 symbols.emplace_back(llm_symbol{-1, -1, word.c_str(), word.size()});
+                symbol_tokens.push_back(word_token);
                 offset = word.size();
             } else if ((tok_pre == LLAMA_VOCAB_PRE_TYPE_GEMMA4 || tok_pre == LLAMA_VOCAB_PRE_TYPE_MMBERT) && word.find_first_not_of('\n') == std::string::npos) {
                 // fix for gemma 4, ref: https://github.com/ggml-org/llama.cpp/pull/21343
                 auto tok = vocab.text_to_token(word);
                 if (tok != LLAMA_TOKEN_NULL) {
                     symbols.emplace_back(llm_symbol{-1, -1, word.c_str(), word.size()});
+                    symbol_tokens.push_back(tok);
                     offset = word.size();
                 }
             }
@@ -684,6 +918,7 @@ struct llm_tokenizer_bpe_session {
                 sym.next = offset == word.size() ? -1 : index + 1;
                 index++;
                 symbols.emplace_back(sym);
+                symbol_tokens.push_back(tokenizer.symbol_token(vocab, sym.text, sym.n));
             }
             for (int i = 1; i < (int) symbols.size(); ++i) {
                 add_new_bigram(i - 1, i);
@@ -696,18 +931,14 @@ struct llm_tokenizer_bpe_session {
                 auto & left_symbol = symbols[bigram.left];
                 auto & right_symbol = symbols[bigram.right];
 
-                if (left_symbol.n == 0 || right_symbol.n == 0) {
-                    continue;
-                }
-                std::string left_token = std::string(left_symbol.text, left_symbol.n);
-                std::string right_token = std::string(right_symbol.text, right_symbol.n);
-                if (left_token + right_token != bigram.text) {
+                if (left_symbol.n == 0 || right_symbol.n == 0 || left_symbol.n + right_symbol.n != bigram.size) {
                     continue;  // Skip this bigram if it's outdated
                 }
 
                 // merge the right sym into the left one
                 left_symbol.n += right_symbol.n;
                 right_symbol.n = 0;
+                symbol_tokens[bigram.left] = bigram.merged;
 
                 // remove the right sym from the chain
                 left_symbol.next = right_symbol.next;
@@ -719,26 +950,14 @@ struct llm_tokenizer_bpe_session {
                 add_new_bigram(bigram.left, left_symbol.next);  // right side of current symbol
             }
 
-            // add the finished tokens to the final list keeping correct order for next and prev
-            for (auto & sym : symbols) {
-                if (sym.n > 0) {
-                    sym.prev = final_prev_index;
-                    sym.next = -1;
-                    if (final_prev_index != -1) {
-                        symbols_final[final_prev_index].next = symbols_final.size();
-                    }
-                    symbols_final.emplace_back(sym);
-                    final_prev_index = symbols_final.size() - 1;
-                }
-            }
-        }
-
-        symbols = symbols_final;
-
-        if (!symbols.empty()) {
-            for (int i = 0; i != -1; i = symbols[i].next) {
-                auto & symbol = symbols[i];
+            // the tokens of the word's symbols, left to right (a merge keeps the left symbol)
+            for (size_t i = 0; i < symbols.size(); ++i) {
+                const auto & symbol = symbols[i];
                 if (symbol.n == 0) {
+                    continue;
+                }
+                if (symbol_tokens[i] != LLAMA_TOKEN_NULL) {
+                    output.push_back(symbol_tokens[i]); // text_to_token of the text
                     continue;
                 }
 
@@ -766,6 +985,10 @@ struct llm_tokenizer_bpe_session {
                     output.push_back(token);
                 }
             }
+
+            if (cached != nullptr) {
+                word_cache.insert(cached, word, output.data() + word_start, output.size() - word_start);
+            }
         }
     }
 
@@ -774,24 +997,42 @@ private:
         if (left == -1 || right == -1) {
             return;
         }
-        std::string left_token  = std::string(symbols[left].text,  symbols[left].n);
-        std::string right_token = std::string(symbols[right].text, symbols[right].n);
 
         int rank_found = -1;
+        llama_token merged = LLAMA_TOKEN_NULL;
 
-        rank_found = vocab.find_bpe_rank(left_token, right_token);
+        const llama_token left_token_id  = symbol_tokens[left];
+        const llama_token right_token_id = symbol_tokens[right];
+        const llm_u64_table::entry * e = nullptr;
+        if (left_token_id != LLAMA_TOKEN_NULL && right_token_id != LLAMA_TOKEN_NULL) {
+            e = tokenizer.merges_by_token.find(llm_tokenizer_bpe::pair_key(left_token_id, right_token_id));
+            if (e == nullptr) {
+                return; // no merge of these two tokens
+            }
+        }
+        if (e != nullptr && e->a != llm_tokenizer_bpe::MERGE_BY_TEXT) {
+            rank_found = e->a;
+            merged     = e->b;
+        } else {
+            std::string left_token  = std::string(symbols[left].text,  symbols[left].n);
+            std::string right_token = std::string(symbols[right].text, symbols[right].n);
 
-        if (rank_found < 0) {
-            return;
+            rank_found = vocab.find_bpe_rank(left_token, right_token);
+
+            if (rank_found < 0) {
+                return;
+            }
+            const std::string merged_text = left_token + right_token;
+            merged = tokenizer.symbol_token(vocab, merged_text.data(), merged_text.size());
         }
 
         llm_bigram_bpe bigram;
 
-        bigram.left  = left;
-        bigram.right = right;
-        bigram.text  = left_token + right_token;
-        bigram.size  = left_token.size() + right_token.size();
-        bigram.rank  = rank_found;
+        bigram.left   = left;
+        bigram.right  = right;
+        bigram.size   = symbols[left].n + symbols[right].n;
+        bigram.rank   = rank_found;
+        bigram.merged = merged;
 
         work_queue.push(bigram);
     }
@@ -800,8 +1041,10 @@ private:
     const llm_tokenizer_bpe & tokenizer;
 
     std::vector<llm_symbol> symbols;
-    std::vector<llm_symbol> symbols_final;
+    std::vector<llama_token> symbol_tokens; // per symbol: text_to_token of its text, see symbol_token()
     llm_bigram_bpe::queue work_queue;
+
+    llm_word_cache word_cache;
 };
 
 //
@@ -4313,6 +4556,18 @@ int llama_vocab::find_bpe_rank(const std::string & token_left, const std::string
     }
 
     return it->second;
+}
+
+void llama_vocab::foreach_bpe_merge(const std::function<void(const std::string &, const std::string &, int)> & fn) const {
+    for (const auto & [pair, rank] : pimpl->bpe_ranks) {
+        fn(pair.first, pair.second, rank);
+    }
+}
+
+void llama_vocab::foreach_text_token(const std::function<void(const std::string &, llama_token)> & fn) const {
+    for (const auto & [text, token] : pimpl->token_to_id) {
+        fn(text, token);
+    }
 }
 
 std::vector<std::string> llama_vocab::get_bpe_merges() const {

@@ -2,6 +2,7 @@
 
 #include "llama.h"
 
+#include <functional>
 #include <string>
 #include <vector>
 #include <memory>
@@ -160,6 +161,10 @@ struct llama_vocab {
 
     int find_bpe_rank(const std::string & token_left, const std::string & token_right) const;
     std::vector<std::string> get_bpe_merges() const;
+
+    // fn(first, second, rank) for each BPE merge, fn(text, token) for each text text_to_token finds
+    void foreach_bpe_merge(const std::function<void(const std::string &, const std::string &, int)> & fn) const;
+    void foreach_text_token(const std::function<void(const std::string &, llama_token)> & fn) const;
 
     std::vector<char> get_precompiled_charsmap() const;
 
