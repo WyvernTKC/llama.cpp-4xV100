@@ -1016,6 +1016,105 @@ static std::vector<size_t> unicode_regex_split_custom_tekken(const std::string &
     });
 }
 
+// GPT-4o / llama4 / gpt-oss (o200k) pre-tokenizer, as tekken with English contractions after a letter run and numbers
+//   of up to three digits
+// regex: [^\r\n\p{L}\p{N}]?((?=[\p{L}])([^a-z]))*((?=[\p{L}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\r\n\p{L}\p{N}]?((?=[\p{L}])([^a-z]))+((?=[\p{L}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+
+// std::regex took ~7 us a character with MSVC and ran out of stack on long runs (an exception: no tokens at all).
+static std::vector<size_t> unicode_regex_split_custom_gpt4o(const std::string & text, const std::vector<size_t> & offsets) {
+    const auto cpts = unicode_cpts_from_utf8(text);
+
+    std::vector<uint8_t> cls(cpts.size());
+    for (size_t i = 0; i < cpts.size(); ++i) {
+        cls[i] = unicode_collapsed_class(cpts[i]);
+    }
+
+    return unicode_regex_split_custom_matches(offsets, [&](const size_t pos, const size_t end) -> size_t {
+        auto is_upper = [&](const size_t p) {
+            return p < end && (cls[p] & COLLAPSED_L) && !(cpts[p] >= 'a' && cpts[p] <= 'z');
+        };
+        auto is_lower = [&](const size_t p) {
+            return p < end && (cls[p] & COLLAPSED_L) && !(cpts[p] >= 'A' && cpts[p] <= 'Z');
+        };
+        auto is_other = [&](const size_t p) {
+            return p < end && !(cls[p] & (COLLAPSED_SPACE | COLLAPSED_L | COLLAPSED_N));
+        };
+        auto lower_of = [](uint32_t c) {
+            return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c;
+        };
+        // (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])? at p: its length
+        auto contraction = [&](const size_t p) -> size_t {
+            if (p + 1 >= end || cpts[p] != '\'') {
+                return 0;
+            }
+            const uint32_t c1 = lower_of(cpts[p + 1]);
+            if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd') {
+                return 2;
+            }
+            if (p + 2 < end) {
+                const uint32_t c2 = lower_of(cpts[p + 2]);
+                if ((c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') || (c1 == 'l' && c2 == 'l')) {
+                    return 3;
+                }
+            }
+            return 0;
+        };
+
+        const uint8_t  c0  = cls[pos];
+        const uint32_t cpt = cpts[pos];
+
+        // [^\r\n\p{L}\p{N}]? - when it can take pos, pos is no letter, so leaving it out cannot match either
+        const size_t q = (!(c0 & (COLLAPSED_L | COLLAPSED_N)) && cpt != '\r' && cpt != '\n') ? pos + 1 : pos;
+
+        size_t u = q;
+        while (is_upper(u)) {
+            u++;
+        }
+
+        // (upper)*(lower)+: the upper run backs off until a lower one follows it
+        if (is_lower(u)) {
+            while (is_lower(u)) {
+                u++;
+            }
+            return u + contraction(u) - pos;
+        }
+        for (size_t k = u; k > q; --k) {
+            if (is_lower(k - 1)) {
+                return k + contraction(k) - pos;
+            }
+        }
+
+        // (upper)+(lower)*, where the lower run is empty because none followed the upper run above
+        if (u > q) {
+            return u + contraction(u) - pos;
+        }
+
+        // \p{N}{1,3}
+        if (c0 & COLLAPSED_N) {
+            size_t p = pos + 1;
+            while (p < end && p < pos + 3 && (cls[p] & COLLAPSED_N)) {
+                p++;
+            }
+            return p - pos;
+        }
+
+        // ?[^\s\p{L}\p{N}]+[\r\n/]*
+        {
+            size_t p = (cpt == ' ' && is_other(pos + 1)) ? pos + 1 : pos;
+            if (is_other(p)) {
+                while (is_other(p)) {
+                    p++;
+                }
+                while (p < end && (cpts[p] == '\r' || cpts[p] == '\n' || cpts[p] == '/')) {
+                    p++;
+                }
+                return p - pos;
+            }
+        }
+
+        return unicode_collapsed_match_spaces(cls, cpts, pos, end);
+    });
+}
+
 template <typename CharT>
 static std::vector<size_t> unicode_regex_split_stl(const std::basic_string<CharT> & text, const std::basic_string<CharT> & regex, const std::vector<size_t> & offsets) {
     using BidirIt = typename std::basic_string<CharT>::const_iterator;
@@ -1351,6 +1450,8 @@ static std::vector<size_t> unicode_regex_split_custom(const std::string & text, 
         bpe_offsets = unicode_regex_split_custom_joyai_words(text, offsets);
     } else if (regex_expr == "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))*((?=[\\p{L}])([^A-Z]))+|[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))+((?=[\\p{L}])([^A-Z]))*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
         bpe_offsets = unicode_regex_split_custom_tekken(text, offsets);
+    } else if (regex_expr == "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))*((?=[\\p{L}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))+((?=[\\p{L}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
+        bpe_offsets = unicode_regex_split_custom_gpt4o(text, offsets);
     } else if (regex_expr == "\\p{Han}+") {
         // K2's first pattern - handle all K2 patterns together
         bpe_offsets = unicode_regex_split_custom_kimi_k2(text, offsets);
