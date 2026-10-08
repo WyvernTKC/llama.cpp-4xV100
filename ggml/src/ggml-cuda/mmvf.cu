@@ -109,11 +109,13 @@ static __global__ void mul_mat_vec_f(
     if constexpr (has_fusion) {
         // sibling rows (one token, one row per block, one channel and sample): the blocks from sib_block0 on run the
         //   rows of a sibling matrix of the same type, width and y into its own dst, those from sib2_block0 on a second's
+        //   and those from gdn_block0 on a third's (gdn_x, the gated delta net rows of mmvq)
         if (fusion.sib_block0 > 0 && blockIdx.x >= fusion.sib_block0) {
-            const bool second = fusion.sib2_x != nullptr && blockIdx.x >= fusion.sib2_block0;
-            const int  r      = rpb*(blockIdx.x - (second ? fusion.sib2_block0 : fusion.sib_block0));
-            x   = (const T *) (second ? fusion.sib2_x : fusion.sib_x) + int64_t(r)*stride_row;
-            dst = (second ? fusion.sib2_dst : fusion.sib_dst) + (r - row);
+            const int k = fusion.gdn_x  != nullptr && blockIdx.x >= fusion.gdn_block0  ? 2 :
+                          fusion.sib2_x != nullptr && blockIdx.x >= fusion.sib2_block0 ? 1 : 0;
+            const int r = rpb*(blockIdx.x - (k == 2 ? fusion.gdn_block0 : k == 1 ? fusion.sib2_block0 : fusion.sib_block0));
+            x   = (const T *) (k == 2 ? fusion.gdn_x : k == 1 ? fusion.sib2_x : fusion.sib_x) + int64_t(r)*stride_row;
+            dst = (k == 2 ? fusion.gdn_dst : k == 1 ? fusion.sib2_dst : fusion.sib_dst) + (r - row);
         }
     }
 
@@ -789,7 +791,7 @@ static bool mmvf_use_load16(
 
 // the sibling rows of a launch (see mul_mat_vec_f) read their own matrices
 static bool mmvf_siblings_aligned16(const ggml_cuda_mm_fusion_args_device & fusion) {
-    return (uintptr_t) fusion.sib_x % 16 == 0 && (uintptr_t) fusion.sib2_x % 16 == 0;
+    return (uintptr_t) fusion.sib_x % 16 == 0 && (uintptr_t) fusion.sib2_x % 16 == 0 && (uintptr_t) fusion.gdn_x % 16 == 0;
 }
 
 template <typename T, typename type_acc, int ncols_dst, bool is_multi_token_id = false>
@@ -1111,13 +1113,14 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             fusion_local.sib_dst = (float *) fusion->sib_dst->data;
         }
         if (fusion->sib && fusion->sib_rows) {
-            // the rows of one or two sibling matrices after those of src0, see mul_mat_vec_f
+            // the rows of up to three sibling matrices after those of src0, see mul_mat_vec_f
             GGML_ASSERT(!ids && !fusion->gate && !fusion->x_bias && !fusion->gate_bias && !fusion->gdn_beta);
             GGML_ASSERT(ggml_nrows(src1) == 1 && ggml_nrows(dst) == 1 && ggml_nrows(src0) == ne01);
+            GGML_ASSERT(!fusion->sib3 || fusion->sib2);
             int64_t row0 = ne01;
-            const ggml_tensor * sibs[2] = { fusion->sib,     fusion->sib2     };
-            ggml_tensor       * dsts[2] = { fusion->sib_dst, fusion->sib2_dst };
-            for (int k = 0; k < 2 && sibs[k] != nullptr; ++k) {
+            const ggml_tensor * sibs[3] = { fusion->sib,     fusion->sib2,     fusion->sib3     };
+            ggml_tensor       * dsts[3] = { fusion->sib_dst, fusion->sib2_dst, fusion->sib3_dst };
+            for (int k = 0; k < 3 && sibs[k] != nullptr; ++k) {
                 const ggml_tensor * sib = sibs[k];
                 GGML_ASSERT(sib->type == src0->type && sib->ne[0] == ne00 && sib->nb[1] == src0->nb[1] && ggml_nrows(sib) == sib->ne[1]);
                 GGML_ASSERT(dsts[k]->type == GGML_TYPE_F32 && ggml_is_contiguous(dsts[k]) && ggml_nelements(dsts[k]) == sib->ne[1]);
@@ -1126,11 +1129,16 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
                     fusion_local.sib_dst    = (float *) dsts[k]->data;
                     fusion_local.sib_block0 = (uint32_t) row0;
                     fusion_local.sib_nrows  = (uint32_t) sib->ne[1];
-                } else {
+                } else if (k == 1) {
                     fusion_local.sib2_x      = sib->data;
                     fusion_local.sib2_dst    = (float *) dsts[k]->data;
                     fusion_local.sib2_block0 = (uint32_t) row0;
                     fusion_local.sib2_nrows  = (uint32_t) sib->ne[1];
+                } else {
+                    fusion_local.gdn_x      = sib->data;
+                    fusion_local.gdn_dst    = (float *) dsts[k]->data;
+                    fusion_local.gdn_block0 = (uint32_t) row0;
+                    fusion_local.gdn_nrows  = (uint32_t) sib->ne[1];
                 }
                 row0 += sib->ne[1];
             }
@@ -1179,7 +1187,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
         case GGML_TYPE_F32: {
             const float * src0_d = (const float *) src0->data;
             // a sibling row is one more block, sibling rows as many more
-            const int64_t nrows = ne01 + (fusion_local.sib_block0 > 0 ? fusion_local.sib_nrows + fusion_local.sib2_nrows :
+            const int64_t nrows = ne01 + (fusion_local.sib_block0 > 0 ? fusion_local.sib_nrows + fusion_local.sib2_nrows + fusion_local.gdn_nrows :
                                           fusion_local.sib_x != nullptr ? 1 : 0);
             mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, nrows, ncols_dst, s01, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
@@ -1187,14 +1195,14 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
         } break;
         case GGML_TYPE_F16: {
             const half * src0_d = (const half *) src0->data;
-            const int64_t nrows = ne01 + fusion_local.sib_nrows + fusion_local.sib2_nrows;
+            const int64_t nrows = ne01 + fusion_local.sib_nrows + fusion_local.sib2_nrows + fusion_local.gdn_nrows;
             mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, nrows, ncols_dst, s01, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
                 ne03,              ne3,           s03, s13,              s3,                 ids_stride, prec, ctx.stream());
         } break;
         case GGML_TYPE_BF16: {
             const nv_bfloat16 * src0_d = (const nv_bfloat16 *) src0->data;
-            const int64_t nrows = ne01 + fusion_local.sib_nrows + fusion_local.sib2_nrows;
+            const int64_t nrows = ne01 + fusion_local.sib_nrows + fusion_local.sib2_nrows + fusion_local.gdn_nrows;
             mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, nrows, ncols_dst, s01, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
                 ne03,              ne3,           s03, s13,              s3,                 ids_stride, prec, ctx.stream());

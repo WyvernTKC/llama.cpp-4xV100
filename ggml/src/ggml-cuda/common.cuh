@@ -1947,6 +1947,9 @@ struct ggml_cuda_mm_fusion_args_host {
     // mmvf: sib (and sib2) are sibling matrices of the same type and K whose rows follow those of src0, as for mmvq
     //   without ids; without it a sib of mmvf is the f32 single row above
     bool sib_rows = false;
+    // mmvf with sib_rows and sib2: a third sibling, its rows after those of sib2 (in the gdn_x rows of the device args)
+    const ggml_tensor * sib3 = nullptr;
+    ggml_tensor * sib3_dst = nullptr;
     // one value per token gating the product before the bias: dst = x_bias + sigmoid(x_sigmoid)*(x*y), one token
     const ggml_tensor * x_sigmoid = nullptr;
     // mmvq with ids, a gate and nothing else: the gate's own ids, of the same layout (pools of cached experts that each

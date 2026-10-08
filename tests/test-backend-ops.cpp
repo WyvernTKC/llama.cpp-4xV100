@@ -5008,6 +5008,7 @@ struct test_mul_mat_sibling_rows : public test_case {
     const int64_t rows_b;
     const int64_t rows_c; // 0: two
     const int64_t n_tokens;
+    const int64_t rows_d; // > 0: a fourth (mmvf takes three siblings)
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5021,12 +5022,13 @@ struct test_mul_mat_sibling_rows : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR6(type, k, rows_a, rows_b, rows_c, n_tokens);
+        return rows_d > 0 ? VARS_TO_STR7(type, k, rows_a, rows_b, rows_c, n_tokens, rows_d) :
+                            VARS_TO_STR6(type, k, rows_a, rows_b, rows_c, n_tokens);
     }
 
     test_mul_mat_sibling_rows(ggml_type type = GGML_TYPE_Q8_0, int64_t k = 2048, int64_t rows_a = 2048, int64_t rows_b = 1024,
-            int64_t rows_c = 0, int64_t n_tokens = 1)
-        : type(type), k(k), rows_a(rows_a), rows_b(rows_b), rows_c(rows_c), n_tokens(n_tokens) {}
+            int64_t rows_c = 0, int64_t n_tokens = 1, int64_t rows_d = 0)
+        : type(type), k(k), rows_a(rows_a), rows_b(rows_b), rows_c(rows_c), n_tokens(n_tokens), rows_d(rows_d) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * wa = ggml_new_tensor_2d(ctx, type, k, rows_a);
@@ -5044,17 +5046,29 @@ struct test_mul_mat_sibling_rows : public test_case {
             ggml_set_name(wc, "wc");
             c = ggml_mul_mat(ctx, wc, x);
         }
+        ggml_tensor * d = nullptr;
+        if (rows_d > 0) {
+            ggml_tensor * wd = ggml_new_tensor_2d(ctx, type, k, rows_d);
+            ggml_set_name(wd, "wd");
+            d = ggml_mul_mat(ctx, wd, x);
+        }
         if (mode == MODE_TEST) {
             ggml_build_forward_expand(gf, a);
             ggml_build_forward_expand(gf, b);
             if (c) {
                 ggml_build_forward_expand(gf, c);
             }
+            if (d) {
+                ggml_build_forward_expand(gf, d);
+            }
         }
         // the node after them reads only the first one
         ggml_tensor * out = ggml_concat(ctx, ggml_scale(ctx, a, 0.5f), b, 0);
         if (c) {
             out = ggml_concat(ctx, out, c, 0);
+        }
+        if (d) {
+            out = ggml_concat(ctx, out, d, 0);
         }
         ggml_set_name(out, "out");
         return out;
@@ -13251,11 +13265,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_attn_gate_mul_mat(256, nh, nb, GGML_TYPE_Q4_K));
         }
     }
-    // one token runs both in one launch (mmvq, and mmvf for f16/bf16/f32 rows, also without 16-byte loads at K 1026)
+    // one token runs both in one launch (mmvq, and mmvf for f16/bf16/f32 rows, also without 16-byte loads at K 1026);
+    //   mmvf takes a third sibling (Muse-Glimmer's Q, K, V and gate: 1024, 256, 256, 1024 rows per device)
     for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F32 }) {
         if (type == GGML_TYPE_F16 || type == GGML_TYPE_BF16) {
             test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 1026, 100, 37, 21, 1));
+            test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 1026, 100, 37, 21, 1, 13));
         }
+        test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 6656, 1024, 256, 256, 1, 1024));
+        test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 1024, 100, 37, 21, 2, 13));
         for (int64_t n_tokens : { 1, 2 }) {
             test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 2048, 2048, 1024, 0, n_tokens));
             test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 1024, 100, 37, 0, n_tokens));

@@ -7162,6 +7162,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node_sibling_kernel != 0) {
         static const bool no_sibling_rows  = getenv("GGML_CUDA_NO_SIBLING_ROWS") != nullptr;
         static const bool no_sibling_rows3 = getenv("GGML_CUDA_NO_SIBLING_ROWS3") != nullptr;
+        static const bool no_sibling_rows4 = getenv("GGML_CUDA_NO_SIBLING_ROWS4") != nullptr;
         const auto next_node = [&](int n) {
             n++;
             while (n < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[n])) {
@@ -7177,10 +7178,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
             return false;
         };
-        ggml_tensor * sibs[2] = { nullptr, nullptr };
+        // mmvf takes a third sibling
+        const int max_sibs = no_sibling_rows3 ? 1 : node_sibling_kernel == 2 && !no_sibling_rows4 ? 3 : 2;
+        ggml_tensor * sibs[3] = { nullptr, nullptr, nullptr };
         int n_sibs = 0;
         int last   = i;
-        while (!no_sibling_rows && n_sibs < (no_sibling_rows3 ? 1 : 2)) {
+        while (!no_sibling_rows && n_sibs < max_sibs) {
             const int j = next_node(last);
             const int k = next_node(j);
             ggml_tensor * sib = j < cgraph->n_nodes ? cgraph->nodes[j] : nullptr;
@@ -7193,6 +7196,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     sibling_kernel(sib) != node_sibling_kernel ||
                     ggml_cuda_tensors_overlap(sib, node) || ggml_cuda_tensors_overlap(sib, node->src[1]) ||
                     (n_sibs > 0 && ggml_cuda_tensors_overlap(sib, sibs[0])) ||
+                    (n_sibs > 1 && ggml_cuda_tensors_overlap(sib, sibs[1])) ||
                     (k < cgraph->n_nodes && reads(cgraph->nodes[k], sib))) {
                 break;
             }
@@ -7206,6 +7210,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (n_sibs > 1) {
                 fusion_data.sib2     = sibs[1]->src[0];
                 fusion_data.sib2_dst = sibs[1];
+            }
+            if (n_sibs > 2) {
+                fusion_data.sib3     = sibs[2]->src[0];
+                fusion_data.sib3_dst = sibs[2];
             }
             if (node_sibling_kernel == 1) {
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr, node, &fusion_data);
