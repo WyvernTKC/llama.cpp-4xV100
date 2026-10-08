@@ -640,8 +640,8 @@ struct server_prompt {
 };
 
 struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
+    common_state_bytes main;
+    common_state_bytes drft;
 
     size_t size() const {
         return main.size() + drft.size();
@@ -676,6 +676,10 @@ struct server_prompt_cache {
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
+
+    // The largest state the cache restored from, kept for the next save: a few hundred MiB cost ~50 ms to free and
+    //   ~100 ms of page faults to fill again, both while the request waits.
+    common_state_bytes spare;
 
     size_t size() const;
 

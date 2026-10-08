@@ -354,15 +354,21 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
+        const int64_t t_start = ggml_time_us();
+
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
             return false;
         }
 
+        const int64_t t_alloc = ggml_time_us();
+
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
+
+        SRV_TRC(" - saved prompt state: alloc %.2f ms, state %.2f ms\n", (t_alloc - t_start) / 1000.0, (ggml_time_us() - t_alloc) / 1000.0);
 
         return true;
     }
@@ -2744,6 +2750,8 @@ private:
 
         // fill a freshly emplaced entry from the live sequence state
         auto fill = [&](common_prompt_checkpoint & cur) {
+            const int64_t t_start = ggml_time_us();
+
             cur.id_task = id_task;
 
             // [TAG_CHECKPOINTS_FIX_POS_MIN]
@@ -2757,9 +2765,9 @@ private:
             common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
             SLT_TRC(slot,
-                    "created %s context checkpoint (%zu host / %zu device) (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                    "created %s context checkpoint (%zu host / %zu device) (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, %.2f ms)\n",
                     cur.dev_slot >= 0 ? "device" : "host", n_in_tier(false), n_in_tier(true),
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024, (ggml_time_us() - t_start) / 1000.0);
         };
 
         // erase the entries of one tier that sit at the position we are about to write

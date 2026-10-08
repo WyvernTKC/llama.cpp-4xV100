@@ -1262,6 +1262,32 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+// Saved state bytes. A copy shares them (the server's prompt cache keeps a slot's checkpoints), so they are written only
+// through resize(), which keeps the buffer of its sole owner when the size fits and gives a new one otherwise. New bytes
+// are not zeroed: every writer fills the whole buffer.
+struct common_state_bytes {
+    std::shared_ptr<uint8_t[]> ptr;
+    size_t n   = 0;
+    size_t cap = 0;
+
+    size_t size()  const { return n; }
+    bool   empty() const { return n == 0; }
+    void   clear()       { ptr.reset(); n = 0; cap = 0; }
+
+    void resize(size_t n_new) {
+        if (ptr && ptr.use_count() == 1 && n_new <= cap) {
+            n = n_new;
+            return;
+        }
+        ptr.reset(n_new > 0 ? new uint8_t[n_new] : nullptr);
+        n   = n_new;
+        cap = n_new;
+    }
+
+          uint8_t * data()       { return ptr.get(); }
+    const uint8_t * data() const { return ptr.get(); }
+};
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1280,8 +1306,8 @@ struct common_prompt_checkpoint {
     size_t dev_bytes_tgt = 0;
     size_t dev_bytes_dft = 0;
 
-    std::vector<uint8_t> data_tgt;
-    std::vector<uint8_t> data_dft;
+    common_state_bytes data_tgt;
+    common_state_bytes data_dft;
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)

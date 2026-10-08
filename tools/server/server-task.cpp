@@ -1777,11 +1777,17 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
+    common_state_bytes state_data_tgt;
+    common_state_bytes state_data_dft;
 
     // check if we can allocate enough memory for the new state
     try {
+        // a conversation comes back a little longer than it left, so a new buffer gets room to be taken as the spare
+        if (spare.cap >= state_size_tgt) {
+            std::swap(state_data_tgt, spare);
+        } else {
+            state_data_tgt.resize(state_size_tgt + state_size_tgt/8);
+        }
         state_data_tgt.resize(state_size_tgt);
         state_data_dft.resize(state_size_dft);
     } catch (const std::bad_alloc & e) {
@@ -1849,6 +1855,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
+        const int64_t t_start = ggml_time_us();
+
         {
             auto & data = it_best->data.main;
 
@@ -1860,8 +1868,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 return false;
             }
 
+            // the larger of the two stays for the next save
+            if (data.cap > spare.cap) {
+                std::swap(data, spare);
+            }
             data.clear();
-            data.shrink_to_fit();
         }
 
         {
@@ -1879,9 +1890,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 }
 
                 data.clear();
-                data.shrink_to_fit();
             }
         }
+
+        SRV_TRC(" - restored prompt state: %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
 
         prompt = std::move(it_best->prompt);
 
