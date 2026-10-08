@@ -54,6 +54,7 @@ void ggml_compute_forward_cpy(const struct ggml_compute_params * params, struct 
 void ggml_compute_forward_cont(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_get_rows(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_get_rows_mean(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_kq_mask(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_get_rows_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_set_rows(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_diag(const struct ggml_compute_params * params, struct ggml_tensor * dst);

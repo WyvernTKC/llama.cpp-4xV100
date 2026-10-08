@@ -1937,6 +1937,37 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
+// A stream holds the tokens of one sequence here (see kq_mask_on_device), so a cell's visibility is its position or -1.
+void llama_kv_cache::set_input_kq_pos(ggml_tensor * dst_kv, ggml_tensor * dst_q, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst_kv->buffer) && ggml_backend_buffer_is_host(dst_q->buffer));
+
+    const int64_t n_kv     = dst_kv->ne[0];
+    const int64_t n_stream = dst_kv->ne[3];
+    const int64_t n_tps    = dst_q->ne[0];
+    GGML_ASSERT(n_tps*n_stream == (int64_t) ubatch->n_tokens);
+
+    int32_t * data_kv = (int32_t *) dst_kv->data;
+    int32_t * data_q  = (int32_t *) dst_q->data;
+
+    for (int64_t s = 0; s < n_stream; ++s) {
+        const llama_seq_id seq_id = ubatch->seq_id[s*n_tps][0];
+
+        const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+        GGML_ASSERT(n_kv <= (int64_t) cells.size());
+
+        const bool seq_all = cells.seq_has_all(seq_id);
+
+        int32_t * dst = data_kv + s*n_kv;
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const bool seen = !cells.is_empty(j) && (seq_all || cells.seq_has(j, seq_id));
+            dst[j] = seen ? cells.pos_get(j) : -1;
+        }
+        for (int64_t i = 0; i < n_tps; ++i) {
+            data_q[s*n_tps + i] = ubatch->pos[s*n_tps + i];
+        }
+    }
+}
+
 // The KV ranges of the KQ mask rows, see ggml_flash_attn_ext_set_kv_ranges: per row {end, hole_begin, hole_end} in cells,
 //   at a granularity of GGML_KQ_RANGE_CHUNK cells. A chunk can be seen by a row if a cell of the row's sequence in it
 //   lies in the row's window of positions, from the smallest and largest position of those cells - an overestimate
@@ -3211,6 +3242,18 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+void llama_kv_cache_context::set_input_kq_pos(ggml_tensor * dst_kv, ggml_tensor * dst_q, const llama_ubatch * ubatch) const {
+    kv->set_input_kq_pos(dst_kv, dst_q, ubatch);
+}
+
+llama_swa_type llama_kv_cache_context::get_swa_type() const {
+    return kv->get_swa_type();
+}
+
+uint32_t llama_kv_cache_context::get_n_swa() const {
+    return kv->get_n_swa();
 }
 
 void llama_kv_cache_context::set_input_kq_ranges(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, int64_t n_kv) const {

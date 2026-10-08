@@ -5487,6 +5487,54 @@ void ggml_compute_forward_get_rows(
 
 // ggml_compute_forward_get_rows_mean
 
+void ggml_compute_forward_kq_mask(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_I32 && src1->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst));
+    GGML_ASSERT(dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F32);
+
+    const int swa_type = ggml_get_op_params_i32(dst, 0);
+    const int n_swa    = ggml_get_op_params_i32(dst, 1);
+
+    const int64_t n_kv = dst->ne[0];
+    const int64_t n_q  = dst->ne[1];
+    const int64_t nr   = n_q*dst->ne[3];
+
+    const int32_t * kv_pos = (const int32_t *) src0->data;
+    const int32_t * q_pos  = (const int32_t *) src1->data;
+
+    const ggml_fp16_t zero_f16 = GGML_CPU_FP32_TO_FP16(0.0f);
+    const ggml_fp16_t ninf_f16 = GGML_CPU_FP32_TO_FP16(-INFINITY);
+
+    for (int64_t r = params->ith; r < nr; r += params->nth) {
+        const int64_t s  = r/n_q;
+        const int32_t p1 = q_pos[r];
+
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const int32_t p0 = kv_pos[s*n_kv + j];
+
+            bool masked = p0 < 0 || p0 > p1;
+            switch (swa_type) {
+                case GGML_KQ_MASK_SWA_STANDARD:  masked = masked || p1 - p0 >= n_swa;      break;
+                case GGML_KQ_MASK_SWA_CHUNKED:   masked = masked || p0 < (p1/n_swa)*n_swa; break;
+                case GGML_KQ_MASK_SWA_SYMMETRIC: masked = masked || p1 - p0 > n_swa/2;     break;
+                default: break;
+            }
+
+            if (dst->type == GGML_TYPE_F16) {
+                ((ggml_fp16_t *) dst->data)[r*n_kv + j] = masked ? ninf_f16 : zero_f16;
+            } else {
+                ((float *) dst->data)[r*n_kv + j] = masked ? -INFINITY : 0.0f;
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_get_rows_mean(
         const ggml_compute_params * params,
               ggml_tensor * dst) {

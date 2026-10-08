@@ -92,6 +92,139 @@ static ggml_tensor * build_attn_inp_kq_ranges(ggml_context * ctx, const ggml_ten
     return res;
 }
 
+// The mask of a long ubatch is built on each device from the positions of the cells and of the tokens. Filled on the host
+//   it is n_kv x n_tokens, and a split backend copies it to every device: 268 MB per device at 131k cells and 1024 tokens.
+//   Causal text attention with one sequence per stream only; ALiBi, M-RoPE image positions and non-causal attention keep
+//   the host mask, as do short ubatches, whose mask is small. LLAMA_KQ_MASK_DEVICE=0 keeps it always.
+static bool kq_mask_on_device(
+        const llama_kv_cache_context * mctx,
+        const llama_ubatch & ubatch,
+        const llama_hparams & hparams,
+        const llama_cparams & cparams) {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_KQ_MASK_DEVICE");
+        return env == nullptr || atoi(env) != 0;
+    }();
+
+    const int64_t n_tokens = ubatch.n_tokens;
+    const int64_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+    const int64_t n_tps    = n_tokens/n_stream;
+
+    if (!enabled || n_tps < 64 || hparams.use_alibi || ubatch.token == nullptr || ubatch.is_mixed()) {
+        return false;
+    }
+
+    // as in llama_kv_cache::set_input_kq_mask
+    bool causal = cparams.causal_attn;
+    if (!causal && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
+        causal = mctx->get_swa_type() == LLAMA_SWA_TYPE_NONE;
+    }
+    if (!causal) {
+        return false;
+    }
+
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        if (ubatch.seq_id[i][0] != ubatch.seq_id[(i/n_tps)*n_tps][0]) {
+            return false;
+        }
+        // a text token has its position in every M-RoPE section; the 2-D order only breaks ties between image tokens
+        if (ubatch.is_pos_2d() && (ubatch.pos[i + n_tokens] != ubatch.pos[i] || ubatch.pos[i + 2*n_tokens] != ubatch.pos[i])) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// the mask an attention input reads, filled on the host or built on the device (kq_mask_on_device)
+static void build_attn_inp_kq_mask_any(
+        ggml_context * ctx,
+        const llama_kv_cache_context * mctx,
+        const llama_ubatch & ubatch,
+        const llama_hparams & hparams,
+        const llama_cparams & cparams,
+        ggml_tensor ** kq_mask,
+        ggml_tensor ** kq_pos,
+        ggml_tensor ** kq_qpos,
+        ggml_tensor ** kq_mask_cnv) {
+    if (!kq_mask_on_device(mctx, ubatch, hparams, cparams)) {
+        *kq_mask     = build_attn_inp_kq_mask(ctx, mctx, ubatch, cparams);
+        *kq_mask_cnv = *kq_mask;
+        return;
+    }
+
+    const int64_t n_kv     = mctx->get_n_kv();
+    const int64_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+
+    *kq_pos = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_kv, 1, 1, n_stream);
+    ggml_set_input(*kq_pos);
+    ggml_set_name(*kq_pos, "attn_inp_kq_pos");
+
+    *kq_qpos = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ubatch.n_tokens/n_stream, 1, 1, n_stream);
+    ggml_set_input(*kq_qpos);
+    ggml_set_name(*kq_qpos, "attn_inp_kq_qpos");
+
+    // flash attention requires an f16 mask
+    *kq_mask_cnv = ggml_kq_mask(ctx, *kq_pos, *kq_qpos, mctx->get_swa_type(), mctx->get_n_swa(),
+            cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32);
+    ggml_set_name(*kq_mask_cnv, "attn_inp_kq_mask");
+}
+
+static void set_input_kq_mask_any(
+        const llama_kv_cache_context * mctx,
+        ggml_tensor * kq_mask,
+        ggml_tensor * kq_pos,
+        ggml_tensor * kq_qpos,
+        ggml_tensor * kq_ranges,
+        const ggml_tensor * kq_mask_cnv,
+        const llama_ubatch * ubatch,
+        bool causal_attn) {
+    if (kq_mask && kq_mask->buffer) {
+        mctx->set_input_kq_mask(kq_mask, ubatch, causal_attn);
+    } else if (kq_pos && kq_pos->buffer) {
+        mctx->set_input_kq_pos(kq_pos, kq_qpos, ubatch);
+    } else {
+        return;
+    }
+
+    if (kq_ranges && kq_ranges->buffer) {
+        mctx->set_input_kq_ranges(kq_ranges, ubatch, causal_attn, kq_mask_cnv->ne[0]);
+    }
+}
+
+static bool can_reuse_kq_mask_any(
+        ggml_tensor * kq_mask,
+        ggml_tensor * kq_pos,
+        ggml_tensor * kq_qpos,
+        const llama_kv_cache_context * mctx,
+        const llama_hparams & hparams,
+        const llm_graph_params & params) {
+    const bool host = kq_mask && kq_mask->buffer;
+    const bool dev  = kq_pos  && kq_pos->buffer;
+    if (!host && !dev) {
+        return true;
+    }
+
+    // a host mask holds for any ubatch, a device-built one only for those it is built for
+    if (dev && !kq_mask_on_device(mctx, params.ubatch, hparams, params.cparams)) {
+        return false;
+    }
+
+    if (host) {
+        return can_reuse_kq_mask(kq_mask, mctx, params.ubatch, params.cparams);
+    }
+
+    const int64_t n_stream = params.cparams.kv_unified ? 1 : params.ubatch.n_seqs_unq;
+
+    bool res = true;
+
+    res &= kq_pos->ne[0]  == mctx->get_n_kv_used();
+    res &= kq_pos->ne[3]  == n_stream;
+    res &= kq_qpos->ne[0] == params.ubatch.n_tokens/n_stream;
+
+    return res;
+}
+
 // the bound on the cells a row of a sliding-window mask sees
 static int32_t kq_ranges_n_visible_max(const llama_hparams & hparams) {
     if (llama_kq_ranges_mode() == 2) {
@@ -552,13 +685,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
 
     // the mask is left unallocated when the graph only stores K/V without attending
     // (e.g. DFlash's KV-injection pass)
-    if (self_kq_mask && self_kq_mask->buffer) {
-        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
-
-        if (self_kq_ranges && self_kq_ranges->buffer) {
-            mctx->set_input_kq_ranges(self_kq_ranges, ubatch, cparams.causal_attn, self_kq_mask->ne[0]);
-        }
-    }
+    set_input_kq_mask_any(mctx, self_kq_mask, self_kq_pos, self_kq_qpos, self_kq_ranges, self_kq_mask_cnv, ubatch, cparams.causal_attn);
 
     if (self_k_rot && self_k_rot->buffer) {
         mctx->set_input_k_rot(self_k_rot);
@@ -579,7 +706,11 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    if (self_kq_pos) {
+        res &= can_reuse_kq_mask_any(self_kq_mask, self_kq_pos, self_kq_qpos, mctx, hparams, params);
+    } else {
+        res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    }
 
     return res;
 }
@@ -702,13 +833,7 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     }
 
     // the kq mask guards on its own buffer: shared cells leave idxs unbacked while the mask stays live
-    if (self_kq_mask && self_kq_mask->buffer) {
-        mctx->get_base()->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
-
-        if (self_kq_ranges && self_kq_ranges->buffer) {
-            mctx->get_base()->set_input_kq_ranges(self_kq_ranges, ubatch, cparams.causal_attn, self_kq_mask->ne[0]);
-        }
-    }
+    set_input_kq_mask_any(mctx->get_base(), self_kq_mask, self_kq_pos, self_kq_qpos, self_kq_ranges, self_kq_mask_cnv, ubatch, cparams.causal_attn);
 
     // swa tensors may not be allocated if there are no SWA attention layers
     if (self_k_idxs_swa && self_k_idxs_swa->buffer) {
@@ -718,13 +843,7 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
         }
     }
 
-    if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
-        mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn);
-
-        if (self_kq_ranges_swa && self_kq_ranges_swa->buffer) {
-            mctx->get_swa()->set_input_kq_ranges(self_kq_ranges_swa, ubatch, cparams.causal_attn, self_kq_mask_swa->ne[0]);
-        }
-    }
+    set_input_kq_mask_any(mctx->get_swa(), self_kq_mask_swa, self_kq_pos_swa, self_kq_qpos_swa, self_kq_ranges_swa, self_kq_mask_swa_cnv, ubatch, cparams.causal_attn);
 
     if (self_k_rot && self_k_rot->buffer) {
         mctx->get_base()->set_input_k_rot(self_k_rot);
@@ -756,9 +875,7 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
       //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
     }
 
-    if (self_kq_mask && self_kq_mask->buffer) {
-        res &= can_reuse_kq_mask(self_kq_mask, mctx->get_base(), params.ubatch, params.cparams);
-    }
+    res &= can_reuse_kq_mask_any(self_kq_mask, self_kq_pos, self_kq_qpos, mctx->get_base(), hparams, params);
 
     // swa tensors may not be allocated if there are no SWA attention layers
     if (self_k_idxs_swa && self_k_idxs_swa->buffer) {
@@ -766,9 +883,7 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
       //res &= self_v_idxs_swa->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
     }
 
-    if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
-        res &= can_reuse_kq_mask(self_kq_mask_swa, mctx->get_swa(), params.ubatch, params.cparams);
-    }
+    res &= can_reuse_kq_mask_any(self_kq_mask_swa, self_kq_pos_swa, self_kq_qpos_swa, mctx->get_swa(), hparams, params);
 
     return res;
 }
@@ -1181,11 +1296,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
-
-    if (inp_attn->self_kq_ranges && inp_attn->self_kq_ranges->buffer) {
-        mctx->get_attn()->set_input_kq_ranges(inp_attn->self_kq_ranges, ubatch, cparams.causal_attn, inp_attn->self_kq_mask->ne[0]);
-    }
+    set_input_kq_mask_any(mctx->get_attn(), inp_attn->self_kq_mask, inp_attn->self_kq_pos, inp_attn->self_kq_qpos,
+            inp_attn->self_kq_ranges, inp_attn->self_kq_mask_cnv, ubatch, cparams.causal_attn);
 
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
@@ -1218,7 +1330,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    res &= can_reuse_kq_mask_any(inp_attn->self_kq_mask, inp_attn->self_kq_pos, inp_attn->self_kq_qpos, mctx->get_attn(), inp_attn->hparams, params);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -1281,13 +1393,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
         attn_ctx->get_base()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
     }
 
-    if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
-        attn_ctx->get_base()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
-
-        if (inp_attn->self_kq_ranges && inp_attn->self_kq_ranges->buffer) {
-            attn_ctx->get_base()->set_input_kq_ranges(inp_attn->self_kq_ranges, ubatch, cparams.causal_attn, inp_attn->self_kq_mask->ne[0]);
-        }
-    }
+    set_input_kq_mask_any(attn_ctx->get_base(), inp_attn->self_kq_mask, inp_attn->self_kq_pos, inp_attn->self_kq_qpos,
+            inp_attn->self_kq_ranges, inp_attn->self_kq_mask_cnv, ubatch, cparams.causal_attn);
 
     // swa tensors may not be allocated if there are no SWA attention layers
     if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
@@ -1295,13 +1402,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
         attn_ctx->get_swa()->set_input_v_idxs(inp_attn->self_v_idxs_swa, ubatch);
     }
 
-    if (inp_attn->self_kq_mask_swa && inp_attn->self_kq_mask_swa->buffer) {
-        attn_ctx->get_swa()->set_input_kq_mask(inp_attn->self_kq_mask_swa, ubatch, cparams.causal_attn);
-
-        if (inp_attn->self_kq_ranges_swa && inp_attn->self_kq_ranges_swa->buffer) {
-            attn_ctx->get_swa()->set_input_kq_ranges(inp_attn->self_kq_ranges_swa, ubatch, cparams.causal_attn, inp_attn->self_kq_mask_swa->ne[0]);
-        }
-    }
+    set_input_kq_mask_any(attn_ctx->get_swa(), inp_attn->self_kq_mask_swa, inp_attn->self_kq_pos_swa, inp_attn->self_kq_qpos_swa,
+            inp_attn->self_kq_ranges_swa, inp_attn->self_kq_mask_swa_cnv, ubatch, cparams.causal_attn);
 
     if (inp_attn->self_k_rot) {
         attn_ctx->get_base()->set_input_k_rot(inp_attn->self_k_rot);
@@ -1347,7 +1449,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
       //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
     }
 
-    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, attn_ctx->get_base(), params.ubatch, params.cparams);
+    res &= can_reuse_kq_mask_any(inp_attn->self_kq_mask, inp_attn->self_kq_pos, inp_attn->self_kq_qpos, attn_ctx->get_base(), inp_attn->hparams, params);
 
     // swa tensors may not be allocated if there are no SWA attention layers
     if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
@@ -1355,7 +1457,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
       //res &= inp_attn->self_v_idxs_swa->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
     }
 
-    res &= can_reuse_kq_mask(inp_attn->self_kq_mask_swa, attn_ctx->get_swa(), params.ubatch, params.cparams);
+    res &= can_reuse_kq_mask_any(inp_attn->self_kq_mask_swa, inp_attn->self_kq_pos_swa, inp_attn->self_kq_qpos_swa, attn_ctx->get_swa(), inp_attn->hparams, params);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -3009,8 +3111,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
-        inp->self_kq_mask_cnv = inp->self_kq_mask;
+        build_attn_inp_kq_mask_any(ctx0, mctx_cur, ubatch, hparams, cparams,
+                &inp->self_kq_mask, &inp->self_kq_pos, &inp->self_kq_qpos, &inp->self_kq_mask_cnv);
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -3024,7 +3126,7 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
 
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
 
-    inp->self_kq_ranges = build_attn_inp_kq_ranges(ctx0, inp->self_kq_mask, cparams);
+    inp->self_kq_ranges = build_attn_inp_kq_ranges(ctx0, inp->self_kq_mask_cnv, cparams);
     if (inp->self_kq_ranges) {
         res->kq_ranges[inp->self_kq_mask_cnv] = { inp->self_kq_ranges, 0 };
     }
@@ -3595,8 +3697,8 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
         inp->self_k_idxs = mctx_cur->get_base()->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->get_base()->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur->get_base(), ubatch, cparams);
-        inp->self_kq_mask_cnv = inp->self_kq_mask;
+        build_attn_inp_kq_mask_any(ctx0, mctx_cur->get_base(), ubatch, hparams, cparams,
+                &inp->self_kq_mask, &inp->self_kq_pos, &inp->self_kq_qpos, &inp->self_kq_mask_cnv);
     }
 
     {
@@ -3605,12 +3707,12 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
         inp->self_k_idxs_swa = mctx_cur->get_swa()->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs_swa = mctx_cur->get_swa()->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask_swa = build_attn_inp_kq_mask(ctx0, mctx_cur->get_swa(), ubatch, cparams);
-        inp->self_kq_mask_swa_cnv = inp->self_kq_mask_swa;
+        build_attn_inp_kq_mask_any(ctx0, mctx_cur->get_swa(), ubatch, hparams, cparams,
+                &inp->self_kq_mask_swa, &inp->self_kq_pos_swa, &inp->self_kq_qpos_swa, &inp->self_kq_mask_swa_cnv);
     }
 
-    inp->self_kq_ranges     = build_attn_inp_kq_ranges(ctx0, inp->self_kq_mask,     cparams);
-    inp->self_kq_ranges_swa = build_attn_inp_kq_ranges(ctx0, inp->self_kq_mask_swa, cparams);
+    inp->self_kq_ranges     = build_attn_inp_kq_ranges(ctx0, inp->self_kq_mask_cnv,     cparams);
+    inp->self_kq_ranges_swa = build_attn_inp_kq_ranges(ctx0, inp->self_kq_mask_swa_cnv, cparams);
     if (inp->self_kq_ranges) {
         res->kq_ranges[inp->self_kq_mask_cnv] = { inp->self_kq_ranges, 0 };
     }
@@ -3820,7 +3922,7 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
     auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
 
-    inp_attn->self_kq_ranges = build_attn_inp_kq_ranges(ctx0, inp_attn->self_kq_mask, cparams);
+    inp_attn->self_kq_ranges = build_attn_inp_kq_ranges(ctx0, inp_attn->self_kq_mask_cnv, cparams);
     if (inp_attn->self_kq_ranges) {
         res->kq_ranges[inp_attn->self_kq_mask_cnv] = { inp_attn->self_kq_ranges, 0 };
     }
@@ -3855,20 +3957,20 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
         inp_attn->self_k_idxs = attn_ctx->get_base()->build_input_k_idxs(ctx0, ubatch);
         inp_attn->self_v_idxs = attn_ctx->get_base()->build_input_v_idxs(ctx0, ubatch);
 
-        inp_attn->self_kq_mask = build_attn_inp_kq_mask(ctx0, attn_ctx->get_base(), ubatch, cparams);
-        inp_attn->self_kq_mask_cnv = inp_attn->self_kq_mask;
+        build_attn_inp_kq_mask_any(ctx0, attn_ctx->get_base(), ubatch, hparams, cparams,
+                &inp_attn->self_kq_mask, &inp_attn->self_kq_pos, &inp_attn->self_kq_qpos, &inp_attn->self_kq_mask_cnv);
     }
 
     {
         inp_attn->self_k_idxs_swa = attn_ctx->get_swa()->build_input_k_idxs(ctx0, ubatch);
         inp_attn->self_v_idxs_swa = attn_ctx->get_swa()->build_input_v_idxs(ctx0, ubatch);
 
-        inp_attn->self_kq_mask_swa = build_attn_inp_kq_mask(ctx0, attn_ctx->get_swa(), ubatch, cparams);
-        inp_attn->self_kq_mask_swa_cnv = inp_attn->self_kq_mask_swa;
+        build_attn_inp_kq_mask_any(ctx0, attn_ctx->get_swa(), ubatch, hparams, cparams,
+                &inp_attn->self_kq_mask_swa, &inp_attn->self_kq_pos_swa, &inp_attn->self_kq_qpos_swa, &inp_attn->self_kq_mask_swa_cnv);
     }
 
-    inp_attn->self_kq_ranges     = build_attn_inp_kq_ranges(ctx0, inp_attn->self_kq_mask,     cparams);
-    inp_attn->self_kq_ranges_swa = build_attn_inp_kq_ranges(ctx0, inp_attn->self_kq_mask_swa, cparams);
+    inp_attn->self_kq_ranges     = build_attn_inp_kq_ranges(ctx0, inp_attn->self_kq_mask_cnv,     cparams);
+    inp_attn->self_kq_ranges_swa = build_attn_inp_kq_ranges(ctx0, inp_attn->self_kq_mask_swa_cnv, cparams);
     if (inp_attn->self_kq_ranges) {
         res->kq_ranges[inp_attn->self_kq_mask_cnv] = { inp_attn->self_kq_ranges, 0 };
     }

@@ -248,6 +248,13 @@ public:
     void set_input_kq_ranges (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, int64_t n_kv) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    // the inputs of a mask built by ggml_kq_mask: per stream the position of each cell its sequence sees (-1 for the
+    //   others), and the positions of the tokens
+    void set_input_kq_pos(ggml_tensor * dst_kv, ggml_tensor * dst_q, const llama_ubatch * ubatch) const;
+
+    llama_swa_type get_swa_type() const { return swa_type; }
+    uint32_t       get_n_swa()    const { return n_swa; }
+
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
@@ -461,7 +468,11 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_kq_ranges (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, int64_t n_kv) const;
+    void set_input_kq_pos    (ggml_tensor * dst_kv, ggml_tensor * dst_q, const llama_ubatch * ubatch) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    llama_swa_type get_swa_type() const;
+    uint32_t       get_n_swa()    const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;

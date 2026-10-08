@@ -586,6 +586,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_GET_ROWS_MEAN,
+        GGML_OP_KQ_MASK,
 
         GGML_OP_UNARY,
 
@@ -1743,6 +1744,26 @@ extern "C" {
             struct ggml_tensor  * a,  // data
             struct ggml_tensor  * b,  // row indices
             int                   n_group);
+
+    // the sliding-window rules of ggml_kq_mask, numbered as llama_swa_type
+    enum ggml_kq_mask_swa {
+        GGML_KQ_MASK_SWA_NONE      = 0,
+        GGML_KQ_MASK_SWA_STANDARD  = 1, // the query sees the n_swa newest positions
+        GGML_KQ_MASK_SWA_CHUNKED   = 2, // the query sees its own chunk of n_swa positions
+        GGML_KQ_MASK_SWA_SYMMETRIC = 3, // the query sees n_swa/2 positions back
+    };
+
+    // causal attention mask from positions: 0 where the query sees the cell, -INF elsewhere
+    // kv_pos I32 [n_kv, 1, 1, n_stream] (a negative position: the stream never sees the cell),
+    // q_pos I32 [n_q, 1, 1, n_stream] -> type (F16 or F32) [n_kv, n_q, 1, n_stream]
+    // a cell is seen when its position is not after the query's and the window (enum ggml_kq_mask_swa) holds it
+    GGML_API struct ggml_tensor * ggml_kq_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kv_pos,
+            struct ggml_tensor  * q_pos,
+            int                   swa_type,
+            int                   n_swa,
+            enum ggml_type        type);
 
     GGML_API struct ggml_tensor * ggml_get_rows_back(
             struct ggml_context * ctx,

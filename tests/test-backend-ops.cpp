@@ -2498,6 +2498,68 @@ struct test_get_rows_mean : public test_case {
     }
 };
 
+// GGML_OP_KQ_MASK
+// the output is 0 or -inf only, so a wrong decision moves an infinity, which the comparison checks position by position
+struct test_kq_mask : public test_case {
+    const ggml_type type;
+    const int64_t n_kv;
+    const int64_t n_q;
+    const int64_t n_stream;
+    const int swa_type;
+    const int n_swa;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, n_kv, n_q, n_stream, swa_type, n_swa);
+    }
+
+    test_kq_mask(ggml_type type = GGML_TYPE_F16, int64_t n_kv = 512, int64_t n_q = 64, int64_t n_stream = 1,
+            int swa_type = GGML_KQ_MASK_SWA_NONE, int n_swa = 0)
+        : type(type), n_kv(n_kv), n_q(n_q), n_stream(n_stream), swa_type(swa_type), n_swa(n_swa) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * kv_pos = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_kv, 1, 1, n_stream);
+        ggml_set_name(kv_pos, "kv_pos");
+
+        ggml_tensor * q_pos = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_q, 1, 1, n_stream);
+        ggml_set_name(q_pos, "q_pos");
+
+        ggml_tensor * out = ggml_kq_mask(ctx, kv_pos, q_pos, swa_type, n_swa, type);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(42);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "kv_pos") == 0) {
+                // the positions 0..n_kv-1 in a shuffled cell order, every 8th cell one the stream does not see
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t s = 0; s < n_stream; ++s) {
+                    int32_t * row = data.data() + s*n_kv;
+                    for (int64_t j = 0; j < n_kv; ++j) {
+                        row[j] = (int32_t) j;
+                    }
+                    std::shuffle(row, row + n_kv, rng);
+                    for (int64_t j = 0; j < n_kv; j += 8) {
+                        row[(j + s) % n_kv] = -1;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "q_pos") == 0) {
+                // the last positions of the sequence and some anywhere in it
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t s = 0; s < n_stream; ++s) {
+                    for (int64_t i = 0; i < n_q; ++i) {
+                        data[s*n_q + i] = i % 3 == 0 ? (int32_t) (rng() % n_kv) : (int32_t) (n_kv - n_q + i);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            }
+        }
+    }
+};
+
 // GET_ROWS_MEAN -> RMS_NORM * weight -> multi-section ROPE: the qwen4exp QSA key pooling, which CUDA fuses
 struct test_get_rows_mean_norm_rope : public test_case {
     const ggml_type type;
@@ -12019,6 +12081,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_get_rows_mean(GGML_TYPE_F32, 6, 10, 3, 3, 2, 3));
+
+    for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        test_cases.emplace_back(new test_kq_mask(type, 512, 64, 1));
+        test_cases.emplace_back(new test_kq_mask(type, 1000, 37, 2));
+        test_cases.emplace_back(new test_kq_mask(type, 1000, 37, 2, GGML_KQ_MASK_SWA_STANDARD,  128));
+        test_cases.emplace_back(new test_kq_mask(type, 777,  65, 1, GGML_KQ_MASK_SWA_CHUNKED,   64));
+        test_cases.emplace_back(new test_kq_mask(type, 600,  16, 3, GGML_KQ_MASK_SWA_SYMMETRIC, 32));
+    }
     test_cases.emplace_back(new test_get_rows_mean(GGML_TYPE_Q8_0, 128, 4096, 1024, 4));
     // one column off: the f16/f32 rows lose the alignment of a pair load
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
