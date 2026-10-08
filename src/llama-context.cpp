@@ -1557,6 +1557,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        // the samplers were applied to this graph, their input tensors are in it now
+        if (!res->t_sampled.empty()) {
+            sampling.res = res;
+        }
+
         if (!ggml_backend_sched_alloc_graph(sched_cur, gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -2823,6 +2828,10 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * gf = model.build_graph(gparams);
 
+    if (!res->t_sampled.empty()) {
+        sampling.res = res;
+    }
+
     this->n_input_tensors = llama_graph_n_input_tensors(gf);
     this->n_outputs = save_n_outputs;
 
@@ -2864,6 +2873,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.res_sampling =*/ sampling.res,
     };
 }
 

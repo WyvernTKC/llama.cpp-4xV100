@@ -1479,6 +1479,26 @@ void llama_sampler_backend_begin(llama_sampler * sampler) {
     }
 }
 
+bool llama_sampler_backend_has_input(const llama_sampler * sampler) {
+    GGML_ASSERT(sampler != nullptr);
+
+    if (sampler->iface != &llama_sampler_chain_i) {
+        return sampler->iface->backend_set_input != nullptr;
+    }
+
+    const auto * chain = (const llama_sampler_chain *) sampler->ctx;
+    for (const auto & entry : chain->samplers) {
+        if (!entry.is_backend) {
+            break;
+        }
+        if (llama_sampler_backend_has_input(entry.ptr)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 // top-k
 
 struct llama_sampler_top_k : public llama_sampler_backend {

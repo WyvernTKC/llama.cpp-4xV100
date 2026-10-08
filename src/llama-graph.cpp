@@ -1401,6 +1401,15 @@ bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
         }
     }
 
+    // a sampler sets its inputs in the graph it was applied to last, the inputs of this one would be stale
+    if (params.res != params.res_sampling) {
+        for (const auto & [seq_id, sampler] : samplers) {
+            if (llama_sampler_backend_has_input(sampler)) {
+                return false;
+            }
+        }
+    }
+
     return true;
 }
 

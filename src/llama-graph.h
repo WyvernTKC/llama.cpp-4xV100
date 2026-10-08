@@ -833,6 +833,9 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // the graph the samplers were applied to last: it holds their input tensors
+    const llm_graph_result * res_sampling = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {

@@ -788,12 +788,25 @@ static void test_backend_logit_bias_sampling(const test_params & params) {
     llama_tokenize(vocab, piece.c_str(), piece.size(), tokens.data(), tokens.size(), false, false);
 
     llama_token bias_token = tokens[0];
+
+    // a fixed bias does not make the token win in every model: after "Hello" it is 10.6 below the best token in
+    //   gemma-4 12B, so bias it to 10 above the best token of a context without samplers
+    std::vector<float> ref_logits;
+    {
+        std::vector<llama_sampler_seq_config> configs;
+        test_context ref_ctx(params, configs, 1);
+        GGML_ASSERT(ref_ctx.decode({{seq_id, "Hello"}}));
+        const float * logits = llama_get_logits_ith(ref_ctx.ctx.get(), ref_ctx.idx_for_seq(seq_id));
+        ref_logits.assign(logits, logits + ref_ctx.n_vocab);
+    }
+    const float bias = std::max(0.0f, *std::max_element(ref_logits.begin(), ref_logits.end()) - ref_logits[bias_token]) + 10.0f;
+
     // TODO: biasing too much here makes the Vulkan sampling fail - should be investigated further
     //       https://github.com/ggml-org/llama.cpp/actions/runs/20894267644/job/60030252675?pr=18753#step:3:23350
     //logit_bias.push_back({ bias_token, +100.0f });
-    logit_bias.push_back({ bias_token, +10.0f });
+    logit_bias.push_back({ bias_token, bias });
 
-    printf("biasing token piece '%s' -> token id %d\n", piece.c_str(), bias_token);
+    printf("biasing token piece '%s' -> token id %d by %.3f\n", piece.c_str(), bias_token, bias);
 
     struct llama_sampler_chain_params backend_chain_params = llama_sampler_chain_default_params();
     llama_sampler_ptr backend_sampler_chain(llama_sampler_chain_init(backend_chain_params));
@@ -813,9 +826,19 @@ static void test_backend_logit_bias_sampling(const test_params & params) {
         GGML_ASSERT(false && "Failed to decode token");
     }
 
-    llama_token backend_token = llama_get_sampled_token_ith(test_ctx.ctx.get(), test_ctx.idx_for_seq(seq_id));
+    const int32_t idx = test_ctx.idx_for_seq(seq_id);
+    llama_token backend_token = llama_get_sampled_token_ith(test_ctx.ctx.get(), idx);
     printf("sampled token = %d, expected = %d\n", backend_token, bias_token);
     GGML_ASSERT(backend_token == bias_token);
+
+    // the bias is added to this token only, after the last logit op of the model (the softcap of gemma)
+    const float * logits = llama_get_sampled_logits_ith(test_ctx.ctx.get(), idx);
+    GGML_ASSERT(logits != nullptr);
+    GGML_ASSERT(llama_get_sampled_logits_count_ith(test_ctx.ctx.get(), idx) == ref_logits.size());
+    for (size_t t = 0; t < ref_logits.size(); ++t) {
+        const float expected = ref_logits[t] + (t == (size_t) bias_token ? bias : 0.0f);
+        GGML_ASSERT(std::fabs(logits[t] - expected) <= 1e-3f*std::max(1.0f, std::fabs(expected)));
+    }
 
     printf("backend logit bias sampling test PASSED\n");
 }
@@ -1751,6 +1774,8 @@ static void test_backend_multi_output_dist_transaction(const test_params & param
     decode();
     verify_random(0, randoms[0]);
     verify_random(1, randoms[1]);
+    // the third output is a ubatch of its own (n_ubatch 2), sampled in a second graph of the context
+    verify_random(2, randoms[2], false);
 
     decode();
     llama_sampler_ptr saved(llama_sampler_clone(chain.get()));

@@ -38,6 +38,9 @@ struct llama_sampler_chain {
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
 void llama_sampler_backend_begin(llama_sampler * sampler);
 
+// true if the backend part of the sampler sets input tensors: they are in the graph it was applied to last
+bool llama_sampler_backend_has_input(const llama_sampler * sampler);
+
 struct llama_sampler * llama_sampler_init_dry_testing(
         float   dry_multiplier,
         float   dry_base,

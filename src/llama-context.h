@@ -344,6 +344,9 @@ private:
         // sequences with a sampler whose raw logits are copied too (llama_set_sampler_raw_logits)
         std::set<llama_seq_id> raw_logits;
 
+        // the graph the samplers were applied to last, see llm_graph_params::res_sampling
+        const llm_graph_result * res = nullptr;
+
         buffer_view<float>       logits     = {nullptr, 0};
         buffer_view<llama_token> sampled    = {nullptr, 0};
         buffer_view<float>       probs      = {nullptr, 0};
