@@ -11,6 +11,40 @@ static __forceinline__ int mmf_get_rows_per_block(const int cc) {
     }
 }
 
+// the K slices of a split matmul added in slice order: part is [ksplit][ncols][nrows]
+static __global__ void mul_mat_f_ksplit_sum(const float * part, float * dst, const int nrows, const int ncols, const int ksplit,
+        const int64_t stride_col_dst) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nrows*ncols) {
+        return;
+    }
+    float sum = part[i];
+    for (int s = 1; s < ksplit; ++s) {
+        sum += part[int64_t(s)*nrows*ncols + i];
+    }
+    dst[int64_t(i / nrows)*stride_col_dst + i % nrows] = sum;
+}
+
+// On Volta a block of rows walks all of K at ~14 GB/s per SM: a matrix of a few row blocks (the K and V projections of
+//   Muse-Glimmer at 16 tokens: 256 x 6656 per device, 8 blocks, 30 us) runs on that many SMs. Split K into slices that
+//   run as the samples of one launch, so each block walks only its slice, and add them up in a second kernel. F16 only:
+//   Volta has no BF16 path in mul_mat_f.
+static int mul_mat_f_ksplit(const int cc, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        const int rows_per_block, const int warp_size) {
+    if (ids || !volta_mma_available(cc) || src0->type != GGML_TYPE_F16 ||
+            src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || src0->ne[1] % rows_per_block != 0) {
+        return 1;
+    }
+    const int64_t nblocks = src0->ne[1] / rows_per_block;
+    const int64_t k_T     = src0->ne[0] / 2;
+    const int     nsm     = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    int ksplit = 1;
+    while (nblocks*ksplit*2 <= nsm && k_T % (ksplit*2*warp_size) == 0 && k_T/(ksplit*2) >= 8*warp_size) {
+        ksplit *= 2;
+    }
+    return ksplit;
+}
+
 void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(!ids ||  ids->type == GGML_TYPE_I32);
@@ -100,6 +134,22 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     const int device    = ggml_cuda_get_device();
     const int cc        = ggml_cuda_info().devices[device].cc;
     const int rows_per_block = mmf_get_rows_per_block(cc);
+
+    static const bool no_ksplit = getenv("GGML_CUDA_MMF_NO_KSPLIT") != nullptr;
+    const int ksplit = no_ksplit ? 1 : mul_mat_f_ksplit(cc, src0, src1, ids, rows_per_block, ggml_cuda_info().devices[device].warp_size);
+    if (ksplit > 1) {
+        const int64_t k_slice = ne00 / ksplit;
+        ggml_cuda_pool_alloc<float> part(ctx.pool(), ksplit*ne01*ncols_dst);
+        // the slices are the samples: x and y advance by k_slice values, each slice into its own partial dst
+        mul_mat_f_switch_rows_per_block<half2>(
+            rows_per_block, (const half2 *) src0->data, src1_d, nullptr, part.get(), k_slice/2, ne01, ncols_dst, s01/2,
+            stride_col_y/2, ne01, 0, 0, 1, 1, 1, s02/2, stride_channel_y, ne01*ncols_dst,
+            ksplit, ksplit, k_slice/2, k_slice, ne01*ncols_dst, ctx.stream(), nullptr);
+        const int n = (int) (ne01*ncols_dst);
+        mul_mat_f_ksplit_sum<<<(n + 255)/256, 256, 0, ctx.stream()>>>(part.get(), dst_d, (int) ne01, (int) ncols_dst, ksplit, stride_col_dst);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
 
     switch (src0->type) {
         case GGML_TYPE_F32: {
