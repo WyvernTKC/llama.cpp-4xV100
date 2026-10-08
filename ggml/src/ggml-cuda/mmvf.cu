@@ -106,16 +106,21 @@ static __global__ void mul_mat_vec_f(
             dst = fusion.sib_dst - row;
         }
     }
-    if constexpr (has_fusion) {
-        // sibling rows (one token, one row per block, one channel and sample): the blocks from sib_block0 on run the
-        //   rows of a sibling matrix of the same type, width and y into its own dst, those from sib2_block0 on a second's
-        //   and those from gdn_block0 on a third's (gdn_x, the gated delta net rows of mmvq)
-        if (fusion.sib_block0 > 0 && blockIdx.x >= fusion.sib_block0) {
-            const int k = fusion.gdn_x  != nullptr && blockIdx.x >= fusion.gdn_block0  ? 2 :
-                          fusion.sib2_x != nullptr && blockIdx.x >= fusion.sib2_block0 ? 1 : 0;
-            const int r = rpb*(blockIdx.x - (k == 2 ? fusion.gdn_block0 : k == 1 ? fusion.sib2_block0 : fusion.sib_block0));
+    // the column stride of the dst this block writes
+    int stride_col_dst_blk = stride_col_dst;
+    // (the plain kernel of several tokens takes sibling rows too: the fused one holds the gate's sums in registers)
+    if constexpr (has_fusion || (load16 && ncols_dst > 1)) {
+        // sibling rows (one channel and sample): the rows from sib_block0 on are the rows of a sibling matrix of the same
+        //   type, width and y, written to its own dst ([rows, tokens], contiguous), those from sib2_block0 on a second's
+        //   and those from gdn_block0 on a third's (gdn_x, the gated delta net rows of mmvq). One token with one row per
+        //   block, or several with 4 rows per block and the 16-byte loads; the bounds are multiples of rpb.
+        if (fusion.sib_block0 > 0 && uint32_t(row) >= fusion.sib_block0) {
+            const int k = fusion.gdn_x  != nullptr && uint32_t(row) >= fusion.gdn_block0  ? 2 :
+                          fusion.sib2_x != nullptr && uint32_t(row) >= fusion.sib2_block0 ? 1 : 0;
+            const int r = row - int(k == 2 ? fusion.gdn_block0 : k == 1 ? fusion.sib2_block0 : fusion.sib_block0);
             x   = (const T *) (k == 2 ? fusion.gdn_x : k == 1 ? fusion.sib2_x : fusion.sib_x) + int64_t(r)*stride_row;
             dst = (k == 2 ? fusion.gdn_dst : k == 1 ? fusion.sib2_dst : fusion.sib_dst) + (r - row);
+            stride_col_dst_blk = int(k == 2 ? fusion.gdn_nrows : k == 1 ? fusion.sib2_nrows : fusion.sib_nrows);
         }
     }
 
@@ -674,7 +679,7 @@ static __global__ void mul_mat_vec_f(
         }
     }
 
-    dst[dcol*stride_col_dst + drow] = value;
+    dst[dcol*stride_col_dst_blk + drow] = value;
 
     if constexpr (!has_fusion) {
         GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, glu_limit, gate_x, x_bias, gate_bias, sumf_gate,
@@ -706,12 +711,18 @@ static void mul_mat_vec_f_switch_fusion(
         fusion.sib_x != nullptr;
     if constexpr (ncols_dst > 1 && !is_multi_token_id && sizeof(T) == 2) {
         if (load16) {
-            if (has_fusion) {
+            if (fusion.sib_block0 > 0) {
+                // sibling rows, nothing else fused
+                GGML_ASSERT(rpb == 4 && !fusion.gate && !fusion.x_bias && !fusion.gate_bias && !fusion.gdn_beta);
+                launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, 4, true>);
+            } else if (has_fusion) {
                 // with several tokens only the gate of a gated delta net layer, which has no biases, fuses
                 GGML_ASSERT(fusion.gdn_beta && rpb == 1);
                 launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, false, 1, true>);
             } else if (rpb == 4) {
                 launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, 4, true>);
+            } else if (rpb == 8) {
+                launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, 8, true>);
             } else {
                 GGML_ASSERT(rpb == 1);
                 launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, 1, true>);
@@ -856,6 +867,17 @@ void launch_mul_mat_vec_f_cuda(
     //   14.7 -> 9.9). Each row sums in the same order either way, so a fused gate keeps one row per block.
     if (load16 && ncols_dst > 1 && ncols_dst <= 6 && !has_fusion && ncols >= 1024 && nrows % 4 == 0 &&
             (nrows/4)*nchannels_dst*nsamples_or_ntokens >= ggml_cuda_info().devices[device].nsm) {
+        rpb = 4;
+        // and 8 for a matrix that still leaves 8 blocks per SM (an LM head: f16 6656 x 50512 at 4 tokens 902 -> 827 us;
+        //   rows of 1024 lose, 26.5 vs 20.8 us)
+        if (nrows % 8 == 0 && (nrows/8)*nchannels_dst*nsamples_or_ntokens >= 8*ggml_cuda_info().devices[device].nsm) {
+            rpb = 8;
+        }
+    }
+
+    // sibling rows of several tokens (see ggml_cuda_mul_mat_vec_f): 4 rows per block, which the row counts allow
+    if (ncols_dst > 1 && fusion.sib_block0 > 0) {
+        GGML_ASSERT(load16 && !is_multi_token_id && nrows % 4 == 0);
         rpb = 4;
     }
 
@@ -1073,7 +1095,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);
-        GGML_ASSERT(  ids || dst->ne[1] == 1 || (fusion->gdn_beta && ggml_cuda_mmvf_fuses_tokens(src0, src1, fusion->gate)));
+        GGML_ASSERT(  ids || dst->ne[1] == 1 || ((fusion->gdn_beta || fusion->sib_rows) && ggml_cuda_mmvf_fuses_tokens(src0, src1, fusion->gate)));
         if (fusion->x_bias) {
             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
@@ -1113,9 +1135,11 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             fusion_local.sib_dst = (float *) fusion->sib_dst->data;
         }
         if (fusion->sib && fusion->sib_rows) {
-            // the rows of up to three sibling matrices after those of src0, see mul_mat_vec_f
+            // the rows of up to three sibling matrices after those of src0, see mul_mat_vec_f; several tokens take
+            //   whole blocks of 4 rows of each
             GGML_ASSERT(!ids && !fusion->gate && !fusion->x_bias && !fusion->gate_bias && !fusion->gdn_beta);
-            GGML_ASSERT(ggml_nrows(src1) == 1 && ggml_nrows(dst) == 1 && ggml_nrows(src0) == ne01);
+            GGML_ASSERT(ggml_nrows(src1) == src1->ne[1] && ggml_nrows(dst) == dst->ne[1] && ggml_is_contiguous(dst) &&
+                ggml_nrows(src0) == ne01 && (dst->ne[1] == 1 || ne01 % 4 == 0));
             GGML_ASSERT(!fusion->sib3 || fusion->sib2);
             int64_t row0 = ne01;
             const ggml_tensor * sibs[3] = { fusion->sib,     fusion->sib2,     fusion->sib3     };
@@ -1123,7 +1147,8 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             for (int k = 0; k < 3 && sibs[k] != nullptr; ++k) {
                 const ggml_tensor * sib = sibs[k];
                 GGML_ASSERT(sib->type == src0->type && sib->ne[0] == ne00 && sib->nb[1] == src0->nb[1] && ggml_nrows(sib) == sib->ne[1]);
-                GGML_ASSERT(dsts[k]->type == GGML_TYPE_F32 && ggml_is_contiguous(dsts[k]) && ggml_nelements(dsts[k]) == sib->ne[1]);
+                GGML_ASSERT(dsts[k]->type == GGML_TYPE_F32 && ggml_is_contiguous(dsts[k]) &&
+                    ggml_nelements(dsts[k]) == sib->ne[1]*dst->ne[1] && (dst->ne[1] == 1 || sib->ne[1] % 4 == 0));
                 if (k == 0) {
                     fusion_local.sib_x      = sib->data;
                     fusion_local.sib_dst    = (float *) dsts[k]->data;

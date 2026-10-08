@@ -13273,6 +13273,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 1026, 100, 37, 21, 1, 13));
         }
         test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 6656, 1024, 256, 256, 1, 1024));
+        // and of a draft's verify batch (2-6 tokens, f16/bf16 rows in blocks of 4)
+        for (int64_t n_tokens : { 2, 4, 6 }) {
+            test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 6656, 1024, 256, 256, n_tokens, 1024));
+        }
+        test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 1024, 100, 36, 20, 3, 12));
         test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 1024, 100, 37, 21, 2, 13));
         for (int64_t n_tokens : { 1, 2 }) {
             test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 2048, 2048, 1024, 0, n_tokens));
@@ -13595,6 +13600,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1, 509, 2051, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 1, 509, 2051, {1, 1}, {1, 1}));
 
+    // a tall matrix that mmf cannot tile (rows not a multiple of 32) at a few tokens: mmvf puts 8 rows in a block
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int n : {2, 4, 6}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 5128, n, 1024, {1, 1}, {1, 1}));
+        }
+    }
     // a few row blocks over a long K at a few tokens: mmf splits K on Volta (Muse-Glimmer K/V and Q per device)
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
         for (int64_t n : {2, 9, 16}) {

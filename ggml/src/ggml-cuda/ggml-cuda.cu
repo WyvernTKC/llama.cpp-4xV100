@@ -7157,8 +7157,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
         return 0;
     };
-    const int node_sibling_kernel = node->op == GGML_OP_MUL_MAT && node->src[1]->type == GGML_TYPE_F32 &&
-        ggml_nrows(node->src[1]) == 1 && ggml_is_contiguous(node) ? sibling_kernel(node) : 0;
+    // 3: mmvf of 2-6 tokens with the 16-byte loads and rows in blocks of 4 (the verify batch of a draft)
+    const auto sibling_kernel_mt = [&](const ggml_tensor * t) -> int {
+        const ggml_tensor * w = t->src[0];
+        const ggml_tensor * y = t->src[1];
+        const bool ok = (w->type == GGML_TYPE_F16 || w->type == GGML_TYPE_BF16) && ggml_nrows(w) == w->ne[1] &&
+            w->ne[1] % 4 == 0 && w->ne[0] % 8 == 0 && w->nb[1] % 16 == 0 && (uintptr_t) w->data % 16 == 0 &&
+            y->ne[1] >= 2 && y->ne[1] <= 6 && ggml_nrows(y) == y->ne[1] && y->nb[1] % 16 == 0 &&
+            (uintptr_t) y->data % 16 == 0 && !ggml_cuda_expert_cache_is(w) &&
+            cuda_ctx->stream_context().concurrent_events.empty() &&
+            ggml_cuda_mul_mat_choose(*cuda_ctx, w, y, t) == GGML_CUDA_MUL_MAT_PATH_MMVF;
+        return ok ? 3 : 0;
+    };
+    static const bool no_sibling_rows_mt = getenv("GGML_CUDA_NO_SIBLING_ROWS_MT") != nullptr;
+    const int node_sibling_kernel = node->op == GGML_OP_MUL_MAT && node->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(node) ?
+        (ggml_nrows(node->src[1]) == 1 ? sibling_kernel(node) : no_sibling_rows_mt ? 0 : sibling_kernel_mt(node)) : 0;
     if (node_sibling_kernel != 0) {
         static const bool no_sibling_rows  = getenv("GGML_CUDA_NO_SIBLING_ROWS") != nullptr;
         static const bool no_sibling_rows3 = getenv("GGML_CUDA_NO_SIBLING_ROWS3") != nullptr;
@@ -7179,7 +7192,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return false;
         };
         // mmvf takes a third sibling
-        const int max_sibs = no_sibling_rows3 ? 1 : node_sibling_kernel == 2 && !no_sibling_rows4 ? 3 : 2;
+        const int max_sibs = no_sibling_rows3 ? 1 : node_sibling_kernel >= 2 && !no_sibling_rows4 ? 3 : 2;
         ggml_tensor * sibs[3] = { nullptr, nullptr, nullptr };
         int n_sibs = 0;
         int last   = i;
@@ -7193,7 +7206,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     !ggml_are_same_stride(sib->src[1], node->src[1]) || sib->src[0]->type != node->src[0]->type ||
                     sib->src[0]->ne[0] != node->src[0]->ne[0] || sib->src[0]->nb[1] != node->src[0]->nb[1] ||
                     ggml_nrows(sib->src[0]) != sib->src[0]->ne[1] || !ggml_is_contiguous(sib) ||
-                    sibling_kernel(sib) != node_sibling_kernel ||
+                    (node_sibling_kernel == 3 ? sibling_kernel_mt(sib) : sibling_kernel(sib)) != node_sibling_kernel ||
                     ggml_cuda_tensors_overlap(sib, node) || ggml_cuda_tensors_overlap(sib, node->src[1]) ||
                     (n_sibs > 0 && ggml_cuda_tensors_overlap(sib, sibs[0])) ||
                     (n_sibs > 1 && ggml_cuda_tensors_overlap(sib, sibs[1])) ||
