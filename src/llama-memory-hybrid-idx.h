@@ -88,10 +88,11 @@ public:
     //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
     // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
     // the caller then adds the attention mask, the only part of the bias that varies within a block
+    // with bias_blk and bias_q instead of bias, the inputs of ggml_kq_block_bias: I32 [n_blocks, ns] and [n_tokens/ns, ns]
     // causal_attn selects the rule: causal forces the query's own block on, non-causal lets every visible block compete on score
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias, bool causal_attn) const;
+                       ggml_tensor * bias, ggml_tensor * bias_blk, ggml_tensor * bias_q, const llama_ubatch * ubatch,
+                       uint32_t ratio, bool blk_bias, bool causal_attn) const;
 
     // The model's indexer pool size.
     uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
@@ -207,8 +208,8 @@ public:
     uint32_t get_n_stream() const;
 
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias, bool causal_attn) const;
+                       ggml_tensor * bias, ggml_tensor * bias_blk, ggml_tensor * bias_q, const llama_ubatch * ubatch,
+                       uint32_t ratio, bool blk_bias, bool causal_attn) const;
 
     // glm5-next and qwen4exp, complete pools of kpool cells per sequence, scored as whole pools.
     uint32_t get_n_kpool    () const; // Padded pool count, where the last pool is always unused.

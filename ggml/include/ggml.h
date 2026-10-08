@@ -1765,6 +1765,15 @@ extern "C" {
             int                   n_swa,
             enum ggml_type        type);
 
+    // the bias of blocks of ratio positions from the same kind of inputs, as F32: blk_pos holds the first position of
+    // each block (-1: the stream does not see it, -2: it is always picked), q_pos the position of each query. A block
+    // from the query's incomplete tail block on gets 1e9, an earlier one 0, one not seen -INF (qwen4exp QSA)
+    GGML_API struct ggml_tensor * ggml_kq_block_bias(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * blk_pos,
+            struct ggml_tensor  * q_pos,
+            int                   ratio);
+
     GGML_API struct ggml_tensor * ggml_get_rows_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // gradients of ggml_get_rows result

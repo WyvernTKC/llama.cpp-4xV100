@@ -4044,10 +4044,25 @@ struct ggml_tensor * ggml_kq_mask(
 
     ggml_set_op_params_i32(result, 0, swa_type);
     ggml_set_op_params_i32(result, 1, n_swa);
+    ggml_set_op_params_i32(result, 2, 0);
 
     result->op     = GGML_OP_KQ_MASK;
     result->src[0] = kv_pos;
     result->src[1] = q_pos;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_kq_block_bias(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * blk_pos,
+        struct ggml_tensor  * q_pos,
+        int                   ratio) {
+    GGML_ASSERT(ratio > 0);
+
+    struct ggml_tensor * result = ggml_kq_mask(ctx, blk_pos, q_pos, GGML_KQ_MASK_SWA_NONE, 0, GGML_TYPE_F32);
+
+    ggml_set_op_params_i32(result, 2, ratio);
 
     return result;
 }

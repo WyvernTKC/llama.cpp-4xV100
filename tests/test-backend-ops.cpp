@@ -2560,6 +2560,59 @@ struct test_kq_mask : public test_case {
     }
 };
 
+// GGML_OP_KQ_MASK as the block bias of ggml_kq_block_bias: 0, 1e9 or -inf. -inf turns the value comparison into NaN,
+// which passes, so the cases without unseen blocks are the ones that check the 0 / 1e9 decisions
+struct test_kq_block_bias : public test_case {
+    const int64_t n_blk;
+    const int64_t n_q;
+    const int64_t n_stream;
+    const int ratio;
+    const bool unseen; // blocks the stream does not see (-INF)
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_blk, n_q, n_stream, ratio, unseen);
+    }
+
+    test_kq_block_bias(int64_t n_blk = 300, int64_t n_q = 64, int64_t n_stream = 1, int ratio = 4, bool unseen = false)
+        : n_blk(n_blk), n_q(n_q), n_stream(n_stream), ratio(ratio), unseen(unseen) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * blk_pos = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_blk, 1, 1, n_stream);
+        ggml_set_name(blk_pos, "blk_pos");
+
+        ggml_tensor * q_pos = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_q, 1, 1, n_stream);
+        ggml_set_name(q_pos, "q_pos");
+
+        ggml_tensor * out = ggml_kq_block_bias(ctx, blk_pos, q_pos, ratio);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(7);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            std::vector<int32_t> data(ggml_nelements(t));
+            if (strcmp(t->name, "blk_pos") == 0) {
+                // block b starts at b*ratio; the last one is the always-picked one, every 7th unseen if asked
+                for (int64_t s = 0; s < n_stream; ++s) {
+                    for (int64_t b = 0; b < n_blk; ++b) {
+                        data[s*n_blk + b] = b == n_blk - 1 ? -2 : unseen && (b + s) % 7 == 0 ? -1 : (int32_t) (b*ratio);
+                    }
+                }
+            } else if (strcmp(t->name, "q_pos") == 0) {
+                // query indices anywhere in the sequence, so the tail start falls inside the rows
+                for (auto & v : data) {
+                    v = (int32_t) (rng() % (n_blk*ratio));
+                }
+            } else {
+                continue;
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+        }
+    }
+};
+
 // GET_ROWS_MEAN -> RMS_NORM * weight -> multi-section ROPE: the qwen4exp QSA key pooling, which CUDA fuses
 struct test_get_rows_mean_norm_rope : public test_case {
     const ggml_type type;
@@ -12089,6 +12142,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_kq_mask(type, 777,  65, 1, GGML_KQ_MASK_SWA_CHUNKED,   64));
         test_cases.emplace_back(new test_kq_mask(type, 600,  16, 3, GGML_KQ_MASK_SWA_SYMMETRIC, 32));
     }
+    test_cases.emplace_back(new test_kq_block_bias(300, 64, 1, 4, false));
+    test_cases.emplace_back(new test_kq_block_bias(513, 37, 2, 4, false));
+    test_cases.emplace_back(new test_kq_block_bias(513, 37, 2, 4, true));
+    test_cases.emplace_back(new test_kq_block_bias(100, 70, 1, 8, false));
     test_cases.emplace_back(new test_get_rows_mean(GGML_TYPE_Q8_0, 128, 4096, 1024, 4));
     // one column off: the f16/f32 rows lose the alignment of a pair load
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {

@@ -792,6 +792,27 @@ static bool qwen4exp_qsa_gather_kv(int64_t n_kv, int64_t n_tps) {
     return mode > 0 || n_kv >= 4096*(n_tps + 3);
 }
 
+// The per-block bias of a long ubatch is built on each device from the first index of every block and the index of every
+//   query, as the KQ mask is: filled on the host it is n_blocks x n_tokens F32 (134 MB at 131k cells and 1024 tokens) and
+//   goes to every device. One sequence per stream, causal attention. LLAMA_QSA_BIAS_DEVICE=0 keeps the host bias.
+static bool qwen4exp_qsa_bias_on_device(const llama_ubatch & ubatch, int64_t n_stream, bool blk_bias, bool causal_attn) {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_QSA_BIAS_DEVICE");
+        return env == nullptr || atoi(env) != 0;
+    }();
+
+    const int64_t n_tps = ubatch.n_tokens/n_stream;
+    if (!enabled || !blk_bias || !causal_attn || n_tps < 64) {
+        return false;
+    }
+    for (int64_t i = 0; i < (int64_t) ubatch.n_tokens; ++i) {
+        if (ubatch.seq_id[i][0] != ubatch.seq_id[(i/n_tps)*n_tps][0]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // QSA attends to a budget of whole blocks of compress_ratio tokens, plus the incomplete tail
 // one mean-pooled indexer key scores each block; set_input resolves the cache layout
 class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
@@ -802,7 +823,7 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
-        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, causal_attn);
+        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias_blk ? nullptr : bias, bias_blk, bias_q, ubatch, ratio, blk_bias, causal_attn);
         if (ones != nullptr) {
             std::vector<float> v(ggml_nelements(ones), 1.0f);
             ggml_backend_tensor_set(ones, v.data(), 0, ggml_nbytes(ones));
@@ -834,6 +855,9 @@ public:
         res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
         res &= ones == nullptr || ones->ne[1] == params.ubatch.n_tokens/n_stream;
 
+        // a host bias holds for any ubatch, a device-built one only for those it is built for
+        res &= bias_blk == nullptr || qwen4exp_qsa_bias_on_device(params.ubatch, n_stream, blk_bias, causal_attn);
+
         return res;
     }
 
@@ -843,6 +867,8 @@ public:
     ggml_tensor * blk_cells = nullptr;   // I32 [ratio*n_blocks, n_stream]
     ggml_tensor * blk_pos   = nullptr;   // I32 [4*n_blocks*n_stream]
     ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
+    ggml_tensor * bias_blk  = nullptr;   // I32 [n_blocks, 1, 1, n_stream], a device builds bias from these two
+    ggml_tensor * bias_q    = nullptr;   // I32 [n_tokens/n_stream, 1, 1, n_stream]
     ggml_tensor * ones      = nullptr;   // F32 [n_idx_h, n_tokens/n_stream, 1, n_stream], fused path only
 
     // fused path: the per-cell mask (bias expanded to cells plus the KQ mask) does not depend on the layer,
@@ -911,12 +937,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
         qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
         qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
-        qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
 
         ggml_set_input(qsa->cell_blk);
         ggml_set_input(qsa->blk_cells);
         ggml_set_input(qsa->blk_pos);
-        ggml_set_input(qsa->bias);
+
+        if (qwen4exp_qsa_bias_on_device(ubatch, n_stream, blk_bias, cparams.causal_attn)) {
+            qsa->bias_blk = ggml_new_tensor_4d(ctx0, GGML_TYPE_I32, n_blocks, 1, 1, n_stream);
+            qsa->bias_q   = ggml_new_tensor_4d(ctx0, GGML_TYPE_I32, n_tps,    1, 1, n_stream);
+            ggml_set_input(qsa->bias_blk);
+            ggml_set_input(qsa->bias_q);
+
+            qsa->bias = ggml_reshape_3d(ctx0, ggml_kq_block_bias(ctx0, qsa->bias_blk, qsa->bias_q, (int) r), n_blocks, n_tps, n_stream);
+        } else {
+            qsa->bias = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+            ggml_set_input(qsa->bias);
+        }
 
         if (fused) {
             qsa->ones = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_idx_h, n_tps, 1, n_stream);

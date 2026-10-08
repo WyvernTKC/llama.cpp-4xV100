@@ -5500,10 +5500,26 @@ void ggml_compute_forward_kq_mask(
 
     const int swa_type = ggml_get_op_params_i32(dst, 0);
     const int n_swa    = ggml_get_op_params_i32(dst, 1);
+    const int ratio    = ggml_get_op_params_i32(dst, 2);
 
     const int64_t n_kv = dst->ne[0];
     const int64_t n_q  = dst->ne[1];
     const int64_t nr   = n_q*dst->ne[3];
+
+    if (ratio > 0) {
+        GGML_ASSERT(dst->type == GGML_TYPE_F32);
+        const int32_t * blk_pos = (const int32_t *) src0->data;
+        const int32_t * qp      = (const int32_t *) src1->data;
+        for (int64_t r = params->ith; r < nr; r += params->nth) {
+            const int64_t s          = r/n_q;
+            const int32_t tail_start = (qp[r] + 1)/ratio*ratio;
+            for (int64_t j = 0; j < n_kv; ++j) {
+                const int32_t p0 = blk_pos[s*n_kv + j];
+                ((float *) dst->data)[r*n_kv + j] = p0 == -2 ? 1e9f : p0 < 0 ? -INFINITY : p0 >= tail_start ? 1e9f : 0.0f;
+            }
+        }
+        return;
+    }
 
     const int32_t * kv_pos = (const int32_t *) src0->data;
     const int32_t * q_pos  = (const int32_t *) src1->data;

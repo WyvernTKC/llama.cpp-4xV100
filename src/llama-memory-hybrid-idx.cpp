@@ -344,6 +344,8 @@ void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * blk_cells,
         ggml_tensor * blk_pos,
         ggml_tensor * bias,
+        ggml_tensor * bias_blk,
+        ggml_tensor * bias_q,
         const llama_ubatch * ubatch,
         uint32_t ratio,
         bool blk_bias,
@@ -365,7 +367,14 @@ void llama_memory_hybrid_idx::set_input_qsa(
     int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
     int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
     int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
-    float   * dst_bias      = (float   *) bias->data;
+
+    // a device builds the bias from the first index of each block and the index of each query
+    const bool bias_dev = bias_blk != nullptr;
+    GGML_ASSERT(!bias_dev || (blk_bias && causal_attn));
+
+    float   * dst_bias     = bias_dev ? nullptr : (float *) bias->data;
+    int32_t * dst_bias_blk = bias_dev ? (int32_t *) bias_blk->data : nullptr;
+    int32_t * dst_bias_q   = bias_dev ? (int32_t *) bias_q->data   : nullptr;
 
     // a block is keyed on (sequence set, index bucket): a unified cache counts every sequence
     // from zero, so the bucket alone would pool two sequences into one block
@@ -567,6 +576,18 @@ void llama_memory_hybrid_idx::set_input_qsa(
         const bool     have_dead = n_bid < n_blocks;
         const int32_t  dead_bid  = have_dead ? n_bid : n_blocks - 1;
 
+        // the stream holds one sequence here, so a block is seen by all of its tokens or by none
+        if (bias_dev) {
+            const llama_seq_id seq_id = ubatch->seq_id[s*n_tps][0];
+            int32_t * cur = dst_bias_blk + s*n_blocks;
+            for (int64_t b = 0; b < n_blocks; ++b) {
+                cur[b] = b < n_bid && cells.seq_has((uint32_t) bid_cell[b], seq_id) ? bid_idx[b] : -1;
+            }
+            if (have_dead) {
+                cur[dead_bid] = -2;
+            }
+        }
+
         for (int64_t j = 0; j < n_kv; ++j) {
             const int32_t g = cell_grp[j];
 
@@ -608,6 +629,11 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 }
 
                 q = lo - 1;
+            }
+
+            if (bias_dev) {
+                dst_bias_q[i] = (int32_t) q;
+                continue;
             }
 
             // the tail is an incomplete block and is always visible, as in the reference
@@ -948,13 +974,15 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * blk_cells,
         ggml_tensor * blk_pos,
         ggml_tensor * bias,
+        ggml_tensor * bias_blk,
+        ggml_tensor * bias_q,
         const llama_ubatch * ubatch,
         uint32_t ratio,
         bool blk_bias,
         bool causal_attn) const {
     GGML_ASSERT(mem != nullptr);
 
-    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, causal_attn);
+    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, bias_blk, bias_q, ubatch, ratio, blk_bias, causal_attn);
 }
 
 llama_memory_hybrid_idx_context::kpool_access::kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd) : ctx(ctx) {
