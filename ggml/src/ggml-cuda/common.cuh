@@ -1618,6 +1618,10 @@ struct ggml_backend_cuda_context {
     const ggml_tensor * conv_folded_concat = nullptr;
     int                 conv_folded_skip   = 0;
 
+    // the first node of a topk_moe that a router's launch already ran (ggml_cuda_topk_moe_fold), and its other nodes
+    const ggml_tensor * topk_folded_node = nullptr;
+    int                 topk_folded_skip = 0;
+
     ~ggml_backend_cuda_context();
 
     cudaStream_t stream(int device, int stream) {
@@ -1650,14 +1654,15 @@ struct ggml_backend_cuda_context {
         return cublas_handles[device][curr_stream_no];
     }
 
-    // two flags for a kernel whose blocks wait on its first block (see rms_norm_emit_q8_1), zero between launches
+    // two flags for a kernel whose blocks wait on its first block (see rms_norm_emit_q8_1), then the ticket of the
+    //   topk_moe in a router's launch (ggml_cuda_topk_moe_fold); all zero between launches
     unsigned int * block_flags[GGML_CUDA_MAX_DEVICES] = { nullptr };
 
     unsigned int * block_flags_get() {
         if (block_flags[device] == nullptr) {
             ggml_cuda_set_device(device);
-            CUDA_CHECK(cudaMalloc(&block_flags[device], 2*sizeof(unsigned int)));
-            CUDA_CHECK(cudaMemset(block_flags[device], 0, 2*sizeof(unsigned int)));
+            CUDA_CHECK(cudaMalloc(&block_flags[device], 4*sizeof(unsigned int)));
+            CUDA_CHECK(cudaMemset(block_flags[device], 0, 4*sizeof(unsigned int)));
         }
         return block_flags[device];
     }
@@ -1910,6 +1915,19 @@ struct ggml_cuda_mm_fusion_args_host {
     int64_t conv_w_stride = 0; // floats
     float * conv_dst = nullptr;
     float * conv_slot[2] = { nullptr, nullptr };
+    // mmvf, f32, one token: the topk_moe of the expert logits in dst, run by the block of the launch that ends last
+    //   (ggml_cuda_topk_moe_fold); topk_ticket is a zeroed counter that block resets
+    float * topk_weights = nullptr;
+    int32_t * topk_ids = nullptr;
+    unsigned int * topk_ticket = nullptr;
+    int topk_n_expert = 0;
+    int topk_n_used = 0;
+    float topk_clamp = 0.0f;
+    float topk_scale = 1.0f;
+    bool topk_sigmoid = false;
+    bool topk_sqrt_softplus = false;
+    bool topk_with_norm = false;
+    bool topk_delayed_softmax = false;
     // a sibling matrix of one row with the same input, computed as one more row: sib_dst = sib*y (f32, one token)
     // mmvq without ids and nothing else fused: a sibling matrix of the same type and K with the same input, its rows
     //   computed after those of src0 in the same launch: sib_dst = sib*y (one token)
@@ -1970,9 +1988,9 @@ struct ggml_cuda_mm_fusion_args_device {
     uint32_t shared_stride_col_dst = 0;
 };
 
-// The convolution in the epilogue of a one-token mmvq (ggml_cuda_gdn_conv_fold) is a parameter of its own kernel only:
-//   every byte of ggml_cuda_mm_fusion_args_device is one of every mmvq and mmvf launch (120 bytes more cost Goetia
-//   1.3% of its tg).
+// The convolution in the epilogue of a one-token mmvq (ggml_cuda_gdn_conv_fold) and the topk_moe in the last block of a
+//   router's mmvf launch (ggml_cuda_topk_moe_fold) are parameters of their own kernels only: every byte of
+//   ggml_cuda_mm_fusion_args_device is one of every mmvq and mmvf launch (120 bytes more cost Goetia 1.3% of its tg).
 struct ggml_cuda_mmvq_conv_args {
     const float *   states     = nullptr; // see ggml_cuda_mm_fusion_args_host
     const int32_t * ids        = nullptr;
@@ -1983,7 +2001,21 @@ struct ggml_cuda_mmvq_conv_args {
     float *         slot0      = nullptr;
     float *         slot1      = nullptr;
 };
-// in place of it in the other kernels
+struct ggml_cuda_mmvf_topk_args {
+    const float *  logits          = nullptr; // see ggml_cuda_mm_fusion_args_host
+    float *        weights         = nullptr;
+    int32_t *      ids             = nullptr;
+    unsigned int * ticket          = nullptr;
+    int            n_expert        = 0;
+    int            n_used          = 0;
+    float          clamp           = 0.0f;
+    float          scale           = 1.0f;
+    bool           sigmoid         = false;
+    bool           sqrt_softplus   = false;
+    bool           with_norm       = false;
+    bool           delayed_softmax = false;
+};
+// in place of either in the other kernels
 struct ggml_cuda_no_args {
     ggml_cuda_no_args() = default;
     template <typename T>
@@ -1992,6 +2024,7 @@ struct ggml_cuda_no_args {
 // the device arguments as the host code of mmvq and mmvf carries them to the launch
 struct ggml_cuda_mm_fusion_args_launch : ggml_cuda_mm_fusion_args_device {
     ggml_cuda_mmvq_conv_args conv;
+    ggml_cuda_mmvf_topk_args topk;
 };
 
 struct ggml_cuda_kernel_launch_params {

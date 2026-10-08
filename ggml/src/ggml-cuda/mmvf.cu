@@ -4,18 +4,59 @@
 #include "mmvf.cuh"
 #include "mmf.cuh"
 #include "convert.cuh"
+#include "topk-moe.cuh"
+
+// The block of a router's launch that writes its logit last selects the experts of all of them (see
+//   ggml_cuda_topk_moe_fold): every block counts itself on the ticket after its write, and the last one reads the logits
+//   from L2 and runs the selection of topk_moe_cuda on them with one warp.
+template <int n_experts>
+static __device__ __forceinline__ void mul_mat_vec_f_topk_moe(const ggml_cuda_mmvf_topk_args & topk, const int lane) {
+    unsigned int ticket = 0;
+    if (lane == 0) {
+        __threadfence();
+        ticket = atomicAdd(topk.ticket, 1u);
+    }
+    ticket = __shfl_sync(0xFFFFFFFF, ticket, 0);
+    if (ticket != gridDim.x*gridDim.y*gridDim.z - 1) {
+        return;
+    }
+    __threadfence();
+
+    constexpr int experts_per_thread = n_experts / WARP_SIZE;
+    float wt[experts_per_thread];
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) {
+        wt[i] = __ldcg(topk.logits + i*WARP_SIZE + lane);
+    }
+    const float bias_v[1] = { 0.0f };
+
+    topk_moe_config config;
+    config.use_sigmoid       = topk.sigmoid;
+    config.use_sqrt_softplus = topk.sqrt_softplus;
+    config.with_norm         = topk.with_norm;
+    config.delayed_softmax   = topk.delayed_softmax;
+    config.n_groups          = 1;
+    config.n_group_used      = 1;
+    topk_moe_select<n_experts, false, false>(wt, bias_v, topk.weights, topk.ids, topk.n_used, topk.clamp, topk.scale, config);
+
+    if (lane == 0) {
+        *topk.ticket = 0;
+    }
+}
 
 // rpb > 1 puts that many consecutive rows in a block: they share the y loads, and each row still sums in
 // exactly the order it would with a block of its own. With several tokens it needs load16.
 // load16 (2-byte weights) reads 8 weights per 16-byte load instead of 2 per 4-byte load, which changes the
 // order in which a row sums, so its results can differ in the last bits.
-template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false, int rpb = 1, bool load16 = false>
+// topk_n: the expert count of a topk_moe run in the last block (topk_args), see mul_mat_vec_f_topk_moe
+template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false, int rpb = 1, bool load16 = false,
+          int topk_n = 0>
 static __global__ void mul_mat_vec_f(
         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const int ncols2, const uint3 nchannels_y, const int stride_row, const int stride_col_y2, const int stride_col_dst,
         const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ids_stride) {
+        const int ids_stride, const std::conditional_t<(topk_n > 0), ggml_cuda_mmvf_topk_args, ggml_cuda_no_args> topk_args) {
     const T       * GGML_CUDA_RESTRICT x   = x_ptr;
     const float   * GGML_CUDA_RESTRICT y   = y_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
@@ -559,6 +600,18 @@ static __global__ void mul_mat_vec_f(
         }
     }
 
+    if constexpr (topk_n > 0) {
+        static_assert(ncols_dst == 1 && rpb == 1 && !is_multi_token_id && !load16, "topk_moe needs one token and one row per block");
+        if (tid >= warp_size) {
+            return;
+        }
+        if (tid == 0) {
+            dst[row] = sumf[0];
+        }
+        mul_mat_vec_f_topk_moe<topk_n>(topk_args, tid);
+        return;
+    }
+
     if (tid >= ncols_dst*rpb) {
         return;
     }
@@ -629,7 +682,7 @@ static __global__ void mul_mat_vec_f(
 
 template<typename T, typename type_acc, int ncols_dst, int block_size, bool is_multi_token_id = false>
 static void mul_mat_vec_f_switch_fusion(
-        const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_launch & fusion, float * dst,
         const int64_t ncols, const uint3 nchannels_y,
         const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst,
         const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
@@ -638,12 +691,13 @@ static void mul_mat_vec_f_switch_fusion(
         const bool load16, const cudaStream_t stream) {
 
     const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, nbytes_shared, stream};
+    GGML_ASSERT(fusion.topk.ids == nullptr || (ncols_dst == 1 && !is_multi_token_id && sizeof(T) == 4 && rpb == 1 && !load16));
 
     const auto launch = [&](auto kernel) {
         ggml_cuda_kernel_launch(kernel, launch_params,
             x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
             channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-            sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+            sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, fusion.topk);
     };
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
@@ -695,6 +749,18 @@ static void mul_mat_vec_f_switch_fusion(
     }
     GGML_ASSERT(rpb == 1);
 
+    if constexpr (ncols_dst == 1 && !is_multi_token_id && std::is_same_v<T, float>) {
+        if (fusion.topk.ids != nullptr) {
+            switch (fusion.topk.n_expert) {
+                case 128: launch(mul_mat_vec_f<T, type_acc, 1, block_size, true, false, 1, false, 128>); return;
+                case 256: launch(mul_mat_vec_f<T, type_acc, 1, block_size, true, false, 1, false, 256>); return;
+                case 512: launch(mul_mat_vec_f<T, type_acc, 1, block_size, true, false, 1, false, 512>); return;
+                default: GGML_ABORT("fatal error");
+            }
+        }
+    }
+    GGML_ASSERT(fusion.topk.ids == nullptr);
+
     if constexpr (ncols_dst == 1) {
         if (has_fusion) {
             launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id>);
@@ -728,7 +794,7 @@ static bool mmvf_siblings_aligned16(const ggml_cuda_mm_fusion_args_device & fusi
 
 template <typename T, typename type_acc, int ncols_dst, bool is_multi_token_id = false>
 void launch_mul_mat_vec_f_cuda(
-        const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_launch & fusion, float * dst,
         const int64_t ncols, const int64_t nrows,
         const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst,
         const int64_t nchannels_x, const int64_t nchannels_y, const int64_t nchannels_dst,
@@ -778,7 +844,7 @@ void launch_mul_mat_vec_f_cuda(
     // very tall matrices (f16 62080x5120 -10%), rows of 2k-17k are within +-3%, and below ~8 blocks per SM it
     // loses.
     int rpb = 1;
-    if (ncols_dst == 1 && !is_multi_token_id && is_volta && fusion.sib_x == nullptr &&
+    if (ncols_dst == 1 && !is_multi_token_id && is_volta && fusion.sib_x == nullptr && fusion.topk.ids == nullptr &&
             (load16 ? ncols <= 512 : (ncols <= 1024 || nrows >= 16384)) &&
             nrows % 4 == 0 && (nrows/4)*nchannels_dst*nsamples_or_ntokens >= 8*ggml_cuda_info().devices[device].nsm) {
         rpb = 4;
@@ -854,7 +920,7 @@ void launch_mul_mat_vec_f_cuda(
 
 template <typename T, typename type_acc>
 static void mul_mat_vec_f_cuda_switch_ncols_dst(
-        const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_launch & fusion, float * dst,
         const int64_t ncols, const int64_t nrows, const int64_t ncols_dst,
         const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst,
         const int64_t nchannels_x, const int64_t nchannels_y, const int64_t nchannels_dst,
@@ -951,7 +1017,7 @@ static void mul_mat_vec_f_cuda_switch_ncols_dst(
 
 template<typename T>
 static void mul_mat_vec_f_cuda(
-        const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_launch & fusion, float * dst,
         const int64_t ncols, const int64_t nrows, const int64_t ncols_dst,
         const int64_t stride_row, const int64_t stride_col_y, const int stride_col_dst,
         const int64_t nchannels_x, const int64_t nchannels_y, const int64_t nchannels_dst,
@@ -1001,7 +1067,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
     float         *  dst_d =       (float         *)  dst->data;
 
-    ggml_cuda_mm_fusion_args_device fusion_local{};
+    ggml_cuda_mm_fusion_args_launch fusion_local{};
 
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);
@@ -1068,6 +1134,23 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
                 }
                 row0 += sib->ne[1];
             }
+        }
+        if (fusion->topk_ids) {
+            GGML_ASSERT(!ids && !fusion->gate && !fusion->x_bias && !fusion->gate_bias && !fusion->gdn_beta && !fusion->sib_rows);
+            GGML_ASSERT(src0->type == GGML_TYPE_F32 && ggml_nrows(dst) == 1 && ggml_is_contiguous(dst) &&
+                dst->ne[0] == fusion->topk_n_expert && fusion->topk_weights && fusion->topk_ticket);
+            fusion_local.topk.logits          = dst_d;
+            fusion_local.topk.weights         = fusion->topk_weights;
+            fusion_local.topk.ids             = fusion->topk_ids;
+            fusion_local.topk.ticket          = fusion->topk_ticket;
+            fusion_local.topk.n_expert        = fusion->topk_n_expert;
+            fusion_local.topk.n_used          = fusion->topk_n_used;
+            fusion_local.topk.clamp           = fusion->topk_clamp;
+            fusion_local.topk.scale           = fusion->topk_scale;
+            fusion_local.topk.sigmoid         = fusion->topk_sigmoid;
+            fusion_local.topk.sqrt_softplus   = fusion->topk_sqrt_softplus;
+            fusion_local.topk.with_norm       = fusion->topk_with_norm;
+            fusion_local.topk.delayed_softmax = fusion->topk_delayed_softmax;
         }
     }
 
@@ -1155,7 +1238,7 @@ void ggml_cuda_op_mul_mat_vec_f(
     const int64_t stride_sample_y    = 0;
     const int64_t stride_sample_dst  = 0;
 
-    ggml_cuda_mm_fusion_args_device empty{};
+    ggml_cuda_mm_fusion_args_launch empty{};
     switch (src0->type) {
         case GGML_TYPE_F32: {
             const float * src0_d = (const float *) src0_dd_i;
