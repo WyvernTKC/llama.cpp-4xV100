@@ -1019,7 +1019,7 @@ static std::vector<size_t> unicode_regex_split_custom_tekken(const std::string &
 // GPT-4o / llama4 / gpt-oss (o200k) pre-tokenizer, as tekken with English contractions after a letter run and numbers
 //   of up to three digits
 // regex: [^\r\n\p{L}\p{N}]?((?=[\p{L}])([^a-z]))*((?=[\p{L}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\r\n\p{L}\p{N}]?((?=[\p{L}])([^a-z]))+((?=[\p{L}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+
-// std::regex took ~7 us a character with MSVC and ran out of stack on long runs (an exception: no tokens at all).
+// std::regex took ~2-3 us a character with MSVC and ran out of stack on long runs (an exception: no tokens at all).
 static std::vector<size_t> unicode_regex_split_custom_gpt4o(const std::string & text, const std::vector<size_t> & offsets) {
     const auto cpts = unicode_cpts_from_utf8(text);
 
