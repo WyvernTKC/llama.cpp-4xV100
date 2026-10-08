@@ -553,10 +553,11 @@ struct value_object_t : public value_t {
         }
     }
     virtual value & at(const value & key, value & default_val) override {
-        if (!has_key(key)) {
-            return default_val;
+        if (!key->is_immutable() || !key->is_hashable()) {
+            throw std::runtime_error("Object key of unhashable type: " + key->type());
         }
-        return unordered.at(key);
+        auto it = unordered.find(key);
+        return it == unordered.end() ? default_val : it->second;
     }
     virtual value & at(const value & key) override {
         if (!has_key(key)) {

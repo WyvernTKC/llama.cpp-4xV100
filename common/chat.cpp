@@ -946,6 +946,29 @@ std::string common_chat_template_direct_apply_impl(
         jinja::caps_apply_reasoning_effort(ctx, reasoning_effort);
     }
 
+    // A request renders the same prompt twice: its parser renders it, and common_chat_template_generation_prompt_impl
+    //   renders it again (with the generation prompt, and without, to tell where that starts); a render of a long
+    //   chat takes 0.1 s and more. The last two renders of the thread are kept, keyed by all the render reads and by
+    //   the second it runs in (strftime_now renders the time, so a later request does not reuse a render).
+    struct render_memo {
+        const jinja::program * prog = nullptr;
+        std::string            source;
+        std::string            key;
+        std::string            result;
+    };
+    static thread_local render_memo memo[2];
+    static thread_local int         memo_next = 0;
+    std::string memo_key = inp.dump();
+    memo_key += inputs.mark_input ? '1' : '0';
+    memo_key += inputs.add_bos    ? '1' : '0';
+    memo_key += inputs.add_eos    ? '1' : '0';
+    memo_key += std::to_string((long long) std::time(nullptr));
+    for (const auto & m : memo) {
+        if (m.prog == &tmpl.prog && m.key == memo_key && m.source == tmpl.source()) {
+            return m.result;
+        }
+    }
+
     jinja::global_from_json(ctx, inp, inputs.mark_input);
 
     // render
@@ -962,6 +985,9 @@ std::string common_chat_template_direct_apply_impl(
     if (inputs.add_eos && string_ends_with(result, tmpl.eos_token())) {
         result = result.substr(0, result.size() - tmpl.eos_token().size());
     }
+
+    memo[memo_next] = { &tmpl.prog, tmpl.source(), std::move(memo_key), result };
+    memo_next ^= 1;
     return result;
 }
 

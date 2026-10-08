@@ -74,20 +74,19 @@ struct context {
     }
     ~context() = default;
 
-    context(const context & parent) : context() {
-        // inherit variables (for example, when entering a new scope)
-        auto & pvar = parent.env->as_ordered_object();
-        for (const auto & pair : pvar) {
-            set_val(pair.first, pair.second);
-        }
-        current_time = parent.current_time;
-        is_get_stats = parent.is_get_stats;
-        src = parent.src;
+    context(const context & parent) : src(parent.src), current_time(parent.current_time), is_get_stats(parent.is_get_stats) {
+        // inherit variables (for example, when entering a new scope): the parent's entries in its order, keys and
+        //   values shared, as inserting each of them into a new context did (its defaults are the parent's first
+        //   entries); an insert allocates its key and hashes it twice, per variable per scope
+        value parent_env = parent.env;
+        env = mk_val<value_object>(parent_env);
+        env->has_builtins = false;
     }
 
     value get_val(const std::string & name) {
-        value default_val = mk_val<value_undefined>(name);
-        return env->at(name, default_val);
+        value missing;
+        const value & val = env->at(name, missing);
+        return val ? val : mk_val<value_undefined>(name);
     }
 
     void set_val(const std::string & name, const value & val) {

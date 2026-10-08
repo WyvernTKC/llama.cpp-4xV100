@@ -82,16 +82,19 @@ value statement::execute(context & ctx) const {
 
 value identifier::execute_impl(context & ctx) const {
     auto it = ctx.get_val(val);
-    auto builtins = global_builtins();
     if (!it->is_undefined()) {
         if (ctx.is_get_stats) {
             value_t::stats_t::mark_used(it);
         }
         JJ_DEBUG("Identifier '%s' found, type = %s", val.c_str(), it->type().c_str());
         return it;
-    } else if (builtins.find(val) != builtins.end()) {
+    }
+    // a reference: copying the map per identifier allocated every entry of it
+    const auto & builtins = global_builtins();
+    const auto builtin = builtins.find(val);
+    if (builtin != builtins.end()) {
         JJ_DEBUG("Identifier '%s' found in builtins", val.c_str());
-        return mk_val<value_func>(val, builtins.at(val));
+        return mk_val<value_func>(val, builtin->second);
     } else {
         JJ_DEBUG("Identifier '%s' not found, returning undefined", val.c_str());
         return mk_val<value_undefined>(val);
@@ -305,7 +308,7 @@ static value try_builtin_func(context & ctx, const std::string & name, value & i
         value_t::stats_t::mark_used(input);
         input->stats.ops.insert(name);
     }
-    auto builtins = input->get_builtins();
+    const auto & builtins = input->get_builtins();
     auto it = builtins.find(name);
     if (it != builtins.end()) {
         JJ_DEBUG("Binding built-in '%s'", name.c_str());
