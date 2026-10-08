@@ -12922,8 +12922,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_attn_gate_mul_mat(256, nh, nb, GGML_TYPE_Q4_K));
         }
     }
-    // one token runs both in one launch
-    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K }) {
+    // one token runs both in one launch (mmvq, and mmvf for f16/bf16/f32 rows, also without 16-byte loads at K 1026)
+    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F32 }) {
+        if (type == GGML_TYPE_F16 || type == GGML_TYPE_BF16) {
+            test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 1026, 100, 37, 21, 1));
+        }
         for (int64_t n_tokens : { 1, 2 }) {
             test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 2048, 2048, 1024, 0, n_tokens));
             test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 1024, 100, 37, 0, n_tokens));
