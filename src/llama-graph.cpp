@@ -2654,7 +2654,7 @@ ggml_tensor * llm_graph_context::build_inp_out_ids() const {
     //    return nullptr;
     //}
 
-    auto inp = std::make_unique<llm_graph_input_out_ids>(hparams, cparams, n_outputs);
+    auto inp = std::make_unique<llm_graph_input_out_ids>(hparams, cparams, (uint32_t) n_outputs);
 
     auto & cur = inp->out_ids;
 

@@ -9379,7 +9379,10 @@ struct test_get_rows_fused : public test_case {
                 if (t->type == GGML_TYPE_I64) {
                     ggml_backend_tensor_set(t, perm.data(), 0, ggml_nbytes(t));
                 } else {
-                    std::vector<int32_t> v(perm.begin(), perm.begin() + n_k);
+                    std::vector<int32_t> v(n_k);
+                    for (int64_t i = 0; i < n_k; i++) {
+                        v[i] = (int32_t) perm[i];
+                    }
                     ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
                 }
             } else {
