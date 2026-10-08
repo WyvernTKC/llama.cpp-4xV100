@@ -4473,6 +4473,112 @@ struct test_gdn_gate : public test_case {
     }
 };
 
+// The projections of test_gdn_gate in one launch and the convolution of qkv after them, build_conv_state of one sequence
+//   and one token, which that launch runs in the epilogue of the qkv rows
+struct test_gdn_qkv_conv : public test_case {
+    const ggml_type type;
+    const int64_t n_embd;
+    const int64_t n_head;
+    const int64_t rows_qkv;
+    const int64_t rows_z;
+    const int64_t K;        // rollback slots, n_rs_seq + 1
+    const int32_t src_row;  // the cache row of the start state
+    const int64_t kv_head;  // the cell the slots store to
+
+    static constexpr int64_t d_conv  = 4;
+    static constexpr int64_t n_cells = 3;
+
+    std::vector<ggml_tensor *> outs;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_QKV_CONV";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outs; }
+
+    std::string vars() override {
+        return VARS_TO_STR8(type, n_embd, n_head, rows_qkv, rows_z, K, src_row, kv_head);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_gdn_qkv_conv(ggml_type type = GGML_TYPE_Q8_0, int64_t n_embd = 2048, int64_t n_head = 8, int64_t rows_qkv = 2048,
+            int64_t rows_z = 1024, int64_t K = 1, int32_t src_row = 1, int64_t kv_head = 1)
+        : type(type), n_embd(n_embd), n_head(n_head), rows_qkv(rows_qkv), rows_z(rows_z), K(K), src_row(src_row),
+          kv_head(kv_head) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
+        ggml_tensor * w_alpha = ggml_new_tensor_2d(ctx, type, n_embd, n_head);
+        ggml_tensor * w_beta  = ggml_new_tensor_2d(ctx, type, n_embd, n_head);
+        ggml_tensor * w_qkv   = ggml_new_tensor_2d(ctx, type, n_embd, rows_qkv);
+        ggml_tensor * w_z     = ggml_new_tensor_2d(ctx, type, n_embd, rows_z);
+        ggml_tensor * dt      = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_head);
+        ggml_tensor * a       = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_head);
+        ggml_tensor * w_conv  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, rows_qkv);
+        ggml_tensor * cache   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (d_conv - 1)*rows_qkv, n_cells*K);
+        ggml_tensor * ids     = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(cur, "cur");
+        ggml_set_name(cache, "cache");
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * alpha = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w_alpha, cur), n_head, 1, 1);
+        ggml_tensor * gate  = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha, dt)), a);
+        gate = ggml_reshape_4d(ctx, gate, 1, n_head, 1, 1);
+        ggml_set_name(gate, "gate");
+
+        ggml_tensor * beta = ggml_reshape_4d(ctx, ggml_mul_mat(ctx, w_beta, cur), 1, n_head, 1, 1);
+        beta = ggml_sigmoid(ctx, beta);
+        ggml_set_name(beta, "beta");
+
+        ggml_tensor * qkv = ggml_mul_mat(ctx, w_qkv, cur);
+        ggml_tensor * z   = ggml_mul_mat(ctx, w_z, cur);
+        ggml_set_name(z, "z");
+
+        // build_conv_state after the projections, its slot copies before the convolution
+        ggml_tensor * states     = ggml_reshape_3d(ctx, ggml_get_rows(ctx, cache, ids), d_conv - 1, rows_qkv, 1);
+        ggml_tensor * conv_input = ggml_concat(ctx, states, ggml_transpose(ctx, ggml_reshape_3d(ctx, qkv, rows_qkv, 1, 1)), 0);
+        ggml_tensor * silu       = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, w_conv));
+        ggml_set_name(silu, "silu");
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, gate);
+            ggml_build_forward_expand(gf, beta);
+            ggml_build_forward_expand(gf, qkv);
+            ggml_build_forward_expand(gf, z);
+            for (int64_t s = 0; s <= std::min<int64_t>(1, K - 1); ++s) {
+                ggml_tensor * win = ggml_view_3d(ctx, conv_input, d_conv - 1, rows_qkv, 1, conv_input->nb[1], conv_input->nb[2],
+                        ggml_row_size(conv_input->type, 1 - s));
+                ggml_tensor * dst = ggml_view_2d(ctx, cache, (d_conv - 1)*rows_qkv, 1, cache->nb[1], (s*n_cells + kv_head)*cache->nb[1]);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, win, dst));
+            }
+            ggml_build_forward_expand(gf, silu);
+        }
+
+        // the cache after the slot copies
+        ggml_tensor * cache_out = ggml_scale(ctx, cache, 1.0f);
+        ggml_set_name(cache_out, "cache_out");
+        outs = { gate, beta, z, silu, cache_out };
+        return cache_out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (strcmp(t->name, "ids") == 0) {
+                ggml_backend_tensor_set(t, &src_row, 0, sizeof(src_row));
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_UNARY(SOFTPLUS) + GGML_OP_MUL with a row each: the gate of a gated delta net layer,
 //   softplus(alpha + dt) * a
 struct test_add_softplus_mul : public test_case {
@@ -12684,6 +12790,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_Q8_0, 2048,  8, n_tokens, 1, 2048, 1024));
         test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_Q4_K, 2048, 12, n_tokens, 1, 2560, 1536));
     }
+    // and the convolution of qkv in that launch: the start state in another cell or in the slot, two slots
+    test_cases.emplace_back(new test_gdn_qkv_conv(GGML_TYPE_Q8_0, 2048,  8, 2048, 1024, 1, 1, 1));
+    test_cases.emplace_back(new test_gdn_qkv_conv(GGML_TYPE_Q8_0, 2048,  8, 2048, 1024, 1, 0, 2));
+    test_cases.emplace_back(new test_gdn_qkv_conv(GGML_TYPE_Q8_0, 2048,  8, 2048, 1024, 2, 1, 1));
+    test_cases.emplace_back(new test_gdn_qkv_conv(GGML_TYPE_Q4_K, 2048, 12, 2560, 1536, 1, 2, 0));
     test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_Q8_0, 2048, 32, 6));
     test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_Q8_0, 2048,  8, 4));
     test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_F16,  5120, 12, 4));

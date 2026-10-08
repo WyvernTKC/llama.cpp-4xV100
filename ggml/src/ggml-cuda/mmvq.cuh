@@ -16,6 +16,9 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 bool ggml_cuda_should_fuse_mmvq_gate(enum ggml_type type, int cc, int64_t nrows_x, int64_t nchannels_dst, int64_t nsamples_dst,
     bool mul_mat_id);
 
+// whether a convolution in the epilogue of a one-token mmvq of this type (fusion conv_*) costs the kernel no occupancy
+bool ggml_cuda_mmvq_conv_epilogue_pays(enum ggml_type type, int cc);
+
 // whether the one-token short q8_0 kernel takes this MUL_MAT_ID with a sibling of one more channel, sib*sib_y
 bool ggml_cuda_mul_mat_vec_q_short_sibling(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
         const ggml_tensor * sib, const ggml_tensor * sib_y);

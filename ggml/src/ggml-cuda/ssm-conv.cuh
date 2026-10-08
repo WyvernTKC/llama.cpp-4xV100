@@ -1,4 +1,17 @@
 #include "common.cuh"
+#include "unary.cuh"
+
+// one channel of one token: silu(window . w + b), as ssm_conv_state_f32 and the epilogue of mul_mat_vec_q compute it
+template <int d_conv>
+static __device__ __forceinline__ float ggml_cuda_ssm_conv_silu(const float * win, const float * wv, const float b) {
+    float sumf = 0.0f;
+#pragma unroll
+    for (int j = 0; j < d_conv; ++j) {
+        sumf += win[j] * wv[j];
+    }
+    sumf += b;
+    return ggml_cuda_op_silu_single(sumf);
+}
 
 void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node = nullptr, ggml_tensor * silu_dst = nullptr);
 

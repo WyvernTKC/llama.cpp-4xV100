@@ -1613,6 +1613,11 @@ struct ggml_backend_cuda_context {
         std::unique_ptr<ggml_cuda_pool_alloc<float>> add_x; // the shared expert's down projection
     } session_red;
 
+    // the CONCAT of a build_conv_state whose chain the qkv projection already ran (ggml_cuda_gdn_conv_fold), and the
+    //   nodes to skip from it, up to its last slot CPY
+    const ggml_tensor * conv_folded_concat = nullptr;
+    int                 conv_folded_skip   = 0;
+
     ~ggml_backend_cuda_context();
 
     cudaStream_t stream(int device, int stream) {
@@ -1895,6 +1900,16 @@ struct ggml_cuda_mm_fusion_args_host {
     ggml_tensor * gdn_beta = nullptr;
     const ggml_tensor * gdn_x = nullptr;
     ggml_tensor * gdn_dst = nullptr;
+    // mmvq with gdn_x, one token: the d_conv 4 convolution of build_conv_state in the epilogue of the rows of src0, each
+    //   row one channel: conv_dst = silu(conv(window)), the window being the 3 columns of the cache row conv_states (at
+    //   conv_ids[0]) and the row's value; the windows from column s on go to conv_slot[s], see ggml_cuda_gdn_conv_fold
+    const float * conv_states = nullptr;
+    const int32_t * conv_ids = nullptr;
+    int64_t conv_row_stride = 0; // floats
+    const float * conv_w = nullptr;
+    int64_t conv_w_stride = 0; // floats
+    float * conv_dst = nullptr;
+    float * conv_slot[2] = { nullptr, nullptr };
     // a sibling matrix of one row with the same input, computed as one more row: sib_dst = sib*y (f32, one token)
     // mmvq without ids and nothing else fused: a sibling matrix of the same type and K with the same input, its rows
     //   computed after those of src0 in the same launch: sib_dst = sib*y (one token)
@@ -1953,6 +1968,30 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * shared_gate = nullptr;
     float * shared_dst = nullptr;
     uint32_t shared_stride_col_dst = 0;
+};
+
+// The convolution in the epilogue of a one-token mmvq (ggml_cuda_gdn_conv_fold) is a parameter of its own kernel only:
+//   every byte of ggml_cuda_mm_fusion_args_device is one of every mmvq and mmvf launch (120 bytes more cost Goetia
+//   1.3% of its tg).
+struct ggml_cuda_mmvq_conv_args {
+    const float *   states     = nullptr; // see ggml_cuda_mm_fusion_args_host
+    const int32_t * ids        = nullptr;
+    int64_t         row_stride = 0;
+    const float *   w          = nullptr;
+    int64_t         w_stride   = 0;
+    float *         dst        = nullptr;
+    float *         slot0      = nullptr;
+    float *         slot1      = nullptr;
+};
+// in place of it in the other kernels
+struct ggml_cuda_no_args {
+    ggml_cuda_no_args() = default;
+    template <typename T>
+    ggml_cuda_no_args(const T &) {}
+};
+// the device arguments as the host code of mmvq and mmvf carries them to the launch
+struct ggml_cuda_mm_fusion_args_launch : ggml_cuda_mm_fusion_args_device {
+    ggml_cuda_mmvq_conv_args conv;
 };
 
 struct ggml_cuda_kernel_launch_params {

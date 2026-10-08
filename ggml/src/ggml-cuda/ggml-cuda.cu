@@ -3751,6 +3751,76 @@ static bool ggml_cuda_ssm_conv_state_fusion_match(
     return true;
 }
 
+// The chain of build_conv_state, one token, run in the epilogue of the qkv projection at node qkv_last (the last node of
+//   that launch): each row of qkv is one channel, so its block has the channel's value and convolves it, as the kernel at
+//   the CONCAT would. The SILU output and the slots are then written that many nodes earlier: no node run in between may
+//   touch the SILU, the cache row or the ids (the GET_ROWS, the CONCAT and the CPYs do not run), and the SILU may not
+//   sit on any input or output of the projection launch. Returns the CONCAT's index, or -1.
+static int ggml_cuda_gdn_conv_fold(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int qkv_last,
+                                   const ggml_tensor * qkv, const ggml_tensor * const * launch_tensors, const int n_launch_tensors,
+                                   ggml_cuda_ssm_conv_state_fusion & f) {
+    static const bool disabled = getenv("GGML_CUDA_NO_CONV_FOLD") != nullptr;
+    if (disabled || !ggml_cuda_mmvq_conv_epilogue_pays(qkv->src[0]->type, ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        return -1;
+    }
+    int concat_idx = -1;
+    for (int j = qkv_last + 1; j < cgraph->n_nodes && j <= qkv_last + 32; j++) {
+        if (cgraph->nodes[j]->op == GGML_OP_CONCAT) {
+            concat_idx = j;
+            break;
+        }
+    }
+    if (concat_idx < 0 || !ggml_cuda_ssm_conv_state_fusion_match(cuda_ctx, cgraph, concat_idx, f)) {
+        return -1;
+    }
+    if (f.long_path || f.gr_shared || f.ssm_conv->ne[1] != 1 || f.gr_idx <= qkv_last ||
+            f.x->data != qkv->data || f.x->nb[1] != sizeof(float) || f.x->ne[1] != qkv->ne[0] || ggml_nrows(qkv) != 1 ||
+            f.ssm_conv->src[1]->ne[0] != 4) {
+        return -1;
+    }
+    for (int s = 2; s <= GGML_CUDA_SSM_CONV_STATE_MAX_TOKENS; s++) {
+        if (f.slots.dst[s] != nullptr) {
+            return -1;
+        }
+    }
+    // the SILU may sit exactly on qkv when nothing but the views to the CONCAT read qkv: the block of a row writes the
+    //   SILU over it last
+    bool silu_on_qkv = f.silu->data == qkv->data && ggml_nbytes(f.silu) == ggml_nbytes(qkv) && ggml_is_contiguous(f.silu) &&
+        ggml_is_contiguous(qkv) && f.silu->ne[0] == qkv->ne[0] && ggml_cuda_graph_use_count(cgraph, f.x) == 1;
+    for (const ggml_tensor * t = f.x; silu_on_qkv && t != qkv; t = t->src[0]) {
+        silu_on_qkv = t->view_src != nullptr && t->src[0] != nullptr && ggml_cuda_graph_use_count(cgraph, t->src[0]) == 1;
+    }
+    for (int a = 0; a < n_launch_tensors; a++) {
+        if (ggml_cuda_tensors_overlap(f.silu, launch_tensors[a]) && !(launch_tensors[a] == qkv && silu_on_qkv)) {
+            return -1;
+        }
+    }
+    const auto folded = [&](const int j) {
+        if (j == f.gr_idx || j == concat_idx) {
+            return true;
+        }
+        const ggml_tensor * n = cgraph->nodes[j];
+        return j <= f.last_cpy && n->op == GGML_OP_CPY && n->src[0]->op == GGML_OP_VIEW && n->src[0]->src[0] == cgraph->nodes[concat_idx];
+    };
+    for (int j = qkv_last + 1; j < f.conv_idx; j++) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n) || folded(j)) {
+            continue;
+        }
+        if (ggml_cuda_tensors_overlap(n, f.silu) || ggml_cuda_tensors_overlap(n, f.ids) ||
+                (j <= f.last_cpy && ggml_cuda_tensors_overlap(n, f.states))) {
+            return -1;
+        }
+        for (int k = 0; k < GGML_MAX_SRC; k++) {
+            if (n->src[k] != nullptr && (ggml_cuda_tensors_overlap(n->src[k], f.silu) ||
+                    (j <= f.last_cpy && ggml_cuda_tensors_overlap(n->src[k], f.states)))) {
+                return -1;
+            }
+        }
+    }
+    return concat_idx;
+}
+
 // whether node i, the GET_ROWS of a convolution state or the SSM_CONV after it, belongs to a fused build_conv_state;
 //   n_skip: the nodes after the SSM_CONV up to its SILU
 static bool ggml_cuda_ssm_conv_state_is_folded(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i,
@@ -5886,6 +5956,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // a build_conv_state that the qkv projection ran (ggml_cuda_gdn_conv_fold)
+    if (node == cuda_ctx->conv_folded_concat) {
+        cuda_ctx->conv_folded_concat = nullptr;
+        return cuda_ctx->conv_folded_skip;
+    }
+
     if (node->op == GGML_OP_UNARY) {
         const int n_skip = ggml_cuda_try_fuse_qsa_cell_scores(cuda_ctx, cgraph, i);
         if (n_skip > 0) {
@@ -7291,6 +7367,24 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             fusion_data.gdn_dt   = add->src[0] == cgraph->nodes[i + 1] ? add->src[1] : add->src[0];
             fusion_data.gdn_a    = mul_a->src[0] == cgraph->nodes[i + 3] ? mul_a->src[1] : mul_a->src[0];
             fusion_data.gdn_beta = beta;
+            // and the convolution of qkv in the epilogue of its rows
+            ggml_cuda_ssm_conv_state_fusion cf;
+            const ggml_tensor * launch_tensors[5] = { x, qkv, z, mul_a, beta };
+            const int concat_idx = ggml_cuda_gdn_conv_fold(cuda_ctx, cgraph, k, qkv, launch_tensors, 5, cf);
+            if (concat_idx >= 0) {
+                fusion_data.conv_states     = (const float *) ((const char *) cf.states->data + cf.state_offs);
+                fusion_data.conv_ids        = (const int32_t *) cf.ids->data;
+                fusion_data.conv_row_stride = (int64_t) (cf.states->nb[1] / sizeof(float));
+                fusion_data.conv_w          = (const float *) cf.ssm_conv->src[1]->data;
+                fusion_data.conv_w_stride   = (int64_t) (cf.ssm_conv->src[1]->nb[1] / sizeof(float));
+                fusion_data.conv_dst        = (float *) cf.silu->data;
+                fusion_data.conv_slot[0]    = cf.slots.dst[0];
+                fusion_data.conv_slot[1]    = cf.slots.dst[1];
+                cuda_ctx->q8_1_input_invalidate(cf.silu);
+                cuda_ctx->cublas_input_invalidate(cf.silu);
+                cuda_ctx->conv_folded_concat = cgraph->nodes[concat_idx];
+                cuda_ctx->conv_folded_skip   = cf.last_cpy - concat_idx;
+            }
             ggml_cuda_mul_mat_vec_q(*cuda_ctx, qkv->src[0], qkv->src[1], nullptr, qkv, &fusion_data);
             return k - i;
         }

@@ -229,13 +229,7 @@ static __global__ void ssm_conv_state_f32(const float * states, const int32_t * 
 
 #pragma unroll
     for (int t = 0; t < n_t; ++t) {
-        float sumf = 0.0f;
-#pragma unroll
-        for (int j = 0; j < d_conv; ++j) {
-            sumf += win[t + j] * wv[j];
-        }
-        sumf += b;
-        dst[t*dst_stride_t + c] = ggml_cuda_op_silu_single(sumf);
+        dst[t*dst_stride_t + c] = ggml_cuda_ssm_conv_silu<d_conv>(win + t, wv, b);
     }
 }
 
