@@ -1,6 +1,29 @@
 #include "argsort.cuh"
 #include "top-k.cuh"
 
+// Adjusted implementation thresholds from #28547, can be overridden at build time
+#ifndef GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC
+#    if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+// not measured on HIP/MUSA, keep the old split
+#        define GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC 1024
+#    else
+#        define GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC 512
+#    endif
+#endif // GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC
+
+#ifndef GGML_CUDA_TOP_K_NCOLS_THRESHOLD_ARGSORT
+#    define GGML_CUDA_TOP_K_NCOLS_THRESHOLD_ARGSORT 4096
+#endif // GGML_CUDA_TOP_K_NCOLS_THRESHOLD_ARGSORT
+
+// bitonic up to this width while nrows fits in one wave of SMs, 0 disables
+#ifndef GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC_FEW_ROWS
+#    if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+#        define GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC_FEW_ROWS 0
+#    else
+#        define GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC_FEW_ROWS 1024
+#    endif
+#endif // GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC_FEW_ROWS
+
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
 // DeviceTopK has a race condition before CCCL 3.4.3.
@@ -13,6 +36,15 @@
 using namespace cub;
 #    endif  // CCCL >= 3.4.3
 #endif      // GGML_CUDA_USE_CUB
+
+// max rows for the per-row DeviceTopK / CUB argsort path before switching to radix / bitonic
+#ifndef GGML_CUDA_TOP_K_NROWS_THRESHOLD
+#    ifdef CUB_TOP_K_AVAILABLE
+#        define GGML_CUDA_TOP_K_NROWS_THRESHOLD 2
+#    else
+#        define GGML_CUDA_TOP_K_NROWS_THRESHOLD 1
+#    endif
+#endif // GGML_CUDA_TOP_K_NROWS_THRESHOLD
 
 #ifdef CUB_TOP_K_AVAILABLE
 
@@ -40,7 +72,7 @@ static void top_k_cub(ggml_cuda_pool & pool,
                          ncols, k, env));
 }
 
-#elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
+#endif                            // CUB_TOP_K_AVAILABLE
 
 static int next_power_of_2(int x) {
     int n = 1;
@@ -49,10 +81,6 @@ static int next_power_of_2(int x) {
     }
     return n;
 }
-
-#endif                            // CUB_TOP_K_AVAILABLE
-
-#if !defined(CUB_TOP_K_AVAILABLE)
 
 static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
     const uint32_t bits = __float_as_uint(value);
@@ -527,7 +555,34 @@ static void top_k_radix_cuda(
     }
 }
 
-#endif // !defined(CUB_TOP_K_AVAILABLE)
+
+static void top_k_argsort_cuda(
+        ggml_cuda_pool & pool,
+        const float * src, int * dst, int ncols, int64_t nrows, int k, bool use_cub, cudaStream_t stream) {
+    const int64_t chunk_nrows = ggml_cuda_chunk_nrows((size_t) ncols * sizeof(int), nrows);
+
+    ggml_cuda_pool_alloc<int> tmp_alloc(pool, (size_t) ncols * chunk_nrows);
+    int * tmp = tmp_alloc.get();
+
+    for (int64_t i = 0; i < nrows; i += chunk_nrows) {
+        const int iter_nrows = std::min(chunk_nrows, nrows - i);
+
+        if (use_cub) {
+#ifdef GGML_CUDA_USE_CUB
+            argsort_f32_i32_cuda_cub(pool, src, tmp, ncols, iter_nrows, GGML_SORT_ORDER_DESC, stream);
+#else
+            GGML_ABORT("CUB is not available");
+#endif // GGML_CUDA_USE_CUB
+        } else {
+            argsort_f32_i32_cuda_bitonic(src, tmp, ncols, iter_nrows, GGML_SORT_ORDER_DESC, stream);
+        }
+        CUDA_CHECK(cudaMemcpy2DAsync(dst, k * sizeof(int), tmp, ncols * sizeof(int), k * sizeof(int), iter_nrows,
+                                     cudaMemcpyDeviceToDevice, stream));
+
+        src += (size_t) ncols * iter_nrows;
+        dst += (size_t) k     * iter_nrows;
+    }
+}
 
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
@@ -544,62 +599,59 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    nrows = ggml_nrows(src0);
     const int64_t    k     = dst->ne[0];
     ggml_cuda_pool & pool  = ctx.pool();
-#ifdef CUB_TOP_K_AVAILABLE
-    // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
-    // https://github.com/NVIDIA/cccl/issues/6391
-    // TODO: investigate if there exists a point where parallelized argsort is faster than sequential top-k
-    for (int i = 0; i < nrows; i++) {
-        top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
-    }
-#elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
+
+    const int device = ggml_cuda_get_device();
+
+#if defined(GGML_CUDA_USE_CUB) && !defined(CUB_TOP_K_AVAILABLE)
     // above 4096 CUB falls back to a multi-pass sort of the whole row just to keep k elements
     if (ncols > 4096) {
         top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
         return;
     }
     // up to 4096 keys a row fits one block, so the select is a single launch: on a V100 2-6x the argsort for one
-    //   row and 10x for a thousand rows of 1024. Only many rows of a few keys pack tighter into the bitonic sort.
+    //   row and 10x for a thousand rows of 1024. Only many rows of a few keys pack tighter into the bitonic sort below.
     if (ncols > 64 || nrows <= 64) {
         top_k_radix_small_cuda(src0_d, dst_d, ncols, nrows, k, stream);
         return;
     }
-    // Fall back to argsort + copy
-    const int    ncols_pad      = next_power_of_2(ncols);
-    const size_t shared_mem     = ncols_pad * sizeof(int);
-    const size_t max_shared_mem = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
-    const bool   use_bitonic    = shared_mem <= max_shared_mem && ncols <= 1024;
-    const int    chunk_nrows    = argsort_f32_i32_cuda_cub_chunk_nrows(src0->nb[1], nrows);
+#endif // defined(GGML_CUDA_USE_CUB) && !defined(CUB_TOP_K_AVAILABLE)
 
-    ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * chunk_nrows);
-    int *                     tmp_dst = temp_dst_alloc.get();
+#ifdef CUB_TOP_K_AVAILABLE
+    // a single row always uses DeviceTopK if available
+    const bool bitonic_short    = nrows > 1 && ncols <= GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC;
+#else
+    const bool bitonic_short    = ncols <= GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC;
+#endif // CUB_TOP_K_AVAILABLE
+    const bool bitonic_few_rows = nrows > GGML_CUDA_TOP_K_NROWS_THRESHOLD &&
+                                  ncols <= GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC_FEW_ROWS &&
+                                  nrows <= ggml_cuda_info().devices[device].nsm;
 
-    for (int64_t i = 0; i < nrows; i += chunk_nrows) {
-        int iter_nrows = std::min((int64_t) chunk_nrows, nrows - i);
-
-        if (use_bitonic) {
-            argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, iter_nrows, GGML_SORT_ORDER_DESC, stream);
-        } else {
-            argsort_f32_i32_cuda_cub(pool, src0_d, tmp_dst, ncols, iter_nrows, GGML_SORT_ORDER_DESC, stream);
+    if (bitonic_short || bitonic_few_rows) {
+        // the padded row must fit in shared memory
+        const int ncols_pad = next_power_of_2(ncols);
+        if (ncols_pad * sizeof(int) <= ggml_cuda_info().devices[device].smpb) {
+            top_k_argsort_cuda(pool, src0_d, dst_d, ncols, nrows, k, false, stream);
+            return;
         }
-        CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), iter_nrows,
-                                     cudaMemcpyDeviceToDevice, stream));
+    }
 
-        src0_d += ncols * iter_nrows;
-        dst_d  += k     * iter_nrows;
+    if (nrows > GGML_CUDA_TOP_K_NROWS_THRESHOLD) {
+        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        return;
+    }
+
+#ifdef CUB_TOP_K_AVAILABLE
+    // TODO: Assess perf of `DeviceBatchedTopK` for multi-row TopK & CCCL >= 3.5.0, re-running perf sweep of https://github.com/ggml-org/llama.cpp/pull/28713
+    for (int64_t i = 0; i < nrows; i++) {
+        top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
+    }
+#elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
+    if (ncols <= GGML_CUDA_TOP_K_NCOLS_THRESHOLD_ARGSORT) {
+        top_k_argsort_cuda(pool, src0_d, dst_d, ncols, nrows, k, true, stream);
+    } else {
+        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
     }
 #else                             // GGML_CUDA_USE_CUB
-#if defined(GGML_USE_HIP)
-    if (ncols > 1024) {
-        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
-    } else {
-#endif // defined(GGML_USE_HIP)
-        ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);
-        int *                     tmp_dst = temp_dst_alloc.get();
-        argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, nrows, GGML_SORT_ORDER_DESC, stream);
-        CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), nrows,
-                                     cudaMemcpyDeviceToDevice, stream));
-#if defined(GGML_USE_HIP)
-    }
-#endif // defined(GGML_USE_HIP)
-#endif
+    top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+#endif                            // CUB_TOP_K_AVAILABLE
 }

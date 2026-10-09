@@ -974,6 +974,9 @@ struct ggml_backend_sched {
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
 
+    ggml_backend_sched_copy_callback callback_copy;
+    void * callback_copy_user_data;
+
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -2213,6 +2216,12 @@ static void ggml_backend_sched_expert_cache_plan_make(int64_t n_expert, int cap,
     plan.valid = true;
 }
 
+static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
+    return t->buffer != NULL &&
+        ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        ggml_backend_buffer_is_host(t->buffer);
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
 
@@ -2335,7 +2344,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 batch_src.clear();
             }
         };
-        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+        // with a copy callback, the weights in host memory are copied last, so that the callback can read the other inputs of the split
+        const bool host_weights_last = sched->callback_copy != NULL && !ggml_backend_is_meta(split_backend);
+        for (int input_pass_id = 0; input_pass_id < (host_weights_last ? 2 : 1)*split->n_inputs; input_pass_id++) {
+            const int input_id = input_pass_id % split->n_inputs;
+            if (host_weights_last && ggml_backend_sched_is_host_weight(split->inputs[input_id]) != (input_pass_id >= split->n_inputs)) {
+                continue;
+            }
             // only the unselected branches of ggml_build_forward_select read it, which no backend computes
             if (!split->inputs_needed[input_id]) {
                 continue;
@@ -2427,6 +2442,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 const bool cache_may_take = meta_try_partial && expert_cache_on && !sync_always;
                 if (!cache_may_take) {
                     wait_for_split();
+                }
+
+                // the user may copy a weight in host memory itself, e.g. only the used experts. Not with meta: its
+                //   staging slots and expert pools own the device copy
+                if (host_weights_last && ggml_backend_sched_is_host_weight(input) &&
+                        sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
+                    continue;
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -3095,6 +3117,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_copy = callback;
+    sched->callback_copy_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

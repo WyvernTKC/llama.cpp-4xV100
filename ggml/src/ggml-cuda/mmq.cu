@@ -141,7 +141,10 @@ void ggml_cuda_mul_mat_q(
     GGML_TENSOR_BINARY_OP_LOCALS;
 
     cudaStream_t stream = ctx.stream();
-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    const int    id    = ggml_cuda_get_device();
+    const int    cc    = ggml_cuda_info().devices[id].cc;
+    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
 
     const size_t ts_src0 = ggml_type_size(src0->type);
     const size_t ts_src1 = ggml_type_size(src1->type);
@@ -176,7 +179,7 @@ void ggml_cuda_mul_mat_q(
     const int64_t s03 = src0->nb[3] / ts_src0;
     const int64_t s3  =  dst->nb[3] / ts_dst;
 
-    const bool fallback = ne01 % 128 != 0;
+    const bool fallback = ggml_cuda_mmq_needs_fallback(ne01);
 
     const ggml_prec prec_src1 = ggml_cuda_mmq_get_prec_src1(src0, dst, cc);
 
@@ -184,9 +187,103 @@ void ggml_cuda_mul_mat_q(
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
+    int J_best        = 0;
+    int nthreads_best = 0;
+    {
+        int64_t ncols_opt = ne11;
+        if (ids) {
+            const int64_t n_expert_used = ids->ne[0];
+            ncols_opt = ne12;
+
+            // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
+            // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
+            if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+                ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+            }
+        }
+
+        int ntiles_J_best = INT_MAX;
+
+        for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, J, fallback, cc, prec_src1);
+            if (config.type == GGML_TYPE_COUNT) {
+                continue;
+            }
+
+            if (mmq_get_nbytes_shared(config, cc) > smpbo) {
+                continue;
+            }
+
+            const int ntiles_x = (ncols_opt + config.J - 1) / config.J;
+
+            if (ntiles_x < ntiles_J_best) {
+                J_best = J;
+                nthreads_best = config.nthreads;
+                ntiles_J_best = ntiles_x;
+            }
+        }
+    }
+    GGML_ASSERT(J_best > 0);
+
+    // ncols_max has to survive one expert taking every token, so for a MoE launch the J above is the
+    // worst case. An expert typically holds only ncols_dst/n_expert columns, and a tile computes all
+    // J of them regardless - only the write back is masked - so the surplus is wasted dp4a work: at
+    // batch 512 with 256 experts, 89% of it. Derive J from the expected per-expert column count
+    // instead. Every J from 8 to 128 is a valid tiling and the host-side tile bound
+    // sum(ceil(rows/J)) <= ncols_dst/J + n_expert still holds, so there is still no readback and the
+    // dense tile map and CUDA graphs survive. Never raise J above the worst-case value: a batch
+    // smaller than one tile must keep its own smaller J.
+    //
+    // A dense launch has no expert dispersion, so its J above is already the exact column count and
+    // there is no surplus to reclaim - shrinking it only multiplies x-tile re-reads, which measures
+    // up to 2.3x slower. Dense is therefore left alone.
+    //
+    // Only 16 and 32 are candidates. A tile width that is not a power of two divides badly into the
+    // threads - at I=128 and 256 threads J=24 leaves 12 outputs per thread instead of 16 - and
+    // measures worse than both neighbours: on nemotron-h-moe, whose 24 columns per expert make J=24
+    // the natural choice, J=24 is 1.26x over the worst-case J where J=32 is 1.57x.
+    //
+    // Measured on 4x V100 (sm_70, dp4a) against the worst-case J: 1.46-1.57x prefill across five MoE
+    // models under -sm layer (Q8_0/Q4_K/Q6_K, 128-512 experts) and 1.30-1.40x under -sm tensor,
+    // where row splitting has already cut each device's MMQ share. Below 16 the x-tile re-reads
+    // start to bite. Not measured on the Turing+ MMA path, which shares this function but tiles
+    // differently. GGML_CUDA_MMQ_J_AUTO=0 restores the worst-case J.
+    static const bool J_auto = getenv("GGML_CUDA_MMQ_J_AUTO") ? atoi(getenv("GGML_CUDA_MMQ_J_AUTO")) != 0 : true;
+    if (J_auto && ids && ne02 > 0) {
+        const int64_t cols_per_expert = ne12*ids->ne[0] / ne02;
+
+        int J_moe = cols_per_expert <= 16 ? 16 : 32;
+        if (J_moe > J_best) J_moe = J_best;
+
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, J_moe, fallback, cc, prec_src1);
+        if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
+            J_best        = J_moe;
+            nthreads_best = config.nthreads;
+        }
+    }
+
+    // GGML_CUDA_MMQ_J pins J for MoE launches and GGML_CUDA_MMQ_J_DENSE for dense ones, so the two
+    // regimes can be swept apart. Both override the choices above.
+    static const int J_env       = getenv("GGML_CUDA_MMQ_J")       ? atoi(getenv("GGML_CUDA_MMQ_J"))       : 0;
+    static const int J_env_dense = getenv("GGML_CUDA_MMQ_J_DENSE") ? atoi(getenv("GGML_CUDA_MMQ_J_DENSE")) : 0;
+
+    const int J_pin = ids ? J_env : J_env_dense;
+    if (J_pin >= 8 && J_pin <= 128 && J_pin % 8 == 0) {
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, J_pin, fallback, cc, prec_src1);
+        if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
+            J_best        = J_pin;
+            nthreads_best = config.nthreads;
+        }
+    }
+
+    // A tile of size J can read in at most J - 1 extra columns.
+    // For simplicity, round up the padding of a full tile to a multiple of the number of bytes that nthreads can load in parallel.
+    const size_t src1_load_chunk_size = nthreads_best * sizeof(int);
+    const size_t src1_q8_1_padding = ((J_best * sizeof(block_q8_1_mmq) + src1_load_chunk_size - 1) / src1_load_chunk_size)
+        * src1_load_chunk_size;
+
     if (!ids) {
-        const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
-            ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+        const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
@@ -223,7 +320,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ne1, ne1};
+            ne1, J_best};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
         return;
     }
@@ -236,8 +333,7 @@ void ggml_cuda_mul_mat_q(
     const int64_t ne_get_rows = ne12 * n_expert_used;
     GGML_ASSERT(ne1 == n_expert_used);
 
-    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
-        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne12) * sizeof(block_q8_1_mmq);
+    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
     const bool with_scale = src0->type == GGML_TYPE_NVFP4 && use_native_fp4;
 
     // the gate of an expert FFN may have made the expert lists and the quantized activations of its up projection. Only
@@ -278,7 +374,8 @@ void ggml_cuda_mul_mat_q(
     } else if (keep) {
         cached.reset();
         cached.ids_src1      = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), ne_get_rows*sizeof(int32_t));
-        cached.ids_dst       = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), ne_get_rows*sizeof(int32_t));
+        // padded for the unconditional reads of a tile, for the largest J: a later launch with another J may reuse it
+        cached.ids_dst       = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), (ne_get_rows + 127)*sizeof(int32_t));
         cached.expert_bounds = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), (ne02 + 1)*sizeof(int32_t));
         cached.q8_1          = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), nbytes_src1_q8_1);
         if (with_scale) {
@@ -306,7 +403,7 @@ void ggml_cuda_mul_mat_q(
         cached.stream_no   = ctx.curr_stream_no;
     } else {
         ids_src1_p      = ids_src1.alloc(ne_get_rows);
-        ids_dst_p       = ids_dst.alloc(ne_get_rows);
+        ids_dst_p       = ids_dst.alloc(ne_get_rows + J_best-1); // Needs to be padded for unconditional memory access.
         expert_bounds_p = expert_bounds.alloc(ne02 + 1);
         src1_q8_1_p     = src1_q8_1.alloc(nbytes_src1_q8_1);
         src1_scale_p    = with_scale ? src1_scale.alloc(ne12*n_expert_used) : nullptr;
@@ -360,13 +457,6 @@ void ggml_cuda_mul_mat_q(
                                          ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
     const int64_t s13 = ne12*s12;
 
-    // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
-    // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
-    int64_t ncols_opt = ne12;
-    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
-        ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
-    }
-
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1_p, ids_dst_p, expert_bounds_p, dst_d,
@@ -374,7 +464,7 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12, ncols_opt};
+        ne12, J_best};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }

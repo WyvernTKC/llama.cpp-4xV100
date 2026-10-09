@@ -995,6 +995,9 @@ static void rms_norm_mul_rope_cuda(
     GGML_ASSERT(n_rot == 0 || (n_rot >= 2 && (n_rot & (n_rot - 1)) == 0 && ncols % n_rot == 0));
     GGML_ASSERT(!rope_fused_dst_is_block<D>() || (set_rows_stride != 0 && ncols % 32 == 0));
 
+    // one (row, channel, sample) per block, blockIdx.y/z handed to the row as they are: the fusion matchers refuse rows
+    //   past the 65535 channels/samples of a grid (#28175), which run unfused
+    GGML_ASSERT(nchannels <= UINT16_MAX && nsamples <= UINT16_MAX);
     const dim3 blocks_num(nrows, nchannels, nsamples);
 
     const float theta_scale = n_dims > 0 ? powf(freq_base, -2.0f/n_dims) : 0.0f;
