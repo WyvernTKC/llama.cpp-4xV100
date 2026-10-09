@@ -1,24 +1,43 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
 
-// one state column per warp: the fused l2 norm needs 1..4 rows per lane, and four columns per warp are not measured on Volta
-constexpr int gdn_cols_per_warp = 1;
+// two state columns per warp, not upstream's four: on V100 with 8-12 heads per device (-sm tensor) two are fastest at
+//   prefill (kernel -7..9%) and four are slower than one at 8 heads; decode is the same for all three
+constexpr int gdn_cols_per_warp = 2;
 
-// rms_norm(x, eps) * post_scale + post_bias over one head, x being a lane's rows. rms_norm_f32<256> takes one value per
-//   thread, sums each 32 of them in a butterfly and adds those sums as below, so these are bitwise its values.
-template <int warp_size, int rows_per_lane>
+// rms_norm(x, eps) * post_scale + post_bias over one head, x[r] being row r * lanes_per_col + lane. rms_norm_f32<256>
+//   takes one value per thread, sums each 32 of them in a butterfly and adds those sums as below. The butterfly steps
+//   wider than lanes_per_col pair rows of one lane, so they run in registers first, the squares rounded as there (no
+//   FMA): these are bitwise its values.
+template <int lanes_per_col, int rows_per_lane>
 static __device__ __forceinline__ void gdn_l2_norm_head(
         float * x, const int ncols, const float eps, const float post_scale, const float post_bias) {
-    static_assert(rows_per_lane == 1 || rows_per_lane == 2 || rows_per_lane == 4, "unsupported head size");
-    float w[rows_per_lane];
+    constexpr int head     = lanes_per_col * rows_per_lane;
+    constexpr int group    = head < 32 ? head : 32;       // the values one warp of rms_norm_f32 sums
+    constexpr int per_lane = group / lanes_per_col;       // of those, the rows in each lane
+    constexpr int n_groups = rows_per_lane / per_lane;
+    static_assert(n_groups == 1 || n_groups == 2 || n_groups == 4, "unsupported head size");
+    float w[n_groups];
 #pragma unroll
-    for (int r = 0; r < rows_per_lane; r++) {
-        w[r] = warp_reduce_sum<warp_size>(x[r] * x[r]);
+    for (int g = 0; g < n_groups; g++) {
+        float p[per_lane];
+#pragma unroll
+        for (int m = 0; m < per_lane; m++) {
+            p[m] = __fmul_rn(x[g * per_lane + m], x[g * per_lane + m]);
+        }
+#pragma unroll
+        for (int d = per_lane / 2; d > 0; d /= 2) {
+#pragma unroll
+            for (int m = 0; m < d; m++) {
+                p[m] += p[m + d];
+            }
+        }
+        w[g] = warp_reduce_sum<lanes_per_col>(p[0]);
     }
     float sum = w[0];
-    if constexpr (rows_per_lane == 2) {
+    if constexpr (n_groups == 2) {
         sum = w[0] + w[1];
-    } else if constexpr (rows_per_lane == 4) {
+    } else if constexpr (n_groups == 4) {
         sum = (w[0] + w[2]) + (w[1] + w[3]);
     }
     const float mean  = sum / ncols;
