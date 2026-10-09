@@ -1081,8 +1081,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     //   for its slowest device: Goetia's experts, 704 = 5.5 x 128, put 256 rows on a device against 176 on average, its
     //   dense FFN 2112 put 640 against 528, Qwen3.8-Flash's 640 put 256 against 160. A multiple of 64 or of 32 is taken
     //   where it lowers the largest per-layer load; the others keep 128. Offloaded experts take a smaller one only where
-    //   its bytes stay a multiple of 4: their copies move the rows of the slice in units of the alignment (64 columns of
-    //   q8_0 are 68 bytes, 32 are 34).
+    //   its bytes stay even: their copies move the rows of the slice in units of the alignment, and the 2-byte aligned ones
+    //   (32 columns of q8_0 are 34 bytes) in the 8-byte words that cover them (see expert_cache_copy_slot_covering), which
+    //   read up to ~10% more, so such a granule has to cut the largest load by 10%.
     auto get_ffn_granularity = [&](int64_t blck_size, size_t type_size, int64_t ne, bool offloaded) -> int64_t {
         const int64_t g_perf = std::lcm(blck_size, (int64_t) 128);
         const int64_t n      = (int64_t) ud->n_devices;
@@ -1129,11 +1130,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         double  m_best = max_load(g_perf);
         for (const int64_t gmin : {(int64_t) 64, (int64_t) 32}) {
             const int64_t g = std::lcm(blck_size, gmin);
-            if (g >= g_best || (offloaded && (g / blck_size * type_size) % 4 != 0)) {
+            if (g >= g_best || (offloaded && (g / blck_size * type_size) % 2 != 0)) {
                 continue;
             }
-            const double m = max_load(g);
-            if (m < 0.98 * m_best) {
+            const bool   covering = offloaded && (g / blck_size * type_size) % 4 != 0;
+            const double m        = max_load(g);
+            if (m < (covering ? 0.90 : 0.98) * m_best) {
                 g_best = g;
                 m_best = m;
             }

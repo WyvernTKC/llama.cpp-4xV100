@@ -36,6 +36,7 @@ struct ggml_cuda_expert_cache {
     uint64_t                   magic = GGML_CUDA_EXPERT_CACHE_MAGIC;
     int                        device;
     int                        align;  // largest of 16/8/4/2/1 that divides every address and stride the copy uses
+    bool                       covering; // align < 4, copied in the 8-byte words that cover each chunk
     ggml_cuda_expert_cache_dev d;
     void *                     state = nullptr;
 };
@@ -265,7 +266,39 @@ static __device__ __forceinline__ void expert_cache_copy_slot(const ggml_cuda_ex
     }
 }
 
-// blockIdx.z is the cache of the group, each copied with the widest unit its addresses allow
+// A slice that is only 2-byte aligned (a K slice of q8_0 rows, 34-byte blocks) is read in the aligned 8-byte words that
+//   cover each chunk instead of 2-byte units, which are slow over PCIe, and the units of TS inside the chunk are stored.
+//   The words stay in the chunk's row: rows start 8-byte aligned (see covering in ggml_cuda_expert_cache_create).
+template <typename TS>
+static __device__ __forceinline__ void expert_cache_copy_slot_covering(const ggml_cuda_expert_cache_dev & d, char * pool, const int m) {
+    const int    e     = d.miss_expert[m];
+    const int    s     = d.miss_slot[m];
+    const char * src_e = d.host + (size_t) e*d.expert_bytes + d.offset_dev;
+    char       * dst_s = pool + (size_t) s*d.slot_bytes;
+
+    const size_t nw = (d.chunk_dev + 14) / 8; // the words a chunk can touch
+    const size_t n  = (size_t) d.n_chunks * nw;
+    for (size_t i = (size_t) blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x*blockDim.x) {
+        const size_t c     = i / nw;
+        const char * src_c = src_e + c*d.chunk_full;
+        const char * end   = src_c + d.chunk_dev;
+        const char * word  = (const char *) ((uintptr_t) src_c & ~(uintptr_t) 7) + 8*(i - c*nw);
+        if (word >= end) {
+            continue;
+        }
+        const uint2    v = *(const uint2 *) word;
+        const uint64_t u = (uint64_t) v.x | ((uint64_t) v.y << 32);
+        char * dst_w = dst_s + c*d.chunk_dev + (word - src_c); // where the word's first byte goes
+#pragma unroll
+        for (int k = 0; k < 8; k += sizeof(TS)) {
+            if (word + k >= src_c && word + k < end) {
+                *(TS *) (dst_w + k) = (TS) (u >> (8*k));
+            }
+        }
+    }
+}
+
+// blockIdx.z is the cache of the group, each copied with the widest unit its addresses allow (negative: covering)
 static __global__ void expert_cache_copy(const ggml_cuda_expert_cache_group g) {
     const int z = blockIdx.z;
     const ggml_cuda_expert_cache_dev & d = g.d[z];
@@ -278,6 +311,8 @@ static __global__ void expert_cache_copy(const ggml_cuda_expert_cache_group g) {
         case  8: expert_cache_copy_slot<int2>   (d, g.pool[z], m); break;
         case  4: expert_cache_copy_slot<int32_t>(d, g.pool[z], m); break;
         case  2: expert_cache_copy_slot<int16_t>(d, g.pool[z], m); break;
+        case -2: expert_cache_copy_slot_covering<uint16_t>(d, g.pool[z], m); break;
+        case -1: expert_cache_copy_slot_covering<uint8_t> (d, g.pool[z], m); break;
         default: expert_cache_copy_slot<int8_t> (d, g.pool[z], m); break;
     }
 }
@@ -385,6 +420,7 @@ void * ggml_cuda_expert_cache_create(int device, const void * host_buf, size_t h
     c->d.cap          = cap;
     c->d.max_ids      = max_ids;
     c->align = expert_cache_align({(size_t) (uintptr_t) dev_ptr, expert_bytes, chunk_full, chunk_dev, offset_dev, c->d.slot_bytes});
+    c->covering = c->align < 4 && expert_cache_align({(size_t) (uintptr_t) dev_ptr, expert_bytes, chunk_full}) >= 8;
 
     const size_t n_i32 = (size_t) n_expert + 2*cap + 1 + 3*max_ids + 1 + 2;
     ggml_cuda_set_device(device);
@@ -460,7 +496,7 @@ void ggml_cuda_expert_cache_gather_group(ggml_backend_cuda_context & ctx, const 
         GGML_ASSERT(pools[k]->nb[2] == c->d.slot_bytes);
         g.d[k]     = c->d;
         g.pool[k]  = (char *) pools[k]->data;
-        g.align[k] = c->align;
+        g.align[k] = c->covering ? -c->align : c->align;
         nbx = std::max(nbx, (int) std::min<size_t>(64, (c->d.slot_bytes/c->align + nthreads - 1)/nthreads));
     }
 
