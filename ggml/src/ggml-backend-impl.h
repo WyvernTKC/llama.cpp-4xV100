@@ -99,6 +99,8 @@ extern "C" {
     //
 
     GGML_API bool ggml_backend_is_meta       (ggml_backend_t backend);
+    // a host buffer is about to be freed: the meta backend forgets any layout it gave the weights in it
+    GGML_API void ggml_backend_meta_buffer_freed(ggml_backend_buffer_t buffer);
     GGML_API bool ggml_backend_meta_stage_weight_ranges(ggml_backend_t backend, struct ggml_tensor * dst, const void * base,
                                                         const size_t * offsets, const size_t * sizes, size_t n_ranges);
     // Keep `cap` of a MoE weight's experts resident in a per-tensor pool and move only the experts a

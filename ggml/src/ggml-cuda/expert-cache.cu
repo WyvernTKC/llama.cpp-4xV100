@@ -445,6 +445,9 @@ void * ggml_cuda_expert_cache_create(int device, const void * host_buf, size_t h
     CUDA_CHECK(cudaMemset(c->d.last_used, 0,    (size_t) cap*sizeof(uint32_t)));
     CUDA_CHECK(cudaMemset(c->d.clock,     0,    sizeof(uint32_t)));
     CUDA_CHECK(cudaMemset(c->d.n_miss,    0,    sizeof(int32_t)));
+    // the meta backend may lay the host weight out anew once its caches exist (ggml_backend_meta_dm_apply): nothing
+    //   queued before may still read it
+    CUDA_CHECK(cudaDeviceSynchronize());
     return c;
 }
 
@@ -454,10 +457,11 @@ void ggml_cuda_expert_cache_free(void * cache) {
         return;
     }
     ggml_cuda_set_device(c->device);
+    // nothing may still copy from the host weight: the meta backend puts its rows back after this (ggml_backend_meta_dm_drop)
+    cudaDeviceSynchronize();
     static const bool stats = getenv("GGML_META_EXPERT_CACHE_STATS") != nullptr;
     if (stats) {
         uint32_t st[2] = {0, 0};
-        cudaDeviceSynchronize();
         if (cudaMemcpy(st, c->d.stats, sizeof(st), cudaMemcpyDeviceToHost) == cudaSuccess && st[0] > 0) {
             fprintf(stderr, "expert-cache-dev: dev %d cap %d n_expert %d slot_bytes %zu calls %u misses %u miss/call %.4f MiB/call %.3f\n",
                 c->device, c->d.cap, c->d.n_expert, c->d.slot_bytes, st[0], st[1], (double) st[1]/st[0],

@@ -193,9 +193,17 @@ void ggml_backend_meta_expert_cache_rearm(void) {
 // budget the CPU path wins at batch 1. This lives here rather than in the CUDA device because it
 // depends on the split: under SPLIT_MODE_LAYER a layer's experts land on one device. A dense matmul
 // has no expert selection at all and keeps the plain batch threshold.
+struct ggml_backend_meta_dm;
+static std::shared_ptr<const ggml_backend_meta_dm> ggml_backend_meta_dm_find(const void * p);
+
 static bool ggml_backend_meta_moe_offload_always(const ggml_tensor * op, size_t n_devices) {
     if (op->op != GGML_OP_MUL_MAT_ID || op->src[0] == nullptr || op->src[2] == nullptr || n_devices == 0) {
         return false;
+    }
+
+    // stored device by device for the expert cache: the CPU cannot read it (ggml_backend_meta_dm)
+    if (ggml_backend_meta_dm_find(op->src[0]->data)) {
+        return true;
     }
 
     // Without staging slots there is no partial copy - MMQ needs the padded, zeroed destination a
@@ -742,6 +750,204 @@ static const std::vector<ggml_tensor *> * ggml_backend_meta_buffer_simple_tensor
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
 
+// Device-major layout of an offloaded expert weight split on axis 0, where a device owns one chunk of every row (a K
+//   slice). A missed expert's slice crosses PCIe as n_rows short reads spread over the whole expert, which move at ~70%
+//   of the rate of one contiguous run (Qwen3.8-Flash down, 2560 chunks of 170 B: 8.0 vs 11.3 GB/s; a DeepSeek Q3_K
+//   down, 4096 x 220 B: 8.3 vs 11.8). While the device cache owns such a weight, each expert's bytes are stored device
+//   by device instead: device j's slice of expert e is one run at e*expert_bytes + dst[j], its chunks back to back as
+//   in the device's own tensor. The copies of the weight into the split (set_tensor_async_impl, buffer_set_tensor) find
+//   the layout by address; the CPU never computes with the weight meanwhile (moe_offload_always); the rows go back
+//   when the cache lets go of it, or are dropped with the buffer. GGML_META_EXPERT_DM=0 keeps the rows.
+struct ggml_backend_meta_dm {
+    char *                base         = nullptr; // the weight's data
+    ggml_backend_buffer_t buffer       = nullptr;
+    size_t                expert_bytes = 0;
+    int64_t               n_expert     = 0;
+    int64_t               n_rows       = 0;
+    size_t                row_bytes    = 0;
+    std::vector<size_t>   chunk; // per device: the bytes of a row it owns
+    std::vector<size_t>   src;   // per device: where they start in a row
+    std::vector<size_t>   dst;   // per device: where its run starts in an expert
+    uint64_t              hash = 0; // GGML_META_EXPERT_DM_CHECK: of the rows before the permutation
+};
+
+struct ggml_backend_meta_dm_registry {
+    std::mutex                                                     mutex;
+    std::map<uintptr_t, std::shared_ptr<const ggml_backend_meta_dm>> by_base;
+};
+
+static std::atomic<int> g_meta_dm_n{0};
+
+static ggml_backend_meta_dm_registry & ggml_backend_meta_dm_reg() {
+    static ggml_backend_meta_dm_registry * reg = new ggml_backend_meta_dm_registry();
+    return *reg;
+}
+
+static bool ggml_backend_meta_dm_enabled() {
+    static const bool on = !getenv("GGML_META_EXPERT_DM") || atoi(getenv("GGML_META_EXPERT_DM")) != 0;
+    return on;
+}
+
+// the device-major weight that p points into, if any
+static std::shared_ptr<const ggml_backend_meta_dm> ggml_backend_meta_dm_find(const void * p) {
+    if (g_meta_dm_n.load(std::memory_order_acquire) == 0) {
+        return nullptr;
+    }
+    ggml_backend_meta_dm_registry & reg = ggml_backend_meta_dm_reg();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    auto it = reg.by_base.upper_bound((uintptr_t) p);
+    if (it == reg.by_base.begin()) {
+        return nullptr;
+    }
+    --it;
+    const ggml_backend_meta_dm & dm = *it->second;
+    return (uintptr_t) p < it->first + (size_t) dm.n_expert*dm.expert_bytes ? it->second : nullptr;
+}
+
+static bool ggml_backend_meta_dm_check() {
+    static const bool on = getenv("GGML_META_EXPERT_DM_CHECK") != nullptr;
+    return on;
+}
+
+// of one expert in row layout, for GGML_META_EXPERT_DM_CHECK
+static uint64_t ggml_backend_meta_dm_hash(const char * x, size_t n, int64_t e) {
+    uint64_t h = 1469598103934665603ull ^ (uint64_t) e;
+    for (size_t i = 0; i < n; i++) {
+        h = (h ^ (uint8_t) x[i])*1099511628211ull;
+    }
+    return h;
+}
+
+// rows -> device-major (to_dm) or back, expert by expert on a few threads; returns the hash of the rows when checking
+static uint64_t ggml_backend_meta_dm_permute(const ggml_backend_meta_dm & dm, bool to_dm) {
+    const int n_threads = (int) std::max<int64_t>(1, std::min<int64_t>({16, (int64_t) std::thread::hardware_concurrency(), dm.n_expert}));
+    std::atomic<int64_t>  next{0};
+    std::atomic<uint64_t> hash{0};
+    auto work = [&]() {
+        std::vector<char> tmp(dm.expert_bytes);
+        for (int64_t e = next++; e < dm.n_expert; e = next++) {
+            char * x = dm.base + (size_t) e*dm.expert_bytes;
+            memcpy(tmp.data(), x, dm.expert_bytes);
+            if (to_dm && ggml_backend_meta_dm_check()) {
+                hash ^= ggml_backend_meta_dm_hash(tmp.data(), dm.expert_bytes, e);
+            }
+            for (size_t j = 0; j < dm.chunk.size(); j++) {
+                for (int64_t r = 0; dm.chunk[j] > 0 && r < dm.n_rows; r++) {
+                    const size_t a = (size_t) r*dm.row_bytes + dm.src[j];
+                    const size_t b = dm.dst[j] + (size_t) r*dm.chunk[j];
+                    memcpy(x + (to_dm ? b : a), tmp.data() + (to_dm ? a : b), dm.chunk[j]);
+                }
+            }
+            if (!to_dm && ggml_backend_meta_dm_check()) {
+                hash ^= ggml_backend_meta_dm_hash(x, dm.expert_bytes, e);
+            }
+        }
+    };
+    std::vector<std::thread> threads;
+    for (int t = 1; t < n_threads; t++) {
+        threads.emplace_back(work);
+    }
+    work();
+    for (std::thread & t : threads) {
+        t.join();
+    }
+    return hash.load();
+}
+
+// Lay w out device by device for its axis-0 split ss and register it; nullptr if the weight does not qualify. The
+//   caller makes sure nothing still reads w from host memory (every device synchronized).
+static std::shared_ptr<const ggml_backend_meta_dm> ggml_backend_meta_dm_apply(const ggml_tensor * w,
+        const ggml_backend_meta_split_state & ss, size_t n_dev) {
+    // a buffer that does not own its memory maps the model file, possibly read-only
+    if (!ggml_backend_meta_dm_enabled() || ss.axis != GGML_BACKEND_SPLIT_AXIS_0 || w->extra != nullptr ||
+            w->buffer == nullptr || w->buffer->iface.free_buffer == nullptr || w->ne[3] != 1 || !ggml_is_contiguous(w)) {
+        return nullptr;
+    }
+    auto dm = std::make_shared<ggml_backend_meta_dm>();
+    dm->base         = (char *) w->data;
+    dm->buffer       = w->buffer;
+    dm->expert_bytes = w->nb[2];
+    dm->n_expert     = w->ne[2];
+    dm->n_rows       = w->ne[1];
+    dm->row_bytes    = w->nb[1];
+    size_t src = 0;
+    for (size_t j = 0; j < n_dev; j++) {
+        const size_t chunk_j = ggml_row_size(w->type, ss.ne[j]);
+        dm->chunk.push_back(chunk_j);
+        dm->src.push_back(src);
+        dm->dst.push_back(src*w->ne[1]);
+        src += chunk_j;
+    }
+    if (src != dm->row_bytes || (size_t) dm->n_rows*dm->row_bytes != dm->expert_bytes) {
+        return nullptr;
+    }
+
+    const int64_t t0 = ggml_time_us();
+    dm->hash = ggml_backend_meta_dm_permute(*dm, /*to_dm =*/ true);
+    {
+        ggml_backend_meta_dm_registry & reg = ggml_backend_meta_dm_reg();
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        reg.by_base[(uintptr_t) dm->base] = dm;
+        g_meta_dm_n.store((int) reg.by_base.size(), std::memory_order_release);
+    }
+    static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+    if (!reported.test_and_set()) {
+        GGML_LOG_INFO("%s: offloaded experts split by K are stored device by device in host memory (first %s, %.0f ms)\n",
+            __func__, w->name, (ggml_time_us() - t0)/1000.0);
+    }
+    if (ggml_backend_meta_dm_check()) {
+        GGML_LOG_WARN("%s: %s at %p device by device in %.0f ms\n", __func__, w->name, (void *) dm->base, (ggml_time_us() - t0)/1000.0);
+    }
+    return dm;
+}
+
+// put the rows back (restore) or just forget the layout (the buffer is going away)
+static void ggml_backend_meta_dm_drop(const std::shared_ptr<const ggml_backend_meta_dm> & dm, bool restore) {
+    if (!dm) {
+        return;
+    }
+    {
+        ggml_backend_meta_dm_registry & reg = ggml_backend_meta_dm_reg();
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        auto it = reg.by_base.find((uintptr_t) dm->base);
+        if (it == reg.by_base.end() || it->second != dm) {
+            return; // dropped with its buffer already
+        }
+        reg.by_base.erase(it);
+        g_meta_dm_n.store((int) reg.by_base.size(), std::memory_order_release);
+    }
+    if (restore) {
+        const uint64_t hash = ggml_backend_meta_dm_permute(*dm, /*to_dm =*/ false);
+        if (ggml_backend_meta_dm_check()) {
+            GGML_LOG_WARN("%s: rows of %p restored, hash %016" PRIx64 " %s\n", __func__, (void *) dm->base, hash,
+                hash == dm->hash ? "matches" : "DIFFERS");
+        }
+    }
+}
+
+// The host buffer of device-major weights is being freed: forget their layout, the bytes go with it
+void ggml_backend_meta_buffer_freed(ggml_backend_buffer_t buffer) {
+    if (g_meta_dm_n.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    ggml_backend_meta_dm_registry & reg = ggml_backend_meta_dm_reg();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    for (auto it = reg.by_base.begin(); it != reg.by_base.end(); ) {
+        it = it->second->buffer == buffer ? reg.by_base.erase(it) : std::next(it);
+    }
+    g_meta_dm_n.store((int) reg.by_base.size(), std::memory_order_release);
+}
+
+// The experts a copy of [offset, offset + size) of a device-major weight covers: it starts at an expert, and its end
+//   rounds up to one (a range extended over the rows MMQ reads past takes the next expert whole)
+static void ggml_backend_meta_dm_range(const ggml_backend_meta_dm & dm, const void * data, size_t offset, size_t size,
+        int64_t & e0, int64_t & n_e) {
+    GGML_ASSERT(offset % dm.expert_bytes == 0 && (size_t) ((const char *) data - dm.base) == offset &&
+        "a copy of a device-major expert weight must start at an expert of that weight");
+    e0  = (int64_t) (offset/dm.expert_bytes);
+    n_e = std::min<int64_t>((int64_t) ((size + dm.expert_bytes - 1)/dm.expert_bytes), dm.n_expert - e0);
+}
+
 // Expert cache in device memory (GGML_META_EXPERT_CACHE_DEVICE=1 with GGML_META_EXPERT_CACHE=<cap>). A MoE
 //   weight left in host memory stays the src of its MUL_MAT_ID instead of being copied into the split. Each
 //   device gets a pool of cap experts of its slice, and the device's MUL_MAT_ID gathers the routed experts
@@ -761,6 +967,7 @@ struct ggml_backend_meta_gathered_weight {
     uint64_t                               slots_gen = 0; // g_meta_gather_gen when slots was read
     ggml_context_ptr                     pool_ctx;
     bool                                 failed = false;
+    std::shared_ptr<const ggml_backend_meta_dm> dm; // the weight's host bytes are device-major while set
     // what the entry was built for: a tuner can change the cap between graphs, and a reloaded model can
     // hand out the same tensor address again
     int                   cap    = 0;
@@ -810,6 +1017,9 @@ static void ggml_backend_meta_gathered_weight_release(ggml_backend_meta_gathered
     gw.pool_tensors.clear();
     gw.pool_bufs.clear();
     gw.pool_ctx.reset();
+    // cache_free synchronized every device that read the weight, so its rows can go back
+    ggml_backend_meta_dm_drop(gw.dm, /*restore =*/ true);
+    gw.dm.reset();
 }
 
 static void ggml_backend_meta_gather_release_all() {
@@ -913,10 +1123,13 @@ static ggml_backend_meta_gathered_weight * ggml_backend_meta_gathered_weight_get
     gw.pool_tensors.assign(n_dev, nullptr);
     gw.caches.assign(n_dev, nullptr);
 
-    // one expert is n_chunks pieces of chunk_full bytes, each device owns chunk_dev of every piece
+    // one expert is n_chunks pieces of chunk_full bytes, each device owns chunk_dev of every piece; device-major, a
+    //   device's slice of an expert is one piece (ggml_backend_meta_dm)
     const int     axis       = ss.axis;
     const size_t  chunk_full = w->nb[axis + 1];
     const int64_t n_chunks   = w->nb[2] / chunk_full;
+    const bool    dm         = ggml_backend_meta_dm_enabled() && axis == GGML_BACKEND_SPLIT_AXIS_0 && n_chunks > 1 &&
+        w->extra == nullptr && w->buffer->iface.free_buffer != nullptr && w->ne[3] == 1;
     int64_t ne_before = 0;
     for (size_t j = 0; j < n_dev; j++) {
         const int64_t ne_j = ss.ne[j];
@@ -952,13 +1165,26 @@ static ggml_backend_meta_gathered_weight * ggml_backend_meta_gathered_weight_get
         pool->data   = ggml_backend_buffer_get_base(buf);
         ggml_backend_buffer_init_tensor(buf, pool);
 
-        gw.caches[j] = cache_create(dev, ggml_backend_buffer_get_base(w->buffer), ggml_backend_buffer_get_size(w->buffer),
-            w->data, w->ne[2], cap, w->nb[2], chunk_full, chunk_dev, offset_dev, n_chunks, /*max_ids =*/ cap);
+        // device-major: after the devices before it, n_chunks pieces each
+        const size_t slice_dev = (size_t) n_chunks*chunk_dev;
+        const size_t run_dev   = (size_t) n_chunks*offset_dev;
+        gw.caches[j] = dm
+            ? cache_create(dev, ggml_backend_buffer_get_base(w->buffer), ggml_backend_buffer_get_size(w->buffer),
+                w->data, w->ne[2], cap, w->nb[2], slice_dev, slice_dev, run_dev, 1, /*max_ids =*/ cap)
+            : cache_create(dev, ggml_backend_buffer_get_base(w->buffer), ggml_backend_buffer_get_size(w->buffer),
+                w->data, w->ne[2], cap, w->nb[2], chunk_full, chunk_dev, offset_dev, n_chunks, /*max_ids =*/ cap);
         if (gw.caches[j] == nullptr) {
             return give_up("the host memory could not be registered or the state not allocated");
         }
         pool->extra        = gw.caches[j];
         gw.pool_tensors[j] = pool;
+    }
+    // cache_create synchronized each device, so no copy still reads the rows
+    if (dm) {
+        gw.dm = ggml_backend_meta_dm_apply(w, ss, n_dev);
+        if (!gw.dm) {
+            return give_up("its experts could not be laid out device by device");
+        }
     }
     static bool reported = false;
     if (!reported) {
@@ -2677,6 +2903,21 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
     const bool segmented = split_state.n_segments != 1 || split_state.nr[0] != 1;
+    // an offloaded expert weight stored device by device, see set_tensor_async_impl
+    if (const auto dm = !segmented && split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 ? ggml_backend_meta_dm_find(data) : nullptr) {
+        int64_t e0, n_e;
+        ggml_backend_meta_dm_range(*dm, data, offset, size, e0, n_e);
+        for (size_t j = 0; j < n_bufs; j++) {
+            ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+            const size_t  slice         = dm->chunk[j]*dm->n_rows;
+            GGML_ASSERT(simple_tensor->nb[1] == dm->chunk[j] && simple_tensor->nb[2] == slice);
+            if (slice > 0) {
+                ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + dm->dst[j], e0*slice, slice, n_e, slice,
+                    dm->expert_bytes);
+            }
+        }
+        return;
+    }
     if (segmented || (split_state.axis >= GGML_BACKEND_SPLIT_AXIS_0 && split_state.axis <= GGML_BACKEND_SPLIT_AXIS_2)) {
         ggml_backend_meta_buffer_copy_run(buffer, n_bufs, size, ggml_backend_meta_copy_parts(tensor, split_state, n_bufs, offset, size),
                 [&](const ggml_backend_meta_copy_part & p) {
@@ -3572,6 +3813,21 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
         case GGML_BACKEND_SPLIT_AXIS_0:
         case GGML_BACKEND_SPLIT_AXIS_1:
         case GGML_BACKEND_SPLIT_AXIS_2: {
+            // an offloaded expert weight stored device by device: one run per expert and device
+            if (const auto dm = split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 ? ggml_backend_meta_dm_find(data) : nullptr) {
+                int64_t e0, n_e;
+                ggml_backend_meta_dm_range(*dm, data, offset, size, e0, n_e);
+                for (size_t j = 0; j < n_backends; j++) {
+                    ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                    const size_t  slice         = dm->chunk[j]*dm->n_rows;
+                    GGML_ASSERT(simple_tensor->nb[1] == dm->chunk[j] && simple_tensor->nb[2] == slice);
+                    if (slice > 0) {
+                        ggml_backend_tensor_set_2d_async(backend_j(j), simple_tensor, (const char *) data + dm->dst[j],
+                            e0*slice, slice, n_e, slice, dm->expert_bytes);
+                    }
+                }
+                break;
+            }
             // Exploit that tensors are contiguous to splice it with simple tensors as "chunks".
             const size_t chunk_size_full = tensor->nb[split_state.axis + 1];
             GGML_ASSERT(offset % chunk_size_full == 0);

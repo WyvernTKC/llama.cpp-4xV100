@@ -261,6 +261,7 @@ void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
         return;
     }
 
+    ggml_backend_meta_buffer_freed(buffer);
     if (buffer->iface.free_buffer != NULL) {
         buffer->iface.free_buffer(buffer);
     }
