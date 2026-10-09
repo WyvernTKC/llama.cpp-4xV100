@@ -674,13 +674,25 @@ static constexpr __host__ __device__ int mmvq_conv_min_blocks(const ggml_type ty
 #endif
 }
 
+// the blocks per SM of the paired gate/up kernel: on Volta the q8_0 wide one takes 86 registers without a bound, which leaves
+//   2 blocks of 256 threads per SM; 3 fit at 80
+static constexpr __host__ __device__ int mmvq_paired_min_blocks(const ggml_type type, const bool wide) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA
+    return wide && type == GGML_TYPE_Q8_0 ? 3 : 1;
+#else
+    GGML_UNUSED(type);
+    GGML_UNUSED(wide);
+    return 1;
+#endif
+}
+
 // paired: a fused gate on twice the warps, the first half summing x and the second half the gate over the same rows and
 //   K slices as the plain kernel, so a thread keeps the sums of one matrix as there and each sum is the plain one
 // conv: the convolution of build_conv_state in the epilogue of the rows of x (conv_args), one row per block
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool wide = false,
           bool paired = false, bool conv = false>
 __launch_bounds__((paired ? 2 : 1)*calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(),
-    conv ? mmvq_conv_min_blocks(type) : 1)
+    conv ? mmvq_conv_min_blocks(type) : paired ? mmvq_paired_min_blocks(type, wide) : 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
