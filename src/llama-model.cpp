@@ -1080,12 +1080,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     //   dither balances the totals but every layer still gives some device a whole granule more, and each layer waits
     //   for its slowest device: Goetia's experts, 704 = 5.5 x 128, put 256 rows on a device against 176 on average, its
     //   dense FFN 2112 put 640 against 528, Qwen3.8-Flash's 640 put 256 against 160. A multiple of 64 or of 32 is taken
-    //   where it lowers the largest per-layer load; the others keep 128. Offloaded experts keep it too: their copies
-    //   move the rows of the slice, and a narrower row loses the wide copy units (34 bytes of q8_0 are 2-byte aligned).
-    auto get_ffn_granularity = [&](int64_t blck_size, int64_t ne, bool offloaded) -> int64_t {
+    //   where it lowers the largest per-layer load; the others keep 128. Offloaded experts take a smaller one only where
+    //   its bytes stay a multiple of 4: their copies move the rows of the slice in units of the alignment (64 columns of
+    //   q8_0 are 68 bytes, 32 are 34).
+    auto get_ffn_granularity = [&](int64_t blck_size, size_t type_size, int64_t ne, bool offloaded) -> int64_t {
         const int64_t g_perf = std::lcm(blck_size, (int64_t) 128);
         const int64_t n      = (int64_t) ud->n_devices;
-        if (offloaded || n < 2) {
+        if (n < 2) {
             return g_perf;
         }
         const float * tensor_split = ud->model->tensor_split();
@@ -1128,7 +1129,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         double  m_best = max_load(g_perf);
         for (const int64_t gmin : {(int64_t) 64, (int64_t) 32}) {
             const int64_t g = std::lcm(blck_size, gmin);
-            if (g >= g_best) {
+            if (g >= g_best || (offloaded && (g / blck_size * type_size) % 4 != 0)) {
                 continue;
             }
             const double m = max_load(g);
@@ -1140,7 +1141,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         return g_best;
     };
 
-    auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments,
+    auto get_split_granularity = [&](int64_t blck_size, size_t type_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments,
             bool offloaded) -> std::vector<int64_t> {
         // for better performance it may make sense to round up blck_size to a higher power of 2 so that more efficient kernels can be used
         {
@@ -1411,7 +1412,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
             GGML_ASSERT(segments.size() == 1);
-            return {get_ffn_granularity(blck_size, segments[0].first, offloaded)};
+            return {get_ffn_granularity(blck_size, type_size, segments[0].first, offloaded)};
         }
 
         // everything else
@@ -1486,7 +1487,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
         }
         const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
-        const std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments, offloaded);
+        const std::vector<int64_t> granularity = get_split_granularity(blck_size, ggml_type_size(tc.tensor_axis_0->type), tc.il, segments, offloaded);
         for (size_t is = 0; is < segments.size(); is++) {
             const int64_t  ne_s = segments[is].first;
             const uint32_t nr_s = segments[is].second;
