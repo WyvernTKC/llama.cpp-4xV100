@@ -7286,6 +7286,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 5;
     }
 
+    // DeepSeek-V4's hyper-connection mixes: a weightless norm of one long row and a few f32 rows of w over it
+    //   (not ggml_can_fuse: it wants the nodes of the same shape)
+    if (node->op == GGML_OP_RMS_NORM && i + 1 < cgraph->n_nodes && ggml_node_get_use_count(cgraph, i) == 1 &&
+            (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && (cgraph->nodes[i + 1]->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+            ggml_cuda_should_fuse_rms_norm_mul_mat(node, cgraph->nodes[i + 1])) {
+        ggml_cuda_op_rms_norm_mul_mat(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        return 1;
+    }
+
     // the norms (and ropes) of the Q, K and V of one token, two or three of the fusions below with only views between
     //   them, or after the first the plain SET_ROWS of a V into its cache: one launch
     if (node->op == GGML_OP_RMS_NORM) {

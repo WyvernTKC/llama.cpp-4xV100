@@ -55,6 +55,10 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                                      ggml_tensor *               mul_tensor,
                                      ggml_tensor *               add_tensor);
 
+// MUL_MAT(w, RMS_NORM(x)) of one token and up to 31 f32 rows of a long K (DeepSeek-V4's hyper-connection mixes), one launch
+bool ggml_cuda_should_fuse_rms_norm_mul_mat(const ggml_tensor * rms_norm, const ggml_tensor * mul_mat);
+void ggml_cuda_op_rms_norm_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul_mat);
+
 void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

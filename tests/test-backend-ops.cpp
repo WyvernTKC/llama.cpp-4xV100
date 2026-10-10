@@ -5680,6 +5680,40 @@ struct test_relu_sqr : public test_case {
 
 // GGML_OP_MUL + GGML_OP_ADD + GGML_OP_UNARY(SIGMOID) + GGML_OP_SCALE (fused operation), the DeepSeek V4
 // hyper-connection coefficients: a column slice of the mixes times a weight scalar plus a weight vector.
+// MUL_MAT(w, RMS_NORM(x)), one token and a few f32 rows (DeepSeek-V4's hyper-connection mixes: 24 rows of 4 x 5120)
+struct test_rms_norm_mul_mat : public test_case {
+    const int64_t ncols;
+    const int64_t nrows;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_MAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ncols, nrows);
+    }
+
+    // the scale meets the sum instead of each value
+    double max_nmse_err() override { return 1e-6; }
+
+    test_rms_norm_mul_mat(int64_t ncols = 20480, int64_t nrows = 24) : ncols(ncols), nrows(nrows) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ncols, 1);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ncols, nrows);
+        ggml_set_name(x, "x");
+        ggml_set_name(w, "w");
+        ggml_tensor * norm = ggml_rms_norm(ctx, x, 1e-6f);
+        ggml_set_name(norm, "norm");
+        ggml_tensor * out = ggml_mul_mat(ctx, w, norm);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_mul_add_sigmoid_scale : public test_case {
     const int64_t n_tokens;
     const int64_t off; // first mixes column of the slice, -1 for the head (whole mixes, no views)
@@ -13822,6 +13856,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 8, false, 512, n, k));
             }
         }
+    }
+    // the hyper-connection mixes of DeepSeek-V4 (24 rows of 4 x 4096 / 4 x 5120), a ragged last slice, the 31-row and 128-slice limits
+    for (auto [ncols, nrows] : std::vector<std::pair<int64_t, int64_t>>{{16384, 24}, {20480, 24}, {20480, 4}, {5000, 31}, {32768, 31}, {1030, 1}}) {
+        test_cases.emplace_back(new test_rms_norm_mul_mat(ncols, nrows));
     }
     // a K-quant slice of 2-3 super-blocks (DeepSeek-V4.1's 2304-column experts split in four): a warp per row, one token
     for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {

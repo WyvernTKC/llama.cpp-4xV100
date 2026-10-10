@@ -2056,6 +2056,148 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                           eps, stream);
 }
 
+// MUL_MAT(w, RMS_NORM(x)) for one token, a weightless norm and a few f32 rows of a long K: DeepSeek-V4's hyper-connection
+//   mixes, 24 rows of the 20480 values of the four streams. As two ops that is a one-block norm of the whole row (7-9 us)
+//   and a matvec of 24 blocks (9-10 us). Here the blocks take slices of K: each sums the squares of its slice of x and its
+//   partial dot products with the raw x, and the last block to finish (a ticket in block_flags) adds the slices in order
+//   and scales the sums, rms_norm(x)*w = (x*w)*rsqrt(mean(x*x) + eps). The scale meets the sum, not each x, so this
+//   rounds differently from the two ops.
+#define RMS_NORM_MM_MAX_ROWS 31  // the sum of squares of a slice goes after them, 32 floats a slice
+#define RMS_NORM_MM_CHUNK    256
+#define RMS_NORM_MM_MAX_BLOCKS 128 // 16 slices for each of the 8 threads of a sum in the last block
+#define RMS_NORM_MM_TICKET   3 // in block_flags, after the topk_moe ticket; zero between launches
+
+static __global__ void rms_norm_mul_mat_f32(const float * __restrict__ x, const float * __restrict__ w, const int64_t stride_w,
+        float * __restrict__ partial, float * __restrict__ dst, const int ncols, const int nrows, const float eps,
+        unsigned int * __restrict__ ticket) {
+    constexpr int nwarps = RMS_NORM_MM_CHUNK/WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int col0 = blockIdx.x*RMS_NORM_MM_CHUNK;
+    const int col  = col0 + threadIdx.x;
+
+    __shared__ float x_s[RMS_NORM_MM_CHUNK];
+    __shared__ float sq_s[nwarps];
+    __shared__ bool  last;
+
+    const float xv = col < ncols ? x[col] : 0.0f;
+    x_s[threadIdx.x] = xv;
+    const float sq = warp_reduce_sum(xv*xv);
+    if (lane == 0) {
+        sq_s[warp] = sq;
+    }
+    __syncthreads();
+
+    float * partial_b = partial + (size_t) blockIdx.x*(RMS_NORM_MM_MAX_ROWS + 1);
+    // a warp per row of w, its lanes over the slice; the rows of a warp unrolled so that all their loads are in flight
+    constexpr int rows_per_warp = (RMS_NORM_MM_MAX_ROWS + nwarps - 1)/nwarps;
+    float acc[rows_per_warp] = { 0.0f };
+#pragma unroll
+    for (int k = lane; k < RMS_NORM_MM_CHUNK; k += WARP_SIZE) {
+#pragma unroll
+        for (int i = 0; i < rows_per_warp; ++i) {
+            const int r = warp + i*nwarps;
+            if (r < nrows && col0 + k < ncols) {
+                acc[i] += x_s[k]*w[r*stride_w + col0 + k];
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < rows_per_warp; ++i) {
+        const int r = warp + i*nwarps;
+        const float a = warp_reduce_sum(acc[i]);
+        if (r < nrows && lane == 0) {
+            partial_b[r] = a;
+        }
+    }
+    if (threadIdx.x == 0) {
+        float t = 0.0f;
+#pragma unroll
+        for (int i = 0; i < nwarps; ++i) {
+            t += sq_s[i];
+        }
+        partial_b[RMS_NORM_MM_MAX_ROWS] = t;
+    }
+
+    // the last block sums the slices
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        last = atomicAdd(ticket, 1u) == gridDim.x - 1;
+    }
+    __syncthreads();
+    if (!last) {
+        return;
+    }
+    __threadfence();
+
+    // 8 threads per sum (the rows, then the squares at RMS_NORM_MM_MAX_ROWS), each over every 8th slice with all its
+    //   loads in flight at once, then a fixed tree; a warp per sum with its loads in turn took 5 us more
+    static_assert(RMS_NORM_MM_CHUNK == 8*(RMS_NORM_MM_MAX_ROWS + 1), "8 threads per sum");
+    __shared__ float sum_s[RMS_NORM_MM_MAX_ROWS + 1];
+    {
+        const int r   = threadIdx.x / 8;
+        const int sub = threadIdx.x % 8;
+        float t = 0.0f;
+        if (r < nrows || r == RMS_NORM_MM_MAX_ROWS) {
+            float v[RMS_NORM_MM_MAX_BLOCKS/8];
+#pragma unroll
+            for (int j = 0; j < RMS_NORM_MM_MAX_BLOCKS/8; ++j) {
+                const int b = sub + 8*j;
+                v[j] = b < (int) gridDim.x ? __ldcg(partial + (size_t) b*(RMS_NORM_MM_MAX_ROWS + 1) + r) : 0.0f;
+            }
+#pragma unroll
+            for (int j = 0; j < RMS_NORM_MM_MAX_BLOCKS/8; ++j) {
+                t += v[j];
+            }
+        }
+#pragma unroll
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            t += __shfl_xor_sync(0xffffffff, t, offset, WARP_SIZE);
+        }
+        if (sub == 0) {
+            sum_s[r] = t;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < nrows) {
+        const float scale = rsqrtf(sum_s[RMS_NORM_MM_MAX_ROWS]/ncols + eps);
+        dst[threadIdx.x] = sum_s[threadIdx.x]*scale;
+    }
+    if (threadIdx.x == 0) {
+        *ticket = 0;
+    }
+}
+
+bool ggml_cuda_should_fuse_rms_norm_mul_mat(const ggml_tensor * rms_norm, const ggml_tensor * mul_mat) {
+    static const bool off = getenv("GGML_CUDA_NO_NORM_MUL_MAT") != nullptr;
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * w = mul_mat->src[0];
+    return !off && GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
+        rms_norm->op == GGML_OP_RMS_NORM && mul_mat->op == GGML_OP_MUL_MAT && mul_mat->src[1] == rms_norm &&
+        x->type == GGML_TYPE_F32 && rms_norm->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && mul_mat->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(x) && ggml_is_contiguous(rms_norm) && ggml_nrows(x) == 1 &&
+        w->ne[0] == x->ne[0] && w->ne[1] <= RMS_NORM_MM_MAX_ROWS && w->ne[2] == 1 && w->ne[3] == 1 &&
+        w->nb[0] == sizeof(float) && w->nb[1] % sizeof(float) == 0 &&
+        ggml_is_contiguous(mul_mat) && ggml_nrows(mul_mat) == 1 &&
+        x->ne[0] >= 4*RMS_NORM_MM_CHUNK && x->ne[0] <= RMS_NORM_MM_MAX_BLOCKS*RMS_NORM_MM_CHUNK;
+}
+
+void ggml_cuda_op_rms_norm_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul_mat) {
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * w = mul_mat->src[0];
+    float eps;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+
+    const int ncols   = (int) x->ne[0];
+    const int nblocks = (ncols + RMS_NORM_MM_CHUNK - 1)/RMS_NORM_MM_CHUNK;
+    ggml_cuda_pool_alloc<float> partial(ctx.pool(), (size_t) nblocks*(RMS_NORM_MM_MAX_ROWS + 1));
+    rms_norm_mul_mat_f32<<<nblocks, RMS_NORM_MM_CHUNK, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data,
+        w->nb[1]/sizeof(float), partial.get(), (float *) mul_mat->data, ncols, (int) w->ne[1], eps,
+        ctx.block_flags_get() + RMS_NORM_MM_TICKET);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * grad  = dst->src[0]; // gradients
     const ggml_tensor * src0f = dst->src[1]; // src0 from forward pass
