@@ -13823,6 +13823,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // a K-quant slice of 2-3 super-blocks (DeepSeek-V4.1's 2304-column experts split in four): a warp per row, one token
+    for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (int64_t k : {512, 768}) {
+            for (int64_t n : {1, 2}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1280, n, k, {1, 1}, {1, 1}));
+            }
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 6, false, 1280, 1, k));
+        }
+    }
 
     // few src1 rows (speculative verify): odd m, a single K block, long K, every tile width, broadcast batches
     for (int64_t n : {2, 3, 5, 8, 9, 13, 16}) {
