@@ -40,3 +40,12 @@ bool ggml_cuda_expert_cache_fill(ggml_backend_cuda_context & ctx, void * cache, 
 // Reads the pool slot of every expert (-1 when absent) into slot_of[n_expert]. Synchronous; the caller makes
 // sure no gather that could change it is still queued.
 bool ggml_cuda_expert_cache_read_slots(void * cache, int32_t * slot_of);
+
+// Warming the pool from a wide ubatch. The meta backend puts ggml_cuda_expert_cache_warm_tag(cache, pool, n_evict) into the
+//   extra of the whole staged copy of the weight (this device's slice of every expert, one slot-sized stride per expert);
+//   the MUL_MAT_ID that reads it calls ggml_cuda_expert_cache_warm, which brings the experts the ubatch routed to most into
+//   the pool's empty slots and in place of its n_evict least recently used residents, copied from the staged copy on the
+//   compute stream. The tag lives as long as the cache.
+void * ggml_cuda_expert_cache_warm_tag(void * cache, void * pool_data, int n_evict);
+bool   ggml_cuda_expert_cache_is_warm(const ggml_tensor * staged);
+void   ggml_cuda_expert_cache_warm(ggml_backend_cuda_context & ctx, const ggml_tensor * staged, const ggml_tensor * ids);

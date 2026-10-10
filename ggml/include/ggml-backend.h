@@ -230,6 +230,9 @@ extern "C" {
     //   slot of every expert (-1 when absent), so the caller can copy the others from host memory.
     typedef bool   (*ggml_backend_expert_cache_fill_t)(ggml_backend_t backend, void * cache, const void * pool_data, void * dst);
     typedef bool   (*ggml_backend_expert_cache_read_slots_t)(void * cache, int32_t * slot_of);
+    // The extra of such a whole copy that makes its MUL_MAT_ID also bring the experts the ubatch routes to most into the
+    //   pool at pool_data, from the copy itself: into empty slots and in place of n_evict residents; valid while the cache lives
+    typedef void * (*ggml_backend_expert_cache_warm_tag_t)(void * cache, void * pool_data, int n_evict);
 
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);

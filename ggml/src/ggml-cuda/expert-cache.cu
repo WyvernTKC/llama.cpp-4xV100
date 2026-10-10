@@ -7,7 +7,19 @@
 #include <mutex>
 #include <vector>
 
-#define GGML_CUDA_EXPERT_CACHE_MAGIC 0x6578706572746373ull
+#define GGML_CUDA_EXPERT_CACHE_MAGIC      0x6578706572746373ull
+#define GGML_CUDA_EXPERT_CACHE_WARM_MAGIC 0x6578707761726d73ull
+
+struct ggml_cuda_expert_cache;
+
+// In the extra of a whole staged copy of a pooled weight (this device's slice of every expert): its MUL_MAT_ID also
+//   brings the experts the ubatch routed to most into the pool, see expert_cache_warm_plan
+struct expert_cache_warm_tag {
+    uint64_t                 magic   = GGML_CUDA_EXPERT_CACHE_WARM_MAGIC;
+    ggml_cuda_expert_cache * cache   = nullptr;
+    char *                   pool    = nullptr;
+    int                      n_evict = 0;
+};
 
 struct ggml_cuda_expert_cache_dev {
     const char * host;         // device pointer to expert 0 in host memory
@@ -29,7 +41,7 @@ struct ggml_cuda_expert_cache_dev {
     int32_t  * miss_expert; // [max_ids]
     int32_t  * miss_slot;   // [max_ids]
     int32_t  * n_miss;      // [1]
-    uint32_t * stats;       // [2] calls, misses - GGML_META_EXPERT_CACHE_STATS
+    uint32_t * stats;       // [4] calls, misses, warms, warm misses - GGML_META_EXPERT_CACHE_STATS
 };
 
 struct ggml_cuda_expert_cache {
@@ -39,6 +51,7 @@ struct ggml_cuda_expert_cache {
     bool                       covering; // align < 4, copied in the 8-byte words that cover each chunk
     ggml_cuda_expert_cache_dev d;
     void *                     state = nullptr;
+    expert_cache_warm_tag      warm;
 };
 
 // The caches of one launch: the experts of a MoE layer routed by the same ids (gate, up, down), each with its own
@@ -335,6 +348,163 @@ static __global__ void expert_cache_fill(const ggml_cuda_expert_cache_dev d, con
     }
 }
 
+// After a wide ubatch read a whole staged copy of the weight, the experts it routed to most (ties to the lower id) come
+//   into the pool: the first n_evict of them as if the LRU had been handed them coldest first (resident ones take a new
+//   stamp, the others the least recently used slots no selected expert holds), the next ones only into slots that hold
+//   no expert yet. A full pool so keeps all its residents but n_evict, the most recently used ones. The misses are listed
+//   for expert_cache_copy. One block, the same decision on every device and in every pool of the layer, as for a gather.
+static __global__ void expert_cache_warm_plan(const ggml_cuda_expert_cache_dev d, const int32_t * ids,
+        const int n_rows, const int n_per_row, const int row_stride, const int n_evict) {
+    extern __shared__ int s_warm[]; // count [n_expert], expert by rank [cap], resident [cap], last_used [cap], expert_of [cap]
+    int      * s_cnt  = s_warm;
+    int      * s_sel  = s_cnt + d.n_expert;
+    int      * s_res  = s_sel + d.cap;
+    uint32_t * s_last = (uint32_t *) (s_res + d.cap);
+    int      * s_exp  = (int *) (s_last + d.cap);
+    __shared__ int s_n_sel;
+    __shared__ int s_n_empty;
+
+    // every stamp so far is below clock, see expert_cache_plan
+    const uint32_t clock = *d.clock;
+    if (threadIdx.x == 0) {
+        s_n_sel   = 0;
+        s_n_empty = 0;
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < d.n_expert; e += blockDim.x) {
+        s_cnt[e] = 0;
+    }
+    for (int s = threadIdx.x; s < d.cap; s += blockDim.x) {
+        s_last[s] = d.last_used[s];
+        s_exp[s]  = d.expert_of[s];
+        if (s_exp[s] < 0) {
+            atomicAdd(&s_n_empty, 1);
+        }
+    }
+    __syncthreads();
+    if (n_evict == 0 && s_n_empty == 0) {
+        if (threadIdx.x == 0) {
+            *d.n_miss = 0;
+        }
+        return;
+    }
+
+    const int n_ids = n_rows*n_per_row;
+    for (int i = threadIdx.x; i < n_ids; i += blockDim.x) {
+        atomicAdd(&s_cnt[ids[(i / n_per_row)*row_stride + (i % n_per_row)]], 1);
+    }
+    __syncthreads();
+
+    // the rank of a routed expert: how many were routed more often, or as often with a lower id
+    for (int e = threadIdx.x; e < d.n_expert; e += blockDim.x) {
+        const int c = s_cnt[e];
+        if (c == 0) {
+            continue;
+        }
+        int r = 0;
+        for (int e2 = 0; e2 < d.n_expert; e2++) {
+            const int c2 = s_cnt[e2];
+            r += c2 > c || (c2 == c && e2 < e);
+        }
+        if (r < d.cap) {
+            s_sel[r] = e;
+            atomicAdd(&s_n_sel, 1);
+        }
+    }
+    __syncthreads();
+    const int n_sel = s_n_sel;
+    const int n_top = min(n_evict, n_sel);
+
+    // rank r is stamped clock + n_sel - r: the first n_top are above every other slot, so none of them is a victim below
+    for (int r = threadIdx.x; r < n_sel; r += blockDim.x) {
+        const int sl = d.slot_of[s_sel[r]];
+        s_res[r] = sl >= 0;
+        if (sl >= 0 && r < n_top) {
+            s_last[sl]      = clock + (uint32_t) (n_sel - r);
+            d.last_used[sl] = clock + (uint32_t) (n_sel - r);
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x >= WARP_SIZE) {
+        return;
+    }
+
+    const int lane   = threadIdx.x;
+    int       n_miss = 0;
+    for (int i = 0; i < n_sel; i++) {
+        const int  r   = i < n_top ? n_top - 1 - i : i; // the first n_top coldest first, then the others hottest first
+        const bool top = i < n_top;
+        if (s_res[r]) {
+            continue;
+        }
+        uint32_t best   = 0xffffffffu;
+        int      best_i = 0x7fffffff;
+        for (int s = lane; s < d.cap; s += WARP_SIZE) {
+            const uint32_t v = top || s_exp[s] < 0 ? s_last[s] : 0xffffffffu;
+            if (v < best) {
+                best   = v;
+                best_i = s;
+            }
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            const uint32_t ob = __shfl_xor_sync(0xffffffff, best,   off);
+            const int      oi = __shfl_xor_sync(0xffffffff, best_i, off);
+            if (ob < best || (ob == best && oi < best_i)) {
+                best   = ob;
+                best_i = oi;
+            }
+        }
+        if (best_i == 0x7fffffff) {
+            break; // past the first n_top: no empty slot left
+        }
+        if (lane == 0) {
+            const int e      = s_sel[r];
+            const int victim = best_i;
+            const int old    = s_exp[victim];
+            if (old >= 0) {
+                d.slot_of[old] = -1;
+            }
+            s_exp[victim]         = e;
+            d.expert_of[victim]   = e;
+            d.slot_of[e]          = victim;
+            s_last[victim]        = clock + (uint32_t) (n_sel - r);
+            d.last_used[victim]   = clock + (uint32_t) (n_sel - r);
+            d.miss_expert[n_miss] = e;
+            d.miss_slot[n_miss]   = victim;
+        }
+        n_miss++;
+        __syncwarp();
+    }
+    if (lane == 0) {
+        *d.n_miss = n_miss;
+        *d.clock  = clock + (uint32_t) n_sel + 1;
+        d.stats[2] += 1;
+        d.stats[3] += n_miss;
+    }
+}
+
+// GGML_META_EXPERT_CACHE_CHECK=1 (validation): every resident slot of the pool compared byte by byte with its expert's
+//   slice in host memory. One block per slot; bad[0] counts the slots checked, bad[1] the bytes that differ.
+static __global__ void expert_cache_check(const ggml_cuda_expert_cache_dev d, const char * pool, unsigned int * bad) {
+    const int e = d.expert_of[blockIdx.x];
+    if (e < 0) {
+        return;
+    }
+    const char * src_e = d.host + (size_t) e*d.expert_bytes + d.offset_dev;
+    const char * dst_s = pool + (size_t) blockIdx.x*d.slot_bytes;
+    unsigned int n_bad = 0;
+    for (size_t off = threadIdx.x; off < d.slot_bytes; off += blockDim.x) {
+        const size_t c = off / d.chunk_dev;
+        n_bad += dst_s[off] != src_e[c*d.chunk_full + (off - c*d.chunk_dev)];
+    }
+    if (threadIdx.x == 0) {
+        atomicAdd(&bad[0], 1u);
+    }
+    if (n_bad > 0) {
+        atomicAdd(&bad[1], n_bad);
+    }
+}
+
 // Registered host ranges, so several weights in one buffer register it once.
 struct expert_cache_host_reg {
     const char * base;
@@ -419,10 +589,11 @@ void * ggml_cuda_expert_cache_create(int device, const void * host_buf, size_t h
     c->d.n_expert     = (int) n_expert;
     c->d.cap          = cap;
     c->d.max_ids      = max_ids;
+    c->warm.cache     = c;
     c->align = expert_cache_align({(size_t) (uintptr_t) dev_ptr, expert_bytes, chunk_full, chunk_dev, offset_dev, c->d.slot_bytes});
     c->covering = c->align < 4 && expert_cache_align({(size_t) (uintptr_t) dev_ptr, expert_bytes, chunk_full}) >= 8;
 
-    const size_t n_i32 = (size_t) n_expert + 2*cap + 1 + 3*max_ids + 1 + 2;
+    const size_t n_i32 = (size_t) n_expert + 2*cap + 1 + 3*max_ids + 1 + 4;
     ggml_cuda_set_device(device);
     if (cudaMalloc(&c->state, n_i32*sizeof(int32_t)) != cudaSuccess) {
         (void) cudaGetLastError();
@@ -439,7 +610,7 @@ void * ggml_cuda_expert_cache_create(int device, const void * host_buf, size_t h
     c->d.miss_slot   = p; p += max_ids;
     c->d.n_miss      = p; p += 1;
     c->d.stats       = (uint32_t *) p;
-    CUDA_CHECK(cudaMemset(c->d.stats,     0,    2*sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemset(c->d.stats,     0,    4*sizeof(uint32_t)));
     CUDA_CHECK(cudaMemset(c->d.slot_of,   0xff, (size_t) n_expert*sizeof(int32_t)));
     CUDA_CHECK(cudaMemset(c->d.expert_of, 0xff, (size_t) cap*sizeof(int32_t)));
     CUDA_CHECK(cudaMemset(c->d.last_used, 0,    (size_t) cap*sizeof(uint32_t)));
@@ -461,12 +632,27 @@ void ggml_cuda_expert_cache_free(void * cache) {
     cudaDeviceSynchronize();
     static const bool stats = getenv("GGML_META_EXPERT_CACHE_STATS") != nullptr;
     if (stats) {
-        uint32_t st[2] = {0, 0};
-        if (cudaMemcpy(st, c->d.stats, sizeof(st), cudaMemcpyDeviceToHost) == cudaSuccess && st[0] > 0) {
-            fprintf(stderr, "expert-cache-dev: dev %d cap %d n_expert %d slot_bytes %zu calls %u misses %u miss/call %.4f MiB/call %.3f\n",
-                c->device, c->d.cap, c->d.n_expert, c->d.slot_bytes, st[0], st[1], (double) st[1]/st[0],
-                (double) st[1]/st[0]*c->d.slot_bytes/1048576.0);
+        uint32_t st[4] = {0, 0, 0, 0};
+        if (cudaMemcpy(st, c->d.stats, sizeof(st), cudaMemcpyDeviceToHost) == cudaSuccess && (st[0] > 0 || st[2] > 0)) {
+            fprintf(stderr, "expert-cache-dev: dev %d cap %d n_expert %d slot_bytes %zu calls %u misses %u miss/call %.4f MiB/call %.3f"
+                " warms %u warm misses %u\n",
+                c->device, c->d.cap, c->d.n_expert, c->d.slot_bytes, st[0], st[1], st[0] > 0 ? (double) st[1]/st[0] : 0.0,
+                st[0] > 0 ? (double) st[1]/st[0]*c->d.slot_bytes/1048576.0 : 0.0, st[2], st[3]);
         }
+        (void) cudaGetLastError();
+    }
+    // the pool is known once a warm tag was asked for
+    static const bool check = getenv("GGML_META_EXPERT_CACHE_CHECK") != nullptr;
+    if (check && c->warm.pool != nullptr) {
+        unsigned int * bad = nullptr;
+        unsigned int   res[2] = {0, 0};
+        if (cudaMalloc(&bad, sizeof(res)) == cudaSuccess && cudaMemset(bad, 0, sizeof(res)) == cudaSuccess) {
+            expert_cache_check<<<c->d.cap, 256>>>(c->d, c->warm.pool, bad);
+            if (cudaMemcpy(res, bad, sizeof(res), cudaMemcpyDeviceToHost) == cudaSuccess) {
+                fprintf(stderr, "expert-cache-check: dev %d slots %u bad %u\n", c->device, res[0], res[1]);
+            }
+        }
+        cudaFree(bad);
         (void) cudaGetLastError();
     }
     cudaFree(c->state);
@@ -572,4 +758,56 @@ bool ggml_cuda_expert_cache_fill(ggml_backend_cuda_context & ctx, void * cache, 
     }
     CUDA_CHECK(cudaGetLastError());
     return true;
+}
+
+void * ggml_cuda_expert_cache_warm_tag(void * cache, void * pool_data, int n_evict) {
+    ggml_cuda_expert_cache * c = (ggml_cuda_expert_cache *) cache;
+    if (c == nullptr || c->magic != GGML_CUDA_EXPERT_CACHE_MAGIC || pool_data == nullptr || n_evict < 0) {
+        return nullptr;
+    }
+    c->warm.pool    = (char *) pool_data;
+    c->warm.n_evict = std::min(n_evict, c->d.cap);
+    return &c->warm;
+}
+
+bool ggml_cuda_expert_cache_is_warm(const ggml_tensor * staged) {
+    return staged != nullptr && staged->extra != nullptr &&
+        ((const expert_cache_warm_tag *) staged->extra)->magic == GGML_CUDA_EXPERT_CACHE_WARM_MAGIC;
+}
+
+void ggml_cuda_expert_cache_warm(ggml_backend_cuda_context & ctx, const ggml_tensor * staged, const ggml_tensor * ids) {
+    const expert_cache_warm_tag *      tag = (const expert_cache_warm_tag *) staged->extra;
+    const ggml_cuda_expert_cache *     c   = tag->cache;
+    const ggml_cuda_expert_cache_dev & d   = c->d;
+    if (c->device != ctx.device || staged->ne[2] != d.n_expert || staged->nb[2] != d.slot_bytes ||
+            staged->ne[3] != 1 || ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t) || ids->ne[2] != 1 || ids->ne[3] != 1) {
+        return;
+    }
+    const size_t smem = ((size_t) d.n_expert + 4*(size_t) d.cap)*sizeof(int32_t);
+    if (smem > 48*1024) {
+        return;
+    }
+    const int n_per_row  = (int) ids->ne[0];
+    const int n_rows     = (int) ids->ne[1];
+    const int row_stride = (int) (ids->nb[1]/sizeof(int32_t));
+    cudaStream_t stream = ctx.stream();
+    expert_cache_warm_plan<<<1, 512, smem, stream>>>(d, (const int32_t *) ids->data, n_rows, n_per_row, row_stride, tag->n_evict);
+    CUDA_CHECK(cudaGetLastError());
+
+    // the misses come from the staged copy, one slot-sized run per expert, through the gather's copy kernel
+    ggml_cuda_expert_cache_group g = {};
+    g.n                 = 1;
+    g.d[0]              = d;
+    g.d[0].host         = (const char *) staged->data;
+    g.d[0].expert_bytes = d.slot_bytes;
+    g.d[0].chunk_full   = d.slot_bytes;
+    g.d[0].chunk_dev    = d.slot_bytes;
+    g.d[0].offset_dev   = 0;
+    g.d[0].n_chunks     = 1;
+    g.pool[0]           = tag->pool;
+    g.align[0]          = expert_cache_align({(size_t) (uintptr_t) staged->data, (size_t) (uintptr_t) tag->pool, d.slot_bytes});
+    const int nthreads = 256;
+    const int nbx      = (int) std::min<size_t>(64, (d.slot_bytes/g.align[0] + nthreads - 1)/nthreads);
+    expert_cache_copy<<<dim3(std::max(nbx, 1), d.cap, 1), nthreads, 0, stream>>>(g);
+    CUDA_CHECK(cudaGetLastError());
 }

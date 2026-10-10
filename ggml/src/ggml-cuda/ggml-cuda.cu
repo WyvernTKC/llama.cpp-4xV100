@@ -2348,6 +2348,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if (ggml_cuda_expert_cache_is(src0)) {
         ggml_cuda_expert_cache_remap(ctx, src0, ids, &ids_remap);
         ids = &ids_remap;
+    } else if (ggml_cuda_expert_cache_is_warm(src0)) {
+        // a whole staged copy of a pooled weight: its pool takes the experts this ubatch routed to most
+        ggml_cuda_expert_cache_warm(ctx, src0, ids);
     }
 
     GGML_TENSOR_BINARY_OP_LOCALS
@@ -3067,6 +3070,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             if (cgraph->nodes[i]->src[j]) {
                 prop.node_src_data_ptrs[j] = cgraph->nodes[i]->src[j]->data;
+                prop.node_src_extra[j]     = cgraph->nodes[i]->src[j]->extra; // e.g. an expert cache warm tag
                 memcpy(prop.node_src_ne[j], cgraph->nodes[i]->src[j]->ne, sizeof(prop.node_src_ne[j]));
                 memcpy(prop.node_src_nb[j], cgraph->nodes[i]->src[j]->nb, sizeof(prop.node_src_nb[j]));
             }
@@ -9709,6 +9713,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_expert_cache_read_slots") == 0) {
         return (void *)ggml_cuda_expert_cache_read_slots;
+    }
+    if (strcmp(name, "ggml_backend_expert_cache_warm_tag") == 0) {
+        return (void *)ggml_cuda_expert_cache_warm_tag;
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_launch") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_launch;
