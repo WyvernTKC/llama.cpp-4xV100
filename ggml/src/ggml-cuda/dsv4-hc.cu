@@ -485,14 +485,17 @@ void ggml_cuda_op_dsv4_hc_post_gated(ggml_backend_cuda_context & ctx, ggml_tenso
 //   input is quantized as scale_unary_kernel does it, the mix is formed as in dsv4_hc_pre_f32; a row sums its blocks in
 //   order, which is not the order of mul_mat_vec_q, so the result is not bitwise that of the three launches. A token's
 //   result does not depend on the other tokens: the verify step of a draft computes what one-token decode does.
+//   Past one token a second set of hc warps sums every other token's rows (a block is alone on its SM).
 template <int hc, int k_blocks, int ntok>
-__launch_bounds__(WARP_SIZE*hc, 1)
+__launch_bounds__(WARP_SIZE*hc*(ntok > 1 ? 2 : 1), 1)
 static __global__ void dsv4_hc_up_pre_q8_0(
         const float * lo, const char * w_up, const float * x, float * dst, block_q8_1 * q8, const float lo_scale,
         const float lo_bias, const int n_embd, const int64_t sx1, const float scale, const int slo1, const int sx2,
         const int sd1, const int q8_row_blocks) {
     static_assert(k_blocks % 2 == 0, "a row must be whole ints");
     static_assert(ntok >= 1 && ntok <= hc, "a warp writes each token");
+    constexpr int nsplit = ntok > 1 ? 2 : 1;
+    constexpr int nwarps = hc*nsplit;
     constexpr int row_ints   = k_blocks*sizeof(block_q8_0)/sizeof(int);
     constexpr int chunk_int4 = WARP_SIZE*row_ints/4; // the 32 rows of one stream
     static_assert((WARP_SIZE*row_ints) % 4 == 0, "32 rows must be whole int4");
@@ -503,26 +506,28 @@ static __global__ void dsv4_hc_up_pre_q8_0(
 
     ggml_cuda_pdl_lc();
     const int lane = threadIdx.x;
-    const int s    = threadIdx.y;
+    const int w    = threadIdx.y;
+    const int s    = w % hc; // the stream of this warp's rows
+    const int h    = w / hc; // and its tokens, those t with t % nsplit == h
     const int j0   = blockIdx.x*WARP_SIZE;
 
     if (j0 >= n_embd) {
         // the padding blocks of the q8_1 copy
-        if (q8 && s < ntok) {
-            quantize_q8_1_lane(0.0f, q8 + s*q8_row_blocks + blockIdx.x, lane);
+        if (q8 && w < ntok) {
+            quantize_q8_1_lane(0.0f, q8 + w*q8_row_blocks + blockIdx.x, lane);
         }
         return;
     }
 
     // the weights are not written by an earlier kernel, so they load before the dependency wait
-    for (int i = s*WARP_SIZE + lane; i < hc*chunk_int4; i += hc*WARP_SIZE) {
+    for (int i = w*WARP_SIZE + lane; i < hc*chunk_int4; i += nwarps*WARP_SIZE) {
         const int is = i / chunk_int4;
         const int4 * src = (const int4 *) (w_up + ((int64_t) is*n_embd + j0)*row_ints*sizeof(int));
         rows_s4[i] = src[i % chunk_int4];
     }
 
     ggml_cuda_pdl_sync();
-    for (int tb = s; tb < ntok*k_blocks; tb += hc) {
+    for (int tb = w; tb < ntok*k_blocks; tb += nwarps) {
         const int t = tb / k_blocks;
         const int b = tb % k_blocks;
         const float v = ggml_cuda_op_silu_single(lo_scale*lo[t*slo1 + b*QK8_1 + lane] + lo_bias);
@@ -557,6 +562,9 @@ static __global__ void dsv4_hc_up_pre_q8_0(
         }
 #pragma unroll
         for (int t = 0; t < ntok; ++t) {
+            if (t % nsplit != h) {
+                continue;
+            }
             const int * u = (const int *) y_s[t][b].qs;
             int sumi = 0;
 #pragma unroll
@@ -568,12 +576,14 @@ static __global__ void dsv4_hc_up_pre_q8_0(
     }
 #pragma unroll
     for (int t = 0; t < ntok; ++t) {
-        g_s[t][s][lane] = acc[t];
+        if (t % nsplit == h) {
+            g_s[t][s][lane] = acc[t];
+        }
     }
     __syncthreads();
 
-    if (s < ntok) {
-        const int t = s;
+    if (w < ntok) {
+        const int t = w;
         const int j = j0 + lane;
         float sum = 0.0f;
 #pragma unroll
@@ -636,7 +646,7 @@ void ggml_cuda_op_dsv4_hc_up_pre(ggml_backend_cuda_context & ctx, const ggml_ten
     int64_t      ne_padded = 0;
     block_q8_1 * q8        = (block_q8_1 *) ctx.q8_1_emit_alloc(pre, ne_padded, ntok);
 
-    const dim3 block_dims(WARP_SIZE, DSV4_HC_UP_PRE_HC, 1);
+    const dim3 block_dims(WARP_SIZE, DSV4_HC_UP_PRE_HC*(ntok > 1 ? 2 : 1), 1);
     const dim3 grid_dims(std::max<int64_t>(n_embd, ne_padded)/WARP_SIZE, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
     const auto launch = [&](auto kernel) {
