@@ -12472,11 +12472,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 1, true,  true));
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 1, false, true));
     test_cases.emplace_back(new test_dsv4_hc_pre(640,  4, 1, true,  true));
-    // the gate from the up projection of the low-rank mix (qwen4exp), in one launch at one token
+    // the gate from the up projection of the low-rank mix (qwen4exp), in one launch at 1 to 4 tokens
     test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 1, true,  true,  320));
     test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 1, true,  false, 320));
     test_cases.emplace_back(new test_dsv4_hc_pre(640,  4, 1, true,  true,  320));
     test_cases.emplace_back(new test_dsv4_hc_pre(640,  4, 2, true,  true,  320));
+    test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 3, true,  false, 320));
+    test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 4, true,  true,  320));
+    test_cases.emplace_back(new test_dsv4_hc_pre(640,  4, 4, true,  true,  320));
+    test_cases.emplace_back(new test_dsv4_hc_pre(640,  4, 5, true,  true,  320));
     test_cases.emplace_back(new test_dsv4_hc_pre(96,   4, 3, true,  true));
     for (int64_t n_hc : {1, 2, 3, 5, 8, 65}) {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17));

@@ -7791,8 +7791,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
-    // qwen4exp, one token: SCALE -> SILU of a hyper-connection mix, its up projection and the gated DSV4_HC_PRE that reads
-    //   it (past the reshape views) in one launch, two launches less per mix
+    // qwen4exp, 1 to 4 tokens: SCALE -> SILU of a hyper-connection mix, its up projection and the gated DSV4_HC_PRE that
+    //   reads it (past the reshape views) in one launch, two launches less per mix
     if (node->op == GGML_OP_SCALE && i + 4 < cgraph->n_nodes) {
         static const bool disabled = getenv("GGML_CUDA_NO_HC_UP_PRE") != nullptr;
         int j = i + 3;
