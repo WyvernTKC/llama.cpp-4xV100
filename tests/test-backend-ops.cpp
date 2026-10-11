@@ -7549,6 +7549,51 @@ struct test_mul_mat_id_shared_src1 : public test_case {
     }
 };
 
+// a MUL_MAT of an input and a MUL_MAT_ID of the same rows reshaped to [k, 1, n] (a shared expert and the routed experts
+//   of one norm): the q8_1 copy of the first serves the second, also at several tokens
+struct test_mul_mat_id_shared_rows : public test_case {
+    const ggml_type type_a;
+    const int64_t n;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_SHARED_ROWS";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(type_a, n);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_id_shared_rows(ggml_type type_a = GGML_TYPE_Q8_0, int64_t n = 4) : type_a(type_a), n(n) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int n_mats = 16, n_used = 4;
+        const int64_t m = 64, k = 512;
+        ggml_tensor * as  = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_tensor * w   = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+        ggml_tensor * b0  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * b   = ggml_scale(ctx, b0, 1.0f);
+        ggml_tensor * sh  = ggml_mul_mat(ctx, w, b);
+        ggml_tensor * moe = ggml_mul_mat_id(ctx, as, ggml_reshape_3d(ctx, b, k, 1, n), ids);
+        ggml_tensor * out = ggml_add(ctx, moe, ggml_reshape_3d(ctx, sh, m, 1, n));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, 16);
+    }
+};
+
 // GGML_OP_MUL_MAT_ID
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
@@ -14225,6 +14270,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
         test_cases.emplace_back(new test_mul_mat_id_shared_src1(type_a, 16, 4, 64, 64, 256));
         test_cases.emplace_back(new test_mul_mat_id_shared_src1(type_a, 128, 8, 32, 512, 512));
+        for (int64_t n : { 1, 2, 4 }) {
+            test_cases.emplace_back(new test_mul_mat_id_shared_rows(type_a, n));
+        }
     }
 
     // prefill batches, whose expert lists several warps of mm_ids_helper build: a specialised and the generic number of

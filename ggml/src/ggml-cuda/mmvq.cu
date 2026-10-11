@@ -2369,12 +2369,20 @@ static void ggml_cuda_mul_mat_vec_q_impl(
         // width: reuse it when a later matmul reads the same input, e.g. the q/k/v projections. A view of
         // the same rows of the same tensor reads the same bytes, e.g. the MUL_MAT_ID reshape of a norm
         // that the shared expert reads as it is.
+        //   Several tokens: [ne0, 1, T] (MUL_MAT_ID) and [ne0, T] are the same rows in the same order, as is the copy.
         const ggml_tensor * src1_owner = src1->view_src ? src1->view_src : src1;
         auto & cached = ctx.q8_1_inputs[src1->data];
+        const auto rows_in_order = [](const auto * ne, const auto * nb) {
+            return int64_t(nb[2]) == int64_t(ne[1])*int64_t(nb[1]) && int64_t(nb[3]) == int64_t(ne[2])*int64_t(nb[2]);
+        };
+        const bool same_rows = cached.ne[0] == src1->ne[0] && int64_t(cached.nb[0]) == int64_t(src1->nb[0]) &&
+            int64_t(cached.nb[1]) == int64_t(src1->nb[1]) &&
+            cached.ne[1]*cached.ne[2]*cached.ne[3] == src1->ne[1]*src1->ne[2]*src1->ne[3] &&
+            rows_in_order(cached.ne, cached.nb) && rows_in_order(src1->ne, src1->nb);
         const bool reuse = cached.buf && cached.src1 == src1_owner && cached.ne_padded == ne10_padded &&
             cached.stream_no == ctx.curr_stream_no &&
-            std::equal(std::begin(cached.ne), std::end(cached.ne), src1->ne) &&
-            std::equal(std::begin(cached.nb), std::end(cached.nb), src1->nb);
+            ((std::equal(std::begin(cached.ne), std::end(cached.ne), src1->ne) &&
+              std::equal(std::begin(cached.nb), std::end(cached.nb), src1->nb)) || same_rows);
 
         if (!reuse) {
             cached.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), nbytes_src1_q8_1);
