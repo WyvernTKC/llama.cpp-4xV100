@@ -5512,13 +5512,6 @@ static int ggml_cuda_try_fuse_moe_down_shexp(ggml_backend_cuda_context * cuda_ct
         ids = &ids_remap;
     }
 
-    auto shexp = std::make_unique<ggml_cuda_pool_alloc<float>>(cuda_ctx->pool(), ggml_nelements(mm));
-    ggml_cuda_mm_fusion_args_host fusion_data{};
-    fusion_data.sib     = mm->src[0];
-    fusion_data.sib_y   = mm->src[1];
-    fusion_data.sib_out = shexp->get();
-    ggml_cuda_mul_mat_vec_q(*cuda_ctx, down->src[0], down->src[1], ids, down, &fusion_data);
-
     // In a session, a sum that ends the subgraph is the input of the all-reduce right after it, which can compute it
     //   (ggml_backend_cuda_session_allreduce): the sum is not written here, one launch less per layer.
     static const bool no_red_ar = getenv("GGML_CUDA_NO_REDUCE_AR") != nullptr;
@@ -5528,6 +5521,25 @@ static int ggml_cuda_try_fuse_moe_down_shexp(ggml_backend_cuda_context * cuda_ct
     for (int k = t + 4; last && k < cgraph->n_nodes; k++) {
         last = ggml_cuda_is_view_or_noop(cgraph->nodes[k]) || (cgraph->nodes[k]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0;
     }
+
+    auto shexp = std::make_unique<ggml_cuda_pool_alloc<float>>(cuda_ctx->pool(), ggml_nelements(mm));
+    ggml_cuda_mm_fusion_args_host fusion_data{};
+    fusion_data.sib     = mm->src[0];
+    fusion_data.sib_y   = mm->src[1];
+    fusion_data.sib_out = shexp->get();
+    // the all-reduce of the sum folded into the launch (ggml_cuda_ar_fold_moe_args): the sum is not written anywhere
+    static const bool no_moe_fold = getenv("GGML_CUDA_NO_AR_FOLD_MOE") != nullptr;
+    const bool fold = last && !no_moe_fold && cuda_ctx->ar_fold.next == add && ggml_are_same_shape(match.experts, down) &&
+        match.experts->data == down->data && match.experts->ne[1] <= 8;
+    if (fold) {
+        fusion_data.ar_weights = match.weights;
+        fusion_data.ar_gate    = g;
+    }
+    ggml_cuda_mul_mat_vec_q(*cuda_ctx, down->src[0], down->src[1], ids, down, &fusion_data);
+    if (fold && cuda_ctx->ar_fold.pushed) {
+        return t + 3 - i;
+    }
+
     if (last) {
         ggml_backend_cuda_context::session_reduction_t & red = cuda_ctx->session_red;
         GGML_ASSERT(red.dst == nullptr);

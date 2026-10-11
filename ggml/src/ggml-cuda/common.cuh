@@ -1537,6 +1537,17 @@ struct ggml_cuda_ar_fold_args {
     int            n_devs    = 0;
 };
 
+// the MoE all-reduce folded into the expert down projection of one token (see mul_mat_vec_q_short): the last block of a
+//   group of rows to finish sums the experts' rows (dst) and the gated shared expert as moe_weighted_reduction does and
+//   pushes the sums as the LL lines of ar
+struct ggml_cuda_ar_fold_moe_args {
+    ggml_cuda_ar_fold_args ar;
+    const float *  weights = nullptr; // [n_used]
+    const float *  gate    = nullptr; // the shared expert's gate (one value), its output being the sibling's dst
+    unsigned int * tickets = nullptr; // a zeroed counter per group of rows, reset by its last block
+    int            n_used  = 0;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1688,6 +1699,18 @@ struct ggml_backend_cuda_context {
     //   topk_moe in a router's launch (ggml_cuda_topk_moe_fold), all zero between launches; then the epoch and the
     //   tagged slots of a row split over blocks (row_split_reduce in norm.cu)
     unsigned int * block_flags[GGML_CUDA_MAX_DEVICES] = { nullptr };
+
+    // the tickets of ggml_cuda_ar_fold_moe_args, zero between launches
+    unsigned int * ar_tickets[GGML_CUDA_MAX_DEVICES] = { nullptr };
+
+    unsigned int * ar_tickets_get() {
+        if (ar_tickets[device] == nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaMalloc(&ar_tickets[device], 4096*sizeof(unsigned int)));
+            CUDA_CHECK(cudaMemset(ar_tickets[device], 0, 4096*sizeof(unsigned int)));
+        }
+        return ar_tickets[device];
+    }
 
     unsigned int * block_flags_get() {
         if (block_flags[device] == nullptr) {
@@ -1971,6 +1994,10 @@ struct ggml_cuda_mm_fusion_args_host {
     ggml_tensor * sib_dst = nullptr;
     const ggml_tensor * sib_y = nullptr;
     float * sib_out = nullptr;
+    // mmvq with ids, short q8_0 rows and sib_y: the all-reduce of the experts' weighted sum (weights [n_used]) plus the
+    //   sibling gated by sigmoid(ar_gate) folded into the launch, see ggml_cuda_ar_fold_moe_args
+    const ggml_tensor * ar_weights = nullptr;
+    const ggml_tensor * ar_gate    = nullptr;
     // mmvq without ids, with sib: a second sibling of the same kind, its rows after those of sib (sib2_dst = sib2*y)
     const ggml_tensor * sib2 = nullptr;
     ggml_tensor * sib2_dst = nullptr;
@@ -2059,9 +2086,15 @@ struct ggml_cuda_no_args {
 struct ggml_cuda_mm_fusion_args_launch : ggml_cuda_mm_fusion_args_device {
     ggml_cuda_mmvq_conv_args conv;
     ggml_cuda_mmvf_topk_args topk;
-    // with ar_pushed: a launch that can push its rows as the LL lines of ar does so and sets *ar_pushed
+    // with ar_pushed: a launch that can push its rows as the LL lines of ar does so and sets *ar_pushed; with ar_moe the
+    //   expert down projection of a MoE pushes the sum of its experts instead
     ggml_cuda_ar_fold_args   ar;
     bool *                   ar_pushed = nullptr;
+    bool                     ar_moe    = false;
+    const float *            ar_weights = nullptr;
+    const float *            ar_gate    = nullptr;
+    unsigned int *           ar_tickets = nullptr;
+    int                      ar_n_used  = 0;
 };
 
 struct ggml_cuda_kernel_launch_params {

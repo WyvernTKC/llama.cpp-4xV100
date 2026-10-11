@@ -1121,13 +1121,22 @@ static __global__ void mul_mat_vec_q(
 #define MMVQ_SHORT_NWARPS 4
 #define MMVQ_SHORT_MAX_LANES (2*WARP_SIZE)
 
-template <ggml_type type, int rows_per_thread, bool has_fusion, bool quant_y = false, int lanes = MMVQ_SHORT_LANES>
-__launch_bounds__(MMVQ_SHORT_NWARPS*WARP_SIZE, 1)
+// ar (with ids, quant_y and the sibling): the MoE all-reduce folded in, its ggml_cuda_ar_fold_moe_args the one value of
+//   ar_args (empty otherwise, so the other kernels keep their parameters)
+template <typename T>
+static __device__ __forceinline__ const T & mmvq_first_arg(const T & a) {
+    return a;
+}
+
+// ar keeps the registers of the plain kernel (16 blocks per SM): Ornith's 9 x 128 blocks then stay in one wave
+template <ggml_type type, int rows_per_thread, bool has_fusion, bool quant_y = false, int lanes = MMVQ_SHORT_LANES, bool ar = false,
+          typename... ArArgs>
+__launch_bounds__(MMVQ_SHORT_NWARPS*WARP_SIZE, ar ? 16 : 1)
 static __global__ void mul_mat_vec_q_short(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
         float * dst_ptr, const uint32_t ncols_x, const uint32_t nrows_x, const uint3 nchannels_y, const uint32_t stride_row_x,
         const uint3 channel_ratio, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
-        const uint32_t stride_channel_dst) {
+        const uint32_t stride_channel_dst, const ArArgs... ar_args) {
     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
@@ -1263,13 +1272,13 @@ static __global__ void mul_mat_vec_q_short(
         tmp[i] = warp_reduce_sum<lanes>(tmp[i]);
     }
 
-    if (lane != 0) {
+    if (!ar && lane != 0) {
         return;
     }
 #pragma unroll
     for (int i = 0; i < rows_per_thread; ++i) {
         const int row = row0 + i*rows_per_slice;
-        if (row >= (int) nrows_x) {
+        if ((ar && lane != 0) || row >= (int) nrows_x) {
             break;
         }
         float result = tmp[i];
@@ -1280,6 +1289,67 @@ static __global__ void mul_mat_vec_q_short(
             result += x_biases[i];
         }
         dst[row] = result;
+    }
+
+    // ar: once every expert's block of these rows has written them, the last one sums them as moe_weighted_reduction_f32
+    //   (and ggml_cuda_p2p_ar_ll_moe_reduce_kernel) does and pushes the sums; the host folds only whole groups of rows
+    if constexpr (ar) {
+        static_assert(sizeof...(ArArgs) == 1 && quant_y, "the fold needs its arguments and the sibling");
+        const ggml_cuda_ar_fold_moe_args & m = mmvq_first_arg(ar_args...);
+        constexpr int rows_per_block = rows_per_thread*rows_per_slice;
+        static_assert(rows_per_block % 4 == 0, "whole float4s per block");
+        const int tid = threadIdx.y*WARP_SIZE + threadIdx.x;
+
+        __shared__ bool last;
+        __syncthreads();
+        if (tid == 0) {
+            __threadfence();
+            last = atomicAdd(m.tickets + blockIdx.x, 1u) == gridDim.y - 1;
+            if (last) {
+                m.tickets[blockIdx.x] = 0;
+                __threadfence();
+            }
+        }
+        __syncthreads();
+        if (!last) {
+            return;
+        }
+
+        // the products of all (row, expert) pairs at once, one per thread (up to 8 experts, which the host checks),
+        //   then one thread per row adds them in expert order: few registers, so the blocks stay in one wave
+        constexpr int ne_max = 8;
+        __shared__ float prod[ne_max][rows_per_block];
+        const int r0 = rows_per_block*blockIdx.x;
+        for (int k = tid; k < m.n_used*rows_per_block; k += MMVQ_SHORT_NWARPS*WARP_SIZE) {
+            const int e = k / rows_per_block;
+            const int r = k % rows_per_block;
+            prod[e][r] = __fmul_rn(__ldcg(dst_ptr + e*stride_channel_dst + r0 + r), m.weights[e]);
+        }
+        float xa = 0.0f;
+        float sig = 0.0f;
+        if (tid < rows_per_block) {
+            xa  = __ldcg(fusion.sib_dst + r0 + tid);
+            sig = ggml_cuda_op_sigmoid_single(*m.gate);
+        }
+        __syncthreads();
+        float v = 0.0f;
+        if (tid < rows_per_block) {
+            v = prod[0][tid];
+            for (int e = 1; e < m.n_used; ++e) {
+                v = __fadd_rn(v, prod[e][tid]);
+            }
+            v = __fadd_rn(v, __fmul_rn(xa, sig));
+        }
+        // the warps of the rows, whole: the even row's thread pushes the pair
+        if (tid < (rows_per_block + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE) {
+            const float v1 = __shfl_down_sync(0xFFFFFFFF, v, 1);
+            if (tid < rows_per_block && tid % 2 == 0) {
+                const int r = r0 + tid;
+                ggml_cuda_ar_fold_push(m.ar, ggml_cuda_ar_seq(m.ar, r/4), r/4, (r/2) % 2, v, v1);
+            }
+        }
+    } else {
+        ((void) ar_args, ...);
     }
 }
 
@@ -1594,12 +1664,31 @@ static void mul_mat_vec_q_short_launch_rpt(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
         const uint32_t ncols_x, const uint32_t nrows_x, const uint3 nchannels_y, const uint32_t stride_row_x,
         const uint3 channel_ratio, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
-        const uint32_t stride_channel_dst, const int nchannels_dst, cudaStream_t stream) {
+        const uint32_t stride_channel_dst, const int nchannels_dst, cudaStream_t stream,
+        const ggml_cuda_mm_fusion_args_launch * fold = nullptr) {
     constexpr int rows_per_block = rows_per_thread*MMVQ_SHORT_NWARPS*(WARP_SIZE/lanes);
     // and the sibling, see mul_mat_vec_q_short
     const dim3 block_nums((nrows_x + rows_per_block - 1) / rows_per_block, nchannels_dst + (ids && fusion.sib_x ? 1 : 0), 1);
     const dim3 block_dims(WARP_SIZE, MMVQ_SHORT_NWARPS, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+    // the MoE all-reduce folded in: whole groups of rows, the sibling (the shared expert) and nothing else fused
+    if constexpr (quant_y && lanes == MMVQ_SHORT_LANES && rows_per_block % 4 == 0) {
+        if (fold != nullptr && fold->ar_moe && fold->ar_pushed != nullptr && ids != nullptr && fusion.sib_x != nullptr &&
+                fusion.x_bias == nullptr && fusion.x_sigmoid == nullptr && nrows_x % rows_per_block == 0 &&
+                block_nums.x <= 4096 && stride_channel_dst >= nrows_x) {
+            ggml_cuda_ar_fold_moe_args m;
+            m.ar      = fold->ar;
+            m.weights = fold->ar_weights;
+            m.gate    = fold->ar_gate;
+            m.tickets = fold->ar_tickets;
+            m.n_used  = fold->ar_n_used;
+            ggml_cuda_kernel_launch(mul_mat_vec_q_short<type, rows_per_thread, false, quant_y, lanes, true, ggml_cuda_ar_fold_moe_args>,
+                launch_params, vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y, stride_row_x, channel_ratio,
+                stride_channel_x, stride_channel_y, stride_channel_dst, m);
+            *fold->ar_pushed = true;
+            return;
+        }
+    }
     if (fusion.x_bias != nullptr || fusion.x_sigmoid != nullptr) {
         ggml_cuda_kernel_launch(mul_mat_vec_q_short<type, rows_per_thread, true, quant_y, lanes>, launch_params,
             vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y, stride_row_x, channel_ratio, stride_channel_x,
@@ -1617,20 +1706,21 @@ static void mul_mat_vec_q_short_launch_lanes(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
         const uint32_t ncols_x, const uint32_t nrows_x, const uint3 nchannels_y, const uint32_t stride_row_x,
         const uint3 channel_ratio, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
-        const uint32_t stride_channel_dst, const int nchannels_dst, const int nsm, cudaStream_t stream) {
+        const uint32_t stride_channel_dst, const int nchannels_dst, const int nsm, cudaStream_t stream,
+        const ggml_cuda_mm_fusion_args_launch * fold = nullptr) {
     constexpr int rows_per_slice = MMVQ_SHORT_NWARPS*(WARP_SIZE/lanes);
     const auto nblocks = [&](int rpt) {
         return int64_t((nrows_x + rpt*rows_per_slice - 1) / (rpt*rows_per_slice)) * nchannels_dst;
     };
     if (nblocks(4) >= 8*nsm) {
         mul_mat_vec_q_short_launch_rpt<type, 4, quant_y, lanes>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y, stride_row_x,
-            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst, nchannels_dst, stream);
+            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst, nchannels_dst, stream, fold);
     } else if (nblocks(2) >= 8*nsm) {
         mul_mat_vec_q_short_launch_rpt<type, 2, quant_y, lanes>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y, stride_row_x,
-            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst, nchannels_dst, stream);
+            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst, nchannels_dst, stream, fold);
     } else {
         mul_mat_vec_q_short_launch_rpt<type, 1, quant_y, lanes>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y, stride_row_x,
-            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst, nchannels_dst, stream);
+            channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst, nchannels_dst, stream, fold);
     }
 }
 
@@ -1640,7 +1730,8 @@ static void mul_mat_vec_q_short_launch(const int lanes,
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
         const uint32_t ncols_x, const uint32_t nrows_x, const uint3 nchannels_y, const uint32_t stride_row_x,
         const uint3 channel_ratio, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
-        const uint32_t stride_channel_dst, const int nchannels_dst, const int nsm, cudaStream_t stream) {
+        const uint32_t stride_channel_dst, const int nchannels_dst, const int nsm, cudaStream_t stream,
+        const ggml_cuda_mm_fusion_args_launch * fold = nullptr) {
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
     if constexpr (!quant_y) {
@@ -1653,7 +1744,7 @@ static void mul_mat_vec_q_short_launch(const int lanes,
     if constexpr (qi/vdr <= MMVQ_SHORT_LANES) {
         GGML_ASSERT(lanes == MMVQ_SHORT_LANES);
         mul_mat_vec_q_short_launch_lanes<type, quant_y, MMVQ_SHORT_LANES>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y,
-            stride_row_x, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst, nchannels_dst, nsm, stream);
+            stride_row_x, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst, nchannels_dst, nsm, stream, fold);
     } else {
         GGML_ABORT("no 16-lane short kernel for this type");
     }
@@ -2366,10 +2457,22 @@ static void ggml_cuda_mul_mat_vec_q_impl(
         }
     }
 
-    // the all-reduce of the output folded into the launch, if it can take it (see ggml_backend_cuda_context::ar_fold)
+    // the all-reduce of the output folded into the launch, if it can take it (see ggml_backend_cuda_context::ar_fold);
+    //   with ar_weights that of the MoE sum of the experts this launch computes, which the caller checked is next
     if (ctx.ar_fold.next == dst && src1_rot == 0) {
         fusion_local.ar        = ctx.ar_fold.next_call.args;
         fusion_local.ar_pushed = &ctx.ar_fold.pushed;
+    }
+    if (fusion && fusion->ar_weights && ctx.ar_fold.next != nullptr && src1_rot == 0) {
+        GGML_ASSERT(ids && fusion->sib_y && fusion->ar_gate && ggml_is_contiguous(fusion->ar_weights) &&
+            ggml_nelements(fusion->ar_weights) == ne1);
+        fusion_local.ar         = ctx.ar_fold.next_call.args;
+        fusion_local.ar_pushed  = &ctx.ar_fold.pushed;
+        fusion_local.ar_moe     = true;
+        fusion_local.ar_weights = (const float *) fusion->ar_weights->data;
+        fusion_local.ar_gate    = (const float *) fusion->ar_gate->data;
+        fusion_local.ar_tickets = ctx.ar_tickets_get();
+        fusion_local.ar_n_used  = (int) ne1;
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.
@@ -2396,7 +2499,7 @@ static void ggml_cuda_mul_mat_vec_q_impl(
             const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0) : init_fastdiv_values(nchannels_dst / ne02);
             mul_mat_vec_q_short_launch<GGML_TYPE_Q8_0, true>(MMVQ_SHORT_LANES, src0->data, src1_d, ids_d, fusion_local, dst_d, ne00, ne01,
                 nchannels_y_fd, nb01/ts_src0, channel_ratio_fd, nb02/ts_src0, (ids ? nb11 : nb12)/ts_src1,
-                (ids ? nb1 : nb2)/ts_dst, nchannels_dst, ggml_cuda_info().devices[ggml_cuda_get_device()].nsm, stream);
+                (ids ? nb1 : nb2)/ts_dst, nchannels_dst, ggml_cuda_info().devices[ggml_cuda_get_device()].nsm, stream, &fusion_local);
             return;
         }
     }
