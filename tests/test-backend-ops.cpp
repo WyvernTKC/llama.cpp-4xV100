@@ -13490,9 +13490,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_scale_mul(GGML_TYPE_F32, { 9000, 2, 1, 1 }, 1e-6f, 0.5f));
     test_cases.emplace_back(new test_rms_norm_scale_mul(GGML_TYPE_F32, { 1536, 3, 1, 1 }, 1e-6f, 2.0f, true));
 
-    // one token fuses; rows of 1024 would take 4 rows per block on Volta without the sibling; 3 tokens do not fuse
+    // 1-4 tokens fuse (rows of 1024 would take 4 rows per block on Volta without the sibling); 5 do not (mmvf takes f32
+    //   rows of up to 4 tokens on Volta, 3 on Ampere)
     for (const std::array<int64_t, 3> & s : std::vector<std::array<int64_t, 3>>{
-            { 2048, 256, 1 }, { 1024, 64, 1 }, { 4096, 512, 1 }, { 2048, 2, 1 }, { 2048, 256, 3 } }) {
+            { 2048, 256, 1 }, { 1024, 64, 1 }, { 4096, 512, 1 }, { 2048, 2, 1 }, { 2048, 256, 3 },
+            { 2560, 512, 2 }, { 2560, 512, 4 }, { 2048, 2, 4 }, { 2048, 256, 5 } }) {
         test_cases.emplace_back(new test_mul_mat_sibling_row(s[0], s[1], s[2]));
     }
     // one token fuses (k 128: a split shared expert, 512: a whole one), two tokens do not

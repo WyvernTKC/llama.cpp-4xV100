@@ -99,15 +99,17 @@ static __global__ void mul_mat_vec_f(
         y   += token_idx*stride_col_y2*2;
         dst += token_idx*stride_col_dst;
     }
-    if constexpr (has_fusion && std::is_same_v<T, float>) {
-        // the row of a sibling matrix with the same y is the last block's (one token, one row per block)
+    // the column stride of the dst this block writes
+    int stride_col_dst_blk = stride_col_dst;
+    if constexpr (std::is_same_v<T, float> && (has_fusion || (ncols_dst > 1 && !is_multi_token_id))) {
+        // the row of a sibling matrix with the same y is the last block's (one row per block; several tokens in the plain
+        //   kernel, the sibling's dst holding them one after the other)
         if (fusion.sib_x != nullptr && fusion.sib_block0 == 0 && blockIdx.x == gridDim.x - 1) {
             x   = (const T *) fusion.sib_x;
             dst = fusion.sib_dst - row;
+            stride_col_dst_blk = 1;
         }
     }
-    // the column stride of the dst this block writes
-    int stride_col_dst_blk = stride_col_dst;
     // (the plain kernel of several tokens takes sibling rows too: the fused one holds the gate's sums in registers)
     if constexpr (has_fusion || (load16 && ncols_dst > 1)) {
         // sibling rows (one channel and sample): the rows from sib_block0 on are the rows of a sibling matrix of the same
@@ -781,7 +783,11 @@ static void mul_mat_vec_f_switch_fusion(
        }
     }
 
-    GGML_ASSERT(!has_fusion && "fusion with several tokens needs the 16-byte loads");
+    // several tokens of f32 rows: the plain kernel takes the one sibling row (a shared expert gate after its router)
+    const bool sib_row_only = fusion.sib_x != nullptr && fusion.sib_block0 == 0 && !fusion.gate && !fusion.x_bias &&
+        !fusion.gate_bias;
+    GGML_ASSERT((!has_fusion || (std::is_same_v<T, float> && !is_multi_token_id && sib_row_only)) &&
+        "fusion with several tokens needs the 16-byte loads");
 
     launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, is_multi_token_id>);
 }
@@ -1095,7 +1101,8 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);
-        GGML_ASSERT(  ids || dst->ne[1] == 1 || ((fusion->gdn_beta || fusion->sib_rows) && ggml_cuda_mmvf_fuses_tokens(src0, src1, fusion->gate)));
+        GGML_ASSERT(  ids || dst->ne[1] == 1 || ((fusion->gdn_beta || fusion->sib_rows) && ggml_cuda_mmvf_fuses_tokens(src0, src1, fusion->gate)) ||
+            (fusion->sib && !fusion->sib_rows && !fusion->gate && !fusion->x_bias && !fusion->gate_bias && !fusion->gdn_beta));
         if (fusion->x_bias) {
             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
@@ -1130,7 +1137,8 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             GGML_ASSERT(!ids && !fusion->gate && !fusion->x_bias && !fusion->gate_bias && !fusion->gdn_beta);
             GGML_ASSERT(src0->type == GGML_TYPE_F32 && fusion->sib->type == GGML_TYPE_F32);
             GGML_ASSERT(fusion->sib->ne[0] == ne00 && ggml_nrows(fusion->sib) == 1 && ggml_is_contiguous(fusion->sib));
-            GGML_ASSERT(ggml_nrows(dst) == 1 && fusion->sib_dst->type == GGML_TYPE_F32 && ggml_nelements(fusion->sib_dst) == 1);
+            GGML_ASSERT(ggml_nrows(dst) == dst->ne[1] && ggml_is_contiguous(dst) && fusion->sib_dst->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(fusion->sib_dst) && ggml_nelements(fusion->sib_dst) == dst->ne[1]);
             fusion_local.sib_x   = fusion->sib->data;
             fusion_local.sib_dst = (float *) fusion->sib_dst->data;
         }
