@@ -7918,9 +7918,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// a GET_ROWS of the only row of src with one id: the id is 0, so the output is src
+static bool ggml_cuda_get_rows_is_identity(const ggml_cgraph * cgraph, const ggml_tensor * g) {
+    return g->op == GGML_OP_GET_ROWS && g->type == GGML_TYPE_F32 && g->src[0]->type == GGML_TYPE_F32 &&
+        ggml_nrows(g->src[0]) == 1 && ggml_nelements(g->src[1]) == 1 && ggml_are_same_shape(g, g->src[0]) &&
+        !(g->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_cuda_graph_use_count(cgraph, g) == 1;
+}
+
 // The all-reduce whose lines the matmul before it pushed (ggml_backend_cuda_context::ar_fold), at node i, the first
 //   compute node of the next subgraph: if that is the residual add of the reduced tensor with the norm after it, they
 //   run as one launch that polls the lines (3 nodes done); otherwise the receive half of the LL kernel runs first (0).
+//   The last layer of a model that keeps only the output rows (inp_out_ids) gathers both inputs of the add first: at one
+//   row with one output that is the identity, so the gathers do not run either (5 nodes done).
 //   cgraph nullptr: the receive half.
 static int ggml_cuda_ar_fold_consume(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     ggml_backend_cuda_context::ar_fold_t & f = cuda_ctx->ar_fold;
@@ -7941,6 +7950,37 @@ static int ggml_cuda_ar_fold_consume(ggml_backend_cuda_context * cuda_ctx, ggml_
             ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + 2);
             ggml_cuda_op_rms_norm_pre_add_ar(*cuda_ctx, add, norm, mul, c.args, t);
             return 3;
+        }
+    }
+    static const bool no_gathered = getenv("GGML_CUDA_NO_AR_FOLD_GATHER") != nullptr;
+    if (cgraph != nullptr && !no_gathered && i + 4 < cgraph->n_nodes) {
+        ggml_tensor * add  = cgraph->nodes[i + 2];
+        ggml_tensor * norm = cgraph->nodes[i + 3];
+        ggml_tensor * mul  = cgraph->nodes[i + 4];
+        const int outputs[2] = { i + 2, i + 4 };
+        const enum ggml_op ops[5] = { GGML_OP_GET_ROWS, GGML_OP_GET_ROWS, GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
+        const bool gathered = ggml_cuda_get_rows_is_identity(cgraph, cgraph->nodes[i]) &&
+            ggml_cuda_get_rows_is_identity(cgraph, cgraph->nodes[i + 1]) && add->op == GGML_OP_ADD &&
+            (add->src[0] == cgraph->nodes[i] || add->src[0] == cgraph->nodes[i + 1]) &&
+            (add->src[1] == cgraph->nodes[i] || add->src[1] == cgraph->nodes[i + 1]) && add->src[0] != add->src[1] &&
+            norm->op == GGML_OP_RMS_NORM && mul->op == GGML_OP_MUL && ggml_can_fuse_subgraph(cgraph, i, 5, ops, outputs, 2);
+        if (gathered) {
+            // the same nodes reading the sources of the gathers, so that the checks see the tensors the kernel reads
+            ggml_tensor add_s  = *add;
+            ggml_tensor norm_s = *norm;
+            ggml_tensor mul_s  = *mul;
+            add_s.src[0]  = add->src[0]->src[0];
+            add_s.src[1]  = add->src[1]->src[0];
+            norm_s.src[0] = &add_s;
+            mul_s.src[mul->src[0] == norm ? 0 : 1] = &norm_s;
+            if (ggml_cuda_rms_norm_pre_add_ar_supported(&add_s, &norm_s, &mul_s, t)) {
+                ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + 4);
+                if (cuda_ctx->q8_1_emit == mul) {
+                    cuda_ctx->q8_1_emit = &mul_s;
+                }
+                ggml_cuda_op_rms_norm_pre_add_ar(*cuda_ctx, &add_s, &norm_s, &mul_s, c.args, t);
+                return 5;
+            }
         }
     }
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(c.comm_ctx);
