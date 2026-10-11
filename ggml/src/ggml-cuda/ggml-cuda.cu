@@ -728,6 +728,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         if (block_flags[i] != nullptr) {
             CUDA_CHECK(cudaFree(block_flags[i]));
         }
+        if (ar_tickets[i] != nullptr) {
+            CUDA_CHECK(cudaFree(ar_tickets[i]));
+        }
     }
 }
 
