@@ -5323,7 +5323,11 @@ static bool ggml_cuda_topk_moe_fold(ggml_backend_cuda_context * cuda_ctx, const 
 
 // Name t (the node at i_out) for its kernel to write the q8_1 copy of, see q8_1_emit_alloc, if the first MMVQ
 //   matmul that reads t, or a view of all of it, comes before any node writes t again
-static void ggml_cuda_q8_1_request(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i_out) {
+// flat: the kernel writes the q8_1 copy in the order of t's elements, so the matmul may read t as rows of any length that
+//   needs no q8_1 padding (qwen4exp's hc down projection reads the 4 normed streams of a token as one row, a gated delta
+//   net's output projection the heads of a token)
+static void ggml_cuda_q8_1_request(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i_out,
+        const bool flat = false) {
     const ggml_tensor * t = cgraph->nodes[i_out];
     cuda_ctx->q8_1_emit    = nullptr;
     cuda_ctx->q8_1_emit_as = nullptr;
@@ -5343,7 +5347,7 @@ static void ggml_cuda_q8_1_request(ggml_backend_cuda_context * cuda_ctx, const g
                 // all of t as one row, or its rows as the tokens of a batch when a row needs no q8_1 padding (an MMVQ
                 //   batch reads its rows at the padded stride)
                 const bool one_row = ggml_nelements(y) == y->ne[0] && y->ne[0] == ggml_nelements(t);
-                const bool rows    = y->ne[0] == t->ne[0] && ggml_nelements(y) == ggml_nelements(t) &&
+                const bool rows    = (y->ne[0] == t->ne[0] || flat) && ggml_nelements(y) == ggml_nelements(t) &&
                     y->ne[0] % MATRIX_ROW_PADDING == 0;
                 if (ggml_is_contiguous(y) && (one_row || rows)) {
                     cuda_ctx->q8_1_emit    = t;
@@ -7638,7 +7642,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int outputs[1] = { i + 3 };
         const enum ggml_op ops[4] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
         if (ggml_can_fuse_subgraph(cgraph, i, 4, ops, outputs, 1)) {
-            ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + 3);
+            ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + 3, /*flat =*/ true);
             ggml_cuda_op_rms_norm_gated(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3]);
             return 3;
         }
@@ -7789,7 +7793,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     !(cgraph->nodes[i + 4]->flags & GGML_TENSOR_FLAG_OUTPUT) &&
                     !ggml_cuda_tensors_overlap(cgraph->nodes[i + 5], raw) &&
                     ggml_cuda_should_fuse_dsv4_hc_post_rms_norm(post, cgraph->nodes[i + 4], cgraph->nodes[i + 5])) {
-                ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + 5);
+                ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + 5, /*flat =*/ true);
                 ggml_cuda_op_dsv4_hc_post_rms_norm(*cuda_ctx, post, node, sc2, cgraph->nodes[i + 4], cgraph->nodes[i + 5]);
                 return 5;
             }

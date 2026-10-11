@@ -12543,6 +12543,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(2048, 1, true, true, 2));
     test_cases.emplace_back(new test_dsv4_hc_post(2048, 5, true, true, 1));
     test_cases.emplace_back(new test_dsv4_hc_post(512,  3, true, true, 2));
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 4, true, true, 2));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 2, true, true, 1));
 
     // glu ops
@@ -13627,10 +13628,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 128, 48, 4, 2 }, op));
         test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 64, 5, 4, 3 }, op));
         test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 1536, 2, 1, 1 }, op));
-        // one token writes the q8_1 copy for the matmul; not with rows wider than a block or with 2 tokens
+        // the norm writes the q8_1 copy for the matmul (several tokens too, rows of 512 multiples); not with rows wider
+        //   than a block
         test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 128, 8, 1, 1 }, op, 256));
         test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 128, 12, 1, 1 }, op, 256));
         test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 128, 8, 2, 1 }, op, 256));
+        test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 128, 12, 4, 1 }, op, 256));
         test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 1536, 2, 1, 1 }, op, 64));
     }
 

@@ -1365,12 +1365,13 @@ void ggml_cuda_op_dsv4_hc_post_rms_norm(ggml_backend_cuda_context & ctx, ggml_te
     const int64_t n_tokens = post->ne[2];
     const int64_t w_stride = ggml_nelements(w) == ncols ? 0 : ncols;
 
-    // the q8_1 copy of the output for the matmul that reads all of it, as in ggml_cuda_op_rms_norm_fused
+    // the q8_1 copy of the output for the matmul that reads all of it, as in ggml_cuda_op_rms_norm_fused; written in
+    //   element order, which is the matmul's layout for its rows of any length without padding (see ggml_cuda_q8_1_request)
     block_q8_1 * q8 = nullptr;
     if (ctx.q8_1_emit == mul && ggml_nelements(mul) % MATRIX_ROW_PADDING == 0) {
         int64_t ne_padded = 0;
-        q8 = (block_q8_1 *) ctx.q8_1_emit_alloc(mul, ne_padded);
-        GGML_ASSERT(q8 == nullptr || ne_padded == ggml_nelements(mul));
+        q8 = (block_q8_1 *) ctx.q8_1_emit_alloc(mul, ne_padded, ggml_nrows(mul));
+        GGML_ASSERT(q8 == nullptr || ggml_nelements(mul) % ne_padded == 0);
     }
 
     const dim3 blocks_num(hc, n_tokens, 1);
@@ -1940,8 +1941,10 @@ void ggml_cuda_op_rms_norm_gated(ggml_backend_cuda_context & ctx, ggml_tensor * 
         block_q8_1 * q8_dst = nullptr;
         if (ctx.q8_1_emit == mul_gate && ncols <= block_size && ncols % QK8_1 == 0 &&
                 ggml_nelements(mul_gate) % MATRIX_ROW_PADDING == 0 && ggml_is_contiguous(mul_gate)) {
+            // in element order: the matmul's layout for its rows of any length without padding (several tokens too)
             int64_t ne_padded = 0;
-            q8_dst = (block_q8_1 *) ctx.q8_1_emit_alloc(mul_gate, ne_padded);
+            q8_dst = (block_q8_1 *) ctx.q8_1_emit_alloc(mul_gate, ne_padded, ggml_nrows(mul_gate));
+            GGML_ASSERT(q8_dst == nullptr || ggml_nelements(mul_gate) % ne_padded == 0);
         }
         const dim3 block_dims(block_size, 1, 1);
         const ggml_cuda_kernel_launch_params launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0, ctx.stream()};
