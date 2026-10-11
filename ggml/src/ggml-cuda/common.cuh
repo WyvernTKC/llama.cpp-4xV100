@@ -1801,6 +1801,14 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_dsv4_compress_fold dsv4_fold;
 
+    // the sigmoid gate after a FLASH_ATTN_EXT, sigmoid(gate) * attn in the CONT, UNARY and MUL after it (qwen35): the
+    //   combine of a split KV applies it, writes the MUL output and sets done (see ggml_cuda_try_fuse_fattn_gate)
+    struct fattn_gate_args {
+        const ggml_tensor * cont = nullptr;
+        ggml_tensor *       mul  = nullptr;
+        bool                done = false;
+    } fattn_gate;
+
     // A kernel can write the q8_1 copy of its output for the MMVQ matmul that reads it next, which then
     //   skips its quantize launch. ggml_cuda_q8_1_request names the output and the tensor the matmul reads it as (the
     //   output or a view of all of it); the launcher takes the buffer with q8_1_emit_alloc. The copy waits in

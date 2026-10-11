@@ -5146,6 +5146,10 @@ struct test_flash_attn_ext_mul_mat : public test_case {
     const ggml_type type_KV;
     const ggml_type type_w;
     const int64_t nb;
+    const bool gated; // the output gated as sigmoid(gate) * attn, the gate the second half of each head of q (qwen35)
+
+    ggml_tensor * gated_node = nullptr;
+    ggml_tensor * out_node   = nullptr;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5154,17 +5158,28 @@ struct test_flash_attn_ext_mul_mat : public test_case {
 
     bool run_whole_graph() override { return true; }
 
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (gated_node) {
+            return { gated_node, out_node };
+        }
+        return {};
+    }
+
     double max_nmse_err() override {
         return 5e-4;
     }
 
     std::string vars() override {
-        return VARS_TO_STR7(hs, nh, nr2, kv, type_KV, type_w, nb);
+        std::string s = VARS_TO_STR7(hs, nh, nr2, kv, type_KV, type_w, nb);
+        if (gated) {
+            s += "," + VARS_TO_STR1(gated);
+        }
+        return s;
     }
 
     test_flash_attn_ext_mul_mat(int64_t hs = 256, int64_t nh = 2, int64_t nr2 = 4, int64_t kv = 512,
-            ggml_type type_KV = GGML_TYPE_F16, ggml_type type_w = GGML_TYPE_Q8_0, int64_t nb = 1)
-        : hs(hs), nh(nh), nr2(nr2), kv(kv), type_KV(type_KV), type_w(type_w), nb(nb) {}
+            ggml_type type_KV = GGML_TYPE_F16, ggml_type type_w = GGML_TYPE_Q8_0, int64_t nb = 1, bool gated = false)
+        : hs(hs), nh(nh), nr2(nr2), kv(kv), type_KV(type_KV), type_w(type_w), nb(nb), gated(gated) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*nr2, 1);
@@ -5179,11 +5194,21 @@ struct test_flash_attn_ext_mul_mat : public test_case {
         ggml_tensor * fa = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
         ggml_prec_set_acc(fa, GGML_PREC_F32);
         ggml_tensor * x  = ggml_reshape_2d(ctx, fa, hs*nh*nr2, nb);
+        if (gated) {
+            ggml_tensor * q_full = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*hs, nh*nr2, nb);
+            ggml_set_name(q_full, "q_full");
+            ggml_tensor * gate = ggml_view_3d(ctx, q_full, hs, nh*nr2, nb, q_full->nb[1], q_full->nb[2], hs*ggml_element_size(q_full));
+            gate = ggml_cont_2d(ctx, gate, hs*nh*nr2, nb);
+            x = ggml_mul(ctx, x, ggml_sigmoid(ctx, gate));
+            ggml_set_name(x, "gated");
+            gated_node = x;
+        }
         ggml_tensor * w  = ggml_new_tensor_2d(ctx, type_w, hs*nh*nr2, 512);
         ggml_set_name(w, "w");
 
         ggml_tensor * out = ggml_mul_mat(ctx, w, x);
         ggml_set_name(out, "out");
+        out_node = out;
         return out;
     }
 
@@ -13570,6 +13595,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_flash_attn_ext_mul_mat(256, 2, 4, kv, type_KV, GGML_TYPE_Q4_K, nb));
                 test_cases.emplace_back(new test_flash_attn_ext_mul_mat(512, 1, 8, kv, type_KV, GGML_TYPE_Q8_0, nb));
                 test_cases.emplace_back(new test_flash_attn_ext_mul_mat(128, 3, 1, kv, type_KV, GGML_TYPE_Q8_0, nb));
+                // the qwen35 output gate after it, which the combine of a KV split applies
+                test_cases.emplace_back(new test_flash_attn_ext_mul_mat(256, 1, 4, kv, type_KV, GGML_TYPE_Q8_0, nb, true));
+                test_cases.emplace_back(new test_flash_attn_ext_mul_mat(256, 2, 2, kv, type_KV, GGML_TYPE_Q8_0, nb, true));
+                test_cases.emplace_back(new test_flash_attn_ext_mul_mat(128, 3, 1, kv, type_KV, GGML_TYPE_Q8_0, nb, true));
             }
         }
     }

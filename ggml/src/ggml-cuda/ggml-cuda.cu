@@ -6158,6 +6158,53 @@ static bool ggml_cuda_dsv4_compress_fold_step(ggml_backend_cuda_context * cuda_c
     return std::binary_search(f.skip.begin(), f.skip.end(), i);
 }
 
+// A FLASH_ATTN_EXT whose output only the CONT, SIGMOID and MUL after it read, sigmoid(gate) * attn (the attention output
+//   gate of qwen35, see ggml_cuda_should_fuse_cont_unary_mul): with a split KV the combine applies the gate and writes the
+//   MUL output, so the attention output is not written; else the gate kernel runs after the attention.
+static int ggml_cuda_try_fuse_fattn_gate(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_FATTN_GATE") != nullptr;
+    ggml_tensor * fa = cgraph->nodes[i];
+    if (disabled || fa->op != GGML_OP_FLASH_ATTN_EXT || fa->type != GGML_TYPE_F32 || (fa->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            !ggml_is_contiguous(fa) || ggml_cuda_graph_use_count(cgraph, fa) != 1) {
+        return 0;
+    }
+    int j = i + 1;
+    while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+        j++;
+    }
+    if (j + 2 >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * cont  = cgraph->nodes[j];
+    ggml_tensor * unary = cgraph->nodes[j + 1];
+    ggml_tensor * mul   = cgraph->nodes[j + 2];
+    if (!ggml_cuda_should_fuse_cont_unary_mul(cont, unary, mul) || ggml_get_unary_op(unary) != GGML_UNARY_OP_SIGMOID) {
+        return 0;
+    }
+    const int outputs[1] = { j + 2 };
+    const enum ggml_op ops[3] = { GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL };
+    const ggml_tensor * attn = mul->src[0] == unary ? mul->src[1] : mul->src[0];
+    // the gate rows are those of the attention output: one per head and token
+    if (!ggml_can_fuse_subgraph(cgraph, j, 3, ops, outputs, 1) || cont->src[0]->ne[0] != fa->ne[0] ||
+            (attn->op != GGML_OP_RESHAPE && attn->op != GGML_OP_VIEW) || attn->view_src != fa || attn->view_offs != 0 ||
+            (attn->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_cuda_graph_use_count(cgraph, attn) != 1) {
+        return 0;
+    }
+
+    static const bool no_gate_q8_1 = getenv("GGML_CUDA_NO_GATE_Q8_1") != nullptr;
+    if (!no_gate_q8_1) {
+        ggml_cuda_q8_1_request(cuda_ctx, cgraph, j + 2);
+    }
+    cuda_ctx->fattn_gate = { cont, mul, false };
+    ggml_cuda_flash_attn_ext(*cuda_ctx, fa);
+    const bool done = cuda_ctx->fattn_gate.done;
+    cuda_ctx->fattn_gate = {};
+    if (!done) {
+        ggml_cuda_op_cont_unary_mul(*cuda_ctx, cont, unary, mul);
+    }
+    return j + 2 - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     ggml_cuda_try_gather_expert_group(cuda_ctx, cgraph, i);
 
@@ -6188,6 +6235,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_FILL) {
         const int n_skip = ggml_cuda_try_fuse_qsa_topk_mask(cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        const int n_skip = ggml_cuda_try_fuse_fattn_gate(cuda_ctx, cgraph, i);
         if (n_skip > 0) {
             return n_skip;
         }

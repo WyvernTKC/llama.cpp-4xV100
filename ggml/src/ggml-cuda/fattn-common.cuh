@@ -2,6 +2,7 @@
 
 #include "common.cuh"
 #include "convert.cuh"
+#include "unary.cuh"
 #include "vecdotq.cuh"
 
 #include <cstdint>
@@ -1119,6 +1120,8 @@ static __global__ void flash_attn_stream_k_fixup_general(
 // The columns of a head go to D/DS blocks of DS threads, so that more SMs read the partial results; each block finds the
 //   max of all partials (exact in any order) and their scales in parallel, then every column sums its partials in order,
 //   which gives the values of one block per head.
+// gate: nullptr, or the rows of the gate (one per head and token, gate_s1 floats apart) of sigmoid(gate) * attn, which
+//   dst then gets (see ggml_cuda_try_fuse_fattn_gate)
 template<int D, int DS> // D == head size, DS == columns per block
 __launch_bounds__(DS, 1)
 static __global__ void flash_attn_combine_results(
@@ -1126,7 +1129,9 @@ static __global__ void flash_attn_combine_results(
         const float2 * VKQ_meta_ptr,
         float * dst_ptr,
         const int parallel_blocks,
-        block_q8_1 * q8_dst) {
+        block_q8_1 * q8_dst,
+        const float * gate,
+        const int64_t gate_s1) {
     static_assert(D % DS == 0 && (DS == D || DS % WARP_SIZE == 0), "bad column split");
     ggml_cuda_pdl_lc();
     const float  * GGML_CUDA_RESTRICT VKQ_parts = VKQ_parts_ptr;
@@ -1207,7 +1212,11 @@ static __global__ void flash_attn_combine_results(
         VKQ_denominator += KQ_max_scale * meta[l].y;
     }
 
-    const float val = VKQ_numerator / VKQ_denominator;
+    float val = VKQ_numerator / VKQ_denominator;
+    if (gate != nullptr) {
+        // as ggml_cuda_op_cont_unary_mul computes it
+        val = ggml_cuda_op_sigmoid_single(gate[j_dst_unrolled*gate_s1 + d]) * val;
+    }
     dst[d] = val;
 
     // the q8_1 copy of one token's output for the matmul that reads it (D a multiple of 32), see launch_fattn
@@ -1644,19 +1653,30 @@ void launch_fattn(
         const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]*(DV/DS));
         const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
 
+        // the gate after the attention, which the combine applies: it writes the gated output in place of KQV
+        ggml_tensor * out     = KQV;
+        const float * gate    = nullptr;
+        int64_t       gate_s1 = 0;
+        if (ctx.fattn_gate.mul != nullptr && Q->ne[3] == 1) {
+            out     = ctx.fattn_gate.mul;
+            gate    = (const float *) ctx.fattn_gate.cont->src[0]->data;
+            gate_s1 = ctx.fattn_gate.cont->src[0]->nb[1] / sizeof(float);
+            ctx.fattn_gate.done = true;
+        }
+
         // the q8_1 copy of one token's output for the MMVQ matmul that reads it, see ggml_cuda_q8_1_request: whole
         //   blocks of 32 in a head and no padding
         block_q8_1 * q8_dst = nullptr;
-        if (DV % QK8_1 == 0 && Q->ne[1] == 1 && Q->ne[3] == 1 && ggml_is_contiguous(KQV) &&
-                ggml_nelements(KQV) % MATRIX_ROW_PADDING == 0) {
+        if (DV % QK8_1 == 0 && Q->ne[1] == 1 && Q->ne[3] == 1 && ggml_is_contiguous(out) &&
+                ggml_nelements(out) % MATRIX_ROW_PADDING == 0) {
             int64_t ne_padded = 0;
-            q8_dst = (block_q8_1 *) ctx.q8_1_emit_alloc(KQV, ne_padded);
-            GGML_ASSERT(q8_dst == nullptr || ne_padded == ggml_nelements(KQV));
+            q8_dst = (block_q8_1 *) ctx.q8_1_emit_alloc(out, ne_padded);
+            GGML_ASSERT(q8_dst == nullptr || ne_padded == ggml_nelements(out));
         }
 
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
         ggml_cuda_kernel_launch(flash_attn_combine_results<DV, DS>, launch_params,
-            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks, q8_dst);
+            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) out->data, parallel_blocks, q8_dst, gate, gate_s1);
     }
     CUDA_CHECK(cudaGetLastError());
 }
