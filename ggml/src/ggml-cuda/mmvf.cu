@@ -1333,7 +1333,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                 if (ampere_mma_available(cc)) {
                     return ne11 <= 3;
                 }
-                if (cc >= GGML_CUDA_CC_TURING) {
+                // Volta at 4 columns: a 2560 x 512 router 12.0 us vs cuBLAS 21.3 (30.7 with the f16 compute type,
+                //   which converts the weights on every call), 4096 x 256 11.2 vs 16.5
+                if (cc >= GGML_CUDA_CC_VOLTA) {
                     return ne11 <= 4;
                 }
                 return ne11 <= 3;
