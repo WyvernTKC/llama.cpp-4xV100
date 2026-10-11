@@ -1753,8 +1753,9 @@ bool ggml_cuda_rms_norm_pre_add_ar_supported(const ggml_tensor * add, const ggml
     const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
     const int ncols      = add->ne[0];
     const int block_size = ncols < 1024 ? 256 : 1024;
+    // blocks of 1024 threads spill past 2 columns per thread
     return (is_t(add->src[0]) != is_t(add->src[1])) && ggml_is_contiguous(w) && ggml_nelements(w) == ncols &&
-        ncols <= (block_size == 256 ? 4 : 8)*block_size;
+        ncols <= (block_size == 256 ? 4 : 2)*block_size;
 }
 
 void ggml_cuda_op_rms_norm_pre_add_ar(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * rms_norm, ggml_tensor * mul,
@@ -1785,7 +1786,7 @@ void ggml_cuda_op_rms_norm_pre_add_ar(ggml_backend_cuda_context & ctx, ggml_tens
     // the sum is written into t too unless an output sits on it (t is then dead after the add)
     float * t_d = ggml_cuda_tensors_overlap(t, add) || ggml_cuda_tensors_overlap(t, mul) ? nullptr : (float *) t->data;
 
-    GGML_ASSERT(ncols <= (block_size == 256 ? 4 : 8)*block_size);
+    GGML_ASSERT(ncols <= (block_size == 256 ? 4 : 2)*block_size);
     const dim3 block_dims(block_size, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params{grid, block_dims, 32 * sizeof(float), ctx.stream()};
     if (block_size == 256) {
@@ -1795,7 +1796,7 @@ void ggml_cuda_op_rms_norm_pre_add_ar(ggml_backend_cuda_context & ctx, ggml_tens
                 q8_d, nq8, flags);
         });
     } else {
-        rms_norm_pre_add_ar_cols<1024, 8>(ncols, [&](auto cols) {
+        rms_norm_pre_add_ar_cols<1024, 2>(ncols, [&](auto cols) {
             ggml_cuda_kernel_launch(rms_norm_pre_add_ar_f32<1024, decltype(cols)::value>, launch_params, ar,
                 (const float *) b->data, (float *) add->data, (float *) mul->data, t_d, ncols, eps, (const float *) w->data,
                 q8_d, nq8, flags);

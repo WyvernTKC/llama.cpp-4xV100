@@ -8379,7 +8379,10 @@ static void ggml_backend_cuda_session_allreduce_next(void * comm_ctx_v, struct g
     ggml_backend_cuda_context::ar_fold_t & f = cuda_ctx->ar_fold;
     f.next   = nullptr;
     f.pushed = false;
-    if (no_fold || comm_ctx->p2p_ar == nullptr ||
+    // the norm that polls the lines keeps the row in registers: up to 2 columns per thread in blocks of 1024 threads, past
+    //   that it spills (5 columns, Qwen3.8-27B's 5120: 696 bytes of stack, 40 us per launch)
+    const int64_t ncols = ggml_nelements(tensors[rank]);
+    if (no_fold || ncols > 2*1024 || comm_ctx->p2p_ar == nullptr ||
             !ggml_cuda_p2p_ar_fold_args(comm_ctx->p2p_ar, comm_ctx->backends.data(), tensors, rank, f.next_call.args)) {
         return;
     }
