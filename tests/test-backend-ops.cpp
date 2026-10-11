@@ -5085,6 +5085,48 @@ struct test_mul_mat_sibling_rows : public test_case {
     }
 };
 
+// a gate and an up projection of the same input and the GLU that reads both (a shared expert): one token fuses the gate,
+//   2-4 tokens run the two as sibling rows of one mmvq launch with the GLU after it
+struct test_mul_mat_sibling_glu : public test_case {
+    const ggml_type type;
+    const int64_t k;
+    const int64_t rows;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SIBLING_GLU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, k, rows, n_tokens);
+    }
+
+    test_mul_mat_sibling_glu(ggml_type type = GGML_TYPE_Q8_0, int64_t k = 2560, int64_t rows = 160, int64_t n_tokens = 4)
+        : type(type), k(k), rows(rows), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * wu = ggml_new_tensor_2d(ctx, type, k, rows);
+        ggml_tensor * wg = ggml_new_tensor_2d(ctx, type, k, rows);
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
+        ggml_set_name(wu, "wu");
+        ggml_set_name(wg, "wg");
+        ggml_set_name(x, "x");
+
+        ggml_tensor * up   = ggml_mul_mat(ctx, wu, x);
+        ggml_tensor * gate = ggml_mul_mat(ctx, wg, x);
+        ggml_tensor * out  = ggml_swiglu_split(ctx, gate, up);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // FLASH_ATTN_EXT and the matmul that reads its output, the output projection of an attention layer: at one token the
 //   combine of a KV split writes the q8_1 copy of the output
 struct test_flash_attn_ext_mul_mat : public test_case {
@@ -13512,6 +13554,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 1024, 100, 37, 0, n_tokens));
             test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 2048, 2048, 512, 512, n_tokens));
             test_cases.emplace_back(new test_mul_mat_sibling_rows(type, 1024, 100, 37, 21, n_tokens));
+        }
+    }
+    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K }) {
+        for (int64_t n_tokens : { 1, 2, 4 }) {
+            test_cases.emplace_back(new test_mul_mat_sibling_glu(type, 2560, 160, n_tokens));
         }
     }
     // 2-4 tokens of q8_0 rows in pairs: qwen4exp's hyper-connection down projection and its inject, a gated delta net's

@@ -7264,7 +7264,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const int j = next_node(last);
             const int k = next_node(j);
             ggml_tensor * sib = j < cgraph->n_nodes ? cgraph->nodes[j] : nullptr;
-            // the node after it must not read it: it may fuse with it
+            // the node after it must not read it: it may fuse with it (not past one token for mmvq, which fuses no gate
+            //   or epilogue there: a shared expert's gate and up before their GLU)
             if (sib == nullptr || sib->op != GGML_OP_MUL_MAT || !(sib->flags & GGML_TENSOR_FLAG_COMPUTE) ||
                     sib->src[1]->data != node->src[1]->data || !ggml_are_same_shape(sib->src[1], node->src[1]) ||
                     !ggml_are_same_stride(sib->src[1], node->src[1]) || sib->src[0]->type != node->src[0]->type ||
@@ -7274,7 +7275,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     ggml_cuda_tensors_overlap(sib, node) || ggml_cuda_tensors_overlap(sib, node->src[1]) ||
                     (n_sibs > 0 && ggml_cuda_tensors_overlap(sib, sibs[0])) ||
                     (n_sibs > 1 && ggml_cuda_tensors_overlap(sib, sibs[1])) ||
-                    (k < cgraph->n_nodes && reads(cgraph->nodes[k], sib))) {
+                    (node_sibling_kernel != 4 && k < cgraph->n_nodes && reads(cgraph->nodes[k], sib))) {
                 break;
             }
             sibs[n_sibs++] = sib;
