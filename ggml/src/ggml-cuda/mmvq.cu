@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "allreduce-p2p.cuh"
 #include "quantize.cuh"
 #include "ssm-conv.cuh"
 #include "unary.cuh"
@@ -689,8 +690,10 @@ static constexpr __host__ __device__ int mmvq_paired_min_blocks(const ggml_type 
 // paired: a fused gate on twice the warps, the first half summing x and the second half the gate over the same rows and
 //   K slices as the plain kernel, so a thread keeps the sums of one matrix as there and each sum is the plain one
 // conv: the convolution of build_conv_state in the epilogue of the rows of x (conv_args), one row per block
+// ar: the rows go to the LL lines of an all-reduce folded into this launch (conv_args holds its ggml_cuda_ar_fold_args),
+//   not to dst; see ggml_cuda_ar_fold_push
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool wide = false,
-          bool paired = false, bool conv = false>
+          bool paired = false, bool conv = false, bool ar = false>
 __launch_bounds__((paired ? 2 : 1)*calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(),
     conv ? mmvq_conv_min_blocks(type) : paired ? mmvq_paired_min_blocks(type, wide) : 1)
 static __global__ void mul_mat_vec_q(
@@ -699,7 +702,8 @@ static __global__ void mul_mat_vec_q(
         uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
-        const uint32_t ids_stride, const std::conditional_t<conv, ggml_cuda_mmvq_conv_args, ggml_cuda_no_args> conv_args) {
+        const uint32_t ids_stride,
+        const std::conditional_t<conv, ggml_cuda_mmvq_conv_args, std::conditional_t<ar, ggml_cuda_ar_fold_args, ggml_cuda_no_args>> conv_args) {
     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
@@ -773,6 +777,15 @@ static __global__ void mul_mat_vec_q(
 
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
+
+    // ar: the sequence number of the call, loaded while the dot product runs; a block's rows are in one LL block
+    static_assert(!ar || (ncols_dst == 1 && !has_fusion && !paired && !conv), "the fold pushes the rows of one column");
+    [[maybe_unused]] uint32_t ar_seq = 0;
+    if constexpr (ar) {
+        if (threadIdx.y == 0 && threadIdx.x < rows_per_cuda_block/2) {
+            ar_seq = ggml_cuda_ar_seq(conv_args, row0/4);
+        }
+    }
 
     bool use_gate = false;
     bool use_bias = false;
@@ -1008,7 +1021,7 @@ static __global__ void mul_mat_vec_q(
                 }
             }
 
-            if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < nrows_dst)) {
+            if (!ar && threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < nrows_dst)) {
                 float result = tmp[j][i];
                 if constexpr (has_fusion) {
                     if constexpr (type == GGML_TYPE_NVFP4) {
@@ -1069,6 +1082,18 @@ static __global__ void mul_mat_vec_q(
                         conv_args.dst[row0] = ggml_cuda_ssm_conv_silu<4>(conv_win, conv_wv, 0.0f);
                     }
                 }
+            }
+        }
+    }
+
+    // ar: every lane holds the sums of the block's rows; lane p pushes rows 2p and 2p + 1 (the host only folds whole
+    //   blocks of rows)
+    if constexpr (ar && rows_per_cuda_block % 2 == 0) {
+#pragma unroll
+        for (int p = 0; p < rows_per_cuda_block/2; ++p) {
+            if (threadIdx.x == p) {
+                const int r = row0 + 2*p;
+                ggml_cuda_ar_fold_push(conv_args, ar_seq, r/4, (r/2) % 2, tmp[0][2*p], tmp[0][2*p + 1]);
             }
         }
     }
@@ -1479,6 +1504,11 @@ static std::pair<dim3, dim3> calc_launch_params(
     return {block_nums, block_dims};
 }
 
+// the types whose one-token launches can take an all-reduce fold (each one more kernel per layout)
+static constexpr bool ggml_cuda_mmvq_ar_fold_type(const ggml_type type) {
+    return type == GGML_TYPE_Q8_0;
+}
+
 template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, bool wide = false, bool paired = false>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_launch & fusion, float * dst,
@@ -1522,6 +1552,24 @@ static void mul_mat_vec_q_switch_fusion(
     }
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+
+    // an all-reduce folded into the launch: one column, whole blocks of an even number of rows, nothing else fused
+    if constexpr (c_ncols_dst == 1 && small_k && ggml_cuda_mmvq_ar_fold_type(type)) {
+        constexpr int rpb = calc_rows_per_block(c_ncols_dst, MMVQ_PARAMETERS_VOLTA, small_k,
+            calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_VOLTA, small_k, halve_iters));
+        if (fusion.ar_pushed != nullptr && ids == nullptr && fusion.sib_x == nullptr && fusion.sib2_x == nullptr &&
+                fusion.gdn_x == nullptr && fusion.shared_up == nullptr && block_dims.y == (unsigned) rpb && rpb % 2 == 0 &&
+                block_nums.x*rpb == stride_col_dst && block_nums.y == 1 && block_nums.z == 1 &&
+                get_device_table_id(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) == MMVQ_PARAMETERS_VOLTA) {
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, wide, false, false, true>, launch_params,
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, fusion.ar);
+            *fusion.ar_pushed = true;
+            return;
+        }
+    }
+
     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, wide>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -2316,6 +2364,12 @@ static void ggml_cuda_mul_mat_vec_q_impl(
             fusion_local.gdn_a    = (const float *) fusion->gdn_a->data;
             fusion_local.gdn_beta = (float *) fusion->gdn_beta->data;
         }
+    }
+
+    // the all-reduce of the output folded into the launch, if it can take it (see ggml_backend_cuda_context::ar_fold)
+    if (ctx.ar_fold.next == dst && src1_rot == 0) {
+        fusion_local.ar        = ctx.ar_fold.next_call.args;
+        fusion_local.ar_pushed = &ctx.ar_fold.pushed;
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.

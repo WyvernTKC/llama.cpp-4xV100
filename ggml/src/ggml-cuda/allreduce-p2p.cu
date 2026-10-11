@@ -10,14 +10,12 @@
 #define GGML_CUDA_P2P_AR_NBLOCKS_DEFAULT 16
 #define GGML_CUDA_P2P_AR_NTHREADS        256
 
-// Two staging slots, alternating per call. A rank can run at most one call ahead of its peers
+// Two staging slots (GGML_CUDA_P2P_AR_NSLOTS), alternating per call. A rank can run at most one call ahead of its peers
 // (it cannot finish call k until every peer published its flag for k, and a peer only publishes
 // that flag after it finished reading call k-1), so two slots are enough to keep a fast rank
 // from overwriting payload a slow rank has not consumed yet.
-#define GGML_CUDA_P2P_AR_NSLOTS 2
-
-// LL path for the smallest messages: one float4 per thread, no inter-block coupling.
-#define GGML_CUDA_P2P_AR_LL_NTHREADS 128
+// The LL path for the smallest messages takes one float4 per thread (GGML_CUDA_P2P_AR_LL_NTHREADS per block), no
+// inter-block coupling.
 
 struct ggml_cuda_p2p_ar_args {
     float4 *             stage[GGML_CUDA_MAX_DEVICES];
@@ -222,25 +220,31 @@ static __device__ __forceinline__ float2 ggml_cuda_p2p_ar_unpack2(const uint32_t
 //   above: one line {d0, flag, d1, flag} per two values, or with payload one line per four. The k-th lines of the 32
 //   float4s of a warp are next to each other (32 lines apart from its other ones), so that every store of a warp is
 //   512 contiguous bytes, which cross the link to a peer in large packets.
-template <int n_devs, int payload>
+// push = false: only the sums, the lines of this rank having been pushed by the kernel that made v (a fold, see
+//   ggml_cuda_ar_fold_push)
+template <int n_devs, int payload, bool push = true>
 static __device__ __forceinline__ float4 ggml_cuda_p2p_ar_ll_exchange(const ggml_cuda_p2p_ar_args & a, const float4 v,
         const int64_t i, const uint32_t flag, const int64_t slot_base) {
     constexpr int nl = payload == 0 ? 2 : 1; // lines per float4
     const int64_t line0 = (i & ~(int64_t) (WARP_SIZE - 1))*nl + (i & (WARP_SIZE - 1)); // its line k is line0 + k*32
-    uint4 l[nl];
-    if constexpr (payload == 0) {
-        l[0] = make_uint4(__float_as_uint(v.x), flag, __float_as_uint(v.y), flag);
-        l[1] = make_uint4(__float_as_uint(v.z), flag, __float_as_uint(v.w), flag);
-    } else {
-        l[0] = make_uint4(ggml_cuda_p2p_ar_pack2<payload>(v.x, v.y), flag, ggml_cuda_p2p_ar_pack2<payload>(v.z, v.w), flag);
-    }
-#pragma unroll
-    for (int j = 0; j < n_devs; ++j) {
-        uint4 * dst = a.ll[j] + slot_base + (int64_t) a.rank * a.ll_stride + line0;
-#pragma unroll
-        for (int k = 0; k < nl; ++k) {
-            ggml_cuda_p2p_ar_st_ll(dst + k*WARP_SIZE, l[k]);
+    if constexpr (push) {
+        uint4 l[nl];
+        if constexpr (payload == 0) {
+            l[0] = make_uint4(__float_as_uint(v.x), flag, __float_as_uint(v.y), flag);
+            l[1] = make_uint4(__float_as_uint(v.z), flag, __float_as_uint(v.w), flag);
+        } else {
+            l[0] = make_uint4(ggml_cuda_p2p_ar_pack2<payload>(v.x, v.y), flag, ggml_cuda_p2p_ar_pack2<payload>(v.z, v.w), flag);
         }
+#pragma unroll
+        for (int j = 0; j < n_devs; ++j) {
+            uint4 * dst = a.ll[j] + slot_base + (int64_t) a.rank * a.ll_stride + line0;
+#pragma unroll
+            for (int k = 0; k < nl; ++k) {
+                ggml_cuda_p2p_ar_st_ll(dst + k*WARP_SIZE, l[k]);
+            }
+        }
+    } else {
+        GGML_UNUSED(v);
     }
 
     const uint4 * src = a.ll[a.rank] + slot_base + line0;
@@ -291,7 +295,8 @@ static __device__ __forceinline__ float4 ggml_cuda_p2p_ar_ll_exchange(const ggml
     return sum;
 }
 
-template <int n_devs, int payload = 0>
+// push = false: the receive half alone, see ggml_cuda_p2p_ar_launch_ll_recv
+template <int n_devs, int payload = 0, bool push = true>
 static __global__ void ggml_cuda_p2p_ar_ll_kernel_n(const ggml_cuda_p2p_ar_args a) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -301,8 +306,13 @@ static __global__ void ggml_cuda_p2p_ar_ll_kernel_n(const ggml_cuda_p2p_ar_args 
     const int64_t slot_base = (int64_t) (seq % GGML_CUDA_P2P_AR_NSLOTS) * n_devs * a.ll_stride;
 
     if (i < a.nvec) {
-        const float4 v = ((a.contrib_mask >> a.rank) & 1u) ? a.src[i] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        a.dst[i] = ggml_cuda_p2p_ar_ll_exchange<n_devs, payload>(a, v, i, flag, slot_base);
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if constexpr (push) {
+            if ((a.contrib_mask >> a.rank) & 1u) {
+                v = a.src[i];
+            }
+        }
+        a.dst[i] = ggml_cuda_p2p_ar_ll_exchange<n_devs, payload, push>(a, v, i, flag, slot_base);
     }
 
     __syncthreads();
@@ -645,6 +655,58 @@ void ggml_cuda_p2p_ar_launch_ll(const ggml_cuda_p2p_ar * ar, ggml_backend_t * ba
     const int nblocks_ll = (int) ((args.nvec + GGML_CUDA_P2P_AR_LL_NTHREADS - 1) / GGML_CUDA_P2P_AR_LL_NTHREADS);
     ggml_cuda_p2p_ar_launch_ll_n(args, nblocks_ll, cuda_ctx->stream());
     CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_p2p_ar_launch_ll_recv(const ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors, size_t rank) {
+    unsigned int contrib_mask = 0;
+    GGML_ASSERT(ggml_cuda_p2p_ar_ll_capturable(ar, backends, tensors) && ggml_cuda_p2p_ar_check(ar, backends, tensors, contrib_mask));
+
+    ggml_cuda_p2p_ar_args args = {};
+    for (size_t j = 0; j < ar->n_devices; ++j) {
+        args.ll[j] = ar->ll[j];
+    }
+    args.nvec         = ggml_nelements(tensors[0]) / 4;
+    args.ll_stride    = ar->ll_stride;
+    args.n_devs       = (int) ar->n_devices;
+    args.contrib_mask = contrib_mask;
+    args.rank         = (int) rank;
+    args.src          = nullptr;
+    args.dst          = (float4 *) tensors[rank]->data;
+    args.ll_seq       = ar->ll_seq[rank];
+
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backends[rank]->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    const int nblocks_ll = (int) ((args.nvec + GGML_CUDA_P2P_AR_LL_NTHREADS - 1) / GGML_CUDA_P2P_AR_LL_NTHREADS);
+    const auto launch = [&](auto kernel) {
+        kernel<<<nblocks_ll, GGML_CUDA_P2P_AR_LL_NTHREADS, 0, cuda_ctx->stream()>>>(args);
+    };
+    switch (args.n_devs) {
+        case 2: launch(ggml_cuda_p2p_ar_ll_kernel_n<2, 0, false>); break;
+        case 3: launch(ggml_cuda_p2p_ar_ll_kernel_n<3, 0, false>); break;
+        case 4: launch(ggml_cuda_p2p_ar_ll_kernel_n<4, 0, false>); break;
+        default: GGML_ABORT("fatal error");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+bool ggml_cuda_p2p_ar_fold_args(const ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors, size_t rank,
+        ggml_cuda_ar_fold_args & args) {
+    unsigned int contrib_mask = 0;
+    // the lines of a fold carry f32 values, see ggml_cuda_ar_fold_push
+    if (!ggml_cuda_p2p_ar_ll_capturable(ar, backends, tensors) || !ggml_cuda_p2p_ar_check(ar, backends, tensors, contrib_mask) ||
+            ar->n_devices > 4 || contrib_mask != (1u << ar->n_devices) - 1 || ggml_cuda_p2p_ar_ll_payload() != 0) {
+        return false;
+    }
+    args = {};
+    for (size_t j = 0; j < ar->n_devices; ++j) {
+        args.ll[j] = ar->ll[j];
+    }
+    args.own       = ar->ll[rank];
+    args.ll_seq    = ar->ll_seq[rank];
+    args.ll_stride = ar->ll_stride;
+    args.rank      = (int) rank;
+    args.n_devs    = (int) ar->n_devices;
+    return true;
 }
 
 void ggml_cuda_p2p_ar_launch_ll_moe_reduce(const ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors,

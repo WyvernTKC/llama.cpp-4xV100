@@ -3652,6 +3652,8 @@ struct ggml_backend_meta_context {
     session_allreduce_t           session_allreduce           = nullptr;
     session_end_t                 session_end                 = nullptr;
     session_launch_t              session_launch              = nullptr;
+    // optional: told before a subgraph runs which all-reduce follows it, so its last node can take part in it
+    session_allreduce_t           session_allreduce_next      = nullptr;
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -3709,6 +3711,7 @@ struct ggml_backend_meta_context {
                 session_allreduce           = (session_allreduce_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_session_allreduce");
                 session_end                 = (session_end_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_session_end");
                 session_launch              = (session_launch_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_session_launch");
+                session_allreduce_next      = (session_allreduce_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_session_allreduce_next");
                 if (!session_plan || !session_begin || !session_allreduce_supported || !session_allreduce || !session_end ||
                         !session_launch) {
                     session_plan = nullptr;
@@ -5617,6 +5620,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             // subgraph i of device j, and the all-reduce after it
             auto run_subgraph = [&](size_t j, size_t i) {
                 ggml_backend_t backend_j = backend_ctx->backend_configs[j].backend;
+                if (status[j] == GGML_STATUS_SUCCESS && i + 1 < n_sess && backend_ctx->session_allreduce_next != nullptr) {
+                    backend_ctx->session_allreduce_next(backend_ctx->comm_ctx, &ar_nodes[i*n_backends], j);
+                }
                 if (status[j] == GGML_STATUS_SUCCESS) {
                     status[j] = ggml_backend_graph_compute_async(backend_j, D->graphs[j].session_cgraphs[i]);
                 }

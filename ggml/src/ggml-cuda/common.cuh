@@ -1526,6 +1526,17 @@ struct ggml_cuda_dsv4_compress_fold {
     float   sm_scale = 1.0f;
 };
 
+// An LL all-reduce folded into the kernels around it (see ggml_cuda_ar_fold_push in allreduce-p2p.cuh): the matmul
+//   that makes this rank's partial sum writes it as the LL lines of every rank, the kernel that reads the sum polls them
+struct ggml_cuda_ar_fold_args {
+    uint4 *        ll[4]     = {};      // the LL staging of every rank
+    uint4 *        own       = nullptr; // that of this rank, ll[rank]
+    unsigned int * ll_seq    = nullptr; // this rank's sequence number per LL block
+    int64_t        ll_stride = 0;       // lines per (slot, rank) region
+    int            rank      = 0;
+    int            n_devs    = 0;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1613,6 +1624,24 @@ struct ggml_backend_cuda_context {
         ggml_tensor *       dst     = nullptr; // the sum
         std::unique_ptr<ggml_cuda_pool_alloc<float>> add_x; // the shared expert's down projection
     } session_red;
+
+    // an all-reduce of a session folded into the kernels around it: next is the node it reduces, announced before its
+    //   subgraph runs (ggml_backend_cuda_session_allreduce_next); a matmul writing it pushes its rows as the LL lines of
+    //   every rank (pushed), the all-reduce then launches nothing and recv is left for the next subgraph, whose residual
+    //   add and norm poll the lines, else a kernel that only receives (ggml_cuda_ar_fold_consume)
+    struct ar_fold_call_t {
+        void *                 comm_ctx = nullptr;
+        ggml_tensor *          tensors[GGML_CUDA_MAX_DEVICES] = {};
+        size_t                 rank = 0;
+        ggml_cuda_ar_fold_args args;
+    };
+    struct ar_fold_t {
+        ar_fold_call_t      next_call;
+        const ggml_tensor * next   = nullptr;
+        bool                pushed = false;
+        ar_fold_call_t      recv_call;
+        bool                recv   = false;
+    } ar_fold;
 
     // the CONCAT of a build_conv_state whose chain the qkv projection already ran (ggml_cuda_gdn_conv_fold), and the
     //   nodes to skip from it, up to its last slot CPY
@@ -2030,6 +2059,9 @@ struct ggml_cuda_no_args {
 struct ggml_cuda_mm_fusion_args_launch : ggml_cuda_mm_fusion_args_device {
     ggml_cuda_mmvq_conv_args conv;
     ggml_cuda_mmvf_topk_args topk;
+    // with ar_pushed: a launch that can push its rows as the LL lines of ar does so and sets *ar_pushed
+    ggml_cuda_ar_fold_args   ar;
+    bool *                   ar_pushed = nullptr;
 };
 
 struct ggml_cuda_kernel_launch_params {

@@ -52,3 +52,113 @@ void ggml_cuda_p2p_ar_launch_ll    (const ggml_cuda_p2p_ar * ar, ggml_backend_t 
 void ggml_cuda_p2p_ar_launch_ll_moe_reduce(const ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors,
                                            size_t rank, const float * experts, const float * weights, int n_used,
                                            const float * add_x, const float * add_g);
+
+// The LL kernel's receive half alone, for a call whose rank pushed its lines from the kernel that made its input (see
+//   ggml_cuda_ar_fold_push): polls them, writes the sum into tensors[rank] and moves the sequence numbers on.
+void ggml_cuda_p2p_ar_launch_ll_recv(const ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors, size_t rank);
+
+// The arguments of a fold of this call into the kernels around it, false if the call cannot be folded: it must be
+//   ll_capturable with every rank contributing, on 2 to 4 devices, and a multiple of 4 values.
+bool ggml_cuda_p2p_ar_fold_args(const ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors, size_t rank,
+                                ggml_cuda_ar_fold_args & args);
+
+// The LL scheme of the kernels in allreduce-p2p.cu, for the kernels a fold puts it in. The values of a call are float4s;
+//   LL block b (GGML_CUDA_P2P_AR_LL_NTHREADS float4s) has its own sequence number ll_seq[b]: call seq = ll_seq[b] + 1
+//   uses slot seq % GGML_CUDA_P2P_AR_NSLOTS and flag seq | 1, and its last reader stores seq into ll_seq[b]. Float4 i
+//   goes into two lines {d0, flag, d1, flag}; the k-th lines of the 32 float4s of a warp are next to each other.
+#define GGML_CUDA_P2P_AR_NSLOTS 2
+#define GGML_CUDA_P2P_AR_LL_NTHREADS 128
+
+static __device__ __forceinline__ void ggml_cuda_ar_st_ll(uint4 * p, const uint4 v) {
+    asm volatile("st.volatile.global.v4.u32 [%0], {%1, %2, %3, %4};" :: "l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
+}
+
+static __device__ __forceinline__ uint4 ggml_cuda_ar_ld_ll(const uint4 * p) {
+    uint4 v;
+    asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p) : "memory");
+    return v;
+}
+
+// line k of float4 i of a rank's region
+static __device__ __forceinline__ int64_t ggml_cuda_ar_ll_line(const int64_t i, const int k) {
+    return (i & ~(int64_t) (WARP_SIZE - 1))*2 + (i & (WARP_SIZE - 1)) + k*WARP_SIZE;
+}
+
+// the sequence number of this call for float4 i
+static __device__ __forceinline__ uint32_t ggml_cuda_ar_seq(const ggml_cuda_ar_fold_args & a, const int64_t i) {
+    return a.ll_seq[i / GGML_CUDA_P2P_AR_LL_NTHREADS] + 1;
+}
+
+// values (v0, v1), of line k of float4 i, to every rank
+static __device__ __forceinline__ void ggml_cuda_ar_fold_push(const ggml_cuda_ar_fold_args & a, const uint32_t seq,
+        const int64_t i, const int k, const float v0, const float v1) {
+    const uint32_t flag = seq | 1u;
+    const uint4    l    = make_uint4(__float_as_uint(v0), flag, __float_as_uint(v1), flag);
+    const int64_t  off  = ((int64_t) (seq % GGML_CUDA_P2P_AR_NSLOTS)*a.n_devs + a.rank)*a.ll_stride + ggml_cuda_ar_ll_line(i, k);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        if (j < a.n_devs) {
+            ggml_cuda_ar_st_ll(a.ll[j] + off, l);
+        }
+    }
+}
+
+// the sums of the n values cols[0..n-1] over the ranks, in rank order from 0 as the LL kernels add them; the lines of
+//   all of them are loaded at once and only those that have not arrived are loaded again
+template <int n>
+static __device__ __forceinline__ void ggml_cuda_ar_fold_sum(const ggml_cuda_ar_fold_args & a, const int64_t * cols,
+        const bool * valid, float * sums) {
+    uint32_t       flag[n];
+    const uint4 *  p[n];
+    uint4          r[n][4];
+#pragma unroll
+    for (int c = 0; c < n; ++c) {
+        const int64_t  i   = cols[c] / 4;
+        const uint32_t seq = valid[c] ? ggml_cuda_ar_seq(a, i) : 0;
+        flag[c] = seq | 1u;
+        p[c]    = a.own + (int64_t) (seq % GGML_CUDA_P2P_AR_NSLOTS)*a.n_devs*a.ll_stride + ggml_cuda_ar_ll_line(i, (cols[c] % 4) / 2);
+    }
+#pragma unroll
+    for (int c = 0; c < n; ++c) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            if (valid[c] && j < a.n_devs) {
+                r[c][j] = ggml_cuda_ar_ld_ll(p[c] + j*a.ll_stride);
+            }
+        }
+    }
+    bool done;
+    do {
+        done = true;
+#pragma unroll
+        for (int c = 0; c < n; ++c) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                if (valid[c] && j < a.n_devs && (r[c][j].y != flag[c] || r[c][j].w != flag[c])) {
+                    r[c][j] = ggml_cuda_ar_ld_ll(p[c] + j*a.ll_stride);
+                    done = false;
+                }
+            }
+        }
+    } while (!done);
+#pragma unroll
+    for (int c = 0; c < n; ++c) {
+        float s = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            if (j < a.n_devs) {
+                s += __uint_as_float(cols[c] % 2 == 0 ? r[c][j].x : r[c][j].z);
+            }
+        }
+        sums[c] = valid[c] ? s : 0.0f;
+    }
+}
+
+// after every reader of the call has polled its lines: ll_seq of the LL blocks of a row of ne values moves on, by
+//   threads 0.. of one block
+static __device__ __forceinline__ void ggml_cuda_ar_fold_done(const ggml_cuda_ar_fold_args & a, const int64_t ne, const int tid) {
+    const int64_t nb = (ne/4 + GGML_CUDA_P2P_AR_LL_NTHREADS - 1) / GGML_CUDA_P2P_AR_LL_NTHREADS;
+    if (tid < nb) {
+        a.ll_seq[tid] = a.ll_seq[tid] + 1;
+    }
+}

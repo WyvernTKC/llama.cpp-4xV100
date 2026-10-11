@@ -16,6 +16,12 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
 bool ggml_cuda_should_fuse_rms_norm_pre_add(const ggml_tensor * add, const ggml_tensor * rms_norm, const ggml_tensor * mul);
 void ggml_cuda_op_rms_norm_pre_add(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * rms_norm, ggml_tensor * mul);
 
+// the same with the all-reduce of t, one of the add's inputs, folded in: t's sum is polled from the LL lines of ar
+bool ggml_cuda_rms_norm_pre_add_ar_supported(const ggml_tensor * add, const ggml_tensor * rms_norm, const ggml_tensor * mul,
+                                             const ggml_tensor * t);
+void ggml_cuda_op_rms_norm_pre_add_ar(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * rms_norm, ggml_tensor * mul,
+                                      const ggml_cuda_ar_fold_args & ar, ggml_tensor * t);
+
 // the same with the sigmoid-gated shared expert of a MoE layer added first:
 //   add = (moe + shexp * sigmoid(g)) + residual, mul = rms_norm(add) * w
 bool ggml_cuda_should_fuse_rms_norm_pre_add_gated(const ggml_tensor * sigmoid, const ggml_tensor * mul_gate, const ggml_tensor * add_shexp,

@@ -7852,6 +7852,36 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// The all-reduce whose lines the matmul before it pushed (ggml_backend_cuda_context::ar_fold), at node i, the first
+//   compute node of the next subgraph: if that is the residual add of the reduced tensor with the norm after it, they
+//   run as one launch that polls the lines (3 nodes done); otherwise the receive half of the LL kernel runs first (0).
+//   cgraph nullptr: the receive half.
+static int ggml_cuda_ar_fold_consume(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    ggml_backend_cuda_context::ar_fold_t & f = cuda_ctx->ar_fold;
+    if (!f.recv) {
+        return 0;
+    }
+    f.recv = false;
+    ggml_backend_cuda_context::ar_fold_call_t & c = f.recv_call;
+    ggml_tensor * t = c.tensors[c.rank];
+    if (cgraph != nullptr && i + 2 < cgraph->n_nodes) {
+        ggml_tensor * add  = cgraph->nodes[i];
+        ggml_tensor * norm = cgraph->nodes[i + 1];
+        ggml_tensor * mul  = cgraph->nodes[i + 2];
+        const int outputs[2] = { i, i + 2 };
+        const enum ggml_op ops[3] = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
+        if (add->op == GGML_OP_ADD && norm->op == GGML_OP_RMS_NORM && mul->op == GGML_OP_MUL &&
+                ggml_cuda_rms_norm_pre_add_ar_supported(add, norm, mul, t) && ggml_can_fuse_subgraph(cgraph, i, 3, ops, outputs, 2)) {
+            ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + 2);
+            ggml_cuda_op_rms_norm_pre_add_ar(*cuda_ctx, add, norm, mul, c.args, t);
+            return 3;
+        }
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(c.comm_ctx);
+    ggml_cuda_p2p_ar_launch_ll_recv(comm_ctx->p2p_ar, comm_ctx->backends.data(), c.tensors, c.rank);
+    return 0;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -7998,6 +8028,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 cuda_ctx->q8_1_input_invalidate(node);
                 cuda_ctx->cublas_input_invalidate(node);
+
+                // an all-reduce folded into the matmul before it, see ggml_cuda_ar_fold_consume
+                if (cuda_ctx->ar_fold.recv) {
+                    const int n_done = ggml_cuda_ar_fold_consume(cuda_ctx, cgraph, i);
+                    if (n_done > 0) {
+                        for (int j = i; j < i + n_done; j++) {
+                            cuda_ctx->q8_1_input_invalidate(cgraph->nodes[j]);
+                            cuda_ctx->cublas_input_invalidate(cgraph->nodes[j]);
+                        }
+                        cuda_ctx->q8_1_commit_pending();
+                        i += n_done - 1;
+                        continue;
+                    }
+                }
 
                 // a DeepSeek-V4 compressor launched at its row sum
                 if (ggml_cuda_dsv4_compress_fold_step(cuda_ctx, cgraph, i)) {
@@ -8155,8 +8199,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (cuda_ctx->session_mode != ggml_backend_cuda_context::SESSION_OFF) {
         ggml_cuda_session_reduction_flush(cuda_ctx);
         ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, nullptr);
+        // a subgraph without compute nodes did not take the all-reduce before it
+        ggml_cuda_ar_fold_consume(cuda_ctx, nullptr, 0);
         return GGML_STATUS_SUCCESS;
     }
+    GGML_ASSERT(!cuda_ctx->ar_fold.recv && cuda_ctx->ar_fold.next == nullptr);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -8309,10 +8356,43 @@ static bool ggml_backend_cuda_session_allreduce_supported(void * comm_ctx_v, str
     return comm_ctx != nullptr && ggml_cuda_p2p_ar_ll_capturable(comm_ctx->p2p_ar, comm_ctx->backends.data(), tensors);
 }
 
+// The all-reduce of tensors (one per device) after the subgraph about to run: the matmul that writes tensors[rank] may
+//   push its rows as the LL lines of every rank, see ggml_backend_cuda_context::ar_fold. GGML_CUDA_NO_AR_FOLD=1 turns
+//   it off.
+static void ggml_backend_cuda_session_allreduce_next(void * comm_ctx_v, struct ggml_tensor ** tensors, size_t rank) {
+    static const bool no_fold = getenv("GGML_CUDA_NO_AR_FOLD") != nullptr;
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[rank]->context;
+    GGML_ASSERT(cuda_ctx->session_mode != ggml_backend_cuda_context::SESSION_OFF);
+    ggml_backend_cuda_context::ar_fold_t & f = cuda_ctx->ar_fold;
+    f.next   = nullptr;
+    f.pushed = false;
+    if (no_fold || comm_ctx->p2p_ar == nullptr ||
+            !ggml_cuda_p2p_ar_fold_args(comm_ctx->p2p_ar, comm_ctx->backends.data(), tensors, rank, f.next_call.args)) {
+        return;
+    }
+    f.next_call.comm_ctx = comm_ctx_v;
+    std::copy_n(tensors, comm_ctx->backends.size(), f.next_call.tensors);
+    f.next_call.rank = rank;
+    f.next = tensors[rank];
+}
+
 static void ggml_backend_cuda_session_allreduce(void * comm_ctx_v, struct ggml_tensor ** tensors, size_t rank) {
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[rank]->context;
     GGML_ASSERT(cuda_ctx->session_mode != ggml_backend_cuda_context::SESSION_OFF);
+    // the matmul pushed the lines: the next subgraph receives them
+    ggml_backend_cuda_context::ar_fold_t & f = cuda_ctx->ar_fold;
+    const bool pushed = f.pushed && f.next == tensors[rank];
+    f.next   = nullptr;
+    f.pushed = false;
+    if (pushed) {
+        GGML_ASSERT(!f.recv);
+        ggml_cuda_session_reduction_flush(cuda_ctx);
+        f.recv_call = f.next_call;
+        f.recv      = true;
+        return;
+    }
     // the MoE sum that ended the subgraph, if it is this all-reduce's input, see ggml_cuda_try_fuse_moe_down_shexp
     ggml_backend_cuda_context::session_reduction_t & red = cuda_ctx->session_red;
     const ggml_tensor * t = tensors[rank];
@@ -8335,6 +8415,10 @@ static void ggml_backend_cuda_session_end(ggml_backend_t backend) {
     // a sum that ended the last subgraph has no all-reduce after it
     ggml_cuda_set_device(cuda_ctx->device);
     ggml_cuda_session_reduction_flush(cuda_ctx);
+    // the subgraph that reads an all-reduce after the last one is in the next session
+    ggml_cuda_ar_fold_consume(cuda_ctx, nullptr, 0);
+    cuda_ctx->ar_fold.next   = nullptr;
+    cuda_ctx->ar_fold.pushed = false;
     cuda_ctx->session_mode = ggml_backend_cuda_context::SESSION_OFF;
 
 #ifdef USE_CUDA_GRAPH
@@ -9777,6 +9861,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_session_allreduce") == 0) {
         return (void *)ggml_backend_cuda_session_allreduce;
+    }
+    if (strcmp(name, "ggml_backend_session_allreduce_next") == 0) {
+        return (void *)ggml_backend_cuda_session_allreduce_next;
     }
     if (strcmp(name, "ggml_backend_session_end") == 0) {
         return (void *)ggml_backend_cuda_session_end;
