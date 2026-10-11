@@ -5105,11 +5105,14 @@ struct test_mul_mat_sibling_glu : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(type, k, rows, n_tokens);
+        return down ? VARS_TO_STR5(type, k, rows, n_tokens, down) : VARS_TO_STR4(type, k, rows, n_tokens);
     }
 
-    test_mul_mat_sibling_glu(ggml_type type = GGML_TYPE_Q8_0, int64_t k = 2560, int64_t rows = 160, int64_t n_tokens = 4)
-        : type(type), k(k), rows(rows), n_tokens(n_tokens) {}
+    const bool down; // and the down projection that reads the GLU
+
+    test_mul_mat_sibling_glu(ggml_type type = GGML_TYPE_Q8_0, int64_t k = 2560, int64_t rows = 160, int64_t n_tokens = 4,
+            bool down = false)
+        : type(type), k(k), rows(rows), n_tokens(n_tokens), down(down) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * wu = ggml_new_tensor_2d(ctx, type, k, rows);
@@ -5122,6 +5125,12 @@ struct test_mul_mat_sibling_glu : public test_case {
         ggml_tensor * up   = ggml_mul_mat(ctx, wu, x);
         ggml_tensor * gate = ggml_mul_mat(ctx, wg, x);
         ggml_tensor * out  = ggml_swiglu_split(ctx, gate, up);
+        if (down) {
+            // the GLU writes the q8_1 copy of its rows at the padded stride (160 columns of a split shared expert)
+            ggml_tensor * wd = ggml_new_tensor_2d(ctx, type, rows, 256);
+            ggml_set_name(wd, "wd");
+            out = ggml_mul_mat(ctx, wd, out);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -13607,7 +13616,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K }) {
         for (int64_t n_tokens : { 1, 2, 4 }) {
             test_cases.emplace_back(new test_mul_mat_sibling_glu(type, 2560, 160, n_tokens));
+            test_cases.emplace_back(new test_mul_mat_sibling_glu(type, 2560, type == GGML_TYPE_Q8_0 ? 160 : 256, n_tokens, true));
         }
+        test_cases.emplace_back(new test_mul_mat_sibling_glu(type, 2560, 512, 3, true));
     }
     // 2-4 tokens of q8_0 rows in pairs: qwen4exp's hyper-connection down projection and its inject, a gated delta net's
     //   qkv, gate and alpha rows per device

@@ -5325,9 +5325,10 @@ static bool ggml_cuda_topk_moe_fold(ggml_backend_cuda_context * cuda_ctx, const 
 //   matmul that reads t, or a view of all of it, comes before any node writes t again
 // flat: the kernel writes the q8_1 copy in the order of t's elements, so the matmul may read t as rows of any length that
 //   needs no q8_1 padding (qwen4exp's hc down projection reads the 4 normed streams of a token as one row, a gated delta
-//   net's output projection the heads of a token)
+//   net's output projection the heads of a token). padded: it writes t's rows at the padded stride, zeros after them, so
+//   the matmul may read them as they are when they need padding (a split shared expert's 160 columns at several tokens).
 static void ggml_cuda_q8_1_request(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i_out,
-        const bool flat = false) {
+        const bool flat = false, const bool padded = false) {
     const ggml_tensor * t = cgraph->nodes[i_out];
     cuda_ctx->q8_1_emit    = nullptr;
     cuda_ctx->q8_1_emit_as = nullptr;
@@ -5348,7 +5349,7 @@ static void ggml_cuda_q8_1_request(ggml_backend_cuda_context * cuda_ctx, const g
                 //   batch reads its rows at the padded stride)
                 const bool one_row = ggml_nelements(y) == y->ne[0] && y->ne[0] == ggml_nelements(t);
                 const bool rows    = (y->ne[0] == t->ne[0] || flat) && ggml_nelements(y) == ggml_nelements(t) &&
-                    y->ne[0] % MATRIX_ROW_PADDING == 0;
+                    (y->ne[0] % MATRIX_ROW_PADDING == 0 || (padded && y->ne[0] == t->ne[0]));
                 if (ggml_is_contiguous(y) && (one_row || rows)) {
                     cuda_ctx->q8_1_emit    = t;
                     cuda_ctx->q8_1_emit_as = y;
@@ -8045,12 +8046,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #endif  // NDEBUG
 
                 // one token: the combine of a split KV writes the q8_1 copy of the output, see launch_fattn; so does
-                //   the mix of the hyper-connection streams that a block reads without a norm (qwen4exp)
+                //   the mix of the hyper-connection streams that a block reads without a norm (qwen4exp). Several
+                //   tokens: an f32 SWIGLU (the shared expert of a verify step, its gate not fused there), rows padded
                 static const bool fattn_no_q8_1 = getenv("GGML_CUDA_NO_FATTN_Q8_1") != nullptr;
+                const bool glu_q8_1  = node->op == GGML_OP_GLU && ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU &&
+                    node->type == GGML_TYPE_F32 && ggml_nrows(node) > 1 && ggml_nrows(node) <= MMVQ_MAX_BATCH_SIZE;
                 const bool emit_q8_1 = (node->op == GGML_OP_FLASH_ATTN_EXT && node->src[0]->ne[1] == 1 && !fattn_no_q8_1) ||
-                    (node->op == GGML_OP_DSV4_HC_PRE && ggml_nrows(node) == 1);
+                    (node->op == GGML_OP_DSV4_HC_PRE && ggml_nrows(node) == 1) || glu_q8_1;
                 if (emit_q8_1) {
-                    ggml_cuda_q8_1_request(cuda_ctx, cgraph, i);
+                    ggml_cuda_q8_1_request(cuda_ctx, cgraph, i, /*flat =*/ false, /*padded =*/ glu_q8_1);
                 }
 
                 bool ok = ggml_cuda_glu_with_f16_copy(*cuda_ctx, cgraph, i) || ggml_cuda_compute_forward(*cuda_ctx, node);

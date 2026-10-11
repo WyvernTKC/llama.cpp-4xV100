@@ -352,6 +352,29 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, 
     }
 }
 
+// f32 rows whose q8_1 copy the next matmul reads at its padded stride (several tokens, rows needing padding, e.g. the
+//   160 columns of a split shared expert): thread i of the padded rows writes the value of its column (as
+//   unary_gated_op_kernel computes it), or 0 past the row, into the copy. Whole warps: n and n_padded are multiples of 32.
+template <float (*op)(float)>
+static __global__ void unary_gated_q8_rows_kernel(const float * x, const float * g, float * dst, const uint32_t k_padded,
+        const uint32_t n, const uint32_t n_padded, const int64_t o0, const int64_t o1, block_q8_1 * q8) {
+    ggml_cuda_pdl_lc();
+    const uint32_t i = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= k_padded) {
+        return;
+    }
+    const uint32_t row = i / n_padded;
+    const uint32_t col = i - row*n_padded;
+
+    ggml_cuda_pdl_sync();
+    float v = 0.0f;
+    if (col < n) {
+        v = op(x[row*o0 + col]) * g[row*o1 + col];
+        dst[int64_t(row)*n + col] = v;
+    }
+    quantize_q8_1_lane(v, q8 + i/QK8_1, i % QK8_1);
+}
+
 template <float (*op)(float), typename T>
 static void unary_gated_cuda(const T * x, const T * g, T * dst, half * dst_f16, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream) {
     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
@@ -426,6 +449,21 @@ void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             src1_p += swapped ? 0 : nc;
         }
 
+        // the q8_1 copy for the matmul that reads the rows (at its padded stride), see ggml_cuda_q8_1_request
+        if (ctx.q8_1_emit == dst && ctx.q8_1_emit_as != nullptr && ctx.q8_1_emit_as->ne[0] == nc && dst_f16 == nullptr &&
+                nc % QK8_1 == 0 && ggml_nrows(dst)*GGML_PAD(nc, MATRIX_ROW_PADDING) <= INT_MAX) {
+            int64_t ne_padded = 0;
+            block_q8_1 * q8 = (block_q8_1 *) ctx.q8_1_emit_alloc(dst, ne_padded, ggml_nrows(dst));
+            if (q8 != nullptr) {
+                const int64_t k_padded = ggml_nrows(dst)*ne_padded;
+                const int64_t num_blocks = (k_padded + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+                const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
+                ggml_cuda_kernel_launch(unary_gated_q8_rows_kernel<op>, launch_params, src0_p, src1_p, (float *) dst_d,
+                    (uint32_t) k_padded, (uint32_t) nc, (uint32_t) ne_padded, src0_o / (int64_t) sizeof(float),
+                    src1_o / (int64_t) sizeof(float), q8);
+                return;
+            }
+        }
         unary_gated_cuda<op>(src0_p, src1_p, (float *)dst_d, dst_f16, ggml_nelements(dst), nc, src0_o / sizeof(float), src1_o / sizeof(float), stream);
     }
 }
