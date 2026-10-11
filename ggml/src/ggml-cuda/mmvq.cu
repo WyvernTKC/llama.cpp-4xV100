@@ -721,17 +721,16 @@ static __global__ void mul_mat_vec_q(
     const     int tid = warp_size*wy + threadIdx.x;
 
     // without ids, sib_x: the blocks from sib_block0 on compute the rows of the sibling sib_x, which reads the same y,
-    //   and those from sib2_block0 on the rows of a second one, sib2_x; gdn_x: the blocks from gdn_block0 on the rows of
-    //   a gated delta net gate (with fusion.gate and its epilogue)
-    bool sib_rows  = false;
-    bool sib2_rows = false;
+    //   and those from sib2_block0 on the rows of a second one, sib2_x (for any ncols_dst, a sibling's dst holding its
+    //   columns one after the other); gdn_x, one column: the blocks from gdn_block0 on the rows of a gated delta net gate
+    //   (with fusion.gate and its epilogue)
     bool gdn_rows  = false;
     if constexpr (ncols_dst == 1) {
         gdn_rows  = ids_ptr == nullptr && fusion.gdn_x  != nullptr && blockIdx.x >= fusion.gdn_block0;
-        sib2_rows = ids_ptr == nullptr && fusion.sib2_x != nullptr && blockIdx.x >= fusion.sib2_block0 && !gdn_rows;
-        sib_rows  = ids_ptr == nullptr && fusion.sib_x  != nullptr && blockIdx.x >= fusion.sib_block0 && !gdn_rows &&
-            !sib2_rows;
     }
+    const bool sib2_rows = ids_ptr == nullptr && fusion.sib2_x != nullptr && blockIdx.x >= fusion.sib2_block0 && !gdn_rows;
+    const bool sib_rows  = ids_ptr == nullptr && fusion.sib_x  != nullptr && blockIdx.x >= fusion.sib_block0 && !gdn_rows &&
+        !sib2_rows;
     if (sib_rows) {
         vx = fusion.sib_x;
     }
@@ -979,6 +978,7 @@ static __global__ void mul_mat_vec_q(
     // bound for the rows of a block past the last one; with ids the channels are the used experts, a row stride apart
     const uint32_t nrows_dst = gdn_rows ? fusion.gdn_nrows : sib2_rows ? fusion.sib2_nrows : sib_rows ? fusion.sib_nrows :
         ncols_dst == 1 && ids ? stride_channel_dst : stride_col_dst;
+    const uint32_t col_stride_dst = sib_rows || sib2_rows ? nrows_dst : stride_col_dst;
 
     // sum up partial sums and write back result
 #pragma unroll
@@ -1049,7 +1049,7 @@ static __global__ void mul_mat_vec_q(
                         }
                     }
                 }
-                dst[j*stride_col_dst + i] = result;
+                dst[j*col_stride_dst + i] = result;
                 if constexpr (conv) {
                     // as ssm_conv_state_f32 with one token; conv_dst may sit exactly on dst, so it is written last
                     if (conv_row) {
@@ -1830,6 +1830,21 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return idle * 8 <= iters_wide * 2;
     };
 
+    // the siblings' rows after those of x in a launch of 2 to 8 columns, see mul_mat_vec_q
+    const auto sibling_rows = [&](std::pair<dim3, dim3> & dims, const int c_ncols_dst) {
+        ggml_cuda_mm_fusion_args_launch fusion_rows = fusion;
+        const int rpb = calc_rows_per_block(c_ncols_dst, table_id);
+        if (!has_ids && fusion.sib_x != nullptr) {
+            fusion_rows.sib_block0 = dims.first.x;
+            dims.first.x += (fusion.sib_nrows + rpb - 1) / rpb;
+        }
+        if (!has_ids && fusion.sib2_x != nullptr) {
+            fusion_rows.sib2_block0 = dims.first.x;
+            dims.first.x += (fusion.sib2_nrows + rpb - 1) / rpb;
+        }
+        return fusion_rows;
+    };
+
     if (has_ids && ncols_dst > 1) {
         // Multi-token MUL_MAT_ID path - dedicated MoE kernel
         mul_mat_vec_q_moe_launch<type>(
@@ -1904,7 +1919,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 2: {
             constexpr int c_ncols_dst = 2;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_wide<type, c_ncols_dst>(use_wide(c_ncols_dst), vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+            const ggml_cuda_mm_fusion_args_launch fusion_rows = sibling_rows(dims, c_ncols_dst);
+            mul_mat_vec_q_switch_wide<type, c_ncols_dst>(use_wide(c_ncols_dst), vx, vy, ids, fusion_rows, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
                  dims.first, dims.second, 0, ids_stride, stream);
@@ -1912,7 +1928,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 3: {
             constexpr int c_ncols_dst = 3;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_wide<type, c_ncols_dst>(use_wide(c_ncols_dst), vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+            const ggml_cuda_mm_fusion_args_launch fusion_rows = sibling_rows(dims, c_ncols_dst);
+            mul_mat_vec_q_switch_wide<type, c_ncols_dst>(use_wide(c_ncols_dst), vx, vy, ids, fusion_rows, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
                  dims.first, dims.second, 0, ids_stride, stream);
@@ -1920,7 +1937,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 4: {
             constexpr int c_ncols_dst = 4;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_wide<type, c_ncols_dst>(use_wide(c_ncols_dst), vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+            const ggml_cuda_mm_fusion_args_launch fusion_rows = sibling_rows(dims, c_ncols_dst);
+            mul_mat_vec_q_switch_wide<type, c_ncols_dst>(use_wide(c_ncols_dst), vx, vy, ids, fusion_rows, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
                  dims.first, dims.second, 0, ids_stride, stream);
@@ -1928,7 +1946,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 5: {
             constexpr int c_ncols_dst = 5;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_wide<type, c_ncols_dst>(use_wide(c_ncols_dst), vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+            const ggml_cuda_mm_fusion_args_launch fusion_rows = sibling_rows(dims, c_ncols_dst);
+            mul_mat_vec_q_switch_wide<type, c_ncols_dst>(use_wide(c_ncols_dst), vx, vy, ids, fusion_rows, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
                  dims.first, dims.second, 0, ids_stride, stream);
@@ -1936,7 +1955,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 6: {
             constexpr int c_ncols_dst = 6;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_wide<type, c_ncols_dst>(use_wide(c_ncols_dst), vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+            const ggml_cuda_mm_fusion_args_launch fusion_rows = sibling_rows(dims, c_ncols_dst);
+            mul_mat_vec_q_switch_wide<type, c_ncols_dst>(use_wide(c_ncols_dst), vx, vy, ids, fusion_rows, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
                  dims.first, dims.second, 0, ids_stride, stream);
@@ -1944,7 +1964,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 7: {
             constexpr int c_ncols_dst = 7;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_wide<type, c_ncols_dst>(use_wide(c_ncols_dst), vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+            const ggml_cuda_mm_fusion_args_launch fusion_rows = sibling_rows(dims, c_ncols_dst);
+            mul_mat_vec_q_switch_wide<type, c_ncols_dst>(use_wide(c_ncols_dst), vx, vy, ids, fusion_rows, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
                  dims.first, dims.second, 0, ids_stride, stream);
@@ -1952,7 +1973,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 8: {
             constexpr int c_ncols_dst = 8;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_wide<type, c_ncols_dst>(use_wide(c_ncols_dst), vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+            const ggml_cuda_mm_fusion_args_launch fusion_rows = sibling_rows(dims, c_ncols_dst);
+            mul_mat_vec_q_switch_wide<type, c_ncols_dst>(use_wide(c_ncols_dst), vx, vy, ids, fusion_rows, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
                  dims.first, dims.second, 0, ids_stride, stream);
@@ -2146,7 +2168,10 @@ static void ggml_cuda_mul_mat_vec_q_impl(
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        // past one column only sibling rows
+        GGML_ASSERT(  ids || dst->ne[1] == 1 || (fusion->sib && !fusion->gate && !fusion->x_bias && !fusion->gate_bias &&
+            !fusion->x_scale && !fusion->gate_scale && !fusion->x_sigmoid && !fusion->gdn_beta && !fusion->sib_gate &&
+            !fusion->sib_y && !fusion->shared_up));
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);
@@ -2227,14 +2252,16 @@ static void ggml_cuda_mul_mat_vec_q_impl(
             fusion_local.sib_dst  = (float *) fusion->sib_dst->data;
         }
         if (fusion->sib && !ids) {
-            // the sibling's rows after those of src0, one token and nothing else fused (but a gate's rows after them)
+            // the sibling's rows after those of src0 and nothing else fused (but at one token a gate's rows after them);
+            //   past one token the rows go in pairs, so they are whole pairs
             GGML_ASSERT(fusion->sib_dst && !fusion->sib_gate && !fusion->sib_y && !fusion->x_bias &&
-                !fusion->x_scale && !fusion->x_sigmoid && ggml_nrows(src1) == 1);
-            GGML_ASSERT((!fusion->gate && !fusion->gdn_beta) || fusion->gdn_x);
+                !fusion->x_scale && !fusion->x_sigmoid && ggml_nrows(src1) == src1->ne[1]);
+            GGML_ASSERT((!fusion->gate && !fusion->gdn_beta) || (fusion->gdn_x && src1->ne[1] == 1));
+            GGML_ASSERT(src1->ne[1] == 1 || (ne01 % 2 == 0 && fusion->sib->ne[1] % 2 == 0 && ggml_is_contiguous(dst)));
             GGML_ASSERT(fusion->sib->type == src0->type && fusion->sib->ne[0] == ne00 && fusion->sib->nb[1] == nb01 &&
                 ggml_nrows(fusion->sib) == fusion->sib->ne[1]);
             GGML_ASSERT(fusion->sib_dst->type == GGML_TYPE_F32 && ggml_is_contiguous(fusion->sib_dst) &&
-                ggml_nelements(fusion->sib_dst) == fusion->sib->ne[1]);
+                ggml_nelements(fusion->sib_dst) == fusion->sib->ne[1]*src1->ne[1]);
             fusion_local.sib_x     = fusion->sib->data;
             fusion_local.sib_dst   = (float *) fusion->sib_dst->data;
             fusion_local.sib_nrows = (uint32_t) fusion->sib->ne[1];
@@ -2242,9 +2269,9 @@ static void ggml_cuda_mul_mat_vec_q_impl(
         if (fusion->sib2) {
             GGML_ASSERT(fusion->sib && !ids && fusion->sib2_dst);
             GGML_ASSERT(fusion->sib2->type == src0->type && fusion->sib2->ne[0] == ne00 && fusion->sib2->nb[1] == nb01 &&
-                ggml_nrows(fusion->sib2) == fusion->sib2->ne[1]);
+                ggml_nrows(fusion->sib2) == fusion->sib2->ne[1] && (src1->ne[1] == 1 || fusion->sib2->ne[1] % 2 == 0));
             GGML_ASSERT(fusion->sib2_dst->type == GGML_TYPE_F32 && ggml_is_contiguous(fusion->sib2_dst) &&
-                ggml_nelements(fusion->sib2_dst) == fusion->sib2->ne[1]);
+                ggml_nelements(fusion->sib2_dst) == fusion->sib2->ne[1]*src1->ne[1]);
             fusion_local.sib2_x     = fusion->sib2->data;
             fusion_local.sib2_dst   = (float *) fusion->sib2_dst->data;
             fusion_local.sib2_nrows = (uint32_t) fusion->sib2->ne[1];
