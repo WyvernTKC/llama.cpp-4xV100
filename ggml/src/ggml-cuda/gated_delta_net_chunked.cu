@@ -688,9 +688,9 @@ static __global__ void __launch_bounds__(gdn_ch_out_threads, 3) gated_delta_net_
 #endif // defined(VOLTA_MMA_AVAILABLE)
 }
 
-bool ggml_cuda_gated_delta_net_chunked_supported(const int device, const int64_t S_v, const bool kda, const int K, const int64_t n_tokens) {
+bool ggml_cuda_gated_delta_net_chunked_supported(const int device, const int64_t S_v, const bool kda, const int64_t n_tokens) {
     const ggml_cuda_device_info::cuda_device_info & info = ggml_cuda_info().devices[device];
-    return volta_mma_available(info.cc) && S_v == gdn_ch_D && !kda && K == 1 && n_tokens >= 2*gdn_ch_C &&
+    return volta_mma_available(info.cc) && S_v == gdn_ch_D && !kda && n_tokens >= 2*gdn_ch_C &&
         info.smpbo >= std::max(std::max(gdn_ch_prep_smem, gdn_ch_scan_smem<32>()), gdn_ch_out_smem);
 }
 

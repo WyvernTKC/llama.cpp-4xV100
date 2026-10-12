@@ -6989,7 +6989,7 @@ struct test_gated_delta_net : public test_case {
 
     // the chunked prefill of CUDA rounds its tensor core operands to f16
     double max_nmse_err() override {
-        return head_size == 128 && n_seq_tokens >= 128 && !kda && K == 1 ? 1e-6 : 1e-7;
+        return head_size == 128 && n_seq_tokens >= 128 && !kda ? 1e-6 : 1e-7;
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -7072,7 +7072,7 @@ struct test_gated_delta_net_cache_fusion : public test_case {
 
     // the chunked prefill of CUDA rounds its tensor core operands to f16
     double max_nmse_err() override {
-        return head_size == 128 && n_seq_tokens >= 128 && K == 1 ? 1e-6 : 1e-7;
+        return head_size == 128 && n_seq_tokens >= 128 ? 1e-6 : 1e-7;
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -15657,6 +15657,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  300, 1, 3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  300, 2, 1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 4096, 1, 2));
+    // with rollback snapshots: chunked up to K-1 tokens before the end, the sequential kernel after (one sequence)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  300, 1, 1, false, false, /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  133, 1, 3, false, false, /*K=*/6));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  300, 2, 1, false, false, /*K=*/4));
 
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).
@@ -15695,6 +15699,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 128, 130, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 128, 300, 1, 1, true));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 128, 300, 2, 1));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 128, 300, 1, 4, true));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 128, 200, 1, 6));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
