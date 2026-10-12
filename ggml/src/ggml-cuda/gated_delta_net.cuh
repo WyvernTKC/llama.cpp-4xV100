@@ -1,3 +1,5 @@
+#pragma once
+
 #include "common.cuh"
 #include "ggml.h"
 
@@ -33,3 +35,26 @@ void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, g
                                               ggml_cuda_gated_delta_net_fused_cache cache,
                                               const ggml_cuda_gated_delta_net_l2 * l2 = nullptr,
                                               const ggml_cuda_gated_delta_net_gather * gather = nullptr);
+
+// chunked prefill (gated_delta_net_chunked.cu): Volta tensor cores, scalar gate, S_v 128, no rollback snapshots
+struct ggml_cuda_gated_delta_net_chunked_args {
+    const float * q;
+    const float * k;
+    const float * v;
+    const float * g;
+    const float * beta;
+    const float * s;         // start state, or the cache when ids is set
+    float       * dst;       // attention output
+    float       * state;     // final state
+    const int32_t * ids;     // gathered: cache row of each sequence, else nullptr
+    int64_t       s_row_stride;
+    float       * s_pre;     // nullptr, or where the start state goes
+    int64_t H, n_tokens, n_seqs;
+    int64_t sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3;
+    int64_t neqk1, rq3;
+    float   scale;
+};
+
+bool   ggml_cuda_gated_delta_net_chunked_supported(int device, int64_t S_v, bool kda, int K, int64_t n_tokens);
+size_t ggml_cuda_gated_delta_net_chunked_scratch_size(int64_t H, int64_t n_tokens, int64_t n_seqs);
+void   ggml_cuda_gated_delta_net_chunked(const ggml_cuda_gated_delta_net_chunked_args & args, char * scratch, cudaStream_t stream);

@@ -376,6 +376,40 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const ggml_cuda_gated_delta_net_l2     l2_args     = l2     ? *l2     : ggml_cuda_gated_delta_net_l2{};
     const ggml_cuda_gated_delta_net_gather gather_args = gather ? *gather : ggml_cuda_gated_delta_net_gather{};
 
+    // prefill: the chunked kernels (gated_delta_net_chunked.cu), which read q, k and v as float4
+    static const bool chunked_enabled = [] {
+        const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    const bool aligned16 = (uintptr_t) q_d % 16 == 0 && (uintptr_t) k_d % 16 == 0 && (uintptr_t) v_d % 16 == 0 &&
+        sq1 % 4 == 0 && sq2 % 4 == 0 && sq3 % 4 == 0 && sv1 % 4 == 0 && sv2 % 4 == 0 && sv3 % 4 == 0;
+    if (chunked_enabled && !l2 && aligned16 && ggml_cuda_gated_delta_net_chunked_supported(ctx.device, S_v, kda, K, n_tokens)) {
+        ggml_cuda_pool_alloc<char> scratch(ctx.pool(), ggml_cuda_gated_delta_net_chunked_scratch_size(H, n_tokens, n_seqs));
+        ggml_cuda_gated_delta_net_chunked_args args;
+        args.q            = q_d;
+        args.k            = k_d;
+        args.v            = v_d;
+        args.g            = g_d;
+        args.beta         = b_d;
+        args.s            = s_d;
+        args.dst          = dst_d;
+        args.state        = state_d;
+        args.ids          = gather_args.ids;
+        args.s_row_stride = gather_args.row_stride;
+        args.s_pre        = gather_args.pre;
+        args.H            = H;
+        args.n_tokens     = n_tokens;
+        args.n_seqs       = n_seqs;
+        args.sq1 = sq1; args.sq2 = sq2; args.sq3 = sq3;
+        args.sv1 = sv1; args.sv2 = sv2; args.sv3 = sv3;
+        args.sb1 = sb1; args.sb2 = sb2; args.sb3 = sb3;
+        args.neqk1 = neqk1;
+        args.rq3   = rq3;
+        args.scale = scale;
+        ggml_cuda_gated_delta_net_chunked(args, scratch.get(), stream);
+        return;
+    }
+
     const auto launch = [&](auto kda_c, auto keep_rs_c, auto l2_c) {
         launch_gated_delta_net<decltype(kda_c)::value, decltype(keep_rs_c)::value, decltype(l2_c)::value>(
             q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
