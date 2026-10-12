@@ -233,6 +233,16 @@ struct ggml_cuda_mmq_config {
 
 #undef CASE
 
+// Volta (dp4a) runs q8_0 at J = 32 with 128 threads, 4 rows x 8 columns per thread: a third fewer shared loads and
+// ~10% fewer instructions per tile. MoE prefill +1.1%; dense batches of 25-32 columns, too few tiles to fill the SMs,
+// lose 2-3% with half the warps.
+static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_config_volta(const ggml_cuda_mmq_config c) {
+    if (c.type == GGML_TYPE_Q8_0 && c.J == 32) {
+        return ggml_cuda_mmq_config(c.type, 128, c.occupancy, c.I, c.J, c.sram_layout, c.K_vram, c.stream_k, c.fallback);
+    }
+    return c;
+}
+
 static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type type, const int J, const bool fallback, const int cc, const ggml_prec prec_src1) {
     if (GGML_CUDA_CC_IS_AMD(cc)) {
         if (GGML_CUDA_CC_IS_GCN(cc)) {
@@ -258,6 +268,9 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
             return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
         }
         return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
+    }
+    if (volta_mma_available(cc)) {
+        return ggml_cuda_mmq_config_volta(ggml_cuda_mmq_get_config_ampere(type, J, fallback));
     }
     if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) {
         return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
@@ -290,6 +303,8 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
         return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
     }
     return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
+#elif !defined(GGML_USE_MUSA) && __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA
+    return ggml_cuda_mmq_config_volta(ggml_cuda_mmq_get_config_ampere(type, J, fallback));
 #elif !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
 #elif !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A
@@ -422,8 +437,9 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
     }
 }
 
-// q8_0 on Volta at J <= 32: 2 groups of 4 warps with 64 rows each, a thread has rows i0 + 32*r and columns j0 + 4*c.
-// Fewer instructions than one x row per lane per warp (shared wavefronts stay the same: more y columns per thread).
+// q8_0 on Volta at J < 32 (256 threads): 2 groups of 4 warps with 64 rows each, a thread has rows i0 + 32*r and columns
+// j0 + 4*c. Fewer instructions than one x row per lane per warp (shared wavefronts stay the same: more y columns per
+// thread). J = 32 runs 128 threads instead, see ggml_cuda_mmq_config_volta.
 static constexpr __device__ bool ggml_cuda_mmq_dp4a_rg(ggml_type type, int J, bool fallback) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA
     return type == GGML_TYPE_Q8_0 && J <= 32 && ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8) == 128 &&
