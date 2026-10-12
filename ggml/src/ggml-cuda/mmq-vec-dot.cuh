@@ -119,6 +119,40 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int   * y_qs = (const int   *) y + 4;
     const float * y_df = (const float *) y;
 
+    if constexpr (ggml_cuda_mmq_dp4a_rg(type, J, fallback)) {
+        // Same products and summation order per output as below, other thread map: see ggml_cuda_mmq_dp4a_rg.
+        const int2 ij0 = mmq_dp4a_rg_ij0();
+
+// #pragma unroll
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += VDR_Q8_0_Q8_1_MMQ) {
+            const int k0 = k00 + k01;
+
+            int v[2][VDR_Q8_0_Q8_1_MMQ];
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+#pragma unroll
+                for (int l = 0; l < VDR_Q8_0_Q8_1_MMQ; ++l) {
+                    v[r][l] = x_qs[(ij0.x + 32*r)*(2*MMQ_TILE_NE_K + 1) + k0 + l];
+                }
+            }
+
+#pragma unroll
+            for (int c = 0; c < J/4; ++c) {
+                const int j = ij0.y + 4*c;
+
+#pragma unroll
+                for (int r = 0; r < 2; ++r) {
+                    const int i = ij0.x + 32*r;
+
+                    sum[c*2 + r] += vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMQ>
+                        (v[r], &y_qs[j*MMQ_TILE_Y_K + k0 % MMQ_TILE_NE_K],
+                         x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + k0/QI8_0], y_df[j*MMQ_TILE_Y_K + (k0/QI8_1) % (MMQ_TILE_NE_K/QI8_1)]);
+                }
+            }
+        }
+        return;
+    }
+
 // #pragma unroll
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += VDR_Q8_0_Q8_1_MMQ) {
         const int k0 = k00 + k01;

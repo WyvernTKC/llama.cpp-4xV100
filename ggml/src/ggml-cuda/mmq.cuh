@@ -422,6 +422,22 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
     }
 }
 
+// q8_0 on Volta at J <= 32: 2 groups of 4 warps with 64 rows each, a thread has rows i0 + 32*r and columns j0 + 4*c.
+// Fewer instructions than one x row per lane per warp (shared wavefronts stay the same: more y columns per thread).
+static constexpr __device__ bool ggml_cuda_mmq_dp4a_rg(ggml_type type, int J, bool fallback) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA
+    return type == GGML_TYPE_Q8_0 && J <= 32 && ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8) == 128 &&
+        ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) == 256;
+#else
+    GGML_UNUSED_VARS(type, J, fallback);
+    return false;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA
+}
+
+static __device__ __forceinline__ int2 mmq_dp4a_rg_ij0() {
+    return make_int2((threadIdx.y / 4)*64 + threadIdx.x, threadIdx.y % 4);
+}
+
 // FIXME temporary until all combinations of data types and GPUs can use the MMA data layout
 static __host__ int ggml_cuda_mmq_get_nbytes_shared_x(const ggml_cuda_mmq_config & config, const int cc) {
     if (config.use_mma_data_layout(cc)) {
@@ -444,6 +460,32 @@ template <ggml_type type, int J, bool fallback, ggml_prec prec_src1> static __de
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback, prec_src1);
 
     const bool y_scale_used = y_scale != nullptr;
+
+    if constexpr (ggml_cuda_mmq_dp4a_rg(type, J, fallback)) {
+        const int2 ij0 = mmq_dp4a_rg_ij0();
+
+#pragma unroll
+        for (int c = 0; c < J/4; ++c) {
+            const int j = ij0.y + 4*c;
+
+            if (j > j_max) {
+                return;
+            }
+
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                const int i = ij0.x + 32*r;
+
+                if (fallback && i > i_max) {
+                    continue;
+                }
+
+                dst[ids_dst[j]*stride + i] = sum[c*2 + r];
+            }
+        }
+        GGML_UNUSED(y_scale_used);
+        return;
+    }
 
 #pragma unroll
     for (int j0 = 0; j0 < J; j0 += nwarps) {
