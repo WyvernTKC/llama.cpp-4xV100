@@ -61,6 +61,39 @@ static __device__ __forceinline__ float mmf_apply_glu(const ggml_glu_op op, cons
     }
 }
 
+// dst[i] = dot(row i of x, y) for the rows_per_block rows of the block, a warp a row, y being one column of src1 in f32.
+// For the slots of an expert id repeated within a token's row, which the tile code leaves out: MUL_MAT_ID allows them,
+// top-k routing never makes them, so a plain dot product is enough.
+template <typename T, int rows_per_block, int nwarps>
+static __device__ void mul_mat_f_rows_dot(
+        const T * __restrict__ x, const int stride_row, const int ncols, const float * __restrict__ y, float * __restrict__ dst) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+#pragma unroll 1
+    for (int i = threadIdx.y; i < rows_per_block; i += nwarps) {
+        float sum = 0.0f;
+#pragma unroll 1
+        for (int col = threadIdx.x; col < ncols; col += warp_size) {
+            if constexpr (std::is_same_v<T, float>) {
+                sum += x[i*stride_row + col] * y[col];
+            } else {
+                float2 xf;
+                if constexpr (std::is_same_v<T, half2>) {
+                    xf = __half22float2(x[i*stride_row + col]);
+                } else {
+                    xf = ggml_cuda_cast<float2>(x[i*stride_row + col]);
+                }
+                const float2 yf = ((const float2 *) y)[col];
+                sum += xf.x*yf.x + xf.y*yf.y;
+            }
+        }
+        sum = warp_reduce_sum<warp_size>(sum);
+        if (threadIdx.x == 0) {
+            dst[i] = sum;
+        }
+    }
+}
+
 // has_gate (Volta, no ids, at most 8 columns) also multiplies fusion.gate, whose strides are those of x, and writes
 // glu(gate, x) instead of x
 template <typename T, int rows_per_block, int cols_per_block, int nwarps, bool has_ids, bool has_gate = false>
@@ -159,7 +192,10 @@ static __global__ void mul_mat_f(
     T * tile_xy = (T *) compute_base + threadIdx.y*(tile_A::I * tile_k_padded);
 
     if constexpr (has_ids) {
-        int found = 0;
+        // slot_map holds the first slot of each token that names the expert; a token can name it again, and those
+        //   further slots are done below on their own
+        int found  = 0;
+        int repeat = 0;
 
         for (int j0 = 0; j0 < cols_per_block; j0 += nwarps) {
             const int j = j0 + threadIdx.y;
@@ -175,19 +211,53 @@ static __global__ void mul_mat_f(
 
             const int32_t * __restrict__ id_row = ids + j*stride_row_id;
 
-            for (int k = threadIdx.x; k < nchannels_dst; k += warp_size) {
-                int match = id_row[k*stride_col_id] == expert_idx;
-
-                if (match) {
+            int n_match = 0; // the slots before k0 that name the expert
+            for (int k0 = 0; k0 < nchannels_dst; k0 += warp_size) {
+                const int  k     = k0 + threadIdx.x;
+                const bool match = k < nchannels_dst && id_row[k*stride_col_id] == expert_idx;
+#if defined(GGML_USE_HIP)
+                const uint64_t mask = __ballot(match);
+                const int first = n_match == 0 && match && __popcll(mask & ((uint64_t(1) << threadIdx.x) - 1)) == 0;
+                n_match += __popcll(mask);
+#else
+                const uint32_t mask = __ballot_sync(0xFFFFFFFF, match);
+                const int first = n_match == 0 && match && __popc(mask & ((1u << threadIdx.x) - 1)) == 0;
+                n_match += __popc(mask);
+#endif // defined(GGML_USE_HIP)
+                if (first) {
                     slot_map[j] = k;
-                    found = 1;
-                    break;
                 }
             }
+            found  |= n_match > 0;
+            repeat |= n_match > 1;
         }
 
-        if (!__syncthreads_or(found)) {
+        // lane 0 of a warp votes for a match and the other lanes for a repeat, so that one barrier tells both: without
+        //   repeats there are at most nwarps votes
+        static_assert(nwarps < warp_size - 1, "the votes of a repeat must outnumber the warps");
+        const int votes = __syncthreads_count(threadIdx.x == 0 ? found : repeat);
+        if (votes == 0) {
             return;
+        }
+
+        if (votes > nwarps) {
+            constexpr int y_stride_scale = std::is_same_v<T, float> ? 1 : 2;
+#pragma unroll 1
+            for (int j = 0; j < cols_per_block && col_base + j < ncols_dst_total; ++j) {
+                const int32_t * __restrict__ id_row = ids + j*stride_row_id;
+                bool first = true;
+#pragma unroll 1
+                for (int k = 0; k < nchannels_dst; ++k) {
+                    if (id_row[k*stride_col_id] != expert_idx) {
+                        continue;
+                    }
+                    if (!first) {
+                        mul_mat_f_rows_dot<T, rows_per_block, nwarps>(x, stride_row, ncols,
+                            y + k*stride_channel_y + j*stride_col_y*y_stride_scale, dst + k*stride_channel_dst + j*stride_col_dst + row0);
+                    }
+                    first = false;
+                }
+            }
         }
     }
 
@@ -593,6 +663,20 @@ static __global__ void mul_mat_f_ids(
 
     const int32_t * ids_src_expert = ids_src_compact + expert_start;
     const int32_t * ids_dst_expert = ids_dst_compact + expert_start;
+
+    // An expert id repeated within a token's row can give an expert more columns than there are tokens, which sized the
+    // grid: the last tile of the grid also does the columns past it, with a plain dot product.
+    if (tile_idx == int(gridDim.z) - 1) {
+        constexpr int y_stride_scale = std::is_same_v<T, float> ? 1 : 2;
+#pragma unroll 1
+        for (int c = gridDim.z*cols_per_block; c < ncols_expert; ++c) {
+            const uint2 src = fast_div_modulo((uint32_t) ids_src_expert[c], sis1_fd); // token, channel
+            const uint2 out = fast_div_modulo((uint32_t) ids_dst_expert[c], nch_fd);  // token, slot
+            mul_mat_f_rows_dot<T, rows_per_block, nwarps>(x, stride_row, ncols,
+                y   + int(src.y)*stride_channel_y   + int(src.x)*stride_col_y*y_stride_scale,
+                dst + int(out.y)*stride_channel_dst + int(out.x)*stride_col_dst + row0);
+        }
+    }
 
     extern __shared__ char data_mmv[];
     char * compute_base = data_mmv;

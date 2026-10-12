@@ -123,6 +123,7 @@ struct tile_x_sizes {
 // block_q8_1_mmq has (128 8-bit ints == 32 32-bit ints + 4 32-bit scales)
 #define MMQ_TILE_Y_K     (MMQ_TILE_NE_K + MMQ_TILE_NE_K / QI8_1)
 #define MMQ_TILE_Y_FP4_K MMQ_TILE_Y_K
+#define MMQ_NE_STATE     4 // ints of block state after the ids of a tile, see jt_extra in mul_mat_q
 
 enum ggml_cuda_mmq_sram_layout {
     GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0,
@@ -892,7 +893,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr ggml_cuda_mmq_write_back_t write_back = ggml_cuda_mmq_get_write_back<type, J, fallback, prec_src1>();
 
     extern __shared__ int data_mul_mat_q[];
-    int * tile_y = data_mul_mat_q + J;
+    int * tile_y = data_mul_mat_q + J + MMQ_NE_STATE;
     int * tile_x = tile_y + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
@@ -994,6 +995,10 @@ static __global__ void mul_mat_q(
 
         ids_dst_shared[j] = j;
     }
+    int * jt_extra_shared = ids_dst_shared + J;
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        *jt_extra_shared = 0;
+    }
     __syncthreads();
 
     if constexpr (!ggml_cuda_mmq_get_stream_k(type, J, fallback, prec_src1)) {
@@ -1010,67 +1015,79 @@ static __global__ void mul_mat_q(
             jt = tile.y;
         }
 
-        // Defaults for regular matrix multiplication:
-        int col_low    = 0;
-        int col_high   = ncols_dst;
-        int col_diff   = ncols_dst;
-        int offset_y       = wt*stride_sample_y   + zt*stride_channel_y;
-        int offset_dst     = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst;
-        int offset_y_scale;
-        if constexpr (type == GGML_TYPE_NVFP4) {
-            offset_y_scale = wt*nchannels_y.z*ncols_y + zt*ncols_y;
-        } else {
-            GGML_UNUSED(offset_y_scale);
-        }
-
-        if (ids_dst) {
-            col_low  = expert_bounds[zt + 0];
-            col_high = expert_bounds[zt + 1];
-            col_diff = col_high - col_low;
-
-            offset_y   = 0;
-            offset_dst = 0;
+        // An expert id repeated within a token's row (MUL_MAT_ID allows it, top-k routing never does it) can give an
+        // expert more columns than ncols_max, which sized the grid: the block then also does the tiles ntx, 2*ntx, ...
+        // further on. A tile map lists every tile already.
+        for (;; jt += ntx.z) {
+            // Defaults for regular matrix multiplication:
+            int col_low    = 0;
+            int col_high   = ncols_dst;
+            int col_diff   = ncols_dst;
+            int offset_y       = wt*stride_sample_y   + zt*stride_channel_y;
+            int offset_dst     = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst;
+            int offset_y_scale;
             if constexpr (type == GGML_TYPE_NVFP4) {
-                offset_y_scale = 0;
+                offset_y_scale = wt*nchannels_y.z*ncols_y + zt*ncols_y;
+            } else {
+                GGML_UNUSED(offset_y_scale);
             }
 
-            if (jt*J >= col_diff) {
-                return;
-            }
+            if (ids_dst) {
+                col_low  = expert_bounds[zt + 0];
+                col_high = expert_bounds[zt + 1];
+                col_diff = col_high - col_low;
 
-            // __syncthreads(); // There is no previous tile that could cause a race condition.
-#pragma unroll
-            for (int j0 = 0; j0 < J; j0 += nwarps*warp_size) {
-                const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
-
-                if (j0 + nwarps*warp_size > J && j >= J) {
-                    break;
+                offset_y   = 0;
+                offset_dst = 0;
+                if constexpr (type == GGML_TYPE_NVFP4) {
+                    offset_y_scale = 0;
                 }
 
-                ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
+                if (jt*J >= col_diff) {
+                    return;
+                }
+
+                if (jt >= int(ntx.z)) {
+                    __syncthreads(); // the previous tile of the repeated ids is done with ids_dst_shared
+                }
+#pragma unroll
+                for (int j0 = 0; j0 < J; j0 += nwarps*warp_size) {
+                    const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
+
+                    if (j0 + nwarps*warp_size > J && j >= J) {
+                        break;
+                    }
+
+                    ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
+                }
+                __syncthreads();
             }
-            __syncthreads();
+
+            offset_y   += (col_low + jt*J)*(sizeof(block_q8_1_mmq)/sizeof(int));
+            offset_dst += it*I;
+            const float * y_scale_tile = nullptr;
+            if constexpr (type == GGML_TYPE_NVFP4) {
+                offset_y_scale += col_low + jt*J;
+                y_scale_tile = y_scale ? y_scale + offset_y_scale : nullptr;
+            }
+
+            const int tile_x_max_i = nrows_x  - it*I - 1;
+            const int tile_y_max_j = col_diff - jt*J - 1;
+
+            const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
+
+            const bool more_tiles = ids_dst && !tile_map && (jt + int(ntx.z))*J < col_diff;
+
+            constexpr bool fixup = false;
+            mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1>
+                (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+                 stride_row_x, ncols_y, stride_col_dst,
+                 tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+
+            if (!more_tiles) {
+                return;
+            }
         }
-
-        offset_y   += (col_low + jt*J)*(sizeof(block_q8_1_mmq)/sizeof(int));
-        offset_dst += it*I;
-        const float * y_scale_tile = nullptr;
-        if constexpr (type == GGML_TYPE_NVFP4) {
-            offset_y_scale += col_low + jt*J;
-            y_scale_tile = y_scale ? y_scale + offset_y_scale : nullptr;
-        }
-
-        const int tile_x_max_i = nrows_x  - it*I - 1;
-        const int tile_y_max_j = col_diff - jt*J - 1;
-
-        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
-
-        constexpr bool fixup = false;
-        mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1>
-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
-             stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
-        return;
     }
 
     constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback, prec_src1);
@@ -1103,6 +1120,8 @@ static __global__ void mul_mat_q(
             zt = tile.x;
             jt = tile.y;
         }
+        const int jt_extra = *jt_extra_shared; // the tiles of repeated ids past the grid, see below
+        jt += jt_extra;
 
         // Defaults for regular matrix multiplication:
         int col_low    = 0;
@@ -1165,11 +1184,27 @@ static __global__ void mul_mat_q(
 
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
 
+        // An expert id repeated within a token's row (MUL_MAT_ID allows it, top-k routing never does it) can give an
+        // expert more columns than ncols_max, which sized the grid: the block that ends a tile then also does the tiles
+        // ntx, 2*ntx, ... further on, in full, before it moves on. A tile map lists every tile already. The offset of
+        // the next tile goes through shared memory (the ids barriers above order its write after every read of it):
+        // kept in a register across the tile it cost the Volta MoE tiles 0.75% (or 13 registers when jt and col_diff
+        // were kept instead).
+        const bool more_tiles = ids_dst && !tile_map && (jt + int(ntx.z))*J < col_diff;
+        if ((more_tiles || jt_extra) && threadIdx.x == 0 && threadIdx.y == 0) {
+            *jt_extra_shared = more_tiles ? jt_extra + int(ntx.z) : 0;
+        }
+
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+
+        if (*jt_extra_shared) {
+            kb0_start = 0;
+            continue;
+        }
 
         kbc += blocks_per_ne00.z;
         kbc -= fastmodulo(kbc, blocks_per_ne00);
@@ -1422,7 +1457,7 @@ struct mmq_args {
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
-    const size_t nbs_ids = config.J*sizeof(int);
+    const size_t nbs_ids = (config.J + MMQ_NE_STATE)*sizeof(int);
     const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
     const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));

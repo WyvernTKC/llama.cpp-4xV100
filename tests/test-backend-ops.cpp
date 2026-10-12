@@ -14486,6 +14486,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 2050, 10, true, 64, 33, 256));
     }
 
+    // repeated ids in rows of 8 aligned ids, which the CUDA expert lists read 4 at a time, and batches that the lists
+    // split over several warps (f16 at 2048 tokens takes the generic path)
+    for (ggml_type ta : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int n : {4, 16, 64, 512, 2048}) {
+            test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 16, 8, false, 256, n, 256));
+        }
+        test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 16, 8, true, 256, 512, 256));
+    }
+
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
     }
