@@ -2339,7 +2339,23 @@ static bool ggml_backend_meta_has_split_state(const struct ggml_tensor * tensor)
     return tensor != nullptr && ggml_backend_buffer_is_meta(tensor->buffer);
 }
 
+// upstream's name for ggml_backend_meta_view_src_is_host, which also accepts a view_src without a buffer
+static bool ggml_backend_meta_is_host_view(const struct ggml_tensor * tensor) {
+    return ggml_backend_meta_view_src_is_host(tensor);
+}
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
+    // [TAG_META_HOST_VIEWS]
+    // TODO: technically, this check should not be needed if the backend scheduler correctly prevents assigning
+    //       such host-buffer views to the meta backend. figure out how to update the scheduler logic to achieve that
+    //       ref: https://github.com/ggml-org/llama.cpp/pull/30217
+    if (!ggml_backend_buffer_is_meta(tensor->buffer)) {
+        GGML_ASSERT(ggml_backend_meta_is_host_view(tensor));
+
+        // the view is not allocated in the meta buffer, it is not split across the sub-devices
+        return { GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1 };
+    }
+
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     return ggml_backend_meta_get_split_state(buf_ctx->get_simple_tensor_container(tensor), tensor, assume_sync);
 }
