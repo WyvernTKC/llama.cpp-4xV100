@@ -62,6 +62,7 @@ static __global__ void __launch_bounds__(gdn_ch_prep_threads, 1) gated_delta_net
     constexpr int SA = gdn_ch_SA;
     constexpr int nt = gdn_ch_prep_threads;
     constexpr int nw = nt/WARP_SIZE;
+    static_assert(nw >= 14, "warps 0-11 make K K^T, then 0-1 the diagonal blocks of T and 2-13 Q K^T");
 
     extern __shared__ float4 gdn_ch_smem_prep[];
     half2 * sK    = (half2 *) gdn_ch_smem_prep;  // [C][SH] K
@@ -94,6 +95,14 @@ static __global__ void __launch_bounds__(gdn_ch_prep_threads, 1) gated_delta_net
 
     char * rec = scratch + ((int64_t(seq)*H + h)*gridDim.x + c)*gdn_ch_rec;
 
+    // the gates first, so that their cumsum runs while K and Q arrive
+    float gv = 0.0f;
+    float bv = 0.0f;
+    if (tid < L) {
+        gv = g   [gb0 + tid*sb2];
+        bv = beta[gb0 + tid*sb2];
+    }
+
     // K and Q rows, all loads first; 8 lanes per row, 4 rows per warp (the transposed store of K~ below has 4-way conflicts)
     constexpr int nkq = C*D/4/nt;
     float4 kf[nkq];
@@ -110,7 +119,6 @@ static __global__ void __launch_bounds__(gdn_ch_prep_threads, 1) gated_delta_net
 
     // cumsum of the log gates over the chunk
     if (tid < C) {
-        float gv = tid < L ? g[gb0 + tid*sb2] : 0.0f;
 #pragma unroll
         for (int off = 1; off < WARP_SIZE; off *= 2) {
             const float y = __shfl_up_sync(0xFFFFFFFF, gv, off, WARP_SIZE);
@@ -119,7 +127,7 @@ static __global__ void __launch_bounds__(gdn_ch_prep_threads, 1) gated_delta_net
             }
         }
         sgam[tid]  = gv;
-        sbeta[tid] = tid < L ? beta[gb0 + tid*sb2] : 0.0f;
+        sbeta[tid] = bv;
     }
     __syncthreads();
     if (tid < C) {
@@ -155,6 +163,15 @@ static __global__ void __launch_bounds__(gdn_ch_prep_threads, 1) gated_delta_net
             sKt_h[(4*c4 + 3)*2*SC + r] = __float2half(dk*kv.w);
         }
     }
+    // V, which goes into the Q buffer after Q K^T
+    constexpr int nv = C*D/4/nt;
+    float4 vf[nv];
+#pragma unroll
+    for (int i = 0; i < nv; ++i) {
+        const int r  = min((tid + i*nt) / (D/4), L - 1);
+        const int c4 = (tid + i*nt) % (D/4);
+        vf[i] = *(const float4 *) (v_c + r*sv2 + 4*c4);
+    }
     __syncthreads();
     {
         int4 * gQ = (int4 *) (rec + gdn_ch_off_Q);
@@ -166,15 +183,10 @@ static __global__ void __launch_bounds__(gdn_ch_prep_threads, 1) gated_delta_net
     }
     __syncthreads(); // A overwrites K~^T
 
-    // K K^T -> A (f32, smem) and Q K^T -> P (f16, scratch): the 12 tiles of 32x8 on or below the diagonal
-    half2 * gP = (half2 *) (rec + gdn_ch_off_P);
-    for (int it = warp; it < 24; it += nw) {
-        const int  p     = it / 2;
-        const bool is_qk = it % 2;
-        const int  rt    = p < 4 ? 0 : 1;
-        const int  ct    = p < 4 ? p : p - 4;
-
-        const half2 * src_A = is_qk ? sQV : sK;
+    // K K^T and Q K^T: the 12 tiles of 32x8 on or below the diagonal
+    const auto product = [&](const half2 * src_A, const int p) {
+        const int rt = p < 4 ? 0 : 1;
+        const int ct = p < 4 ? p : p - 4;
         gdn_tile_C acc;
 #pragma unroll
         for (int ks = 0; ks < D/8; ++ks) {
@@ -184,37 +196,25 @@ static __global__ void __launch_bounds__(gdn_ch_prep_threads, 1) gated_delta_net
             load_ldmatrix(b, sK    + ct*8*SH  + 4*ks, SH);
             mma(acc, a, b);
         }
+        return acc;
+    };
+    // A (f32, smem), a tile per warp
+    if (warp < 12) {
+        const gdn_tile_C acc = product(sK, warp);
 #pragma unroll
         for (int l = 0; l < gdn_tile_C::ne; l += 2) {
-            const int   r  = rt*32 + gdn_tile_C::get_i(l);
-            const int   s  = ct*8  + gdn_tile_C::get_j(l);
+            const int   r  = (warp < 4 ? 0 : 32) + gdn_tile_C::get_i(l);
+            const int   s  = (warp < 4 ? warp : warp - 4)*8 + gdn_tile_C::get_j(l);
             const float gr = sgam[r];
-            if (is_qk) {
-                const float p0 = s     <= r ? scale*expf(gr - sgam[s    ])*acc.x[l + 0] : 0.0f;
-                const float p1 = s + 1 <= r ? scale*expf(gr - sgam[s + 1])*acc.x[l + 1] : 0.0f;
-                gP[(((r/32)*(C/8) + s/8)*32 + r % 32)*4 + (s % 8)/2] = make_half2(p0, p1);
-            } else {
-                sA[r*SA + s + 0] = s     < r ? sbeta[r]*expf(gr - sgam[s    ])*acc.x[l + 0] : 0.0f;
-                sA[r*SA + s + 1] = s + 1 < r ? sbeta[r]*expf(gr - sgam[s + 1])*acc.x[l + 1] : 0.0f;
-            }
+            sA[r*SA + s + 0] = s     < r ? sbeta[r]*expf(gr - sgam[s    ])*acc.x[l + 0] : 0.0f;
+            sA[r*SA + s + 1] = s + 1 < r ? sbeta[r]*expf(gr - sgam[s + 1])*acc.x[l + 1] : 0.0f;
         }
-    }
-    for (int e = tid; e < 32*16; e += nt) {
-        gP[(C/16)*32*4 + e] = make_half2(0.0f, 0.0f); // the fragments of rows 0..31 above the diagonal
     }
     __syncthreads();
 
-    // V as f16 into the Q buffer, loads first
-    constexpr int nv = C*D/4/nt;
-    float4 vf[nv];
-#pragma unroll
-    for (int i = 0; i < nv; ++i) {
-        const int r  = min((tid + i*nt) / (D/4), L - 1);
-        const int c4 = (tid + i*nt) % (D/4);
-        vf[i] = *(const float4 *) (v_c + r*sv2 + 4*c4);
-    }
-
-    // T = (I + A)^-1 by blocks of 16. The diagonal blocks by forward substitution, thread j of block b owns column j
+    // T = (I + A)^-1 by blocks of 16. The diagonal blocks by forward substitution in the first two warps, thread j of
+    //   block b owns column j; meanwhile Q K^T -> P (f16, scratch) in the next 12 warps
+    half2 * gP = (half2 *) (rec + gdn_ch_off_P);
     if (tid < C) {
         const int b0 = 16*(tid / 16);
         const int j  = tid % 16;
@@ -236,6 +236,21 @@ static __global__ void __launch_bounds__(gdn_ch_prep_threads, 1) gated_delta_net
         for (int r = 0; r < 16; ++r) {
             sT[(b0 + r)*SA + b0 + j] = tc[r];
         }
+    } else if (warp < 14) {
+        const int p = warp - 2;
+        const gdn_tile_C acc = product(sQV, p);
+#pragma unroll
+        for (int l = 0; l < gdn_tile_C::ne; l += 2) {
+            const int   r  = (p < 4 ? 0 : 32) + gdn_tile_C::get_i(l);
+            const int   s  = (p < 4 ? p : p - 4)*8 + gdn_tile_C::get_j(l);
+            const float gr = sgam[r];
+            const float p0 = s     <= r ? scale*expf(gr - sgam[s    ])*acc.x[l + 0] : 0.0f;
+            const float p1 = s + 1 <= r ? scale*expf(gr - sgam[s + 1])*acc.x[l + 1] : 0.0f;
+            gP[(((r/32)*(C/8) + s/8)*32 + r % 32)*4 + (s % 8)/2] = make_half2(p0, p1);
+        }
+    }
+    for (int e = tid; e < 32*16; e += nt) {
+        gP[(C/16)*32*4 + e] = make_half2(0.0f, 0.0f); // the fragments of rows 0..31 above the diagonal
     }
     // the blocks above the diagonal are zero
     for (int e = tid; e < 6*256; e += nt) {
@@ -244,6 +259,8 @@ static __global__ void __launch_bounds__(gdn_ch_prep_threads, 1) gated_delta_net
         const int bk = b < 3 ? b + 1 : (b < 5 ? b - 1 : 3);
         sT[(16*bi + (e % 256) / 16)*SA + 16*bk + e % 16] = 0.0f;
     }
+    __syncthreads();
+    // V into the Q buffer; the next barrier is in the first stage below
 #pragma unroll
     for (int i = 0; i < nv; ++i) {
         const int r  = (tid + i*nt) / (D/4);
@@ -252,7 +269,6 @@ static __global__ void __launch_bounds__(gdn_ch_prep_threads, 1) gated_delta_net
         sQV[r*SH + 2*c4 + 0] = make_half2(vv.x, vv.y);
         sQV[r*SH + 2*c4 + 1] = make_half2(vv.z, vv.w);
     }
-    __syncthreads();
 
     // the blocks below the diagonal by distance d: T_ij = -T_ii sum_{k=j}^{i-1} A_ik T_kj, i = j + d
 #pragma unroll
