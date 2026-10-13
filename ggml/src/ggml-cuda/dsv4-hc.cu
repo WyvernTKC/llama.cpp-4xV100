@@ -519,19 +519,52 @@ static __global__ void dsv4_hc_up_pre_q8_0(
         return;
     }
 
-    // the weights are not written by an earlier kernel, so they load before the dependency wait
-    for (int i = w*WARP_SIZE + lane; i < hc*chunk_int4; i += nwarps*WARP_SIZE) {
-        const int is = i / chunk_int4;
-        const int4 * src = (const int4 *) (w_up + ((int64_t) is*n_embd + j0)*row_ints*sizeof(int));
-        rows_s4[i] = src[i % chunk_int4];
+    // the weights are not written by an earlier kernel, so they load before the dependency wait; all of a thread's loads go
+    //   out before the first store (a loop of 4 loads and 4 stores waited ~6 round trips), and land while y is quantized
+    constexpr int n_int4     = hc*chunk_int4;
+    constexpr int per_thread = (n_int4 + nwarps*WARP_SIZE - 1) / (nwarps*WARP_SIZE);
+    int4 wv[per_thread];
+#pragma unroll
+    for (int k = 0; k < per_thread; ++k) {
+        const int i = (w + k*nwarps)*WARP_SIZE + lane;
+        if (i < n_int4) {
+            const int is = i / chunk_int4;
+            wv[k] = ((const int4 *) (w_up + ((int64_t) is*n_embd + j0)*row_ints*sizeof(int)))[i % chunk_int4];
+        }
     }
 
     ggml_cuda_pdl_sync();
-    for (int tb = w; tb < ntok*k_blocks; tb += nwarps) {
-        const int t = tb / k_blocks;
-        const int b = tb % k_blocks;
-        const float v = ggml_cuda_op_silu_single(lo_scale*lo[t*slo1 + b*QK8_1 + lane] + lo_bias);
-        quantize_q8_1_lane(v, y_s[t] + b, lane);
+    // the mixed values of token w, read by the epilogue
+    float xv[hc];
+    if (w < ntok) {
+#pragma unroll
+        for (int ih = 0; ih < hc; ++ih) {
+            xv[ih] = x[w*sx2 + j0 + lane + ih*sx1];
+        }
+    }
+    constexpr int tb_per_warp = (ntok*k_blocks + nwarps - 1) / nwarps;
+    float lov[tb_per_warp];
+#pragma unroll
+    for (int k = 0; k < tb_per_warp; ++k) {
+        const int tb = w + k*nwarps;
+        if (tb < ntok*k_blocks) {
+            lov[k] = lo[(tb / k_blocks)*slo1 + (tb % k_blocks)*QK8_1 + lane];
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < tb_per_warp; ++k) {
+        const int tb = w + k*nwarps;
+        if (tb < ntok*k_blocks) {
+            const float v = ggml_cuda_op_silu_single(lo_scale*lov[k] + lo_bias);
+            quantize_q8_1_lane(v, y_s[tb / k_blocks] + tb % k_blocks, lane);
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < per_thread; ++k) {
+        const int i = (w + k*nwarps)*WARP_SIZE + lane;
+        if (i < n_int4) {
+            rows_s4[i] = wv[k];
+        }
     }
     __syncthreads();
 
@@ -588,9 +621,8 @@ static __global__ void dsv4_hc_up_pre_q8_0(
         float sum = 0.0f;
 #pragma unroll
         for (int ih = 0; ih < hc; ++ih) {
-            const float xv = x[t*sx2 + j + ih*sx1];
-            const float wv = 1.0f / (1.0f + expf(-g_s[t][ih][lane]));
-            sum += xv * wv;
+            const float gw = 1.0f / (1.0f + expf(-g_s[t][ih][lane]));
+            sum += xv[ih] * gw;
         }
         const float v = scale * sum;
         dst[t*sd1 + j] = v;
