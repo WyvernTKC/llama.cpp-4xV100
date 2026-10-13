@@ -6,6 +6,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cinttypes>
@@ -5617,12 +5618,44 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             });
             reduce(0);
             const bool replay_0 = modes[0] == ggml_backend_meta_context::SESSION_REPLAY;
+            // while every chunk so far replays, a chunk launches as soon as all devices planned it, so the GPUs wait for the
+            //   plan of chunk 0 only (Qwen3.8-Flash: planning all first idled them ~0.28 ms a token); GGML_META_SESSION_NO_PIPELINE=1 off
+            constexpr size_t max_chunks = 64;
+            static const size_t max_pipelined = getenv("GGML_META_SESSION_NO_PIPELINE") ? 1 : max_chunks;
+            std::array<std::atomic<int>, max_chunks> n_planned;
+            for (size_t c = 0; c < std::min(n_chunks, max_pipelined); c++) {
+                n_planned[c].store(0, std::memory_order_relaxed);
+            }
+            std::atomic<size_t> n_launched{replay_0 ? size_t(1) : size_t(0)};
             backend_ctx->lpool->run(n_backends, [&](size_t j) {
-                if (replay_0) {
-                    backend_ctx->session_launch(backend_ctx->backend_configs[j].backend, D->graphs[j].session_cgraphs.data(), 1);
+                ggml_backend_t backend_j = backend_ctx->backend_configs[j].backend;
+                bool launching = replay_0;
+                if (launching) {
+                    backend_ctx->session_launch(backend_j, D->graphs[j].session_cgraphs.data(), 1);
                 }
                 for (size_t c = 1; c < n_chunks; c++) {
                     plan(j, c);
+                    if (!launching) {
+                        continue;
+                    }
+                    launching = c < max_pipelined;
+                    if (launching) {
+                        n_planned[c].fetch_add(1, std::memory_order_acq_rel);
+                        for (int spin = 0; n_planned[c].load(std::memory_order_acquire) < (int) n_backends; ++spin) {
+                            if (spin > 512) {
+                                std::this_thread::yield();
+                            }
+                        }
+                        for (size_t k = 0; k < n_backends; k++) {
+                            launching = launching && modes[k*n_chunks + c] == ggml_backend_meta_context::SESSION_REPLAY;
+                        }
+                    }
+                    if (launching) {
+                        backend_ctx->session_launch(backend_j, D->graphs[j].session_cgraphs.data() + c*chunk, 1);
+                        if (j == 0) {
+                            n_launched.store(c + 1, std::memory_order_relaxed);
+                        }
+                    }
                 }
             });
             for (size_t c = 1; c < n_chunks; c++) {
@@ -5647,7 +5680,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             };
 
-            size_t c = replay_0 ? 1 : 0;
+            size_t c = n_launched.load(std::memory_order_relaxed);
             size_t c_launch = n_chunks; // a captured chunk to launch with the next round
             while (c < n_chunks || c_launch < n_chunks) {
                 size_t c_end = c;
