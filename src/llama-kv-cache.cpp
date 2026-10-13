@@ -3169,6 +3169,10 @@ uint32_t llama_kv_cache_context::get_n_kv_used() const {
     return n_kv_used;
 }
 
+bool llama_kv_cache_context::has_layers() const {
+    return !kv->get_layer_ids().empty();
+}
+
 bool llama_kv_cache_context::add_graph_root(ggml_tensor * t, int dim) const {
     if (!reshape) {
         return false;

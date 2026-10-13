@@ -171,6 +171,28 @@ static void build_attn_inp_kq_mask_any(
     ggml_set_name(*kq_mask_cnv, "attn_inp_kq_mask");
 }
 
+// a device-built mask goes to the graph start, like the copy of a host mask: at its first use it lands between the
+//   activations of that layer (+1 GiB of compute buffer on gemma-4-31B at -ub 16384, ctx 262144). Pin it to the first
+//   backend, as no GPU node sits next to the graph start to take one from. The first layer that reads it marks it for compute.
+static void build_attn_inp_kq_mask_first(
+        ggml_cgraph * gf,
+        ggml_backend_sched_t sched,
+        const llama_kv_cache_context * mctx,
+        ggml_tensor * kq_pos,
+        ggml_tensor * kq_mask_cnv) {
+    if (kq_pos == nullptr || !mctx->has_layers()) {
+        return;
+    }
+
+    ggml_backend_t backend = ggml_backend_sched_get_backend(sched, 0);
+    if (!ggml_backend_supports_op(backend, kq_mask_cnv)) {
+        return;
+    }
+
+    ggml_backend_sched_set_tensor_backend(sched, kq_mask_cnv, backend);
+    ggml_build_forward_order(gf, kq_mask_cnv);
+}
+
 static void set_input_kq_mask_any(
         const llama_kv_cache_context * mctx,
         ggml_tensor * kq_mask,
@@ -3292,6 +3314,8 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
 
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
 
+    build_attn_inp_kq_mask_first(gf, sched, mctx_cur, inp->self_kq_pos, inp->self_kq_mask_cnv);
+
     inp->self_kq_ranges = build_attn_inp_kq_ranges(ctx0, inp->self_kq_mask_cnv, cparams);
     if (inp->self_kq_ranges) {
         res->kq_ranges[inp->self_kq_mask_cnv] = { inp->self_kq_ranges, 0 };
@@ -3865,6 +3889,7 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
         build_attn_inp_kq_mask_any(ctx0, mctx_cur->get_base(), ubatch, hparams, cparams,
                 &inp->self_kq_mask, &inp->self_kq_pos, &inp->self_kq_qpos, &inp->self_kq_mask_cnv);
+        build_attn_inp_kq_mask_first(gf, sched, mctx_cur->get_base(), inp->self_kq_pos, inp->self_kq_mask_cnv);
     }
 
     {
@@ -3875,6 +3900,7 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
         build_attn_inp_kq_mask_any(ctx0, mctx_cur->get_swa(), ubatch, hparams, cparams,
                 &inp->self_kq_mask_swa, &inp->self_kq_pos_swa, &inp->self_kq_qpos_swa, &inp->self_kq_mask_swa_cnv);
+        build_attn_inp_kq_mask_first(gf, sched, mctx_cur->get_swa(), inp->self_kq_pos_swa, inp->self_kq_mask_swa_cnv);
     }
 
     inp->self_kq_ranges     = build_attn_inp_kq_ranges(ctx0, inp->self_kq_mask_cnv,     cparams);
@@ -4088,6 +4114,8 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
     auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
 
+    build_attn_inp_kq_mask_first(gf, sched, mctx_cur->get_attn(), inp_attn->self_kq_pos, inp_attn->self_kq_mask_cnv);
+
     inp_attn->self_kq_ranges = build_attn_inp_kq_ranges(ctx0, inp_attn->self_kq_mask_cnv, cparams);
     if (inp_attn->self_kq_ranges) {
         res->kq_ranges[inp_attn->self_kq_mask_cnv] = { inp_attn->self_kq_ranges, 0 };
@@ -4125,6 +4153,7 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
 
         build_attn_inp_kq_mask_any(ctx0, attn_ctx->get_base(), ubatch, hparams, cparams,
                 &inp_attn->self_kq_mask, &inp_attn->self_kq_pos, &inp_attn->self_kq_qpos, &inp_attn->self_kq_mask_cnv);
+        build_attn_inp_kq_mask_first(gf, sched, attn_ctx->get_base(), inp_attn->self_kq_pos, inp_attn->self_kq_mask_cnv);
     }
 
     {
@@ -4133,6 +4162,7 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
 
         build_attn_inp_kq_mask_any(ctx0, attn_ctx->get_swa(), ubatch, hparams, cparams,
                 &inp_attn->self_kq_mask_swa, &inp_attn->self_kq_pos_swa, &inp_attn->self_kq_qpos_swa, &inp_attn->self_kq_mask_swa_cnv);
+        build_attn_inp_kq_mask_first(gf, sched, attn_ctx->get_swa(), inp_attn->self_kq_pos_swa, inp_attn->self_kq_mask_swa_cnv);
     }
 
     inp_attn->self_kq_ranges     = build_attn_inp_kq_ranges(ctx0, inp_attn->self_kq_mask_cnv,     cparams);

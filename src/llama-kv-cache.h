@@ -432,6 +432,9 @@ public:
     uint32_t get_n_kv() const;
     uint32_t get_n_kv_used() const;
 
+    // false when no layer stores K/V here, e.g. the non-SWA cache of a model whose layers all use SWA
+    bool has_layers() const;
+
     // record a tensor of the graph being built whose dim is the n_kv, false if graphs are not reshaped
     bool add_graph_root(ggml_tensor * t, int dim) const;
 
