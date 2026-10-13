@@ -13810,6 +13810,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_moe_shexp(GGML_TYPE_Q8_0, 16, 8, 2048, 128, 1));
     test_cases.emplace_back(new test_moe_shexp(GGML_TYPE_Q8_0, 16, 8, 2048, 128, 2));
+    // q8_0 rows of 17-32 lanes (a warp per row) quantize their own input too: Qwen3.8-Flash's 160 columns a device
+    test_cases.emplace_back(new test_moe_shexp(GGML_TYPE_Q8_0, 32, 10, 2560, 160, 1));
+    test_cases.emplace_back(new test_moe_shexp(GGML_TYPE_Q8_0, 16, 8, 2048, 192, 1));
     for (ggml_unary_op op : { GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SILU }) {
         for (int64_t n_tokens : { 1, 6, 32 }) {
             test_cases.emplace_back(new test_cont_unary_mul(256, 4,  n_tokens, op));
