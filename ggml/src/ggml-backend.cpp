@@ -2375,6 +2375,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                // An empty input has no data to copy, so nothing to wait for. The output ids of a ubatch that outputs no
+                //   token are one (every ubatch of a prompt but the last): their wait drained the devices in the middle
+                //   of the graph (Qwen3.8-Flash applies them before the last layer's MoE), so the host built the next
+                //   ubatch's graph with the GPUs idle instead of while they finished this one.
+                //   GGML_SCHED_WAIT_EMPTY_INPUTS=1 waits for them too.
+                static const bool wait_empty_inputs = getenv("GGML_SCHED_WAIT_EMPTY_INPUTS") != nullptr;
+                if (ggml_nbytes(input) == 0 && !wait_empty_inputs) {
+                    continue;
+                }
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 // the wait is for the last compute that read this copy slot, so the first input of the split does it for all
                 if (!user_inputs_waited) {
