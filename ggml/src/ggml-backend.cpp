@@ -2338,11 +2338,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_tensor_copy(src, dst);
             }
         };
+        // Whether split_backend has run everything queued on it: another input of the split then needs no sync of its own.
+        //   Queued work comes from the batch flush, a staged weight and the expert paths, not from a sync or a copy that
+        //   only joins the batch. A meta backend syncs every device per call: Qwen3.8-Flash decode synchronized each
+        //   GPU 5 times before its first launch, for one user input and two outputs of the CPU split.
+        //   GGML_SCHED_SYNC_EACH_INPUT=1 syncs for every input again.
+        static const bool sync_each_input = getenv("GGML_SCHED_SYNC_EACH_INPUT") != nullptr;
+        bool split_synced = false;
+        auto sync_split = [&]() {
+            if (!split_synced || sync_each_input) {
+                ggml_backend_synchronize(split_backend);
+                split_synced = true;
+            }
+        };
         auto flush_inputs = [&]() {
             if (!batch_dst.empty()) {
                 ggml_backend_meta_set_tensors(split_backend, batch_dst.size(), batch_dst.data(), batch_src.data());
                 batch_dst.clear();
                 batch_src.clear();
+                split_synced = false;
             }
         };
         // with a copy callback, the weights in host memory are copied last, so that the callback can read the other inputs of the split
@@ -2367,7 +2381,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                         ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                     } else {
-                        ggml_backend_synchronize(split_backend);
+                        sync_split();
                     }
                     user_inputs_waited = true;
                 }
@@ -2424,6 +2438,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 if (!meta_try_partial && ggml_backend_is_meta(split_backend) && split_backend->iface.cpy_tensor_async &&
                         split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                    split_synced = false;
                     continue;
                 }
                 // wait for the split backend to finish using the input before overwriting it.
@@ -2435,7 +2450,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                         ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                     } else {
-                        ggml_backend_synchronize(split_backend);
+                        sync_split();
                     }
                 };
                 // GGML_META_EXPERT_CACHE_SYNC_ALWAYS=1 restores the unconditional sync
@@ -2449,6 +2464,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 //   staging slots and expert pools own the device copy
                 if (host_weights_last && ggml_backend_sched_is_host_weight(input) &&
                         sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
+                    split_synced = false;
                     continue;
                 }
 
@@ -2464,6 +2480,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
+                    split_synced = false;
 
                     flush_inputs(); // the ids below may be one of the inputs copied so far
                     ggml_backend_synchronize(input_backend);
@@ -2649,9 +2666,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         } else {
-                            ggml_backend_synchronize(split_backend);
+                            sync_split();
                         }
                         copy_input(input, input_cpy);
+                    } else {
+                        split_synced = false;
                     }
                 }
             }
