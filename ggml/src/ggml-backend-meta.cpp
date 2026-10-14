@@ -999,6 +999,9 @@ struct ggml_backend_meta_gather_registry {
 //   whole-weight fill reads the pools, so it must follow those gathers on the device; see ggml_backend_meta_stage_weight.
 static std::atomic<uint64_t>     g_meta_gather_gen{0};
 static std::atomic<const void *> g_meta_gather_ctx{nullptr};
+// Counts the changes to the pools that MUL_MAT_IDs are bound to: a registry entry made, rebuilt, given up or released.
+//   A decomposition that gathers keeps its subgraph uids while it is unchanged, see ggml_backend_meta_graph_compute.
+static std::atomic<uint64_t>     g_meta_gather_bind_gen{0};
 
 // Heap allocated and never destroyed: the pools are freed when the last meta backend goes, while the
 //   CUDA runtime is still there. A static destructor would free device memory after it has gone.
@@ -1010,6 +1013,7 @@ static ggml_backend_meta_gather_registry & ggml_backend_meta_gather_reg() {
 static const size_t GGML_META_GATHER_POOL_MARGIN = 256ull*1024*1024;
 
 static void ggml_backend_meta_gathered_weight_release(ggml_backend_meta_gathered_weight & gw, const ggml_tensor * w = nullptr) {
+    g_meta_gather_bind_gen.fetch_add(1);
     // GGML_META_EXPERT_CACHE_STATS: name the pool before the per-device cache lines that follow
     static const bool stats = getenv("GGML_META_EXPERT_CACHE_STATS") != nullptr;
     if (stats && w != nullptr && !gw.caches.empty()) {
@@ -1265,6 +1269,7 @@ static ggml_backend_meta_gathered_weight * ggml_backend_meta_gathered_weight_get
         GGML_LOG_INFO("%s: device expert cache: %d experts per weight, gathered inside MUL_MAT_ID (first weight %s)\n",
             __func__, cap, w->name);
     }
+    g_meta_gather_bind_gen.fetch_add(1);
     return &gw;
 }
 
@@ -3711,6 +3716,7 @@ struct ggml_backend_meta_context {
         size_t   sized_subgraphs = 0;
         bool     gathers         = false; // a MUL_MAT_ID reads a host weight through the device expert cache
         uint64_t reshape_epoch   = 0;     // g_meta_reshape_epoch when the per-device uids were last minted
+        uint64_t gather_bind_gen = 0;     // g_meta_gather_bind_gen when the per-device uids were last minted
     };
     // unique_ptr so growing the pool never invalidates a decomposition pointer
     std::vector<std::unique_ptr<decomposition>> decs;
@@ -4934,6 +4940,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         // the scheduler copies every other host weight into the split, so one read in place is gathered
         D->gathers = false;
         D->reshape_epoch = g_meta_reshape_epoch.load();
+        // the per-device MUL_MAT_IDs were bound to the pools when the graph was allocated, before this
+        D->gather_bind_gen = g_meta_gather_bind_gen.load();
         for (int i = 0; i < cgraph->n_nodes && !D->gathers; i++) {
             const ggml_tensor * node = cgraph->nodes[i];
             D->gathers = node->op == GGML_OP_MUL_MAT_ID && node->src[0] != nullptr && node->src[0]->buffer != nullptr &&
@@ -5620,17 +5628,28 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
     }
 
-    const uint64_t reshape_epoch = g_meta_reshape_epoch.load();
-    if (!needs_rebuild && (D->gathers || !backend_ctx->stage_pending.empty() || !backend_ctx->expert_pools_pending.empty() ||
+    // A gather reads the pools its MUL_MAT_ID was bound to when the graph was allocated, and the per-token state of the
+    //   cache (plan, remap, misses) lives in device memory, so a replay of the captured graph is exact until the pools
+    //   change. Retiring the uids every token cost ~90 us of host time per Qwen3.8-Flash decode token in
+    //   ggml_cuda_graph_update_required, with the GPUs idle. GGML_META_GATHER_KEEP_UIDS=0 retires them every token.
+    static const bool gather_keep_uids = [] {
+        const char * env = getenv("GGML_META_GATHER_KEEP_UIDS");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    const uint64_t reshape_epoch   = g_meta_reshape_epoch.load();
+    const uint64_t gather_bind_gen = g_meta_gather_bind_gen.load();
+    const bool     gathers_rebound = D->gathers && (!gather_keep_uids || D->gather_bind_gen != gather_bind_gen);
+    if (!needs_rebuild && (gathers_rebound || !backend_ctx->stage_pending.empty() || !backend_ctx->expert_pools_pending.empty() ||
             D->reshape_epoch != reshape_epoch)) {
         // a reshape rewrote per-device tensors of this decomposition in place, ggml-cuda must look at them again
-        D->reshape_epoch = reshape_epoch;
+        D->reshape_epoch   = reshape_epoch;
+        D->gather_bind_gen = gather_bind_gen;
         // The decomposition is reusable but its contents are not static: staged expert weights get
         // their per-device data pointer rebound to a different slot on every eval. ggml-cuda skips
         // ggml_cuda_graph_update_required - and so misses that - whenever a subgraph uid matches the
         // one it captured, which it now would, because the rebuild that used to mint a fresh uid per
         // eval is exactly what we are skipping. Retire the uids so it revalidates node properties.
-        // Without staged weights, pools or gathered host weights nothing is rebound (the staging of
+        // Without staged weights, pools or rebound gathers nothing is rebound (the staging of
         // this eval is done by now), and the kept uids spare ggml-cuda comparing every node again.
         for (size_t j = 0; j < n_backends; j++) {
             for (size_t i = 0; i < D->n_subgraphs; i++) {
