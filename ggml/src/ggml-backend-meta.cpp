@@ -3717,6 +3717,10 @@ struct ggml_backend_meta_context {
         bool     gathers         = false; // a MUL_MAT_ID reads a host weight through the device expert cache
         uint64_t reshape_epoch   = 0;     // g_meta_reshape_epoch when the per-device uids were last minted
         uint64_t gather_bind_gen = 0;     // g_meta_gather_bind_gen when the per-device uids were last minted
+        // what session_allreduce_supported said about the all-reduce after each subgraph, -1 = not asked yet: it looks
+        //   at the shapes, layout and devices of the tensors, which only a reshape changes for a decomposition
+        std::vector<int8_t> session_ar_ok;
+        uint64_t            session_ar_epoch = 0; // g_meta_reshape_epoch when session_ar_ok was filled
     };
     // unique_ptr so growing the pool never invalidates a decomposition pointer
     std::vector<std::unique_ptr<decomposition>> decs;
@@ -4942,6 +4946,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         D->reshape_epoch = g_meta_reshape_epoch.load();
         // the per-device MUL_MAT_IDs were bound to the pools when the graph was allocated, before this
         D->gather_bind_gen = g_meta_gather_bind_gen.load();
+        D->session_ar_ok.clear();
         for (int i = 0; i < cgraph->n_nodes && !D->gathers; i++) {
             const ggml_tensor * node = cgraph->nodes[i];
             D->gathers = node->op == GGML_OP_MUL_MAT_ID && node->src[0] != nullptr && node->src[0]->buffer != nullptr &&
@@ -5678,6 +5683,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             backend_ctx->stage_pending.empty() && backend_ctx->expert_pools_pending.empty()) {
         std::vector<ggml_tensor *> & ar_nodes = backend_ctx->session_ar_nodes;
         ar_nodes.resize((D->n_subgraphs - 1)*n_backends);
+        // GGML_META_SESSION_AR_CACHE=0 asks the backend about every all-reduce on every eval, ~40 us a Qwen3.8-Flash token
+        static const bool ar_cache = [] {
+            const char * env = getenv("GGML_META_SESSION_AR_CACHE");
+            return env == nullptr || atoi(env) != 0;
+        }();
+        if (!ar_cache || D->session_ar_ok.size() != D->n_subgraphs || D->session_ar_epoch != reshape_epoch) {
+            D->session_ar_ok.assign(D->n_subgraphs, -1);
+            D->session_ar_epoch = reshape_epoch;
+        }
         bool   session_ok = true;
         size_t n_ok       = 0; // subgraphs a session can run
         for (size_t i = 0; i < D->n_subgraphs && session_ok; i++) {
@@ -5692,9 +5706,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 break;
             }
             n_ok = i + 1;
+            if (i + 1 < D->n_subgraphs && D->subgraph_comm[i] == ggml_backend_meta_context::SUBGRAPH_COMM_ALLREDUCE &&
+                    D->session_ar_ok[i] < 0) {
+                D->session_ar_ok[i] = backend_ctx->session_allreduce_supported(backend_ctx->comm_ctx, &ar_nodes[i*n_backends]) ? 1 : 0;
+            }
             if (i + 1 < D->n_subgraphs &&
-                    !(D->subgraph_comm[i] == ggml_backend_meta_context::SUBGRAPH_COMM_ALLREDUCE &&
-                      backend_ctx->session_allreduce_supported(backend_ctx->comm_ctx, &ar_nodes[i*n_backends]))) {
+                    !(D->subgraph_comm[i] == ggml_backend_meta_context::SUBGRAPH_COMM_ALLREDUCE && D->session_ar_ok[i] == 1)) {
                 break; // the communication after subgraph i is for the loop below
             }
         }
