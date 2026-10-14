@@ -1806,14 +1806,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
                                 ggml_row_size(padded->type, start))));
 
         // column k of the [kern, hc_dim] kernel is one weight per channel
-        ggml_tensor * wk = ggml_cont(ctx0,
-                ggml_view_2d(ctx0, model.layers[il].ple_conv1d, 1, hc_dim,
-                        model.layers[il].ple_conv1d->nb[1],
-                        k * model.layers[il].ple_conv1d->nb[0]));
-        // this kernel keeps the file type, so cast it before it multiplies an f32 activation
-        wk = ggml_reshape_1d(ctx0, wk, hc_dim);
-        if (wk->type != GGML_TYPE_F32) {
-            wk = ggml_cast(ctx0, wk, GGML_TYPE_F32);
+        ggml_tensor * wk = ggml_view_2d(ctx0, model.layers[il].ple_conv1d, 1, hc_dim,
+                model.layers[il].ple_conv1d->nb[1],
+                k * model.layers[il].ple_conv1d->nb[0]);
+        // this kernel keeps the file type, so cast it before it multiplies an f32 activation. The cast reads the strided
+        //   column itself: a cont of it is a 2-byte-wide 2D memcpy on CUDA, ~17 us of copy engine a tap and token.
+        //   LLAMA_PLE_CONV_CONT_TAPS=1 makes the column contiguous first.
+        static const bool cont_taps = getenv("LLAMA_PLE_CONV_CONT_TAPS") != nullptr;
+        if (wk->type != GGML_TYPE_F32 && !cont_taps) {
+            wk = ggml_reshape_1d(ctx0, ggml_cast(ctx0, wk, GGML_TYPE_F32), hc_dim);
+        } else {
+            wk = ggml_reshape_1d(ctx0, ggml_cont(ctx0, wk), hc_dim);
+            if (wk->type != GGML_TYPE_F32) {
+                wk = ggml_cast(ctx0, wk, GGML_TYPE_F32);
+            }
         }
 
         ggml_tensor * term = ggml_mul(ctx0, shifted, wk);
