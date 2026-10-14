@@ -658,6 +658,31 @@ struct ggml_backend_meta_buffer_context {
     };
     std::unordered_map<std::pair<const ggml_tensor *, bool>, split_state_cache_entry, split_state_key_hash> split_state_cache;
 
+    // The split the model gives a leaf of this buffer (a graph input, or an input copy the scheduler made of a weight
+    //   in host memory), by name, type and shape, which is all the model reads of it. The model runs the name through
+    //   its rules (~60 regexes), and split_state_cache above starts over whenever a new graph puts another tensor at a
+    //   cached address: a Qwen3.8-Flash prefill asked again for every input copy of every ubatch, ~20 ms of host time at
+    //   each ubatch boundary with the GPUs drained. GGML_META_LEAF_SS_CACHE=0 asks every time.
+    struct leaf_ss_key {
+        std::string name;
+        ggml_type   type;
+        int64_t     ne[GGML_MAX_DIMS];
+
+        bool operator==(const leaf_ss_key & other) const {
+            return type == other.type && memcmp(ne, other.ne, sizeof(ne)) == 0 && name == other.name;
+        }
+    };
+    struct leaf_ss_key_hash {
+        size_t operator()(const leaf_ss_key & k) const {
+            size_t h = std::hash<std::string>()(k.name) ^ (size_t) k.type;
+            for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                h = h*31 + std::hash<int64_t>()(k.ne[i]);
+            }
+            return h;
+        }
+    };
+    std::unordered_map<leaf_ss_key, ggml_backend_meta_split_state, leaf_ss_key_hash> leaf_ss_cache;
+
     // pinned host memory for large mirrored copies, see ggml_backend_meta_buffer_stage
     ggml_backend_buffer_ptr stage;
     bool                    stage_tried = false;
@@ -1999,6 +2024,20 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         //   A leaf in a compute buffer is always an input; note that GGML_TENSOR_FLAG_INPUT cannot be used to
         //   detect them because ggml_backend_sched strips the flag from the input copies it creates.
         if (!ggml_backend_meta_split_state_from_srcs(tensor)) {
+            static const bool leaf_cache_on = [] {
+                const char * env = getenv("GGML_META_LEAF_SS_CACHE");
+                return env == nullptr || atoi(env) != 0;
+            }();
+            ggml_backend_meta_buffer_context::leaf_ss_key leaf_key;
+            if (leaf_cache_on) {
+                leaf_key.name = tensor->name;
+                leaf_key.type = tensor->type;
+                memcpy(leaf_key.ne, tensor->ne, sizeof(leaf_key.ne));
+                const auto it_leaf = buf_ctx->leaf_ss_cache.find(leaf_key);
+                if (it_leaf != buf_ctx->leaf_ss_cache.end()) {
+                    return it_leaf->second; // checked below when it was asked for
+                }
+            }
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
             const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
             ggml_backend_meta_split_state ret = dev_ctx->get_split_state(tensor, dev_ctx->get_split_state_ud);
@@ -2015,6 +2054,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } else if (ret.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                 GGML_ASSERT(ret.n_segments == 1);
                 GGML_ASSERT(ret.nr[0] == 1);
+            }
+            if (leaf_cache_on) {
+                buf_ctx->leaf_ss_cache.emplace(std::move(leaf_key), ret);
             }
             return ret;
         }
