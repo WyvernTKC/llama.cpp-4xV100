@@ -342,16 +342,43 @@ static __global__ void __launch_bounds__(block_size) rms_norm_mul_q8_f32(const f
     }
 }
 
+// In block_flags: the arrival count and the generation of the blocks of dsv4_hc_post_rms_norm_mul_f32 that wait for each
+//   other (past the slots of row_split_reduce)
+#define HC_POST_SYNC_COUNT 392
+#define HC_POST_SYNC_GEN   393
+
+// every block of the launch has got here; the last one to arrive resets the count and moves the generation on. Every
+//   block must be resident at once.
+static __device__ __forceinline__ void hc_post_blocks_sync(unsigned int * flags) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned int nb  = gridDim.x*gridDim.y;
+        const unsigned int gen = *(volatile unsigned int *) (flags + HC_POST_SYNC_GEN);
+        __threadfence();
+        if (atomicAdd(flags + HC_POST_SYNC_COUNT, 1u) == nb - 1) {
+            atomicExch(flags + HC_POST_SYNC_COUNT, 0u);
+            __threadfence();
+            atomicAdd(flags + HC_POST_SYNC_GEN, 1u);
+        } else {
+            while (*(volatile unsigned int *) (flags + HC_POST_SYNC_GEN) == gen) {
+            }
+        }
+    }
+    __syncthreads();
+}
+
 // An identity-comb hyper-connection combine and the grouped norm the next block takes of it (qwen4exp: DSV4_HC_POST,
 //   gated, then RMS_NORM -> MUL of each stream): y = x * p + r of one stream row is written for the next combine, then
 //   reduced and scaled like rms_norm_mul_q8_f32, optionally with the q8_1 copy. Block (stream, token); y, dst and the
 //   weights are contiguous rows. Every value is that of the ops apart.
-template <int block_size, int cols_per_thread, bool gated, bool q8>
+// sync: the outputs may sit on any input but the weights (ggml-alloc gives a dead input's memory to the norm), so every
+//   block reads its inputs before any block stores (flags, see hc_post_blocks_sync)
+template <int block_size, int cols_per_thread, bool gated, bool q8, bool sync>
 static __global__ void __launch_bounds__(block_size) dsv4_hc_post_rms_norm_mul_f32(
         const float * x, const float * residual, const float * post, float * y, float * dst, const float * w,
         const int ncols, const int hc, const int64_t sx1, const int64_t sr1, const int64_t sr2, const int64_t sp0,
         const int64_t sp1, const float ps_in, const float pb_in, const float ps_out, const float pb_out, const float eps,
-        const int64_t w_stride_stream, block_q8_1 * q8_dst) {
+        const int64_t w_stride_stream, block_q8_1 * q8_dst, unsigned int * flags) {
     ggml_cuda_pdl_lc();
     const int s   = blockIdx.x;
     const int t   = blockIdx.y;
@@ -381,13 +408,31 @@ static __global__ void __launch_bounds__(block_size) dsv4_hc_post_rms_norm_mul_f
         const int col = tid + i*block_size;
         wv[i] = col < ncols ? w[col] : 0.0f;
     }
+    if constexpr (sync) {
 #pragma unroll
-    for (int i = 0; i < cols_per_thread; ++i) {
-        const int col = tid + i*block_size;
-        if (col < ncols) {
-            y[col] = yv[i];
-            tmp += yv[i] * yv[i];
+        for (int i = 0; i < cols_per_thread; ++i) {
+            if (tid + i*block_size < ncols) {
+                tmp += yv[i] * yv[i];
+            }
         }
+        hc_post_blocks_sync(flags);
+#pragma unroll
+        for (int i = 0; i < cols_per_thread; ++i) {
+            const int col = tid + i*block_size;
+            if (col < ncols) {
+                y[col] = yv[i];
+            }
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < cols_per_thread; ++i) {
+            const int col = tid + i*block_size;
+            if (col < ncols) {
+                y[col] = yv[i];
+                tmp += yv[i] * yv[i];
+            }
+        }
+        GGML_UNUSED(flags);
     }
 
     tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
@@ -1499,38 +1544,45 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
     rms_norm_f32_cuda<true>(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream, scale);
 }
 
-bool ggml_cuda_should_fuse_dsv4_hc_post_rms_norm(const ggml_tensor * post, const ggml_tensor * rms_norm, const ggml_tensor * mul) {
+int ggml_cuda_should_fuse_dsv4_hc_post_rms_norm(const ggml_tensor * post, const ggml_tensor * rms_norm, const ggml_tensor * mul,
+        const ggml_tensor * raw) {
     if (post->op != GGML_OP_DSV4_HC_POST || rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL ||
             rms_norm->src[0] != post || post->src[3] != nullptr) {
-        return false;
+        return 0;
     }
     const ggml_tensor * x = post->src[0];
     const ggml_tensor * r = post->src[1];
     const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : (mul->src[1] == rms_norm ? mul->src[0] : nullptr);
     if (w == nullptr || w == rms_norm) {
-        return false;
+        return 0;
     }
     for (const ggml_tensor * t : { x, r, w, post, rms_norm, mul }) {
         if (t->type != GGML_TYPE_F32) {
-            return false;
+            return 0;
         }
     }
     const int64_t ncols = post->ne[0];
     const int64_t hc    = post->ne[1];
-    // rows held in registers; one weight row per stream (or one for all). The combine and the norm output may each sit
-    //   exactly on the residual (ggml-alloc gives its memory to the norm), as a block reads its row of it before it
-    //   writes the same row; neither on anything else it reads, nor on each other
-    return ncols <= 8*1024 && ncols % QK8_1 == 0 && x->nb[0] == sizeof(float) && r->nb[0] == sizeof(float) &&
-        ggml_is_contiguous(post) && ggml_is_contiguous(mul) && ggml_are_same_shape(mul, post) && post->ne[3] == 1 &&
-        ggml_is_contiguous(w) && w->ne[0] == ncols && (ggml_nelements(w) == ncols || ggml_nelements(w) == ncols*hc) &&
-        post->ne[2] <= 65535 && hc <= INT_MAX &&
-        ggml_cuda_same_or_disjoint(post, r) && !ggml_cuda_tensors_overlap(post, x) && !ggml_cuda_tensors_overlap(post, w) &&
-        !ggml_cuda_tensors_overlap(mul, x) && ggml_cuda_same_or_disjoint(mul, r) && !ggml_cuda_tensors_overlap(mul, w) &&
-        !ggml_cuda_tensors_overlap(mul, post);
+    // rows held in registers; one weight row per stream (or one for all); the outputs on neither the weights nor each other
+    if (!(ncols <= 8*1024 && ncols % QK8_1 == 0 && x->nb[0] == sizeof(float) && r->nb[0] == sizeof(float) &&
+            ggml_is_contiguous(post) && ggml_is_contiguous(mul) && ggml_are_same_shape(mul, post) && post->ne[3] == 1 &&
+            ggml_is_contiguous(w) && w->ne[0] == ncols && (ggml_nelements(w) == ncols || ggml_nelements(w) == ncols*hc) &&
+            post->ne[2] <= 65535 && hc <= INT_MAX && !ggml_cuda_tensors_overlap(post, w) && !ggml_cuda_tensors_overlap(mul, w) &&
+            !ggml_cuda_tensors_overlap(mul, post))) {
+        return 0;
+    }
+    // the combine and the norm output may each sit exactly on the residual (ggml-alloc gives its memory to the norm), as a
+    //   block reads its row of it before it writes the same row
+    if (ggml_cuda_same_or_disjoint(post, r) && !ggml_cuda_tensors_overlap(post, x) && !ggml_cuda_tensors_overlap(mul, x) &&
+            ggml_cuda_same_or_disjoint(mul, r) && (raw == nullptr || !ggml_cuda_tensors_overlap(mul, raw))) {
+        return 1;
+    }
+    // else on any input, with the blocks waiting for each other: up to 32 of them (8 tokens), all resident
+    return hc*post->ne[2] <= 32 ? 2 : 0;
 }
 
 void ggml_cuda_op_dsv4_hc_post_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * post, const ggml_tensor * scale_in,
-                                        const ggml_tensor * scale_out, ggml_tensor * rms_norm, ggml_tensor * mul) {
+                                        const ggml_tensor * scale_out, ggml_tensor * rms_norm, ggml_tensor * mul, const bool sync) {
     const ggml_tensor * x = post->src[0];
     const ggml_tensor * r = post->src[1];
     const bool          gated = scale_in != nullptr;
@@ -1562,17 +1614,21 @@ void ggml_cuda_op_dsv4_hc_post_rms_norm(ggml_backend_cuda_context & ctx, ggml_te
     }
 
     const dim3 blocks_num(hc, n_tokens, 1);
+    unsigned int * flags = sync ? ctx.block_flags_get() : nullptr;
     const auto launch = [&](auto block, auto cols, auto gated_c, auto q8_c) {
         constexpr int bs = decltype(block)::value;
         constexpr int nc = decltype(cols)::value;
         if constexpr (nc > 0) {
             const ggml_cuda_kernel_launch_params launch_params{blocks_num, dim3(bs, 1, 1), 32 * sizeof(float), ctx.stream()};
-            ggml_cuda_kernel_launch(dsv4_hc_post_rms_norm_mul_f32<bs, nc, decltype(gated_c)::value, decltype(q8_c)::value>,
+            const auto kernel = sync ?
+                dsv4_hc_post_rms_norm_mul_f32<bs, nc, decltype(gated_c)::value, decltype(q8_c)::value, true> :
+                dsv4_hc_post_rms_norm_mul_f32<bs, nc, decltype(gated_c)::value, decltype(q8_c)::value, false>;
+            ggml_cuda_kernel_launch(kernel,
                 launch_params, (const float *) x->data, (const float *) r->data, (const float *) p->data,
                 (float *) post->data, (float *) mul->data, (const float *) w->data, ncols, hc,
                 (int64_t) (x->nb[1]/sizeof(float)), (int64_t) (r->nb[1]/sizeof(float)), (int64_t) (r->nb[2]/sizeof(float)),
                 (int64_t) (p->nb[0]/sizeof(float)), (int64_t) (p->nb[1]/sizeof(float)),
-                ps_in, pb_in, ps_out, pb_out, eps, w_stride, q8);
+                ps_in, pb_in, ps_out, pb_out, eps, w_stride, q8, flags);
         } else {
             GGML_ABORT("fatal error");
         }

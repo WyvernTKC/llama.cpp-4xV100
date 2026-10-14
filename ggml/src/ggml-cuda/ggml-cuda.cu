@@ -7945,13 +7945,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_is_contiguous(raw) && ggml_is_contiguous(sc2) && ggml_are_same_shape(raw, sc2) &&
                 !ggml_cuda_tensors_overlap(post, raw)) {
             // with the grouped norm of the next block that reads it
-            if (i + 5 < cgraph->n_nodes && ggml_node_has_n_uses(cgraph, i + 4, 1) &&
-                    (cgraph->nodes[i + 4]->flags & GGML_TENSOR_FLAG_COMPUTE) && (cgraph->nodes[i + 5]->flags & GGML_TENSOR_FLAG_COMPUTE) &&
-                    !(cgraph->nodes[i + 4]->flags & GGML_TENSOR_FLAG_OUTPUT) &&
-                    !ggml_cuda_tensors_overlap(cgraph->nodes[i + 5], raw) &&
-                    ggml_cuda_should_fuse_dsv4_hc_post_rms_norm(post, cgraph->nodes[i + 4], cgraph->nodes[i + 5])) {
+            static const bool no_sync = getenv("GGML_CUDA_NO_HC_POST_SYNC") != nullptr;
+            const int fuse = i + 5 < cgraph->n_nodes && ggml_node_has_n_uses(cgraph, i + 4, 1) &&
+                (cgraph->nodes[i + 4]->flags & GGML_TENSOR_FLAG_COMPUTE) && (cgraph->nodes[i + 5]->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                !(cgraph->nodes[i + 4]->flags & GGML_TENSOR_FLAG_OUTPUT) ?
+                ggml_cuda_should_fuse_dsv4_hc_post_rms_norm(post, cgraph->nodes[i + 4], cgraph->nodes[i + 5], raw) : 0;
+            if (fuse == 1 || (fuse == 2 && !no_sync)) {
                 ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + 5, /*flat =*/ true);
-                ggml_cuda_op_dsv4_hc_post_rms_norm(*cuda_ctx, post, node, sc2, cgraph->nodes[i + 4], cgraph->nodes[i + 5]);
+                ggml_cuda_op_dsv4_hc_post_rms_norm(*cuda_ctx, post, node, sc2, cgraph->nodes[i + 4], cgraph->nodes[i + 5], fuse == 2);
                 return 5;
             }
             ggml_cuda_op_dsv4_hc_post_gated(*cuda_ctx, post, node, sc2);
