@@ -1039,6 +1039,39 @@ static void ggml_backend_meta_gathered_weight_release(ggml_backend_meta_gathered
     gw.dm.reset();
 }
 
+// The split the model gives a host weight it gathers. The model runs the name through its rules (~60 regexes a weight),
+//   and the gathers of one Qwen3.8-Flash decode graph build asked for it ~4 times per MUL_MAT_ID: 58% of the host time of
+//   the first decode token, ~100 ms per graph rebuild. It depends only on the weight, so it is asked once; the entry
+//   records what it was asked for, as the registry does, because a reloaded model can hand out the same address.
+//   GGML_META_GATHER_SS_CACHE=0 asks the model every time.
+struct ggml_backend_meta_gather_ss_entry {
+    const void *                  dev_ctx = nullptr;
+    const void *                  data    = nullptr;
+    ggml_backend_buffer_t         buffer  = nullptr;
+    ggml_type                     type    = GGML_TYPE_COUNT;
+    int64_t                       ne[GGML_MAX_DIMS] = {0, 0, 0, 0};
+    ggml_backend_meta_split_state ss;
+};
+
+struct ggml_backend_meta_gather_ss_cache {
+    std::mutex                                                                 mutex;
+    std::unordered_map<const ggml_tensor *, ggml_backend_meta_gather_ss_entry> entries;
+};
+
+// Heap allocated and never destroyed, like the registry
+static ggml_backend_meta_gather_ss_cache & ggml_backend_meta_gather_ss() {
+    static ggml_backend_meta_gather_ss_cache * cache = new ggml_backend_meta_gather_ss_cache();
+    return *cache;
+}
+
+static bool ggml_backend_meta_gather_ss_cache_on() {
+    static const bool on = [] {
+        const char * env = getenv("GGML_META_GATHER_SS_CACHE");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return on;
+}
+
 static void ggml_backend_meta_gather_release_all() {
     ggml_backend_meta_gather_registry & reg = ggml_backend_meta_gather_reg();
     std::lock_guard<std::mutex> lock(reg.mutex);
@@ -1046,6 +1079,9 @@ static void ggml_backend_meta_gather_release_all() {
         ggml_backend_meta_gathered_weight_release(kv.second, kv.first);
     }
     reg.weights.clear();
+    ggml_backend_meta_gather_ss_cache & ss_cache = ggml_backend_meta_gather_ss();
+    std::lock_guard<std::mutex> ss_lock(ss_cache.mutex);
+    ss_cache.entries.clear();
 }
 
 static bool ggml_backend_meta_gather_device_mode() {
@@ -1066,7 +1102,26 @@ static bool ggml_backend_meta_gathers_weight(ggml_backend_dev_t meta_dev, const 
         return false;
     }
     const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
-    const ggml_backend_meta_split_state ss = dev_ctx->get_split_state(w, dev_ctx->get_split_state_ud);
+    ggml_backend_meta_split_state ss;
+    if (ggml_backend_meta_gather_ss_cache_on()) {
+        ggml_backend_meta_gather_ss_cache & cache = ggml_backend_meta_gather_ss();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        ggml_backend_meta_gather_ss_entry & e = cache.entries[w];
+        if (e.dev_ctx != dev_ctx || e.data != w->data || e.buffer != w->buffer || e.type != w->type ||
+                e.ne[0] != w->ne[0] || e.ne[1] != w->ne[1] || e.ne[2] != w->ne[2] || e.ne[3] != w->ne[3]) {
+            e.ss      = dev_ctx->get_split_state(w, dev_ctx->get_split_state_ud);
+            e.dev_ctx = dev_ctx;
+            e.data    = w->data;
+            e.buffer  = w->buffer;
+            e.type    = w->type;
+            for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                e.ne[i] = w->ne[i];
+            }
+        }
+        ss = e.ss;
+    } else {
+        ss = dev_ctx->get_split_state(w, dev_ctx->get_split_state_ud);
+    }
     if ((ss.axis != GGML_BACKEND_SPLIT_AXIS_0 && ss.axis != GGML_BACKEND_SPLIT_AXIS_1) || ss.n_segments != 1 || ss.nr[0] != 1) {
         return false;
     }
