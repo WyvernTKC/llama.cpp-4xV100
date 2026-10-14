@@ -1245,6 +1245,19 @@ static bool ggml_backend_meta_expert_cache_fill_on() {
     return on && ggml_backend_meta_gather_device_mode();
 }
 
+// Where that copy from the pools runs: on the compute streams by default, which wait for the staging anyway and write the
+//   pools. A kernel on a staging stream between the host copies of consecutive weights makes those copies read ~1.5x
+//   their bytes over PCIe (pcie_rx_active_pulse, legacy CUPTI events; any kernel there does it, even one that only spins):
+//   Qwen3.8-Flash prefill 801 -> 967 t/s with the copy moved, wire bytes 1.50x -> 1.14x the payload.
+//   GGML_META_EXPERT_CACHE_FILL_STAGING=1 runs it on the staging streams again.
+static bool ggml_backend_meta_expert_cache_fill_on_staging() {
+    static const bool on = [] {
+        const char * env = getenv("GGML_META_EXPERT_CACHE_FILL_STAGING");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return on;
+}
+
 // A wide ubatch that stages a pooled weight whole also brings the experts it routes to most into the pools, copied on the
 //   device from the staged copy: into every slot that holds no expert yet, and in place of the n least recently used
 //   residents. A pool keeps the rest of what the last decode used, which predicts the next decode better than the
@@ -4529,9 +4542,10 @@ bool ggml_backend_meta_stage_weight_ranges(ggml_backend_t backend, ggml_tensor *
     return true;
 }
 
-// Order the staging streams after every gather queued so far, before a fill reads the pools. Only the first fill
-//   after new gathers records the event, on compute streams that then also hold whatever part of the current
-//   ubatch is queued; decode pays nothing and a prefill waits once. False when the devices have no events.
+// Mark every gather queued so far, for fill_slots to wait on before it reads the residency; a fill on the staging
+//   streams also orders them after it, before it reads the pools. Only the first fill after new gathers records the
+//   event, on compute streams that then also hold whatever part of the current ubatch is queued; decode pays nothing
+//   and a prefill waits once. False when the devices have no events.
 static bool ggml_backend_meta_fill_after_gathers(ggml_backend_t backend) {
     ggml_backend_meta_context * ctx = (ggml_backend_meta_context *) backend->context;
     const size_t n_dev = ggml_backend_meta_n_backends(backend);
@@ -4555,7 +4569,7 @@ static bool ggml_backend_meta_fill_after_gathers(ggml_backend_t backend) {
         }
         ctx->fill_after_gen = gen;
     }
-    for (size_t j = 0; j < n_dev; j++) {
+    for (size_t j = 0; ggml_backend_meta_expert_cache_fill_on_staging() && j < n_dev; j++) {
         ggml_backend_event_wait(ctx->stage_backends[j], ctx->fill_after[j]);
     }
     return true;
@@ -4564,11 +4578,11 @@ static bool ggml_backend_meta_fill_after_gathers(ggml_backend_t backend) {
 // The residency a fill copies by: which experts the pools hold, read once after new gathers, when the host has
 //   waited for them to run. No gather runs during a wide ubatch, so it holds for every fill until the next decode.
 //   Every device assigns the same slots, so one device's copy is enough. Call after fill_after_gathers.
-//   A warm changes the pools of its weight during a prompt: the fill follows the last one on the device and reads the
-//   slots again (by then long done, it was one ubatch ago).
+//   A warm changes the pools of its weight during a prompt: the fill follows the last one on the device (the compute
+//   stream orders it, a staging stream waits for it) and reads the slots again (by then long done, it was one ubatch ago).
 static bool ggml_backend_meta_fill_slots(ggml_backend_t backend, ggml_backend_meta_gathered_weight * gw, int64_t n_expert) {
     ggml_backend_meta_context * ctx = (ggml_backend_meta_context *) backend->context;
-    if (gw->warm_seq != 0) {
+    if (gw->warm_seq != 0 && ggml_backend_meta_expert_cache_fill_on_staging()) {
         for (size_t j = 0; j < gw->warm_done.size() && j < ctx->stage_backends.size(); j++) {
             if (gw->warm_done[j] != nullptr) {
                 ggml_backend_event_wait(ctx->stage_backends[j], gw->warm_done[j]);
@@ -4653,7 +4667,8 @@ static bool ggml_backend_meta_stage_weight(ggml_backend_t backend, ggml_tensor *
         ctx->warm_pending.push_back(gw_warm);
     }
 
-    ggml_backend_meta_gathered_weight * gw = ggml_backend_meta_fill_source(backend, src, dst);
+    ggml_backend_meta_gathered_weight * gw      = ggml_backend_meta_fill_source(backend, src, dst);
+    ggml_backend_meta_gathered_weight * gw_fill = nullptr; // copy the resident experts from these pools
     if (gw != nullptr && ggml_backend_meta_fill_after_gathers(backend) && ggml_backend_meta_fill_slots(backend, gw, src->ne[2])) {
         // the experts the pools do not hold come from host memory, in runs of consecutive ids
         const size_t  expert_size  = src->nb[2];
@@ -4673,14 +4688,9 @@ static bool ggml_backend_meta_stage_weight(ggml_backend_t backend, ggml_tensor *
                 (e1 - e0)*expert_size, &ctx->stage_backends);
             e0 = e1;
         }
-        // and the others from the pools
-        for (size_t j = 0; n_resident > 0 && j < n_dev; j++) {
-            ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(dst, j);
-            if (ggml_nbytes(simple_tensor) == 0) {
-                continue;
-            }
-            const bool ok = gw->cache_fill(ctx->stage_backends[j], gw->caches[j], gw->pool_tensors[j]->data, simple_tensor->data);
-            GGML_ASSERT(ok && "the staging slot is not aligned for the expert cache fill");
+        // and the others from the pools, on the compute streams once they have waited for the staging below
+        if (n_resident > 0) {
+            gw_fill = gw;
         }
         static bool reported = false;
         if (!reported) {
@@ -4692,9 +4702,26 @@ static bool ggml_backend_meta_stage_weight(ggml_backend_t backend, ggml_tensor *
         ggml_backend_meta_set_tensor_async_impl(backend, dst, data, 0, size, &ctx->stage_backends);
     }
 
+    // the pool copy: on the staging stream before the ready event, or on the compute stream after it waited for it
+    //   (see ggml_backend_meta_expert_cache_fill_on_staging)
+    const bool fill_staging = ggml_backend_meta_expert_cache_fill_on_staging();
+    auto fill = [&](size_t j, ggml_backend_t on) {
+        ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(dst, j);
+        if (ggml_nbytes(simple_tensor) == 0) {
+            return;
+        }
+        const bool ok = gw_fill->cache_fill(on, gw_fill->caches[j], gw_fill->pool_tensors[j]->data, simple_tensor->data);
+        GGML_ASSERT(ok && "the staging slot is not aligned for the expert cache fill");
+    };
     for (size_t j = 0; j < n_dev; j++) {
+        if (gw_fill != nullptr && fill_staging) {
+            fill(j, ctx->stage_backends[j]);
+        }
         ggml_backend_event_record(slot.ready[j], ctx->stage_backends[j]);
         ggml_backend_event_wait(ggml_backend_meta_simple_backend(backend, j), slot.ready[j]);
+        if (gw_fill != nullptr && !fill_staging) {
+            fill(j, ggml_backend_meta_simple_backend(backend, j));
+        }
     }
     ctx->stage_pending.push_back(slot_id);
     return true;
