@@ -1258,6 +1258,18 @@ static bool ggml_backend_meta_expert_cache_fill_on_staging() {
     return on;
 }
 
+// A full synchronize of the meta backend drains every gather queued before it, so a fill after one needs no event behind
+//   the gathers: the host does not wait for the head of the next ubatch queued in front of the event. Qwen3.8-Flash applies
+//   out_ids before the last layer's MoE, whose empty MUL_MAT_ID counts as a gather at the end of every non-final ubatch;
+//   the next ubatch's first fill blocked 14-25 ms on it. GGML_META_FILL_SYNC_EPOCH=0 records the event every time.
+static bool ggml_backend_meta_fill_sync_epoch_on() {
+    static const bool on = [] {
+        const char * env = getenv("GGML_META_FILL_SYNC_EPOCH");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return on;
+}
+
 // A wide ubatch that stages a pooled weight whole also brings the experts it routes to most into the pools, copied on the
 //   device from the staged copy: into every slot that holds no expert yet, and in place of the n least recently used
 //   residents. A pool keeps the rest of what the last decode used, which predicts the next decode better than the
@@ -3612,6 +3624,8 @@ struct ggml_backend_meta_context {
     // recorded on the compute streams after the gathers queued up to g_meta_gather_gen == fill_after_gen
     std::vector<ggml_backend_event_t> fill_after;
     uint64_t                          fill_after_gen = 0;
+    // g_meta_gather_gen when the last full synchronize started: every gather up to it has run
+    uint64_t                          synced_gen = 0;
     // pooled weights staged whole into this split with a warm tag, see ggml_backend_meta_stage_weight
     std::vector<ggml_backend_meta_gathered_weight *> warm_pending;
 
@@ -4564,7 +4578,8 @@ static bool ggml_backend_meta_fill_after_gathers(ggml_backend_t backend) {
     }
     const uint64_t gen = g_meta_gather_gen.load();
     if (ctx->fill_after_gen != gen) {
-        for (size_t j = 0; j < n_dev; j++) {
+        // after a full synchronize the event recorded last (or never) has completed and orders nothing that is still queued
+        for (size_t j = 0; !(gen == ctx->synced_gen && ggml_backend_meta_fill_sync_epoch_on()) && j < n_dev; j++) {
             ggml_backend_event_record(ctx->fill_after[j], ggml_backend_meta_simple_backend(backend, j));
         }
         ctx->fill_after_gen = gen;
@@ -4768,10 +4783,12 @@ static bool ggml_backend_meta_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     const int64_t t_start_us = ggml_backend_meta_stats::enabled() ? ggml_time_us() : 0;
+    const uint64_t gather_gen = g_meta_gather_gen.load();
     for (size_t i = 0; i < n_backends; i++) {
         ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, i));
     }
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+    backend_ctx->synced_gen = gather_gen;
     if (ggml_backend_meta_stats::enabled()) {
         backend_ctx->stats.t_sync_us += ggml_time_us() - t_start_us;
     }
