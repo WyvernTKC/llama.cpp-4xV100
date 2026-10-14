@@ -311,22 +311,22 @@ static __device__ __forceinline__ void expert_cache_copy_slot_covering(const ggm
     }
 }
 
-// blockIdx.z is the cache of the group, each copied with the widest unit its addresses allow (negative: covering)
+// blockIdx.z is the cache of the group, each copied with the widest unit its addresses allow (negative: covering);
+//   blockIdx.y steps through the misses
 static __global__ void expert_cache_copy(const ggml_cuda_expert_cache_group g) {
     const int z = blockIdx.z;
     const ggml_cuda_expert_cache_dev & d = g.d[z];
-    const int m = blockIdx.y;
-    if (m >= *d.n_miss) {
-        return;
-    }
-    switch (g.align[z]) {
-        case 16: expert_cache_copy_slot<int4>   (d, g.pool[z], m); break;
-        case  8: expert_cache_copy_slot<int2>   (d, g.pool[z], m); break;
-        case  4: expert_cache_copy_slot<int32_t>(d, g.pool[z], m); break;
-        case  2: expert_cache_copy_slot<int16_t>(d, g.pool[z], m); break;
-        case -2: expert_cache_copy_slot_covering<uint16_t>(d, g.pool[z], m); break;
-        case -1: expert_cache_copy_slot_covering<uint8_t> (d, g.pool[z], m); break;
-        default: expert_cache_copy_slot<int8_t> (d, g.pool[z], m); break;
+    const int n_miss = *d.n_miss;
+    for (int m = blockIdx.y; m < n_miss; m += gridDim.y) {
+        switch (g.align[z]) {
+            case 16: expert_cache_copy_slot<int4>   (d, g.pool[z], m); break;
+            case  8: expert_cache_copy_slot<int2>   (d, g.pool[z], m); break;
+            case  4: expert_cache_copy_slot<int32_t>(d, g.pool[z], m); break;
+            case  2: expert_cache_copy_slot<int16_t>(d, g.pool[z], m); break;
+            case -2: expert_cache_copy_slot_covering<uint16_t>(d, g.pool[z], m); break;
+            case -1: expert_cache_copy_slot_covering<uint8_t> (d, g.pool[z], m); break;
+            default: expert_cache_copy_slot<int8_t> (d, g.pool[z], m); break;
+        }
     }
 }
 
@@ -703,7 +703,16 @@ void ggml_cuda_expert_cache_gather_group(ggml_backend_cuda_context & ctx, const 
     expert_cache_plan<<<n, 512, smem, stream>>>(g, (const int32_t *) ids->data, n_rows, n_per_row, row_stride, fast);
     CUDA_CHECK(cudaGetLastError());
 
-    expert_cache_copy<<<dim3(nbx, n_rows*n_per_row, n), nthreads, 0, stream>>>(g);
+    // A decode step misses few experts, and most of its launches none: Qwen3.8-Flash ~28 of 36 a token. Blocks for every
+    //   id made those launches 1920 blocks that only read n_miss, 4.7 us against ~2.2 for a small kernel; one block
+    //   alone fills the x16 link while the SMs idle. GGML_CUDA_EXPERT_COPY_ROWS sets how many misses go at once,
+    //   0 = one per id.
+    static const int copy_rows = [] {
+        const char * env = getenv("GGML_CUDA_EXPERT_COPY_ROWS");
+        return env != nullptr ? std::max(0, atoi(env)) : 2;
+    }();
+    const int n_y = std::max(1, copy_rows > 0 ? std::min(n_ids, copy_rows) : n_ids);
+    expert_cache_copy<<<dim3(nbx, n_y, n), nthreads, 0, stream>>>(g);
     CUDA_CHECK(cudaGetLastError());
 
     for (int k = 0; k < n; k++) {
