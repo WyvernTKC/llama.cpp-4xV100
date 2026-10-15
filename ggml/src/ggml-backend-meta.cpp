@@ -3806,6 +3806,11 @@ struct ggml_backend_meta_context {
     // optional: told before a subgraph runs which all-reduce follows it, so its last node can take part in it
     session_allreduce_t           session_allreduce_next      = nullptr;
 
+    // optional: several host inputs of a device in one copy, false when it did not take them
+    typedef bool (*set_tensors_batch_t)(ggml_backend_t backend, int n, ggml_tensor * const * tensors, const void * const * data,
+        const size_t * sizes);
+    set_tensors_batch_t set_tensors_batch = nullptr;
+
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
         n_reduce_steps = std::ceil(std::log2(n_devs));
@@ -3823,6 +3828,9 @@ struct ggml_backend_meta_context {
             backend_configs.emplace_back(simple_backends.back(), n_reduce_steps);
         }
         name += ")";
+
+        set_tensors_batch = (set_tensors_batch_t) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0])), "ggml_backend_set_tensors_batch");
 
         if (n_devs > 1) {
             ggml_backend_comm_init_t comm_init = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(
@@ -4077,6 +4085,7 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
 void ggml_backend_meta_set_tensors(ggml_backend_t backend, size_t n, ggml_tensor * const * tensors, const void * const * data) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     std::vector<size_t> mirrored;
+    bool split_copies = false;
     for (size_t i = 0; i < n; i++) {
         const size_t size = ggml_nbytes(tensors[i]);
         if (size == 0) {
@@ -4090,6 +4099,7 @@ void ggml_backend_meta_set_tensors(ggml_backend_t backend, size_t n, ggml_tensor
                    (!plain && (ss.axis == GGML_BACKEND_SPLIT_AXIS_0 || ss.axis == GGML_BACKEND_SPLIT_AXIS_1))) {
             // on the device streams, which the round below waits for
             ggml_backend_meta_set_tensor_async_impl(backend, tensors[i], data[i], 0, size, /*backends_override =*/ nullptr);
+            split_copies = true;
         } else {
             ggml_backend_tensor_set(tensors[i], data[i], 0, size); // PARTIAL: only the buffer path divides the value
         }
@@ -4097,11 +4107,29 @@ void ggml_backend_meta_set_tensors(ggml_backend_t backend, size_t n, ggml_tensor
     ggml_backend_meta_context * ctx = (ggml_backend_meta_context *) backend->context;
     ctx->for_each_device(n_backends, [&](size_t j) {
         ggml_backend_t backend_j = ggml_backend_meta_simple_backend(backend, j);
-        for (size_t i : mirrored) {
+        constexpr size_t max_batch = 64;
+        bool batched = false;
+        if (ctx->set_tensors_batch != nullptr && mirrored.size() > 1 && mirrored.size() <= max_batch) {
+            ggml_tensor * dsts[max_batch];
+            const void *  srcs[max_batch];
+            size_t        sizes[max_batch];
+            for (size_t k = 0; k < mirrored.size(); k++) {
+                const size_t i = mirrored[k];
+                dsts[k]  = ggml_backend_meta_buffer_simple_tensor(tensors[i], j);
+                srcs[k]  = data[i];
+                sizes[k] = ggml_nbytes(tensors[i]);
+            }
+            batched = ctx->set_tensors_batch(backend_j, (int) mirrored.size(), dsts, srcs, sizes);
+        }
+        for (size_t k = 0; k < mirrored.size() && !batched; k++) {
+            const size_t i = mirrored[k];
             ggml_backend_tensor_set_async(backend_j, ggml_backend_meta_buffer_simple_tensor(tensors[i], j), data[i], 0,
                 ggml_nbytes(tensors[i]));
         }
-        ggml_backend_synchronize(backend_j);
+        // a batch is staged in host memory the caller does not own, there is nothing to wait for
+        if (!batched || split_copies) {
+            ggml_backend_synchronize(backend_j);
+        }
     });
 }
 

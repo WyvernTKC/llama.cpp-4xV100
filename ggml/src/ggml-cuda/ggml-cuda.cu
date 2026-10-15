@@ -97,6 +97,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -750,7 +751,36 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+// staging of ggml_backend_cuda_set_tensors_batch, per backend context
+struct ggml_cuda_set_batch {
+    void *         host     = nullptr; // pinned and mapped
+    void *         host_dev = nullptr; // host as the device sees it
+    void *         dev      = nullptr;
+    size_t         size     = 0;
+    unsigned int * done     = nullptr; // in host: the last batch the kernel finished
+    unsigned int * done_dev = nullptr;
+    unsigned int   seq      = 0;       // the last batch launched
+};
+static std::mutex ggml_cuda_set_batch_mutex;
+static std::unordered_map<const ggml_backend_cuda_context *, ggml_cuda_set_batch> ggml_cuda_set_batches;
+
+static void ggml_cuda_set_batch_free(const ggml_backend_cuda_context * ctx) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_set_batch_mutex);
+    auto it = ggml_cuda_set_batches.find(ctx);
+    if (it == ggml_cuda_set_batches.end()) {
+        return;
+    }
+    ggml_cuda_set_device(ctx->device);
+    // the kernel may still read the staging buffer
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaFreeHost(it->second.host));
+    CUDA_CHECK(cudaFree(it->second.dev));
+    ggml_cuda_set_batches.erase(it);
+}
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+    ggml_cuda_set_batch_free(this);
+
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
@@ -2944,6 +2974,127 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+}
+
+struct ggml_cuda_set_batch_entry {
+    char *   dst;
+    uint32_t offset; // of the bytes in the staging buffer
+    uint32_t size;
+};
+
+// block b copies the bytes of entry b from the staging buffer to their tensor; the last block to finish tells the host
+//   through done that the staging buffer may be written again
+static __global__ void k_set_tensors_batch(const char * __restrict__ staging, unsigned int * ticket,
+        volatile unsigned int * done, const unsigned int seq) {
+    const ggml_cuda_set_batch_entry e = ((const ggml_cuda_set_batch_entry *) staging)[blockIdx.x];
+    const char * src = staging + e.offset;
+    if (((uintptr_t) e.dst % 16) == 0 && e.size % 16 == 0) {
+        for (uint32_t i = 16*threadIdx.x; i < e.size; i += 16*blockDim.x) {
+            *(int4 *) (e.dst + i) = *(const int4 *) (src + i);
+        }
+    } else {
+        for (uint32_t i = threadIdx.x; i < e.size; i += blockDim.x) {
+            e.dst[i] = src[i];
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        if (atomicAdd(ticket, 1) == gridDim.x - 1) {
+            *ticket = 0;
+            __threadfence_system();
+            *done = seq;
+        }
+    }
+}
+
+// Small host inputs of one graph in one kernel launch instead of a copy each, which costs ~5 us of host time per copy
+//   (more when the launch workers of all devices call into the driver at once), with the GPU idle between two decoded
+//   tokens. The data is staged in pinned memory, so the caller may write it again at once, and the stream orders the
+//   kernel before later work: no sync is needed after it. Up to 64 KiB the kernel reads the staging buffer in host
+//   memory, above it a copy to the device goes first. false: nothing was copied (too many or too large).
+//   GGML_CUDA_SET_TENSORS_BATCH=0 turns it off.
+static bool ggml_backend_cuda_set_tensors_batch(ggml_backend_t backend, int n, ggml_tensor * const * tensors,
+        const void * const * data, const size_t * sizes) {
+#if defined(GGML_USE_MUSA)
+    // no mapped pinned memory
+    GGML_UNUSED_VARS(backend, n, tensors, data, sizes);
+    return false;
+#else
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_SET_TENSORS_BATCH");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    constexpr size_t max_bytes       = 1u << 20;
+    constexpr size_t max_bytes_mapped = 64u << 10;
+    if (!enabled || n < 2 || n > 1024) {
+        return false;
+    }
+    const size_t header = GGML_PAD(n*sizeof(ggml_cuda_set_batch_entry), 16);
+    size_t total = header;
+    for (int i = 0; i < n; i++) {
+        total += GGML_PAD(sizes[i], 16);
+    }
+    if (total > max_bytes) {
+        return false;
+    }
+
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_batch * b;
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_set_batch_mutex);
+        b = &ggml_cuda_set_batches[cuda_ctx];
+    }
+    ggml_cuda_set_device(cuda_ctx->device);
+    cudaStream_t stream = cuda_ctx->stream();
+    if (b->host != nullptr) {
+        // the previous batch has left the staging buffer: done by the time the caller synchronized, else wait
+        if (*(volatile unsigned int *) b->done != b->seq) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+    }
+    if (b->size < total) {
+        if (b->host) {
+            CUDA_CHECK(cudaFreeHost(b->host));
+            CUDA_CHECK(cudaFree(b->dev));
+        }
+        b->size = std::max(total, (size_t) 64*1024);
+        // a word after the data for done, and the ticket of the blocks at the start of the device buffer
+        CUDA_CHECK(cudaHostAlloc(&b->host, b->size + 16, cudaHostAllocPortable | cudaHostAllocMapped));
+        CUDA_CHECK(cudaMalloc(&b->dev, b->size + 16));
+        CUDA_CHECK(cudaMemsetAsync(b->dev, 0, 16, stream));
+        b->done = (unsigned int *) ((char *) b->host + b->size);
+        *(volatile unsigned int *) b->done = b->seq;
+        if (cudaHostGetDevicePointer(&b->host_dev, b->host, 0) != cudaSuccess) {
+            (void) cudaGetLastError();
+            b->host_dev = nullptr;
+        }
+        b->done_dev = b->host_dev ? (unsigned int *) ((char *) b->host_dev + b->size) : nullptr;
+    }
+    if (b->done_dev == nullptr) {
+        return false; // the kernel cannot tell the host it is done
+    }
+
+    ggml_cuda_set_batch_entry * entries = (ggml_cuda_set_batch_entry *) b->host;
+    size_t offset = header;
+    for (int i = 0; i < n; i++) {
+        ggml_tensor * t = tensors[i];
+        ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+        GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+        entries[i] = { (char *) t->data, (uint32_t) offset, (uint32_t) sizes[i] };
+        memcpy((char *) b->host + offset, data[i], sizes[i]);
+        offset += GGML_PAD(sizes[i], 16);
+    }
+
+    const char * staging = (const char *) b->host_dev;
+    if (total > max_bytes_mapped) {
+        CUDA_CHECK(cudaMemcpyAsync((char *) b->dev + 16, b->host, total, cudaMemcpyHostToDevice, stream));
+        staging = (const char *) b->dev + 16;
+    }
+    b->seq++;
+    k_set_tensors_batch<<<n, 128, 0, stream>>>(staging, (unsigned int *) b->dev, (volatile unsigned int *) b->done_dev, b->seq);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+#endif // defined(GGML_USE_MUSA)
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -10188,6 +10339,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_session_plan") == 0) {
         return (void *)ggml_backend_cuda_session_plan;
+    }
+    if (strcmp(name, "ggml_backend_set_tensors_batch") == 0) {
+        return (void *)ggml_backend_cuda_set_tensors_batch;
     }
     if (strcmp(name, "ggml_backend_session_begin") == 0) {
         return (void *)ggml_backend_cuda_session_begin;
