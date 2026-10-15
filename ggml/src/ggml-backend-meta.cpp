@@ -5770,13 +5770,21 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             //   GGML_META_SESSION_CHUNK sets it
             static const size_t chunk = getenv("GGML_META_SESSION_CHUNK") ?
                 (size_t) std::max(1, atoi(getenv("GGML_META_SESSION_CHUNK"))) : 8;
-            const size_t n_chunks = (n_sess + chunk - 1) / chunk;
+            // the GPUs wait for the plan and the launch of the first chunk only, so a smaller one starts them earlier:
+            //   2 subgraphs keep the GPUs busy while the next chunk is planned (Ornith decode: ~35 us less idle between
+            //   tokens than 8); GGML_META_SESSION_CHUNK0 sets it
+            static const size_t chunk0 = getenv("GGML_META_SESSION_CHUNK0") ?
+                (size_t) std::max(1, atoi(getenv("GGML_META_SESSION_CHUNK0"))) : std::min<size_t>(2, chunk);
+            const size_t n_chunks = n_sess <= chunk0 ? 1 : 1 + (n_sess - chunk0 + chunk - 1) / chunk;
+            // the first subgraph of chunk c, and the one after its last
+            auto chunk_begin = [&](size_t c) { return std::min(n_sess, c == 0 ? (size_t) 0 : chunk0 + (c - 1)*chunk); };
+            auto chunk_end   = [&](size_t c) { return std::min(n_sess, chunk0 + c*chunk); };
             std::vector<int> & modes = backend_ctx->session_modes;
             modes.resize(n_backends*n_chunks);
 
             auto plan = [&](size_t j, size_t c) {
-                const size_t i0 = c*chunk;
-                const size_t i1 = std::min(n_sess, i0 + chunk);
+                const size_t i0 = chunk_begin(c);
+                const size_t i1 = chunk_end(c);
                 modes[j*n_chunks + c] = backend_ctx->session_plan(backend_ctx->backend_configs[j].backend,
                     D->graphs[j].session_cgraphs.data() + i0, (int) (i1 - i0));
             };
@@ -5831,7 +5839,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         }
                     }
                     if (launching) {
-                        backend_ctx->session_launch(backend_j, D->graphs[j].session_cgraphs.data() + c*chunk, 1);
+                        backend_ctx->session_launch(backend_j, D->graphs[j].session_cgraphs.data() + chunk_begin(c), 1);
                         if (j == 0) {
                             n_launched.store(c + 1, std::memory_order_relaxed);
                         }
@@ -5868,18 +5876,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     c_end++;
                 }
                 const int    next = c_end < n_chunks ? modes[c_end] : -1;
-                const size_t i0   = c_end*chunk;
-                const size_t i1   = std::min(n_sess, i0 + chunk);
+                const size_t i0   = chunk_begin(c_end);
+                const size_t i1   = chunk_end(c_end);
 
                 // launches, then a capture or the first eager subgraph
                 backend_ctx->lpool->run(n_backends, [&](size_t j) {
                     ggml_backend_t backend_j  = backend_ctx->backend_configs[j].backend;
                     ggml_cgraph ** cgraphs_j  = D->graphs[j].session_cgraphs.data();
                     if (c_launch < n_chunks) {
-                        backend_ctx->session_launch(backend_j, cgraphs_j + c_launch*chunk, 1);
+                        backend_ctx->session_launch(backend_j, cgraphs_j + chunk_begin(c_launch), 1);
                     }
                     for (size_t cc = c; cc < c_end; cc++) {
-                        backend_ctx->session_launch(backend_j, cgraphs_j + cc*chunk, 1);
+                        backend_ctx->session_launch(backend_j, cgraphs_j + chunk_begin(cc), 1);
                     }
                     if (next < 0) {
                         return;
