@@ -898,7 +898,7 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_DEEPSEEK41) {
         return false; // TODO engram fixture: layer ids, hash primes/offsets and token map
     }
-    if (arch == LLM_ARCH_CLEF) {
+    if (arch == LLM_ARCH_CLEF || arch == LLM_ARCH_VLLM_DECISION2) {
         return false; // TODO decision head tensors
     }
     if (arch == LLM_ARCH_DEEPSEEK2OCR) {

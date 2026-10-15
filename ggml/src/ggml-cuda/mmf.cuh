@@ -1056,9 +1056,8 @@ void mul_mat_f_cuda(
                  stride_col_id, stride_row_id, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ggml_cuda_mm_fusion_args_device{});
         } break;
-        default: {
+        default:
             GGML_ABORT("fatal error");
-        } break;
     }
 
     GGML_UNUSED_VARS(nchannels_y);
@@ -1160,9 +1159,8 @@ static void mul_mat_f_switch_cols_per_block(
                 stride_col_id, stride_row_id, nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream, ids_data);
         } break;
-        default: {
+        default:
             GGML_ABORT("fatal error");
-        } break;
     }
 }
 

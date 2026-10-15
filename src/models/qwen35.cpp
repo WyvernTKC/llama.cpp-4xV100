@@ -245,8 +245,6 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
@@ -698,5 +696,4 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     }
 
     res->t_logits = cur;
-    ggml_build_forward_expand(gf, cur);
 }

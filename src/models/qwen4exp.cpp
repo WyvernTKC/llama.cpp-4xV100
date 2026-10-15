@@ -538,14 +538,13 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     cur = build_lora_mm(model.output, cur, model.output_s);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
 }
 
 // The draft head uses dense attention: it has no QSA path of its own.
 llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
     graph(model, params, no_build_t{}) {
     GGML_ASSERT(hparams.n_layer_nextn == 1 && "QWEN4EXP MTP requires one NextN block");
+    ASSERT_EMBD_OR_TOKEN(ubatch);
 
     const int64_t hc     = hparams.dsv4_hc_mult;
     const int64_t hc_dim = hc * n_embd;
@@ -724,8 +723,6 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     }
 
     res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(

@@ -5366,8 +5366,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 // n_subgraphs keeps pointing into the freed arena, and a later call that reuses this
                 // decomposition with a bigger (but still <= D->sized_subgraphs) subgraph count than this
                 // round, without itself growing past the ceiling, would read that dangling pointer.
+                // Each slot is also sized for D->sized_nnodes, what D->ctx was budgeted for, not for this graph: a
+                // round with fewer nodes than an earlier one can regrow the arena (more subgraphs), and a later reuse
+                // with more nodes than that round would overflow a slot sized by it (upstream #30453: max_nnodes).
                 for (size_t i = 0; i < D->sized_subgraphs; i++) {
-                    D->graphs[j].cgraphs[i].cgraph_main = ggml_new_graph_custom(D->ctx.get(), cgraph->n_nodes, /*grads =*/ false);
+                    D->graphs[j].cgraphs[i].cgraph_main = ggml_new_graph_custom(D->ctx.get(), D->sized_nnodes, /*grads =*/ false);
                 }
             }
             D->cgraphs_aux.resize(n_backends*n_cgraphs_per_device*D->sized_subgraphs);
