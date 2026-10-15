@@ -174,6 +174,22 @@ struct llama_context {
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
 
+    // LLAMA_STATE_SEQ_FLAGS_ASYNC: the backend whose stream does the work on this tensor, nullptr for host memory
+    ggml_backend_t state_async_backend(const ggml_tensor * tensor) const;
+
+    struct state_tensor_read {
+        ggml_tensor * tensor;
+        uint8_t     * dst;
+        size_t        offset;
+        size_t        size;
+    };
+
+    // queue the reads behind the submitted work, into pinned staging; false if a read cannot be queued
+    bool state_read_async(const std::vector<state_tensor_read> & reads);
+
+    // wait for the queued reads and copy them to their destinations
+    void state_read_async_wait();
+
     bool state_load_file(
             const char * filepath,
            llama_token * tokens_out,
@@ -478,6 +494,18 @@ private:
     // keyed by (seq_id, dev_slot) so several states of one sequence can be resident at once
     // - see LLAMA_STATE_SEQ_FLAGS_DEV_SLOT
     std::map<std::pair<llama_seq_id, uint32_t>, llama_memory_buffers> mem_storage;
+
+    // the reads of an async state save: pinned staging, an event per backend, the copies still to do
+    struct state_read_pending {
+        uint8_t * dst;
+        size_t    offs;
+        size_t    size;
+    };
+    ggml_backend_buffer_ptr state_read_buf;
+    std::vector<ggml_backend_buffer_ptr> state_read_buf_old; // replaced by a larger one, freed at synchronize()
+    std::vector<std::pair<ggml_backend_t, ggml_backend_event_ptr>> state_read_events;
+    std::vector<ggml_backend_event_t> state_read_events_used;
+    std::vector<state_read_pending>   state_read_copies;
 
 
     bool has_evaluated_once = false;

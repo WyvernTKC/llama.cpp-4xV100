@@ -932,6 +932,11 @@ extern "C" {
 // unless they were taken into a different device storage slot - see LLAMA_STATE_SEQ_FLAGS_DEV_SLOT below.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
+// llama_state_seq_get_data_ext only: queue the copies behind the work already submitted instead of waiting for it, so the
+// caller can prepare the next batch while the device finishes. The tensor bytes are in dst once the next llama_decode,
+// llama_encode or llama_synchronize on this context returns: keep dst allocated and unread until then.
+#define LLAMA_STATE_SEQ_FLAGS_ASYNC 4
+
 // With LLAMA_STATE_SEQ_FLAGS_ON_DEVICE, bits 8..31 of the flags select one of several independent on-device
 // storage slots for the same seq_id (default slot 0). Each (seq_id, slot) pair keeps its own device buffers, so
 // several states of one sequence can be resident at once - getting a state only invalidates the same slot.

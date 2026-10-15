@@ -341,6 +341,71 @@ struct case_state_roundtrip : ctx_test {
     }
 };
 
+// - decode all but the last token and save the state after a wait
+// - erase, decode the same tokens again and save without waiting, on the host and on the device
+// - decode the last token: it changes the state the saves were queued before
+// - both saves must hold the state from before the last token
+struct case_state_async : ctx_test {
+    const char * name() const override { return "rt_a"; }
+
+    const char * description() const override {
+        return "an async save queued behind a decode holds the state of that decode, not of the next one";
+    }
+
+    case_result run(model_run & mr) const override {
+        auto ctx = mr.ctx();
+        if (!ctx) {
+            return case_result::fail();
+        }
+
+        const llama_pos n_tokens = (llama_pos) mr.tokens.size();
+        CTX_REQUIRE(n_tokens >= 2, "the prompt is too short");
+
+        if (!decode_seq(ctx.get(), mr.tokens, 0, n_tokens - 1, 0, false)) {
+            TLOG_ERR("%s: failed to decode the prompt\n", __func__);
+            return case_result::fail();
+        }
+
+        std::vector<uint8_t> blob_ref;
+        if (!get_seq_state(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, blob_ref)) {
+            return case_result::fail();
+        }
+
+        if (!seq_rm(ctx.get(), 0) || !decode_seq(ctx.get(), mr.tokens, 0, n_tokens - 1, 0, false)) {
+            TLOG_ERR("%s: failed to decode the prompt again\n", __func__);
+            return case_result::fail();
+        }
+
+        std::vector<uint8_t> blob_host;
+        std::vector<uint8_t> blob_dev;
+        if (!get_seq_state(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_ASYNC, blob_host) ||
+            !get_seq_state(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_ASYNC | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE, blob_dev)) {
+            return case_result::fail();
+        }
+
+        if (!decode_seq(ctx.get(), mr.tokens, n_tokens - 1, n_tokens, 0, true)) {
+            TLOG_ERR("%s: failed to decode the last token\n", __func__);
+            return case_result::fail();
+        }
+
+        CTX_REQUIRE(blobs_equal(blob_ref, blob_host), "the async host save differs from the save after a wait");
+
+        if (!seq_rm(ctx.get(), 0) || !set_seq_state(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE, blob_dev)) {
+            TLOG_ERR("%s: failed to restore the async device save\n", __func__);
+            return case_result::fail();
+        }
+
+        std::vector<uint8_t> blob_dev_host;
+        if (!get_seq_state(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, blob_dev_host)) {
+            return case_result::fail();
+        }
+
+        CTX_REQUIRE(blobs_equal(blob_ref, blob_dev_host), "the async device save differs from the save after a wait");
+
+        return case_result::pass();
+    }
+};
+
 // a failed restore must leave the sequence empty and must not change the logits of other sequences
 struct case_state_restore_failure : ctx_test {
     const char * name() const override { return "rf"; }
@@ -686,6 +751,7 @@ std::vector<ctx_test_ptr> make_kv_cases() {
     cases.push_back(std::make_unique<case_seq_cp_scatter>(false));
     cases.push_back(std::make_unique<case_seq_cp_scatter>(true));
     cases.push_back(std::make_unique<case_state_roundtrip>());
+    cases.push_back(std::make_unique<case_state_async>());
     cases.push_back(std::make_unique<case_state_restore_failure>());
     cases.push_back(std::make_unique<case_state_rotation>());
     cases.push_back(std::make_unique<case_state_restore_fragmented>());
