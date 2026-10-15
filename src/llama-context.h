@@ -466,7 +466,10 @@ private:
         bool                   active = false;
     };
     std::array<graph_slot, 8> gf_slots; // [n_tokens - 1]
+    // the same for ubatches without an output (the small chunks of a prompt), whose graph has no LM head
+    std::array<graph_slot, 8> gf_slots_noout;
     uint32_t gf_slots_max = 0; // the token counts up to this one take a slot
+    uint32_t gf_slots_noout_max = 0;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

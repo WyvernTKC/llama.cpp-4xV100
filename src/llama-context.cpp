@@ -786,6 +786,9 @@ void llama_context::sched_reserve() {
         //   tensor), for a few MiB of compute buffers
         const char * env = getenv("LLAMA_GRAPH_SLOTS");
         gf_slots_max = env == nullptr || atoi(env) != 0 ? (uint32_t) gf_slots.size() : 0;
+        // LLAMA_GRAPH_SLOTS_NOOUT=0: the prompt chunks without an output share the main graph
+        const char * env_noout = getenv("LLAMA_GRAPH_SLOTS_NOOUT");
+        gf_slots_noout_max = env_noout == nullptr || atoi(env_noout) != 0 ? gf_slots_max : 0;
     }
 
     sched_new(max_nodes, cparams.pipeline_parallel);
@@ -1537,9 +1540,11 @@ void llama_context::samplers_changed() {
         // the caller may free the old sampler and the next one land at its addresses: a graph a scheduler last built
         //   with the old one would then look the same and keep what the backends derived for the freed tensors
         ggml_backend_sched_renew_uids(sched.get());
-        for (auto & slot : gf_slots) {
-            if (slot.sched) {
-                ggml_backend_sched_renew_uids(slot.sched.get());
+        for (auto * slots : { &gf_slots, &gf_slots_noout }) {
+            for (auto & slot : *slots) {
+                if (slot.sched) {
+                    ggml_backend_sched_renew_uids(slot.sched.get());
+                }
             }
         }
         return;
@@ -2729,10 +2734,11 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 }
 
 llama_context::graph_slot * llama_context::get_gf_slot(const llama_ubatch & ubatch) {
-    if (n_outputs == 0 || ubatch.n_tokens == 0 || ubatch.n_tokens > gf_slots_max) {
+    const bool noout = n_outputs == 0;
+    if (ubatch.n_tokens == 0 || ubatch.n_tokens > (noout ? gf_slots_noout_max : gf_slots_max)) {
         return nullptr;
     }
-    auto & slot = gf_slots[ubatch.n_tokens - 1];
+    auto & slot = (noout ? gf_slots_noout : gf_slots)[ubatch.n_tokens - 1];
     if (!slot.sched) {
         const size_t max_nodes = gf_res_reserve->get_max_nodes();
         slot.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
@@ -2744,11 +2750,13 @@ llama_context::graph_slot * llama_context::get_gf_slot(const llama_ubatch & ubat
 }
 
 void llama_context::gf_slots_invalidate(bool free_slots) {
-    for (auto & slot : gf_slots) {
-        slot.active = false;
-        if (free_slots) {
-            slot.res.reset();
-            slot.sched.reset();
+    for (auto * slots : { &gf_slots, &gf_slots_noout }) {
+        for (auto & slot : *slots) {
+            slot.active = false;
+            if (free_slots) {
+                slot.res.reset();
+                slot.sched.reset();
+            }
         }
     }
     if (free_slots) {
