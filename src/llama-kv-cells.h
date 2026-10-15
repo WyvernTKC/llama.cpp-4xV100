@@ -427,6 +427,21 @@ public:
         return pos[i];
     }
 
+    // the position of every cell, -1 for an empty one
+    const llama_pos * pos_data() const {
+        return pos.data();
+    }
+
+    // calls f(i) for every cell i of seq_id at position p
+    template<typename F>
+    void seq_cells_at(llama_seq_id seq_id, llama_pos p, F && f) const {
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+        const auto & sp = seq_pos[seq_id];
+        for (auto it = sp.lower_bound({ p, 0 }); it != sp.end() && it->first == p; ++it) {
+            f(it->second);
+        }
+    }
+
     const llama_kv_cell_ext & ext_get(uint32_t i) const {
         assert(i < pos.size());
         assert(pos[i] != -1);

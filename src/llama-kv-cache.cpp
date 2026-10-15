@@ -13,6 +13,7 @@
 #include <map>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 
 static bool ggml_is_power_of_2(int n) {
@@ -1661,6 +1662,55 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     const T mask_keep = llama_cast<T>(0.0f);
     const T mask_drop = llama_cast<T>(-INFINITY);
 
+    // A decoded token is one row of one sequence that holds every used cell: a causal row keeps the cells with a
+    //   position in [lo, p1], where lo is where the sliding window starts. Empty cells have position -1, so one
+    //   compare per cell over the position array. LLAMA_KQ_MASK_FAST=0 takes the loop below.
+    static const bool fast_row = [] {
+        const char * env = getenv("LLAMA_KQ_MASK_FAST");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if constexpr (causal && !alibi) {
+        const llama_seq_id seq_id = ubatch->seq_id[0][0];
+        const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+        if (fast_row && ubatch->n_tokens == 1 && n_stream == 1 && cells.seq_has_all(seq_id) && n_kv <= (int64_t) cells.size()) {
+            const llama_pos p1 = ubatch->pos[0];
+            llama_pos lo = 0;
+            if (swa) {
+                switch (swa_type) {
+                    case LLAMA_SWA_TYPE_STANDARD:  lo = p1 - (llama_pos) n_swa + 1;                      break;
+                    case LLAMA_SWA_TYPE_CHUNKED:   lo = (p1 / (llama_pos) n_swa) * (llama_pos) n_swa;     break;
+                    case LLAMA_SWA_TYPE_SYMMETRIC: lo = p1 - (llama_pos) n_swa/2;                       break;
+                    case LLAMA_SWA_TYPE_NONE:                                                           break;
+                }
+                lo = std::max<llama_pos>(lo, 0);
+            }
+            const llama_pos * pos = cells.pos_data();
+            // one unsigned compare per cell: lo <= pos <= p1, and an empty cell (-1) wraps around above the range
+            static_assert(sizeof(T) == 2 || sizeof(T) == 4, "mask type");
+            using U = std::conditional_t<sizeof(T) == 2, uint16_t, uint32_t>;
+            U keep_bits, drop_bits;
+            memcpy(&keep_bits, &mask_keep, sizeof(U));
+            memcpy(&drop_bits, &mask_drop, sizeof(U));
+            const uint32_t span = (uint32_t) (p1 - lo);
+            U * out = (U *) data;
+            for (int64_t j = 0; j < n_kv; ++j) {
+                const U keep = (U) 0 - (U) ((uint32_t) (pos[j] - lo) <= span);
+                out[j] = (U) ((keep & keep_bits) | (~keep & drop_bits));
+            }
+            if (is_2d) {
+                // M-RoPE: a cell at the same position is also masked if it lies after the token in 2D
+                const llama_pos p1_x = ubatch->pos[ubatch->n_tokens*2];
+                const llama_pos p1_y = ubatch->pos[ubatch->n_tokens];
+                cells.seq_cells_at(seq_id, p1, [&](uint32_t j) {
+                    if (j < n_kv && cells.ext_get(j).is_2d_gt(p1_x, p1_y)) {
+                        data[j] = mask_drop;
+                    }
+                });
+            }
+            return;
+        }
+    }
+
     // the min position in the batch for each sequence
     llama_pos seq_pos_min[LLAMA_MAX_SEQ];
     std::fill(seq_pos_min, seq_pos_min + LLAMA_MAX_SEQ, INT32_MAX);
@@ -2014,6 +2064,40 @@ void llama_kv_cache::set_input_kq_ranges(ggml_tensor * dst, const llama_ubatch *
             const auto & cells   = v_cells[strm];
             const bool   seq_all = cells.seq_has_all(seq_id);
             const int64_t n_cells = std::min<int64_t>(n_kv, cells.size());
+            // every used cell is of this sequence: min and max over the positions, without branches (an empty cell
+            //   is -1, so it leaves the max alone and is lifted out of the min). LLAMA_KQ_MASK_FAST=0 off
+            static const bool fast_chunks = [] {
+                const char * env = getenv("LLAMA_KQ_MASK_FAST");
+                return env == nullptr || atoi(env) != 0;
+            }();
+            if (seq_all && fast_chunks) {
+                const llama_pos * pos = cells.pos_data();
+                for (int64_t c = 0; c < n_chunks; ++c) {
+                    const int64_t j0 = c*chunk;
+                    const int64_t j1 = std::min<int64_t>(n_cells, (c + 1)*chunk);
+                    // as unsigned, an empty cell (-1) is above every position; four of each for the pipelines
+                    uint32_t lo[4] = { UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX };
+                    llama_pos hi[4] = { -1, -1, -1, -1 };
+                    int64_t j = j0;
+                    for (; j + 4 <= j1; j += 4) {
+                        for (int k = 0; k < 4; ++k) {
+                            lo[k] = std::min(lo[k], (uint32_t) pos[j + k]);
+                            hi[k] = std::max(hi[k], pos[j + k]);
+                        }
+                    }
+                    for (; j < j1; ++j) {
+                        lo[0] = std::min(lo[0], (uint32_t) pos[j]);
+                        hi[0] = std::max(hi[0], pos[j]);
+                    }
+                    const uint32_t lo_all = std::min(std::min(lo[0], lo[1]), std::min(lo[2], lo[3]));
+                    const llama_pos hi_all = std::max(std::max(hi[0], hi[1]), std::max(hi[2], hi[3]));
+                    // a chunk of empty cells only: as the loop below leaves it
+                    if (hi_all >= 0) {
+                        chunks[c].lo = (llama_pos) lo_all;
+                        chunks[c].hi = hi_all;
+                    }
+                }
+            } else
             for (int64_t j = 0; j < n_cells; ++j) {
                 if (cells.is_empty(j) || (!seq_all && !cells.seq_has(j, seq_id))) {
                     continue;
