@@ -124,6 +124,64 @@ static __global__ void ggml_cuda_p2p_ar_kernel(const ggml_cuda_p2p_ar_args a) {
     }
 }
 
+// AllGather over the same staging and flags: block b pushes its part of this rank's slice to every peer, publishes,
+//   waits for block b of every peer and copies the slices into place. Only copies, so every rank has the same bits.
+static __global__ void ggml_cuda_p2p_ag_kernel(const ggml_cuda_p2p_ar_args a) {
+    const int64_t nblocks = gridDim.x;
+    const int64_t bid     = blockIdx.x;
+
+    const int64_t chunk = (a.nvec + nblocks - 1) / nblocks;
+    const int64_t begin = bid * chunk;
+    const int64_t end   = min(begin + chunk, a.nvec);
+
+    const int64_t slot_base = (int64_t) a.slot * a.n_devs * a.stage_stride;
+
+    for (int j = 0; j < a.n_devs; ++j) {
+        if (j == a.rank) {
+            continue;
+        }
+        float4 * dst = a.stage[j] + slot_base + (int64_t) a.rank * a.stage_stride;
+        for (int64_t i = begin + threadIdx.x; i < end; i += blockDim.x) {
+            dst[i] = a.src[i];
+        }
+    }
+    for (int64_t i = begin + threadIdx.x; i < end; i += blockDim.x) {
+        a.dst[(int64_t) a.rank * a.nvec + i] = a.src[i];
+    }
+
+    __syncthreads();
+    __threadfence_system();
+
+    if (threadIdx.x == 0) {
+        for (int j = 0; j < a.n_devs; ++j) {
+            volatile unsigned long long * f =
+                a.flag[j] + (((int64_t) a.slot * a.n_devs + a.rank) * nblocks + bid);
+            *f = a.seq;
+        }
+        for (int j = 0; j < a.n_devs; ++j) {
+            volatile const unsigned long long * f =
+                a.flag[a.rank] + (((int64_t) a.slot * a.n_devs + j) * nblocks + bid);
+            while (*f < a.seq) {
+#if __CUDA_ARCH__ >= 700
+                __nanosleep(32);
+#endif // __CUDA_ARCH__ >= 700
+            }
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
+
+    const float4 * stage = a.stage[a.rank] + slot_base;
+    for (int j = 0; j < a.n_devs; ++j) {
+        if (j == a.rank) {
+            continue;
+        }
+        for (int64_t i = begin + threadIdx.x; i < end; i += blockDim.x) {
+            a.dst[(int64_t) j * a.nvec + i] = __ldcg(stage + (int64_t) j * a.stage_stride + i);
+        }
+    }
+}
+
 static __device__ __forceinline__ void ggml_cuda_p2p_ar_st_ll(uint4 * p, const uint4 v) {
     asm volatile("st.volatile.global.v4.u32 [%0], {%1, %2, %3, %4};" :: "l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
 }
@@ -748,6 +806,64 @@ void ggml_cuda_p2p_ar_launch_ll_moe_reduce(const ggml_cuda_p2p_ar * ar, ggml_bac
         default: GGML_ABORT("fatal error");
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+bool ggml_cuda_p2p_ar_allgather(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** srcs, ggml_tensor ** dsts) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_P2P_ALLGATHER");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!enabled || ar == nullptr) {
+        return false;
+    }
+    const size_t  n_devices = ar->n_devices;
+    const int64_t ne        = ggml_nelements(srcs[0]);
+    // one row of equal 4-byte slices, in float4s, each slice fitting a rank's staging region
+    if (ne == 0 || ne % 4 != 0 || ggml_type_size(srcs[0]->type) != 4 || ggml_blck_size(srcs[0]->type) != 1 ||
+            (size_t) ne * 4 > ar->max_bytes) {
+        return false;
+    }
+    for (size_t i = 0; i < n_devices; ++i) {
+        const ggml_tensor * s = srcs[i];
+        const ggml_tensor * d = dsts[i];
+        if (s == nullptr || d == nullptr || s->type != srcs[0]->type || d->type != srcs[0]->type ||
+                ggml_nelements(s) != ne || ggml_nelements(d) != ne * (int64_t) n_devices ||
+                ggml_nrows(s) != 1 || ggml_nrows(d) != 1) {
+            return false;
+        }
+        if (!ggml_is_contiguously_allocated(s) || !ggml_is_contiguously_allocated(d) ||
+                ((uintptr_t) s->data % sizeof(float4)) != 0 || ((uintptr_t) d->data % sizeof(float4)) != 0) {
+            return false;
+        }
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backends[i]->context;
+        if (cuda_ctx->device != ar->devices[i]) {
+            return false;
+        }
+    }
+
+    ar->seq++;
+
+    ggml_cuda_p2p_ar_args args = {};
+    for (size_t j = 0; j < n_devices; ++j) {
+        args.stage[j] = ar->stage[j];
+        args.flag [j] = ar->flag [j];
+    }
+    args.nvec         = ne / 4;
+    args.stage_stride = ar->stage_stride;
+    args.n_devs       = (int) n_devices;
+    args.slot         = (int) (ar->seq % GGML_CUDA_P2P_AR_NSLOTS);
+    args.seq          = ar->seq;
+
+    for (size_t i = 0; i < n_devices; ++i) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backends[i]->context;
+        args.rank = (int) i;
+        args.src  = (const float4 *) srcs[i]->data;
+        args.dst  = (float4 *)       dsts[i]->data;
+        ggml_cuda_set_device(cuda_ctx->device);
+        ggml_cuda_p2p_ag_kernel<<<ar->nblocks, GGML_CUDA_P2P_AR_NTHREADS, 0, cuda_ctx->stream()>>>(args);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    return true;
 }
 
 bool ggml_cuda_p2p_ar_prepare(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors) {

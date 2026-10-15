@@ -35,6 +35,11 @@ void ggml_cuda_p2p_ar_free(ggml_cuda_p2p_ar * ar);
 // enqueued on each device's stream.
 bool ggml_cuda_p2p_ar_allreduce(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors);
 
+// AllGather of one row of equal 4-byte slices: dsts[i] receives every srcs[j] at offset j. false without enqueueing
+//   anything if the call is not eligible (a slice above the staging size, several rows, misaligned); the caller falls back.
+//   GGML_CUDA_P2P_ALLGATHER=0 turns it off.
+bool ggml_cuda_p2p_ar_allgather(ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** srcs, ggml_tensor ** dsts);
+
 // The same in two steps: prepare does the eligibility checks and claims a sequence number, launch
 // enqueues one rank's kernel. launch may run on a different thread per rank, so the meta backend can
 // issue it from the thread that already owns that device's graph launch.

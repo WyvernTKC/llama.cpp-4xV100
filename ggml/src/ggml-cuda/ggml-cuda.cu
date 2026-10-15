@@ -1506,6 +1506,10 @@ static bool ggml_backend_cuda_comm_allgather_tensor(void * comm_ctx_v, struct gg
     if (comm_ctx->backends.size() > GGML_CUDA_MAX_DEVICES) {
         return false;
     }
+    // the logits of a backend sampler, every decoded token: ~15 us through peer memory against ~45 us for NCCL's ring
+    if (ggml_cuda_p2p_ar_allgather(comm_ctx->p2p_ar, comm_ctx->backends.data(), srcs, dsts)) {
+        return true;
+    }
     return ggml_backend_cuda_comm_allgather_nccl(comm_ctx, srcs, dsts);
 #else
     GGML_UNUSED(srcs);
