@@ -6546,8 +6546,9 @@ struct test_ssm_conv_state : public test_case {
     const int32_t src_row;  // the cache row of the start state
     const int64_t kv_head;  // the cell the slots store to
     const int64_t n_conv;   // convolutions of one cache row
+    const bool    short_conv; // LFM2: kernel width 3, x = (b*x)^T and gate*conv instead of the silu
+    const int64_t d_conv;
 
-    static constexpr int64_t d_conv  = 4;
     static constexpr int64_t n_cells = 3;
 
     std::vector<ggml_tensor *> silu;
@@ -6563,6 +6564,9 @@ struct test_ssm_conv_state : public test_case {
         if (n_conv > 1) {
             v += "," + VARS_TO_STR1(n_conv);
         }
+        if (short_conv) {
+            v += "," + VARS_TO_STR1(short_conv);
+        }
         return v;
     }
 
@@ -6574,8 +6578,9 @@ struct test_ssm_conv_state : public test_case {
     }
 
     test_ssm_conv_state(int64_t nr = 256, int64_t n_t = 1, int64_t K = 1, int32_t src_row = 1, int64_t kv_head = 1,
-                        int64_t n_conv = 1)
-        : nr(nr), n_t(n_t), K(K), src_row(src_row), kv_head(kv_head), n_conv(n_conv) {}
+                        int64_t n_conv = 1, bool short_conv = false)
+        : nr(nr), n_t(n_t), K(K), src_row(src_row), kv_head(kv_head), n_conv(n_conv), short_conv(short_conv),
+          d_conv(short_conv ? 3 : 4) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t css = (d_conv - 1)*nr;
@@ -6588,9 +6593,21 @@ struct test_ssm_conv_state : public test_case {
         ggml_tensor * state_row = ggml_get_rows(ctx, cache, ids);
         silu.clear();
         for (int64_t c = 0; c < n_conv; ++c) {
-            ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nr, n_t, 1);
+            ggml_tensor * x    = nullptr;
+            ggml_tensor * gate = nullptr;
+            if (short_conv) {
+                // b, c and x of one in projection, as the LFM2 short conv reads them
+                ggml_tensor * bcx = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3*nr, n_t, 1);
+                ggml_format_name(bcx, "bcx%d", (int) c);
+                ggml_tensor * b  = ggml_view_3d(ctx, bcx, nr, n_t, 1, bcx->nb[1], bcx->nb[2], 0);
+                gate             = ggml_view_3d(ctx, bcx, nr, n_t, 1, bcx->nb[1], bcx->nb[2], nr*sizeof(float));
+                ggml_tensor * xx = ggml_view_3d(ctx, bcx, nr, n_t, 1, bcx->nb[1], bcx->nb[2], 2*nr*sizeof(float));
+                x = ggml_mul(ctx, b, xx);
+            } else {
+                x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nr, n_t, 1);
+                ggml_format_name(x, "x%d", (int) c);
+            }
             ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, nr);
-            ggml_format_name(x, "x%d", (int) c);
             ggml_format_name(w, "w%d", (int) c);
 
             ggml_tensor * states = n_conv == 1 ? ggml_reshape_3d(ctx, state_row, d_conv - 1, nr, 1) :
@@ -6611,7 +6628,7 @@ struct test_ssm_conv_state : public test_case {
             if (n_conv > 1) {
                 conv = ggml_reshape_2d(ctx, conv, nr, n_t);
             }
-            silu.push_back(ggml_silu(ctx, conv));
+            silu.push_back(short_conv ? ggml_mul(ctx, gate, conv) : ggml_silu(ctx, conv));
             ggml_format_name(silu.back(), "silu%d", (int) c);
         }
         // the convolutions after all slot copies, as in the model
@@ -13953,6 +13970,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_conv_state(1000, 3, 2, 0, 2));
     test_cases.emplace_back(new test_ssm_conv_state(512,  8, 4, 1, 1));
     test_cases.emplace_back(new test_ssm_conv_state(512,  2, 4, 4, 1));
+    test_cases.emplace_back(new test_ssm_conv_state(256,  1, 1, 1, 1, 1, true));
+    test_cases.emplace_back(new test_ssm_conv_state(512,  1, 1, 2, 0, 1, true));
+    test_cases.emplace_back(new test_ssm_conv_state(2048, 1, 6, 1, 1, 1, true));
+    test_cases.emplace_back(new test_ssm_conv_state(1000, 3, 2, 0, 2, 1, true));
+    test_cases.emplace_back(new test_ssm_conv_state(512,  8, 4, 1, 1, 1, true));
+    test_cases.emplace_back(new test_ssm_conv_state(512, 12, 1, 1, 1, 1, true));
     test_cases.emplace_back(new test_ssm_conv_state(512, 12, 4, 1, 1));
     test_cases.emplace_back(new test_ssm_conv_state(1000,  33, 1, 1, 1));
     test_cases.emplace_back(new test_ssm_conv_state(512,   64, 4, 4, 1));

@@ -233,26 +233,103 @@ static __global__ void ssm_conv_state_f32(const float * states, const int32_t * 
     }
 }
 
+// The same chain for the LFM2 short conv (kernel width 3): the new tokens are a*b, which the thread multiplies itself,
+//   and the output is gate*conv, with the conv summed as ssm_conv_f32 does, instead of the silu.
+template <int n_t>
+static __global__ void ssm_short_conv_state_f32(const float * states, const int32_t * ids, const int64_t row_stride,
+                                                const float * a, const float * b, const int64_t ab_stride_t,
+                                                const float * w, const int64_t w_stride,
+                                                const float * gate, const int64_t gate_stride_t,
+                                                float * dst, const int64_t dst_stride_t,
+                                                const ggml_cuda_ssm_conv_state_slots slots, const int nr) {
+    constexpr int d_conv = 3;
+    ggml_cuda_pdl_lc();
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+    if (c >= nr) {
+        return;
+    }
+
+    float win[d_conv - 1 + n_t];
+    const float * s = states + ids[0]*row_stride + (int64_t) c*(d_conv - 1);
+#pragma unroll
+    for (int k = 0; k < d_conv - 1; ++k) {
+        win[k] = s[k];
+    }
+    float g[n_t];
+#pragma unroll
+    for (int t = 0; t < n_t; ++t) {
+        win[d_conv - 1 + t] = a[t*ab_stride_t + c] * b[t*ab_stride_t + c];
+        g[t] = gate[t*gate_stride_t + c];
+    }
+
+    float wv[d_conv];
+#pragma unroll
+    for (int j = 0; j < d_conv; ++j) {
+        wv[j] = w[c*w_stride + j];
+    }
+    const float bias = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i <= n_t; ++i) {
+        float * slot = slots.dst[i];
+        if (slot != nullptr) {
+#pragma unroll
+            for (int k = 0; k < d_conv - 1; ++k) {
+                slot[(int64_t) c*(d_conv - 1) + k] = win[i + k];
+            }
+        }
+    }
+
+#pragma unroll
+    for (int t = 0; t < n_t; ++t) {
+        float sumf = 0.0f;
+#pragma unroll
+        for (int j = 0; j < d_conv; ++j) {
+            sumf += win[t + j] * wv[j];
+        }
+        sumf += bias;
+        dst[t*dst_stride_t + c] = g[t] * sumf;
+    }
+}
+
 void ggml_cuda_op_ssm_conv_state(ggml_backend_cuda_context & ctx, const ggml_tensor * states, const ggml_tensor * ids,
                                  const ggml_tensor * x, const ggml_tensor * ssm_conv, ggml_tensor * silu,
-                                 const ggml_cuda_ssm_conv_state_slots & slots) {
+                                 const ggml_cuda_ssm_conv_state_slots & slots, const ggml_tensor * gate,
+                                 const ggml_tensor * x_a, const ggml_tensor * x_b) {
     const ggml_tensor * w = ssm_conv->src[1];
 
     const int nr  = (int) w->ne[1];
     const int n_t = (int) silu->ne[1];
-    GGML_ASSERT(w->ne[0] == 4 && n_t >= 1 && n_t <= GGML_CUDA_SSM_CONV_STATE_MAX_TOKENS);
+    GGML_ASSERT(n_t >= 1 && n_t <= GGML_CUDA_SSM_CONV_STATE_MAX_TOKENS);
 
     const int threads = 128;
     const ggml_cuda_kernel_launch_params launch_params((nr + threads - 1) / threads, threads, 0, ctx.stream());
 
     const size_t ts = sizeof(float);
     auto launch = [&](auto NT) {
+        if (gate != nullptr) {
+            ggml_cuda_kernel_launch(ssm_short_conv_state_f32<decltype(NT)::value>, launch_params,
+                (const float *) states->data, (const int32_t *) ids->data, (int64_t) (states->nb[1]/ts),
+                (const float *) x_a->data, (const float *) x_b->data, (int64_t) (x_a->nb[1]/ts),
+                (const float *) w->data, (int64_t) (w->nb[1]/ts), (const float *) gate->data, (int64_t) (gate->nb[1]/ts),
+                (float *) silu->data, (int64_t) (silu->nb[1]/ts), slots, nr);
+            return;
+        }
         ggml_cuda_kernel_launch(ssm_conv_state_f32<4, decltype(NT)::value>, launch_params,
             (const float *) states->data, (const int32_t *) ids->data, (int64_t) (states->nb[1]/ts),
             (const float *) x->data, (int64_t) (x->nb[0]/ts), (int64_t) (x->nb[1]/ts),
             (const float *) w->data, (int64_t) (w->nb[1]/ts), (const float *) nullptr,
             (float *) silu->data, (int64_t) (silu->nb[1]/ts), slots, nr);
     };
+    if (gate != nullptr) {
+        // channels contiguous in a, b and the gate, with the same token stride in a and b
+        GGML_ASSERT(w->ne[0] == 3 && x_a != nullptr && x_b != nullptr);
+        GGML_ASSERT(x_a->nb[0] == ts && x_b->nb[0] == ts && gate->nb[0] == ts && x_a->nb[1] == x_b->nb[1]);
+    } else {
+        GGML_ASSERT(w->ne[0] == 4 && x_a == nullptr);
+    }
     switch (n_t) {
         case 1: launch(std::integral_constant<int, 1>{}); break;
         case 2: launch(std::integral_constant<int, 2>{}); break;

@@ -24,10 +24,12 @@ struct ggml_cuda_ssm_conv_state_slots {
 };
 
 // silu(ssm_conv(concat(states[ids[0]], x^T))) of one sequence of at most GGML_CUDA_SSM_CONV_STATE_MAX_TOKENS tokens,
-//   with the windows of the concat stored to the slots: build_conv_state in one launch, reading the cache row itself
+//   with the windows of the concat stored to the slots: build_conv_state in one launch, reading the cache row itself.
+//   With a gate the output is gate*ssm_conv(...) instead (silu is then that MUL), and with x_a/x_b x is (x_a*x_b)^T.
 void ggml_cuda_op_ssm_conv_state(ggml_backend_cuda_context & ctx, const ggml_tensor * states, const ggml_tensor * ids,
                                  const ggml_tensor * x, const ggml_tensor * ssm_conv, ggml_tensor * silu,
-                                 const ggml_cuda_ssm_conv_state_slots & slots);
+                                 const ggml_cuda_ssm_conv_state_slots & slots, const ggml_tensor * gate = nullptr,
+                                 const ggml_tensor * x_a = nullptr, const ggml_tensor * x_b = nullptr);
 
 // the rollback slots of a longer batch, at the first column of the window each holds in the concat
 struct ggml_cuda_ssm_conv_state_long_slots {
