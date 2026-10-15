@@ -466,6 +466,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ssm_g           ("blk\\.\\d*\\.ssm_g\\.weight");
     static const std::regex pattern_ssm_out_weight  ("blk\\.\\d*\\.ssm_out.weight");
 
+    // LFM2 short convolution
+    static const std::regex pattern_shortconv_in    ("blk\\.\\d*\\.shortconv\\.in_proj\\.weight");
+    static const std::regex pattern_shortconv_conv  ("blk\\.\\d*\\.shortconv\\.conv\\.weight");
+    static const std::regex pattern_shortconv_out   ("blk\\.\\d*\\.shortconv\\.out_proj\\.weight");
+
     static const std::regex pattern_ffn_up_weight     ("blk\\.\\d*\\.ffn_up(_exps)?.weight");
     static const std::regex pattern_ffn_up_bias       ("blk\\.\\d*\\.ffn_up(_exps)?.bias");
     static const std::regex pattern_ffn_gate_weight   ("blk\\.\\d*\\.ffn_gate(_exps)?.weight");
@@ -658,6 +663,38 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         return hparams.n_head_kv(il) == 1 || q_subgroup_split(il);
     };
 
+    // LFM2 short convolution: each channel is convolved alone, so in_proj (b, c and x), the conv and its state are split
+    //   by channel, and out_proj, which sums over the channels, is all-reduced like attn_output. Returns the channels of
+    //   one granule of layer il, or 0 to keep its block mirrored (LLAMA_LFM2_SHORTCONV_MIRRORED=1 always does).
+    auto shortconv_granularity = [&](uint32_t il) -> int64_t {
+        static const bool mirrored = getenv("LLAMA_LFM2_SHORTCONV_MIRRORED") != nullptr;
+        if ((ud->model->arch != LLM_ARCH_LFM2 && ud->model->arch != LLM_ARCH_LFM2MOE) || mirrored ||
+                !hparams.causal_attn || hparams.n_layer_decision > 0 || il >= hparams.n_layer() || !hparams.is_recr(il)) {
+            return 0;
+        }
+        const ggml_tensor * w = ud->model->get_tensor(("blk." + std::to_string(il) + ".shortconv.out_proj.weight").c_str());
+        if (w == nullptr) {
+            return 0;
+        }
+        // whole quant blocks of the out_proj rows; 128 channels, or fewer where a device would get none
+        const int64_t blck = ggml_blck_size(w->type);
+        const int64_t n    = (int64_t) ud->n_devices;
+        int64_t g = std::lcm(blck, (int64_t) 128);
+        while (g > blck && (g/2) % blck == 0 && (int64_t) hparams.n_embd < g*n) {
+            g /= 2;
+        }
+        return (int64_t) hparams.n_embd >= g*n ? g : 0;
+    };
+    auto shortconv_layer = [&]() -> int64_t {
+        if (tensor_name.compare(0, 4, "blk.") == 0) {
+            return std::stoll(tensor_name.substr(4, tensor_name.find('.', 4)));
+        }
+        if (tensor_name.compare(0, 6, "cache_") == 0 && tensor_name.find("_l", 6) != std::string::npos) {
+            return std::stoll(tensor_name.substr(tensor_name.find("_l", 6) + 2));
+        }
+        return -1;
+    };
+
     auto get_tensor_config = [&]() -> tensor_config {
         if (ud->model->arch == LLM_ARCH_HRM_TEXT) {
             // aliased cache slots cannot satisfy the meta-split invariants, so replicate all tensors
@@ -792,9 +829,24 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);  // [n_seq_tokens, n_seq_tokens, n_head, n_seqs]
             }
         }
-        // A Mamba-2 mixer that cannot hand every device whole groups runs replicated instead, the same
-        //   way the LFM2 shortconv block does. Layers do not share any of these tensors, so the choice is
-        //   made per layer, and it covers the mixer only - a layer can also hold attention and an FFN.
+        if ((ud->model->arch == LLM_ARCH_LFM2 || ud->model->arch == LLM_ARCH_LFM2MOE) &&
+                (std::regex_match(tensor_name, pattern_shortconv_in) || std::regex_match(tensor_name, pattern_shortconv_conv) ||
+                 std::regex_match(tensor_name, pattern_shortconv_out) || std::regex_match(tensor_name, pattern_r_cache) ||
+                 std::regex_match(tensor_name, pattern_s_cache))) {
+            const int64_t il = shortconv_layer();
+            if (il < 0 || shortconv_granularity((uint32_t) il) == 0 || std::regex_match(tensor_name, pattern_s_cache)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+            if (std::regex_match(tensor_name, pattern_shortconv_out)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            }
+            // the conv state is [d_conv, n_embd] per sequence, so its channels are on dim 0 of the cache row
+            return get_tensor_config_impl(std::regex_match(tensor_name, pattern_r_cache) ? GGML_BACKEND_SPLIT_AXIS_0 :
+                GGML_BACKEND_SPLIT_AXIS_1, "shortconv.out_proj.weight");
+        }
+        // A Mamba-2 mixer that cannot hand every device whole groups runs replicated instead. Layers do not
+        //   share any of these tensors, so the choice is made per layer, and it covers the mixer only - a
+        //   layer can also hold attention and an FFN.
         if (is_mamba2_grouped() &&
                 (tensor_name.find(".ssm_") != std::string::npos ||
                  std::regex_match(tensor_name, pattern_r_cache) ||
@@ -879,10 +931,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight", "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_r_cache) || std::regex_match(tensor_name, pattern_s_cache)) {
-            if (ud->model->arch == LLM_ARCH_LFM2 || ud->model->arch == LLM_ARCH_LFM2MOE) {
-                // the LFM2 shortconv block runs fully mirrored, so its conv state must be mirrored too
-                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED, "");
-            }
             // lightning attention layers project the head dim with attn_output instead of ssm_out
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight", "attn_output.weight");
         }
@@ -993,6 +1041,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 return {{n_ff_exp, 2}};
             }
             return {{tensor->ne[axis], 1}};
+        }
+
+        // LFM2 in_proj holds b, c and x, n_embd channels each
+        if ((ud->model->arch == LLM_ARCH_LFM2 || ud->model->arch == LLM_ARCH_LFM2MOE) &&
+                std::regex_match(tensor_name, pattern_shortconv_in)) {
+            GGML_ASSERT(tensor->ne[axis] == 3*(int64_t) hparams.n_embd);
+            return {{hparams.n_embd, 3}};
         }
 
         // Mamba-1 stores the in projection as two blocks, x followed by z, that are each split by head
@@ -1157,6 +1212,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 GGML_ASSERT(segments.size() == 1);
                 return {std::lcm(std::lcm(blck_size, (int64_t) 128), head_dim) / head_dim};
             }
+        }
+        if (const int64_t g = shortconv_granularity(il); g > 0 &&
+                (std::regex_match(tensor_name, pattern_shortconv_in) || std::regex_match(tensor_name, pattern_shortconv_conv) ||
+                 std::regex_match(tensor_name, pattern_shortconv_out) || std::regex_match(tensor_name, pattern_r_cache))) {
+            const int64_t d_conv = hparams.n_shortconv_l_cache - 1;
+            return std::vector<int64_t>(segments.size(), std::regex_match(tensor_name, pattern_r_cache) ? d_conv*g : g);
         }
         if (hparams.is_recr(il) && !in_parallel_attn()) {
             // linear attention
