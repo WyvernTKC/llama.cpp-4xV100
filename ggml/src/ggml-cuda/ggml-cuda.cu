@@ -5595,6 +5595,21 @@ static int ggml_cuda_try_defer_glu(ggml_backend_cuda_context * cuda_ctx, const g
     return 0;
 }
 
+// In a session, a MoE sum dst of one token that ends the subgraph (no compute node from k_next on) is the input of the
+//   all-reduce right after it, which can compute it (ggml_backend_cuda_session_allreduce): the sum is not written, one
+//   launch less per layer
+static bool ggml_cuda_moe_sum_to_allreduce(const ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int k_next,
+        const ggml_cuda_moe_weighted_reduction_match & match, const ggml_tensor * dst) {
+    static const bool no_red_ar = getenv("GGML_CUDA_NO_REDUCE_AR") != nullptr;
+    bool last = cuda_ctx->session_mode != ggml_backend_cuda_context::SESSION_OFF && !no_red_ar &&
+        ggml_is_contiguous(match.weights) && ggml_nelements(match.weights) == match.experts->ne[1] &&
+        ggml_is_contiguous(match.experts) && dst->ne[0] % 4 == 0;
+    for (int k = k_next; last && k < cgraph->n_nodes; k++) {
+        last = ggml_cuda_is_view_or_noop(cgraph->nodes[k]) || (cgraph->nodes[k]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0;
+    }
+    return last;
+}
+
 // At one token: the MUL_MAT_ID of the routed experts' down projection, their weighted sum, and a shared expert's down
 //   projection gated by sigmoid(g) and added to the sum (Qwen3.5-MoE builds them in this order): the shared expert runs
 //   in the experts' launch as one more channel and the sum adds it, two launches instead of three. Returns the nodes
@@ -5660,15 +5675,7 @@ static int ggml_cuda_try_fuse_moe_down_shexp(ggml_backend_cuda_context * cuda_ct
         ids = &ids_remap;
     }
 
-    // In a session, a sum that ends the subgraph is the input of the all-reduce right after it, which can compute it
-    //   (ggml_backend_cuda_session_allreduce): the sum is not written here, one launch less per layer.
-    static const bool no_red_ar = getenv("GGML_CUDA_NO_REDUCE_AR") != nullptr;
-    bool last = cuda_ctx->session_mode != ggml_backend_cuda_context::SESSION_OFF && !no_red_ar &&
-        ggml_is_contiguous(match.weights) && ggml_nelements(match.weights) == match.experts->ne[1] &&
-        ggml_is_contiguous(match.experts) && add->ne[0] % 4 == 0;
-    for (int k = t + 4; last && k < cgraph->n_nodes; k++) {
-        last = ggml_cuda_is_view_or_noop(cgraph->nodes[k]) || (cgraph->nodes[k]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0;
-    }
+    const bool last = ggml_cuda_moe_sum_to_allreduce(cuda_ctx, cgraph, t + 4, match, add);
 
     auto shexp = std::make_unique<ggml_cuda_pool_alloc<float>>(cuda_ctx->pool(), ggml_nelements(mm));
     ggml_cuda_mm_fusion_args_host fusion_data{};
@@ -5708,7 +5715,8 @@ static void ggml_cuda_session_reduction_flush(ggml_backend_cuda_context * cuda_c
     if (red.dst == nullptr) {
         return;
     }
-    ggml_cuda_op_moe_weighted_reduction(*cuda_ctx, red.experts, nullptr, red.weights, red.dst, false, red.add_x->get(), red.add_g);
+    ggml_cuda_op_moe_weighted_reduction(*cuda_ctx, red.experts, nullptr, red.weights, red.dst, false,
+        red.add_x ? red.add_x->get() : nullptr, red.add_g);
     red = {};
 }
 
@@ -6585,6 +6593,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 const int64_t off = (const char *) match.dst->data - (const char *) match.experts->data;
                 safe = n_tokens == 1 && off >= 0 && off % (int64_t) match.experts->nb[1] == 0 &&
                     off / (int64_t) match.experts->nb[1] < match.experts->ne[1];
+            }
+            // a sum that ends the session subgraph goes to the all-reduce after it, as in ggml_cuda_try_fuse_moe_down_shexp
+            //   without the shared expert; all of its blocks read the weights, so dst may not sit on them
+            if (safe && n_tokens == 1 && match.expert_scale == nullptr && !over_w && cuda_ctx->session_red.dst == nullptr &&
+                    ggml_cuda_moe_sum_to_allreduce(cuda_ctx, cgraph, i + match.node_count, match, match.dst)) {
+                ggml_backend_cuda_context::session_reduction_t & red = cuda_ctx->session_red;
+                red.experts = match.experts;
+                red.weights = match.weights;
+                red.dst     = match.dst;
+                return match.node_count - 1;
             }
             if (safe) {
                 ggml_cuda_op_moe_weighted_reduction(
@@ -8675,7 +8693,7 @@ static void ggml_backend_cuda_session_allreduce(void * comm_ctx_v, struct ggml_t
             ggml_nelements(t) == red.experts->ne[0]) {
         ggml_cuda_p2p_ar_launch_ll_moe_reduce(comm_ctx->p2p_ar, comm_ctx->backends.data(), tensors, rank,
             (const float *) red.experts->data, (const float *) red.weights->data, (int) red.experts->ne[1],
-            red.add_x->get(), (const float *) red.add_g->data);
+            red.add_x ? red.add_x->get() : nullptr, red.add_g ? (const float *) red.add_g->data : nullptr);
         red = {};
         return;
     }
