@@ -122,6 +122,11 @@ enum llama_decision_order {
 // The embeddings output has one value per entry: row i is the score of option i
 LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch, int32_t idx, enum llama_decision_order order);
 
+// Add an entry whose embedding row is the concatenation of n_parts rows of n_part floats (e.g. the extract layers of a
+// DFlash target), each copied into the batch once. Returns the batch index or the llama_batch_ext_add_embd() errors.
+LLAMA_API int32_t llama_batch_ext_add_embd_parts(struct llama_batch_ext * batch, llama_seq_id seq_id,
+        const float * const * parts, size_t n_parts, size_t n_part);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);

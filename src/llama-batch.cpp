@@ -882,7 +882,14 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     const bool use_embd  = batch.embd  && !(mixed_batch && n_embd_rows == 0);
     const bool has_state = !state_vec.empty();
 
-    const int64_t n_embd_all  = use_embd  ? (int64_t) n_tokens*n_embd       : 0;
+    // embd rows that are contiguous in the batch are read in place: batch.embd outlives every use of the ubatch's embd,
+    // which is inside the encode/decode call, and a copy of wide rows is a big host cost (DFlash target features)
+    bool embd_in_place = use_embd && n_tokens > 0;
+    for (uint32_t i = 1; embd_in_place && i < n_tokens; ++i) {
+        embd_in_place = idxs[i] == idxs[0] + (int32_t) i;
+    }
+
+    const int64_t n_embd_all  = use_embd && !embd_in_place ? (int64_t) n_tokens*n_embd : 0;
     const int64_t n_state_all = has_state ? (int64_t) n_tokens*n_embd_state : 0;
     const int64_t n_pos_all   =             (int64_t) n_tokens*n_pos_per_embd;
 
@@ -908,7 +915,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
             udata->token[i] = batch.token[idxs[i]];
         }
 
-        if (use_embd) {
+        if (use_embd && !embd_in_place) {
             memcpy(udata->embd.data() + i*n_embd, batch.embd + (int64_t) idxs[i]*n_embd, n_embd*sizeof(float));
         }
 
@@ -965,7 +972,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.n_pos        =*/ n_pos_per_embd,
 
         /*.token        =*/ use_token ? udata->token.data() : nullptr,
-        /*.embd         =*/ use_embd  ? udata->embd.data()  : nullptr,
+        /*.embd         =*/ use_embd  ? (embd_in_place ? batch.embd + (int64_t) idxs[0]*n_embd : udata->embd.data()) : nullptr,
         /*.embd_state   =*/ has_state ? udata->embd_state.data() : nullptr,
         /*.pos          =*/ udata->pos.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),
@@ -1232,24 +1239,37 @@ bool llama_batch_ext::set_token_id(int32_t idx, llama_token id) {
 }
 
 bool llama_batch_ext::set_token_embd(int32_t idx, llama_embd embd_in) {
-    if (idx < 0 || idx >= (int32_t) tokens.size()) {
-        return false;
-    }
     if (!embd_in.data) {
         return false;
     }
 
-    const size_t n_total = embd_in.n_rows * embd_in.n_embd;
+    const float * part = embd_in.data;
+
+    return set_token_embd_parts(idx, &part, 1, embd_in.n_rows * embd_in.n_embd);
+}
+
+// the row is the concatenation of the parts, each copied once (e.g. the extract layers of a DFlash target)
+bool llama_batch_ext::set_token_embd_parts(int32_t idx, const float * const * parts, size_t n_parts, size_t n_part) {
+    if (idx < 0 || idx >= (int32_t) tokens.size()) {
+        return false;
+    }
+    for (size_t k = 0; k < n_parts; ++k) {
+        if (!parts[k]) {
+            return false;
+        }
+    }
+
+    const size_t n_total = n_parts * n_part;
     if (n_embd == 0) {
         if (n_total != n_embd_inp && n_total != n_embd_inp_enc) {
-            LLAMA_LOG_ERROR("%s: embedding size mismatch, got %zu rows x %zu = %zu, expected %zu or %zu\n",
-                    __func__, embd_in.n_rows, embd_in.n_embd, n_total, n_embd_inp, n_embd_inp_enc);
+            LLAMA_LOG_ERROR("%s: embedding size mismatch, got %zu x %zu = %zu, expected %zu or %zu\n",
+                    __func__, n_parts, n_part, n_total, n_embd_inp, n_embd_inp_enc);
             return false;
         }
         n_embd = n_total;
     } else if (n_total != n_embd) {
-        LLAMA_LOG_ERROR("%s: embedding size mismatch, got %zu rows x %zu = %zu, expected %zu\n",
-                __func__, embd_in.n_rows, embd_in.n_embd, n_total, n_embd);
+        LLAMA_LOG_ERROR("%s: embedding size mismatch, got %zu x %zu = %zu, expected %zu\n",
+                __func__, n_parts, n_part, n_total, n_embd);
         return false;
     }
 
@@ -1262,7 +1282,9 @@ bool llama_batch_ext::set_token_embd(int32_t idx, llama_embd embd_in) {
 
     t.has_embd = true;
     t.embd_off = embd.size();
-    embd.insert(embd.end(), embd_in.data, embd_in.data + n_total);
+    for (size_t k = 0; k < n_parts; ++k) {
+        embd.insert(embd.end(), parts[k], parts[k] + n_part);
+    }
 
     return true;
 }
@@ -1368,6 +1390,18 @@ int32_t llama_batch_ext_add_embd(llama_batch_ext * batch, llama_seq_id seq_id, l
         return idx;
     }
     if (!batch->set_token_embd(idx, embd)) {
+        return -2;
+    }
+    return idx;
+}
+
+int32_t llama_batch_ext_add_embd_parts(llama_batch_ext * batch, llama_seq_id seq_id,
+        const float * const * parts, size_t n_parts, size_t n_part) {
+    int32_t idx = batch->add_token(seq_id);
+    if (idx < 0) {
+        return idx;
+    }
+    if (!batch->set_token_embd_parts(idx, parts, n_parts, n_part)) {
         return -2;
     }
     return idx;

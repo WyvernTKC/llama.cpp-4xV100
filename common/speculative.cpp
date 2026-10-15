@@ -1201,11 +1201,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     common_batch batch; // noise tokens
 
-    // target features for KV cache injection: each row is gathered from the extract layers into inject_row, then
-    //   copied into the batch, so the features are read from memory once. A common_batch would keep a view of every
-    //   row, and all of them would point at inject_row.
+    // target features for KV cache injection: each row is copied into the batch straight from the extract layers
+    //   (llama_batch_ext_add_embd_parts), so the features are read from memory once
     llama_batch_ext_ptr batch_inject;
-    std::vector<float>  inject_row;
 
     std::vector<common_sampler_ptr> smpls;
 
@@ -1303,7 +1301,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         batch = common_batch(ctx_dft);
         batch_inject.reset(llama_batch_ext_init(ctx_dft));
-        inject_row.resize(n_embd_enc);
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1408,7 +1405,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
 
-        const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+        // the target features go in chunks of a few hundred rows (a row is 133 KB on a 6656-wide target with 5 extract
+        // layers): a whole prompt per decode grows the batch and the draft's host compute buffer to ~1 GB, all copies
+        // of it miss the cache, and the GPUs wait for the host the whole time (LLAMA_DFLASH_INJECT_CHUNK=0: n_ubatch)
+        static const int32_t n_inject_chunk = [] {
+            const char * e = std::getenv("LLAMA_DFLASH_INJECT_CHUNK");
+            return e ? atoi(e) : 256;
+        }();
+        const int32_t n_ubatch = n_inject_chunk > 0 ? std::min(n_inject_chunk, (int32_t) llama_n_ubatch(ctx_dft))
+                                                    : (int32_t) llama_n_ubatch(ctx_dft);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
@@ -1433,23 +1438,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             llama_batch_ext * bx = batch_inject.get();
 
+            std::vector<const float *> parts(target_layer_ids_n);
+
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
-                // gather target features per extract layer; the fused decode encodes and
+                // gather target features per extract layer straight into the batch; the fused decode encodes and
                 // injects them into the K/V cache at the target positions
                 llama_batch_ext_clear(bx);
                 for (int32_t i = 0; i < n_chunk; ++i) {
                     const int32_t row = i_batch_beg[seq_id] + offset + i;
                     for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                        std::memcpy(inject_row.data() + k * (size_t) n_embd_tgt, layers[k] + (size_t) row * n_embd_tgt,
-                                (size_t) n_embd_tgt * sizeof(float));
+                        parts[k] = layers[k] + (size_t) row * n_embd_tgt;
                     }
 
                     const llama_pos p = batch_in.tokens[row].pos[0];
                     const llama_pos pos[4] = { p, p, p, 0 }; // an M-RoPE draft reads all 4, others the first
 
-                    const int32_t idx = llama_batch_ext_add_embd(bx, seq_id, { inject_row.data(), 1, (size_t) n_embd_enc });
+                    const int32_t idx = llama_batch_ext_add_embd_parts(bx, seq_id, parts.data(), target_layer_ids_n, (size_t) n_embd_tgt);
                     if (idx < 0 || !llama_batch_ext_set_pos(bx, idx, pos)) {
                         LOG_ERR("%s: failed to add row %d to the inject batch (idx=%d)\n", __func__, (int) row, (int) idx);
                         return false;
