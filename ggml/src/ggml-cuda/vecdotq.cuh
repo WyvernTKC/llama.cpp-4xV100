@@ -473,7 +473,10 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmq(
 #define VDR_Q3_K_Q8_1_MMVQ 1
 #define VDR_Q3_K_Q8_1_MMQ  2
 
-// contiguous v/x values
+// contiguous v/x values. The values are (vil | vih) - 4: offset_dp4a subtracts the 4 with a second dp4a, fewer instructions
+//   than a __vsub4 for one column; a thread that reuses its weights for several columns does one __vsub4 per int instead.
+//   The int sums are the same.
+template <bool offset_dp4a>
 static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
     const int & vl, const int & vh, const int * __restrict__ u, const uint8_t * __restrict__ scales,
     const int & scale_offset, const float & d3, const float * __restrict__ d8) {
@@ -498,9 +501,15 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
 
         const int vih = ((vh >> i) << 2) & 0x04040404;
 
-        const int vi = __vsub4(vil, vih);
+        int sumi;
+        if constexpr (offset_dp4a) {
+            sumi = ggml_cuda_dp4a(vil | vih, u[i], 0); // SIMD dot product
+            sumi = ggml_cuda_dp4a(0xFCFCFCFC, u[i], sumi);
+        } else {
+            sumi = ggml_cuda_dp4a(__vsub4(vil | vih, 0x04040404), u[i], 0); // SIMD dot product
+        }
 
-        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
+        sumf += d8[i] * (sumi * sc);
     }
 
     return d3 * sumf;
@@ -653,7 +662,8 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
 #define VDR_Q6_K_Q8_1_MMVQ_WIDE 2
 #define VDR_Q6_K_Q8_1_MMQ  8
 
-// contiguous v/x values
+// contiguous v/x values. The values are (vil | vih) - 32, offset_dp4a as for q3_K.
+template <bool offset_dp4a>
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
     const int & vl, const int & vh, const int * __restrict__ u, const int8_t * __restrict__ scales,
     const float & d, const float * __restrict__ d8) {
@@ -668,9 +678,15 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
 
         const int vih = ((vh >> (4*i)) << 4) & 0x30303030;
 
-        const int vi = __vsub4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
+        int sumi;
+        if constexpr (offset_dp4a) {
+            sumi = ggml_cuda_dp4a(vil | vih, u[i], 0); // SIMD dot product
+            sumi = ggml_cuda_dp4a(0xE0E0E0E0, u[i], sumi);
+        } else {
+            sumi = ggml_cuda_dp4a(__vsub4(vil | vih, 0x20202020), u[i], 0); // SIMD dot product
+        }
 
-        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
+        sumf += d8[i] * (sumi * sc);
     }
 
     return d*sumf;
@@ -985,6 +1001,7 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_wide(
     return dm2f.x*sumf_d - dm2f.y*sumf_m;
 }
 
+template <bool offset_dp4a = true>
 static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -997,8 +1014,8 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
 
     const int vl = get_int_b2(bq3_K->qs, iqs);
 
-    // invert the mask with ~ so that a 0/1 results in 4/0 being subtracted
-    const int vh = ~get_int_b2(bq3_K->hmask, iqs % (QI3_K/2)) >> bq8_offset;
+    // a set high bit adds 4, vec_dot_q3_K_q8_1_impl_mmvq subtracts 4 from every value
+    const int vh = get_int_b2(bq3_K->hmask, iqs % (QI3_K/2)) >> bq8_offset;
 
     int    u[QR3_K];
     float d8[QR3_K];
@@ -1009,7 +1026,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
         d8[i] = __low2float(bq8_1[bq8_offset + i].ds);
     }
 
-    return vec_dot_q3_K_q8_1_impl_mmvq(vl, vh, u, bq3_K->scales, scale_offset, d, d8);
+    return vec_dot_q3_K_q8_1_impl_mmvq<offset_dp4a>(vl, vh, u, bq3_K->scales, scale_offset, d, d8);
 }
 
 static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
@@ -1238,6 +1255,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_wide(
     return dm5f.x*sumf_d - dm5f.y*sumf_m;
 }
 
+template <bool offset_dp4a = true>
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -1261,7 +1279,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
         d8[i] = __low2float(bq8_1[bq8_offset + 2*i].ds);
     }
 
-    return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
+    return vec_dot_q6_K_q8_1_impl_mmvq<offset_dp4a>(vl, vh, u, scales, bq6_K->d, d8);
 }
 
 // 2 ints of the block per thread, read as aligned words. iqs is even, so the 2 ints share their scales and y blocks.
@@ -1292,9 +1310,11 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_wide(
         for (int l = 0; l < VDR_Q6_K_Q8_1_MMVQ_WIDE; ++l) {
             const int vil = (vl[l] >> (4*i)) & 0x0F0F0F0F;
             const int vih = (((vh[l] >> vh_shift) >> (4*i)) << 4) & 0x30303030;
-            const int vi  = __vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
+            const int u   = get_int_b4(by->qs, iqs % QI8_1 + l);
 
-            sumi = ggml_cuda_dp4a(vi, get_int_b4(by->qs, iqs % QI8_1 + l), sumi);
+            // (vil | vih) - 32 for each byte, the - 32 as a second dp4a
+            sumi = ggml_cuda_dp4a(vil | vih,  u, sumi);
+            sumi = ggml_cuda_dp4a(0xE0E0E0E0, u, sumi);
         }
         sumf += __low2float(by->ds) * (sumi * scales[4*i]);
     }

@@ -53,10 +53,10 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_MXFP4:   return vec_dot_mxfp4_q8_1;
         case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
         case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
-        case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
+        case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1<true>;
         case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1;
         case GGML_TYPE_Q5_K:    return vec_dot_q5_K_q8_1;
-        case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1;
+        case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1<true>;
         case GGML_TYPE_IQ2_XXS: return vec_dot_iq2_xxs_q8_1;
         case GGML_TYPE_IQ2_XS:  return vec_dot_iq2_xs_q8_1;
         case GGML_TYPE_IQ2_S:   return vec_dot_iq2_s_q8_1;
@@ -190,6 +190,19 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda_wide(ggml_type t
         case GGML_TYPE_Q6_K: return vec_dot_q6_K_q8_1_wide;
         default:             return get_vec_dot_q_cuda(type);
     }
+}
+
+// mul_mat_vec_q reuses a thread's weights for its ncols_dst columns: from 2 columns the q3_K / q6_K offsets cost less as one
+//   __vsub4 per int than as a second dp4a per column (V100, 4096 x 14336 at 4 tokens: 3% / 2%)
+static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda_cols(ggml_type type, int ncols_dst) {
+    if (ncols_dst > 1) {
+        switch (type) {
+            case GGML_TYPE_Q3_K: return vec_dot_q3_K_q8_1<false>;
+            case GGML_TYPE_Q6_K: return vec_dot_q6_K_q8_1<false>;
+            default:             break;
+        }
+    }
+    return get_vec_dot_q_cuda(type);
 }
 
 // Per-architecture maximum batch size for which MMVQ should be used for MUL_MAT_ID.
@@ -717,7 +730,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = wide ? get_vec_dot_q_cuda_wide(type) : get_vec_dot_q_cuda(type);
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = wide ? get_vec_dot_q_cuda_wide(type) : get_vec_dot_q_cuda_cols(type, ncols_dst);
 
     static_assert(!paired || (has_fusion && ncols_dst == 1), "paired needs a fused gate and one column");
     const     int half = paired ? threadIdx.y / nwarps : 0; // 1: the warps of the gate
