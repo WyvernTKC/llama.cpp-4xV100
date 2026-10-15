@@ -540,9 +540,167 @@ static void top_k_radix_small_cuda(const float * src, int * dst, int ncols, int 
     }
 }
 
+// Two launches for long rows with a small k (the backend sampler over the vocab). STAGE 1: block b of a row takes the
+//   top k of its chunk of columns, as keys and columns in column order. The top k of the row are in the union of these,
+//   and the chunks are in column order too, so STAGE 2 selects over the candidates of the row in one block and writes
+//   the same indices in the same order as top_k_radix_cuda: the keys above the k-th first, then the first rank keys
+//   equal to it, each in column order.
+static __host__ __device__ __forceinline__ int n_blocks_stage1(const int ncols, const int chunk) {
+    return (ncols + chunk - 1) / chunk;
+}
+
+template<int BLOCK_SIZE, int NPER, bool STAGE2>
+static __global__ void top_k_two_stage(
+        const float * __restrict__ src,
+        uint32_t * __restrict__ cand_key,
+        int * __restrict__ cand_col,
+        int * __restrict__ dst,
+        int ncols,
+        int chunk,
+        int k) {
+    constexpr int RADIX_BITS = 8;
+    constexpr int NBINS = 1 << RADIX_BITS;
+    static_assert(NBINS == BLOCK_SIZE, "one bin per thread");
+
+    const int tid  = threadIdx.x;
+    const int lane = tid % WARP_SIZE;
+    const int warp = tid / WARP_SIZE;
+    const int row  = blockIdx.y;
+
+    __shared__ int histogram[NBINS];
+    __shared__ int warp_sums[BLOCK_SIZE / WARP_SIZE];
+    __shared__ uint32_t sel_prefix;
+    __shared__ int sel_rank;
+
+    // STAGE 1: columns [col0, col0 + n) of the row; STAGE 2: the k candidates of each chunk of the row
+    int n;
+    int col0 = 0;
+    uint32_t key[NPER];
+    if constexpr (STAGE2) {
+        n = n_blocks_stage1(ncols, chunk) * k;
+        const uint32_t * row_key = cand_key + (size_t) row * n;
+#pragma unroll
+        for (int i = 0; i < NPER; ++i) {
+            const int c = i*BLOCK_SIZE + tid;
+            key[i] = c < n ? row_key[c] : 0;
+        }
+    } else {
+        col0 = blockIdx.x * chunk;
+        n = min(chunk, ncols - col0);
+        const float * row_src = src + (size_t) row * ncols + col0;
+#pragma unroll
+        for (int i = 0; i < NPER; ++i) {
+            const int c = i*BLOCK_SIZE + tid;
+            key[i] = c < n ? top_k_float_to_ordered(row_src[c]) : 0;
+        }
+    }
+
+    uint32_t prefix = 0;
+    uint32_t prefix_mask = 0;
+    int rank = k;
+    for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
+        histogram[tid] = 0;
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < NPER; ++i) {
+            if (i*BLOCK_SIZE + tid < n && (key[i] & prefix_mask) == prefix) {
+                atomicAdd(&histogram[(key[i] >> shift) & (NBINS - 1)], 1);
+            }
+        }
+        __syncthreads();
+
+        const int own = histogram[tid];
+        int ge = own;
+#pragma unroll
+        for (int offset = 1; offset < WARP_SIZE; offset *= 2) {
+            const int y = __shfl_down_sync(0xffffffff, ge, offset);
+            ge += lane + offset < WARP_SIZE ? y : 0;
+        }
+        if (lane == 0) {
+            warp_sums[warp] = ge;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int w = 0; w < BLOCK_SIZE / WARP_SIZE; ++w) {
+            ge += w > warp ? warp_sums[w] : 0;
+        }
+        if (ge - own < rank && rank <= ge) {
+            sel_prefix = prefix | (uint32_t) tid << shift;
+            sel_rank   = rank - (ge - own);
+        }
+        __syncthreads();
+        prefix       = sel_prefix;
+        rank         = sel_rank;
+        prefix_mask |= (uint32_t) (NBINS - 1) << shift;
+    }
+
+    int n_greater = 0;
+    int n_equal   = 0;
+    const size_t cand_offset = ((size_t) row * n_blocks_stage1(ncols, chunk) + (STAGE2 ? 0 : blockIdx.x)) * k;
+#pragma unroll
+    for (int i = 0; i < NPER; ++i) {
+        const int  c       = i*BLOCK_SIZE + tid;
+        const bool valid   = c < n;
+        const bool greater = valid && key[i] > prefix;
+        const bool equal   = valid && key[i] == prefix;
+
+        int total;
+        const int pos = top_k_block_exclusive_scan<BLOCK_SIZE>((int) greater | (int) equal << 16, total, warp_sums);
+        const bool taken = equal && n_equal + (pos >> 16) < rank;
+        if constexpr (STAGE2) {
+            int * row_dst = dst + (size_t) row * k;
+            if (greater) {
+                row_dst[n_greater + (pos & 0xFFFF)] = cand_col[cand_offset + c];
+            }
+            if (taken) {
+                row_dst[k - rank + n_equal + (pos >> 16)] = cand_col[cand_offset + c];
+            }
+        } else if (greater || taken) {
+            // the candidates of the chunk in column order
+            const int out = n_greater + (pos & 0xFFFF) + min(n_equal + (pos >> 16), rank);
+            cand_key[cand_offset + out] = key[i];
+            cand_col[cand_offset + out] = col0 + c;
+        }
+        n_greater += total & 0xFFFF;
+        n_equal   += total >> 16;
+    }
+}
+
+// false: the row does not fit, use top_k_radix_cuda
+static bool top_k_two_stage_cuda(
+        ggml_cuda_pool & pool,
+        const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
+    constexpr int BLOCK_SIZE = 256;
+    constexpr int NPER = 16;
+    static const bool disabled = [] {
+        const char * env = getenv("GGML_CUDA_TOPK_TWO_STAGE");
+        return env != nullptr && atoi(env) == 0;
+    }();
+    const int max_n = BLOCK_SIZE*NPER;
+    if (disabled || nrows > 64 || ncols <= max_n) {
+        return false;
+    }
+    const int n_blocks = (ncols + max_n - 1) / max_n;
+    const int chunk    = (ncols + n_blocks - 1) / n_blocks;
+    // every chunk must give k candidates, and the candidates of a row must fit one block
+    if (n_blocks_stage1(ncols, chunk) != n_blocks || ncols - (n_blocks - 1)*chunk < k || n_blocks*k > max_n) {
+        return false;
+    }
+    ggml_cuda_pool_alloc<uint32_t> cand_key(pool, (size_t) nrows * n_blocks * k);
+    ggml_cuda_pool_alloc<int>      cand_col(pool, (size_t) nrows * n_blocks * k);
+    top_k_two_stage<BLOCK_SIZE, NPER, false><<<dim3(n_blocks, nrows), BLOCK_SIZE, 0, stream>>>(
+        src, cand_key.get(), cand_col.get(), nullptr, ncols, chunk, k);
+    top_k_two_stage<BLOCK_SIZE, NPER, true><<<dim3(1, nrows), BLOCK_SIZE, 0, stream>>>(
+        nullptr, cand_key.get(), cand_col.get(), dst, ncols, chunk, k);
+    return true;
+}
+
 static void top_k_radix_cuda(
         ggml_cuda_pool & pool,
         const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
+    if (top_k_two_stage_cuda(pool, src, dst, ncols, nrows, k, stream)) {
+        return;
+    }
     // 11-bit digits need 3 passes instead of 4, but the select block reads 8x the bins per histogram block,
     //   so cap the histogram blocks at 16 and take them only for a few rows (decode). Past 64k columns the
     //   16 blocks get too long and 8-bit digits over 64 blocks are faster.
