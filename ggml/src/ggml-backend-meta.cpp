@@ -141,7 +141,7 @@ static void ggml_backend_meta_device_get_props(ggml_backend_dev_t dev, ggml_back
         /* .async                 = */ true,
         /* .host_buffer           = */ false, // Not implemented.
         /* .buffer_from_host_ptr  = */ false, // Not implemented.
-        /* .events                = */ false, // Not implemented.
+        /* .events                = */ true,
         /* .mmap_support          = */ true,
     };
     for (ggml_backend_dev_t simple_dev : meta_dev_ctx->simple_devs) {
@@ -318,6 +318,43 @@ static bool ggml_backend_meta_device_supports_buft(ggml_backend_dev_t dev, ggml_
     return true;
 }
 
+// An event of a meta device is one event per simple device, recorded on and waited for by every device's stream.
+static ggml_backend_event_t ggml_backend_meta_device_event_new(ggml_backend_dev_t dev) {
+    GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+
+    std::vector<ggml_backend_event_t> * events = new std::vector<ggml_backend_event_t>();
+    for (ggml_backend_dev_t simple_dev : meta_dev_ctx->simple_devs) {
+        ggml_backend_event_t event = ggml_backend_event_new(simple_dev);
+        if (event == nullptr) {
+            for (ggml_backend_event_t e : *events) {
+                ggml_backend_event_free(e);
+            }
+            delete events;
+            return nullptr;
+        }
+        events->push_back(event);
+    }
+    return new ggml_backend_event { /* .device = */ dev, /* .context = */ events };
+}
+
+static void ggml_backend_meta_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    GGML_UNUSED(dev);
+    std::vector<ggml_backend_event_t> * events = (std::vector<ggml_backend_event_t> *) event->context;
+    for (ggml_backend_event_t e : *events) {
+        ggml_backend_event_free(e);
+    }
+    delete events;
+    delete event;
+}
+
+static void ggml_backend_meta_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    GGML_UNUSED(dev);
+    for (ggml_backend_event_t e : *(std::vector<ggml_backend_event_t> *) event->context) {
+        ggml_backend_event_synchronize(e);
+    }
+}
+
 static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .get_name             = */ ggml_backend_meta_device_get_name,
     /* .get_description      = */ ggml_backend_meta_device_get_description,
@@ -331,9 +368,9 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .supports_op          = */ ggml_backend_meta_device_supports_op,
     /* .supports_buft        = */ ggml_backend_meta_device_supports_buft,
     /* .offload_op           = */ ggml_backend_meta_device_offload_op,
-    /* .event_new            = */ nullptr,
-    /* .event_free           = */ nullptr,
-    /* .event_synchronize    = */ nullptr,
+    /* .event_new            = */ ggml_backend_meta_device_event_new,
+    /* .event_free           = */ ggml_backend_meta_device_event_free,
+    /* .event_synchronize    = */ ggml_backend_meta_device_event_synchronize,
 };
 
 static bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
@@ -4148,13 +4185,11 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
-    GGML_ASSERT(split_state.n_segments == 1);
-    GGML_ASSERT(split_state.nr[0]      == 1);
 
-    // Only the chunk-splicing paths below need contiguity and offset 0; a mirrored read is forwarded
+    // Only the chunk-splicing paths below need contiguity; a mirrored read is forwarded
     // to one device as-is, so a view of the ids tensor is fine there.
     if (split_state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
-        if (offset != 0 || !ggml_is_contiguous(tensor)) {
+        if (!ggml_is_contiguous(tensor)) {
             GGML_ABORT("%s: cannot splice a read of %s (op %s): axis=%d offset=%zu size=%zu "
                 "ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
                 "nb=[%zu,%zu,%zu,%zu] contiguous=%d nbytes=%zu",
@@ -4165,30 +4200,21 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
         }
     }
 
-    switch (split_state.axis) {
-        case GGML_BACKEND_SPLIT_AXIS_0:
-        case GGML_BACKEND_SPLIT_AXIS_1:
-        case GGML_BACKEND_SPLIT_AXIS_2: {
-            // Exploit that tensors are contiguous to splice it with simple tensors as "chunks".
-            const size_t chunk_size_full = tensor->nb[split_state.axis + 1];
-            GGML_ASSERT(offset % chunk_size_full == 0);
-            GGML_ASSERT(size   % chunk_size_full == 0);
-            const int64_t i_start =  offset        /chunk_size_full;
-            const int64_t i_stop  = (offset + size)/chunk_size_full;
-            size_t offset_j = 0;
-            for (size_t j = 0; j < n_backends; j++){
-                ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
-                const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                const size_t chunk_size_j = simple_tensor->nb[split_state.axis + 1];
-                if (chunk_size_j == 0) {
-                    continue;
-                }
-                ggml_backend_tensor_get_2d_async(simple_backend, simple_tensor, (char *) data + offset_j, offset, chunk_size_j,
-                    i_stop - i_start, chunk_size_j, chunk_size_full);
-                offset_j += chunk_size_j;
+    // the same parts as the buffer's get_tensor: any range of whole rows, also of a segmented split (a state save)
+    const bool segmented = split_state.n_segments != 1 || split_state.nr[0] != 1;
+    if (segmented || (split_state.axis >= GGML_BACKEND_SPLIT_AXIS_0 && split_state.axis <= GGML_BACKEND_SPLIT_AXIS_2)) {
+        for (const auto & p : ggml_backend_meta_copy_parts(tensor, split_state, n_backends, offset, size)) {
+            // a device with an empty slice may have no allocation
+            if (p.nbytes == 0 || p.n_rows == 0) {
+                continue;
             }
-            GGML_ASSERT(offset_j == chunk_size_full);
-        } break;
+            ggml_backend_tensor_get_2d_async(ggml_backend_meta_simple_backend(backend, p.j), ggml_backend_meta_buffer_simple_tensor(tensor, p.j),
+                (char *) data + p.data_off, p.simple_off, p.nbytes, p.n_rows, p.stride_simple, p.stride_data);
+        }
+        return;
+    }
+
+    switch (split_state.axis) {
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
             // TODO other simple backend may be better
             ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, 0);
@@ -4879,7 +4905,23 @@ static bool ggml_backend_meta_stage_weight(ggml_backend_t backend, ggml_tensor *
 
 static bool ggml_backend_meta_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst,
         const ggml_tensor * src, ggml_tensor * dst) {
-    GGML_UNUSED(backend_src);
+    // A copy between two tensors of one of the devices, e.g. a state snapshot of that device's part of a split
+    // tensor, goes behind the work queued on the device's stream.
+    if (backend_src == backend_dst && src->buffer != nullptr && dst->buffer != nullptr &&
+            !ggml_backend_buffer_is_meta(src->buffer) && !ggml_backend_buffer_is_meta(dst->buffer)) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(src->buffer));
+        if (dev != ggml_backend_buft_get_device(ggml_backend_buffer_get_type(dst->buffer))) {
+            return false;
+        }
+        for (size_t j = 0; j < ggml_backend_meta_n_backends(backend_dst); j++) {
+            ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend_dst, j);
+            if (ggml_backend_get_device(simple_backend) == dev) {
+                ggml_backend_tensor_copy_async(simple_backend, simple_backend, src, dst);
+                return true;
+            }
+        }
+        return false;
+    }
     // Only host -> meta, which is how ggml_backend_sched moves offloaded weights into the split.
     // The point is the fan-out below: it leaves one async copy per device in flight, so every link runs at
     // the same time. The buffer set_tensor path syncs after each device instead, which uses one link at a time.
@@ -6121,6 +6163,22 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     return GGML_STATUS_SUCCESS;
 }
 
+static void ggml_backend_meta_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+    const std::vector<ggml_backend_event_t> & events = *(std::vector<ggml_backend_event_t> *) event->context;
+    GGML_ASSERT(events.size() == ggml_backend_meta_n_backends(backend));
+    for (size_t j = 0; j < events.size(); j++) {
+        ggml_backend_event_record(events[j], ggml_backend_meta_simple_backend(backend, j));
+    }
+}
+
+static void ggml_backend_meta_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+    const std::vector<ggml_backend_event_t> & events = *(std::vector<ggml_backend_event_t> *) event->context;
+    GGML_ASSERT(events.size() == ggml_backend_meta_n_backends(backend));
+    for (size_t j = 0; j < events.size(); j++) {
+        ggml_backend_event_wait(ggml_backend_meta_simple_backend(backend, j), events[j]);
+    }
+}
+
 static const ggml_backend_i ggml_backend_meta_i = {
     /* .get_name                = */ ggml_backend_meta_get_name,
     /* .free                    = */ ggml_backend_meta_free,
@@ -6135,8 +6193,8 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .graph_plan_update       = */ nullptr,
     /* .graph_plan_compute      = */ nullptr,
     /* .graph_compute           = */ ggml_backend_meta_graph_compute,
-    /* .event_record            = */ nullptr,
-    /* .event_wait              = */ nullptr,
+    /* .event_record            = */ ggml_backend_meta_event_record,
+    /* .event_wait              = */ ggml_backend_meta_event_wait,
     /* .graph_optimize          = */ nullptr,
 };
 
