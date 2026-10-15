@@ -4380,9 +4380,10 @@ void llm_graph_context::build_sampling() const {
     logits_full->flags |= GGML_TENSOR_FLAG_MIRRORED;
     ggml_format_name(logits_full, "logits_mirrored");
 
-    // the padding row gives the chains without a row of the ubatch a valid input
-    // note: unlike upstream, a ubatch with no output returns early above (an empty tensor has no split state under -sm tensor)
-    ggml_tensor * logits_t = ggml_pad(ctx0, logits_full, 0, 1, 0, 0);
+    // upstream pads a row here, so that a ubatch with no output still gives the chains without a row a valid input; a
+    //   ubatch with no output returns early above (an empty tensor has no split state under -sm tensor), so they read
+    //   row 0 instead, without copying the logits of every token once more
+    ggml_tensor * logits_t = logits_full;
 
     for (const auto & entry : samplers) {
         if (entry.second->iface->backend_reset) {
