@@ -33,11 +33,11 @@ private:
     // used by yield_to_queue, all fields are guarded by mutex_tasks
     struct worker_t {
         std::thread             thread;
-        std::condition_variable cv;        // the worker sleeps on this until a yield starts
+        std::condition_variable cv;        // the worker sleeps on this until a yield has a task for it
         std::exception_ptr      exception; // exception thrown while processing tasks, if any
         bool stop     = false;
-        bool busy     = false; // set by yield_to_queue(), cleared by the worker once it is done processing tasks
-        bool yielding = false; // work() is still running on the start_loop() thread
+        bool yielding = false; // work() is still running on the start_loop() thread, the worker may take tasks
+        bool in_task  = false; // the worker is running a task, the end of the yield waits for it
     };
     worker_t worker;
 
