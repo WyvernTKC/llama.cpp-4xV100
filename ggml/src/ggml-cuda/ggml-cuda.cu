@@ -1510,6 +1510,10 @@ static bool ggml_backend_cuda_comm_allgather_tensor(void * comm_ctx_v, struct gg
     if (ggml_cuda_p2p_ar_allgather(comm_ctx->p2p_ar, comm_ctx->backends.data(), srcs, dsts)) {
         return true;
     }
+    // no communicators with GGML_CUDA_ALLREDUCE=internal/none or a failed NCCL init: the meta backend gathers with copies
+    if (comm_ctx->comms.empty()) {
+        return false;
+    }
     return ggml_backend_cuda_comm_allgather_nccl(comm_ctx, srcs, dsts);
 #else
     GGML_UNUSED(srcs);
