@@ -193,6 +193,9 @@ struct if_statement : public statement {
 struct identifier;
 struct tuple_literal;
 
+// true if executing these statements can bind a name in the context they run in
+bool stmts_bind_names(const statements & stmts);
+
 /**
  * Loop over each item in a sequence
  * https://jinja.palletsprojects.com/en/3.0.x/templates/#for
@@ -202,12 +205,14 @@ struct for_statement : public statement {
     statement_ptr iterable;
     statements body;
     statements default_block; // if no iteration took place
+    bool body_binds_names = true; // a body that binds no name shares one scope across iterations
 
     for_statement(statement_ptr && loopvar, statement_ptr && iterable, statements && body, statements && default_block)
         : loopvar(std::move(loopvar)), iterable(std::move(iterable)),
           body(std::move(body)), default_block(std::move(default_block)) {
         chk_type<identifier, tuple_literal>(this->loopvar);
         chk_type<expression>(this->iterable);
+        body_binds_names = stmts_bind_names(this->body);
     }
 
     std::string type() const override { return "For"; }

@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <optional>
 #include <cmath>
 
 #define FILENAME "jinja-runtime"
@@ -484,6 +485,37 @@ value if_statement::execute_impl(context & ctx) const {
     return str;
 }
 
+bool stmts_bind_names(const statements & stmts) {
+    for (const auto & stmt : stmts) {
+        const statement * s = stmt.get();
+        if (const auto * st = dynamic_cast<const set_statement *>(s)) {
+            if (!is_stmt<member_expression>(st->assignee) || stmts_bind_names(st->body)) {
+                return true;
+            }
+        } else if (const auto * st = dynamic_cast<const if_statement *>(s)) {
+            if (stmts_bind_names(st->body) || stmts_bind_names(st->alternate)) {
+                return true;
+            }
+        } else if (const auto * st = dynamic_cast<const for_statement *>(s)) {
+            // the body of a nested loop runs in scopes of its own, its else block runs in ours
+            if (stmts_bind_names(st->default_block)) {
+                return true;
+            }
+        } else if (const auto * st = dynamic_cast<const filter_statement *>(s)) {
+            if (stmts_bind_names(st->body)) {
+                return true;
+            }
+        } else if (dynamic_cast<const expression *>(s) || dynamic_cast<const call_statement *>(s) ||
+                   dynamic_cast<const break_statement *>(s) || dynamic_cast<const continue_statement *>(s) ||
+                   dynamic_cast<const noop_statement *>(s) || dynamic_cast<const comment_statement *>(s)) {
+            // these bind nothing here: a call block runs its body in a scope of its own
+        } else {
+            return true; // macro, or a statement this list does not know
+        }
+    }
+    return false;
+}
+
 value for_statement::execute_impl(context & ctx) const {
     context scope(ctx); // new scope for loop variables
 
@@ -603,7 +635,9 @@ value for_statement::execute_impl(context & ctx) const {
     bool noIteration = true;
     for (size_t i = 0; i < filtered_items.size(); i++) {
         JJ_DEBUG("For loop iteration %zu/%zu", i + 1, filtered_items.size());
-        context loop_scope(scope);
+        // a new scope per iteration only if the body can set a name: "loop" and the loop variables are set again every iteration
+        std::optional<context> iter_scope;
+        context & loop_scope = body_binds_names ? iter_scope.emplace(scope) : scope;
         value_object loop_obj = mk_val<value_object>();
         loop_obj->has_builtins = false; // loop object has no builtins
         loop_obj->insert("index", mk_val<value_int>(i + 1));
