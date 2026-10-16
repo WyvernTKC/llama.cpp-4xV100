@@ -675,15 +675,20 @@ static void build_lilicorr_scores(llm_graph_context & g, const llama_model & mod
     const int64_t factor_dim = model.lilicorr_out_head->ne[1];
     GGML_ASSERT(tokens_per_block == block_size);
 
-    ggml_tensor * candidates = ggml_top_k(ctx0, res->t_logits, top_k);
-    ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
+    // under -sm tensor the head is split over the vocab dim, but top-k and softmax read whole rows. gather the logits first.
+    ggml_tensor * logits = ggml_cont(ctx0, res->t_logits);
+    logits->flags |= GGML_TENSOR_FLAG_MIRRORED;
+    ggml_format_name(logits, "lilicorr_logits_mirrored");
+
+    ggml_tensor * candidates = ggml_top_k(ctx0, logits, top_k);
+    ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, logits, 1, logits->ne[0], n_tokens);
     ggml_tensor * candidate_logits = ggml_reshape_2d(ctx0,
             ggml_get_rows(ctx0, logits_rows, candidates), top_k, n_tokens);
     // Rank features and embeddings require candidates in descending logit order.
     ggml_tensor * order = ggml_argsort(ctx0, candidate_logits, GGML_SORT_ORDER_DESC);
     ggml_tensor * candidate_rows = ggml_reshape_3d(ctx0, candidates, 1, top_k, n_tokens);
     candidates = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, candidate_rows, order), top_k, n_tokens);
-    ggml_tensor * prob_rows   = ggml_reshape_3d(ctx0, ggml_soft_max(ctx0, res->t_logits), 1, res->t_logits->ne[0], n_tokens);
+    ggml_tensor * prob_rows   = ggml_reshape_3d(ctx0, ggml_soft_max(ctx0, logits), 1, logits->ne[0], n_tokens);
     ggml_tensor * probs       = ggml_reshape_2d(ctx0,
             ggml_get_rows(ctx0, prob_rows, candidates), top_k, n_tokens);
 

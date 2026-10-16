@@ -729,6 +729,47 @@ static int test_tensor_split_dither() {
     return ok ? 0 : 1;
 }
 
+// blocks past the last layer (the LiliCorr scorer of a DFlash draft) have no per-layer hparams,
+//   so their split state must not read them
+static int test_split_state_head_blocks() {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_LLAMA, false);
+    if (!gguf_ctx) {
+        return 1;
+    }
+
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback  = silent_model_load_progress;
+    std::vector<ggml_backend_dev_t> devs{ nullptr };
+    model_params.devices = devs.data();
+
+    tensor_data_params tmp = { 0, 1.0f };
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tmp, model_params));
+    if (!model) {
+        throw std::runtime_error("failed to create llama model");
+    }
+
+    llama_meta_device_get_split_state_userdata ud;
+    ud.n_devices = 2;
+    ud.model     = model.get();
+
+    bool ok = true;
+    for (const char * suffix : { "attn_norm.weight", "attn_output.weight", "ffn_up.weight", "ffn_down.weight" }) {
+        ggml_tensor t;
+        memset(&t, 0, sizeof(t));
+        t.type = GGML_TYPE_F16;
+        ggml_format_name(&t, "blk.%u.%s", model->hparams.n_layer_all, suffix);
+        t.ne[0] = 256;
+        t.ne[1] = 256;
+
+        const ggml_backend_meta_split_state state = llama_meta_device_get_split_state(&t, &ud);
+        if (state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            printf("split state of head blocks: %s is not mirrored (axis %d)\n", t.name, (int) state.axis);
+            ok = false;
+        }
+    }
+    return ok ? 0 : 1;
+}
+
 // entries [n/4, n/2) are embd rows, decoded either as token/embd/token chunks or as one mixed batch
 // returns the llama_process() error code
 static int32_t get_logits_mixed(
@@ -1405,7 +1446,10 @@ int main(int argc, char ** argv) {
         if (ret != 0) {
             return ret;
         }
-        return test_tensor_split_dither();
+        if (test_tensor_split_dither() != 0) {
+            return 1;
+        }
+        return test_split_state_head_blocks();
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;

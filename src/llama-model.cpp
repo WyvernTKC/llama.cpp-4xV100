@@ -706,6 +706,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             // aliased cache slots cannot satisfy the meta-split invariants, so replicate all tensors
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, 0, 0};
         }
+        // blocks past the last layer belong to a head (the LiliCorr scorer of a DFlash draft): they have no per-layer
+        //   hparams to split by and are small, so replicate them
+        if (tensor_name.compare(0, 4, "blk.") == 0 && std::stoul(tensor_name.substr(4)) >= hparams.n_layer_all) {
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, 0, 0};
+        }
         if (is_dsv4) {
             if (std::regex_match(tensor_name, pattern_kv_cache) ||
                     std::regex_match(tensor_name, pattern_dsv4_state)) {
