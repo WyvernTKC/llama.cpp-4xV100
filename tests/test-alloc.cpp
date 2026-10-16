@@ -607,6 +607,25 @@ static void test_buffer_size_zero() {
     GGML_ASSERT(backend_b.context->allocated_total() == 0);
 }
 
+// Graph of only empty tensors (eg. the LM head of a ubatch without outputs): the buffer must not be zero-size,
+// or every tensor gets a NULL address and the second use of one allocates it again.
+static void test_empty_tensors() {
+    dummy_backend backend      = dummy_backend_init(64);
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    ggml_tensor * x[4];
+    x[0] = make_input_1d(ctx, 0);
+    x[1] = ggml_scale(ctx, x[0], 2.0f);
+    x[2] = ggml_view_1d(ctx, x[1], 0, 0);
+    x[3] = ggml_add(ctx, x[1], x[2]);
+    assign_names(ctx);
+
+    ggml_gallocr_ptr galloc = allocate_graph(graph, x[3], &backend.buffer_type);
+    check_all_allocated(graph);
+    GGML_ASSERT(x[0]->data != nullptr);
+    GGML_ASSERT(backend.context->allocated_total() > 0);
+}
+
 // Test re-using gallocr for a different graph. The new graph has the same
 // total size, but one of the chunks is larger, so reallocation is required.
 static void test_reallocation() {
@@ -1119,6 +1138,7 @@ int main() {
     run("test_prefer_already_allocated_memory", test_prefer_already_allocated_memory);
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
+    run("test_empty_tensors", test_empty_tensors);
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
