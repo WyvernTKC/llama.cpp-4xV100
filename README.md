@@ -368,6 +368,18 @@ as `n_tokens * n_expert_used` fits in the pool; larger prompt ubatches keep the 
 Results are the same as the host cache's; the merged graph lets the CUDA backend fuse a few more ops,
 so perplexity differs in the last digits unless fusion is disabled, in which case it is identical.
 
+Every expert a ubatch routes to has to be in the pool, so the replacement policy only chooses which
+resident a miss replaces. The default is the least recently used. `GGML_META_EXPERT_CACHE_POLICY=fr`
+(frequency x recency, from capy-flash) replaces the resident with the lowest `freq * 2^(-age/tau)`:
+`freq` counts the expert's routings with a half-life of `GGML_META_EXPERT_CACHE_FR_HALF_LIFE` tokens
+(default 128), `age` counts the pool's plan calls since the slot was last used, and `tau` is
+`GGML_META_EXPERT_CACHE_FR_TAU` (default 32; 0 = frequency alone). It pays where the pool is small next
+to the expert count. On DeepSeek-V4.1 at cap 56 of 384 (4x V100, 28 host layers) it copies 11-15%
+fewer bytes and decodes 3.3% faster in a chat A/B (36.8 -> 38.0 t/s); on DeepSeek-V4-Flash at cap 80
+of 256 (28 host layers) the same A/B gives +1.5% (36.8 -> 37.4 t/s). On Qwen3.8-Flash at cap 320 of
+512 it saves under 1% of the copies and costs ~0.2% decode in plan work, so LRU stays the default.
+Output is bit-identical either way: residency never changes the bytes the matmul reads.
+
 For digging into it: `GGML_META_EXPERT_CACHE_STATS=1` prints the expert bytes a run moved, and with the
 device gather one `expert-cache-dev:` line per pool and device when the pool is freed (calls, misses,
 MiB per call), so a cap sweep gives the hit rate per layer without a trace;
@@ -764,6 +776,9 @@ Recorded so nobody rebuilds them:
 | `GGML_META_MOE_OFFLOAD_MIN_EXPERTS` | unset | old expert-count gate, kept for existing command lines. Setting it replaces the budget above |
 | `GGML_META_EXPERT_CACHE` | off | keep N experts of each offloaded MoE weight resident, decode only. Needs `GGML_META_PARTIAL_COPY` |
 | `GGML_META_EXPERT_CACHE_STATS` | off | print the expert bytes a run moved, for checking the cache is paying |
+| `GGML_META_EXPERT_CACHE_POLICY` | lru | `fr`: replace the resident with the lowest decayed frequency x recency (device cache) |
+| `GGML_META_EXPERT_CACHE_FR_HALF_LIFE` | 128 | `fr`: half-life of the routing count, in tokens |
+| `GGML_META_EXPERT_CACHE_FR_TAU` | 32 | `fr`: recency decay, in plan calls; 0 = frequency alone |
 | `GGML_META_PARTIAL_DEBUG` | off | per weight, whether it took the used-experts-only path and what refused it |
 | `GGML_META_MMID_DEBUG` | off | where each `MUL_MAT_ID` ran, with the `supports_op`/`offload_op`/`op_offload` answers |
 | `GGML_META_STAGE_SLOTS` | 4 | staging slots per device for offloaded weights |

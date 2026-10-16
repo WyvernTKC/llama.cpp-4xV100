@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 #include <mutex>
 #include <vector>
@@ -42,6 +43,14 @@ struct ggml_cuda_expert_cache_dev {
     int32_t  * miss_slot;   // [max_ids]
     int32_t  * n_miss;      // [1]
     uint32_t * stats;       // [4] calls, misses, warms, warm misses - GGML_META_EXPERT_CACHE_STATS
+
+    // GGML_META_EXPERT_CACHE_POLICY=fr, see expert_cache_policy; nullptr with the LRU
+    float    * freq;        // [n_expert] routings, decayed with a half-life in tokens up to tok_of
+    uint32_t * tok_of;      // [n_expert] the token count when freq was last brought up to date
+    uint32_t * win_of;      // [cap] the window (plan or warm call) that last used each slot, then the window count and
+                            //   the token count
+    float      inv_hl;      // 1 / half-life in tokens
+    float      inv_tau;     // 1 / tau in windows, 0: frequency alone
 };
 
 struct ggml_cuda_expert_cache {
@@ -67,6 +76,79 @@ struct ggml_cuda_expert_cache_group {
 // fast: at most this many ids, and no more than the capacity of any cache of the group, see expert_cache_plan
 #define GGML_CUDA_EXPERT_CACHE_PLAN_FAST_IDS 64
 #define GGML_CUDA_EXPERT_CACHE_PLAN_FAST_CAP 4096
+#define GGML_CUDA_EXPERT_CACHE_PLAN_FAST_CAP_FR 2048 // a third array of cap in shared memory
+
+// Which resident a miss replaces. Every routed expert has to be in the pool, so a policy only chooses victims.
+//   lru (default): the least recently used.
+//   fr: the lowest freq*2^(-age/tau), age = windows (plan or warm calls of this pool) since the slot was last used,
+//     freq = routings decayed with a half-life in tokens, ties to the least recently used; the experts of the
+//     current window are never victims. Frequency x recency from capy-flash (github.com/ValerioDolci/capy-flash, T61);
+//     a warm (wide ubatch) adds its routings weighted by their mean recency (its T69) and keeps LRU victims.
+//   GGML_META_EXPERT_CACHE_POLICY=lru|fr, GGML_META_EXPERT_CACHE_FR_TAU=<windows> (0: frequency alone),
+//   GGML_META_EXPERT_CACHE_FR_HALF_LIFE=<tokens>.
+struct expert_cache_policy {
+    bool  fr;
+    float half_life;
+    float tau;
+};
+
+static expert_cache_policy expert_cache_policy_get() {
+    static const expert_cache_policy p = [] {
+        expert_cache_policy r = {false, 128.0f, 32.0f};
+        const char * pol = getenv("GGML_META_EXPERT_CACHE_POLICY");
+        r.fr = pol != nullptr && strcmp(pol, "fr") == 0;
+        const char * hl  = getenv("GGML_META_EXPERT_CACHE_FR_HALF_LIFE");
+        const char * tau = getenv("GGML_META_EXPERT_CACHE_FR_TAU");
+        if (hl != nullptr && atof(hl) > 0.0) {
+            r.half_life = (float) atof(hl);
+        }
+        if (tau != nullptr && atof(tau) >= 0.0) {
+            r.tau = (float) atof(tau);
+        }
+        return r;
+    }();
+    return p;
+}
+
+// The fr key of a slot holding expert e, last used in window win_s, at token count tok and window w: an empty slot
+//   first. The frequency decays lazily, from the token count of its last update.
+static __device__ __forceinline__ float expert_cache_fr_key(const ggml_cuda_expert_cache_dev & d, const int e,
+        const uint32_t win_s, const uint32_t tok, const uint32_t w) {
+    if (e < 0) {
+        return -1.0f;
+    }
+    return d.freq[e]*exp2f(-((float) (tok - d.tok_of[e])*d.inv_hl + (float) (w - win_s)*d.inv_tau));
+}
+
+// (key, last_used, slot) lexicographically
+static __device__ __forceinline__ bool expert_cache_fr_less(const float sa, const uint32_t la, const int ia,
+        const float sb, const uint32_t lb, const int ib) {
+    return sa < sb || (sa == sb && (la < lb || (la == lb && ia < ib)));
+}
+
+// fr: expert e was routed c times (weighted) in the window that brings the token count to tok
+static __device__ __forceinline__ void expert_cache_fr_add(const ggml_cuda_expert_cache_dev & d, const int e,
+        const float c, const uint32_t tok) {
+    d.freq[e]   = d.freq[e]*exp2f(-(float) (tok - d.tok_of[e])*d.inv_hl) + c;
+    d.tok_of[e] = tok;
+}
+
+// fr: the routings of id i, once per expert (at its first position), with how often the ids route to it
+static __device__ __forceinline__ void expert_cache_fr_add_id(const ggml_cuda_expert_cache_dev & d, const int32_t * ids,
+        const int n_ids, const int n_per_row, const int row_stride, const int i, const uint32_t tok) {
+    const int id = ids[(i / n_per_row)*row_stride + (i % n_per_row)];
+    int c = 0;
+    for (int j = 0; j < n_ids; j++) {
+        const int idj = ids[(j / n_per_row)*row_stride + (j % n_per_row)];
+        if (idj == id) {
+            if (j < i) {
+                return;
+            }
+            c++;
+        }
+    }
+    expert_cache_fr_add(d, id, (float) c, tok);
+}
 
 // The scheduler and the LRU run in one block. Hits are marked in parallel, misses are then taken one by one
 // so the victim of one is never the slot another still needs: the argmin over last_used cannot return a
@@ -83,18 +165,27 @@ static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_group g, c
     __shared__ int      s_id[GGML_CUDA_EXPERT_CACHE_PLAN_FAST_IDS];
     __shared__ int      s_miss_expert[GGML_CUDA_EXPERT_CACHE_PLAN_FAST_IDS];
     __shared__ int      s_miss_slot[GGML_CUDA_EXPERT_CACHE_PLAN_FAST_IDS];
-    extern __shared__ uint32_t s_lru[]; // fast: last_used [cap], then expert_of [cap]
+    __shared__ float    s_min_sc[32];
+    extern __shared__ uint32_t s_lru[]; // fast: last_used [cap], then expert_of [cap], then with fr the keys [cap]
 
     const int      n_ids = n_rows*n_per_row;
     const uint32_t clock = *d.clock;
+    const bool     fr    = d.freq != nullptr;
+    const uint32_t win   = fr ? d.win_of[d.cap] + 1 : 0;           // this window
+    const uint32_t tok   = fr ? d.win_of[d.cap + 1] + n_rows : 0;  // the token count after it
 
-    uint32_t * s_last = s_lru;
-    int32_t  * s_exp  = (int32_t *) (s_lru + d.cap);
+    uint32_t * s_last  = s_lru;
+    int32_t  * s_exp   = (int32_t *) (s_lru + d.cap);
+    float    * s_score = (float *) (s_lru + 2*d.cap);
     if (fast) {
-        // it does not depend on the ids, so its round trip overlaps theirs and that of slot_of
+        // it does not depend on the ids, so its round trip overlaps theirs and that of slot_of; with fr the keys too:
+        //   the only slots whose key changes in this window are the ones it uses, and those are never victims
         for (int s = threadIdx.x; s < d.cap; s += blockDim.x) {
             s_last[s] = d.last_used[s];
             s_exp[s]  = d.expert_of[s];
+            if (fr) {
+                s_score[s] = expert_cache_fr_key(d, s_exp[s], d.win_of[s], tok, win);
+            }
         }
     }
 
@@ -109,6 +200,9 @@ static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_group g, c
         if (sl >= 0) {
             // several tokens of one ubatch may route to the same expert; max keeps the stamp deterministic
             atomicMax(&d.last_used[sl], clock + 1 + i);
+            if (fr) {
+                d.win_of[sl] = win;
+            }
         }
     }
     if (threadIdx.x == 0) {
@@ -121,10 +215,18 @@ static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_group g, c
         for (int i = threadIdx.x; i < n_ids; i += blockDim.x) {
             if (s_remap[i] >= 0) {
                 atomicMax(&s_last[s_remap[i]], clock + 1 + i);
+                if (fr) {
+                    s_score[s_remap[i]] = INFINITY; // used in this window: not a victim
+                }
             }
         }
         __syncthreads();
         if (threadIdx.x >= WARP_SIZE) {
+            // fr: the frequencies of the routed experts, beside the misses of warp 0, which never reads them
+            const int i = threadIdx.x - WARP_SIZE;
+            if (fr && i < n_ids) {
+                expert_cache_fr_add_id(d, s_id, n_ids, n_ids, n_ids, i, tok);
+            }
             return;
         }
         const int lane   = threadIdx.x;
@@ -147,19 +249,41 @@ static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_group g, c
 
             uint32_t best   = 0xffffffffu;
             int      best_i = 0x7fffffff;
-            for (int s = lane; s < d.cap; s += WARP_SIZE) {
-                const uint32_t v = s_last[s];
-                if (v < best) {
-                    best   = v;
-                    best_i = s;
+            if (fr) {
+                float best_s = INFINITY;
+                for (int s = lane; s < d.cap; s += WARP_SIZE) {
+                    const float sc = s_score[s];
+                    if (sc != INFINITY && expert_cache_fr_less(sc, s_last[s], s, best_s, best, best_i)) {
+                        best_s = sc;
+                        best   = s_last[s];
+                        best_i = s;
+                    }
                 }
-            }
-            for (int off = 16; off > 0; off >>= 1) {
-                const uint32_t ob = __shfl_xor_sync(0xffffffff, best,   off);
-                const int      oi = __shfl_xor_sync(0xffffffff, best_i, off);
-                if (ob < best || (ob == best && oi < best_i)) {
-                    best   = ob;
-                    best_i = oi;
+                for (int off = 16; off > 0; off >>= 1) {
+                    const float    os = __shfl_xor_sync(0xffffffff, best_s, off);
+                    const uint32_t ob = __shfl_xor_sync(0xffffffff, best,   off);
+                    const int      oi = __shfl_xor_sync(0xffffffff, best_i, off);
+                    if (expert_cache_fr_less(os, ob, oi, best_s, best, best_i)) {
+                        best_s = os;
+                        best   = ob;
+                        best_i = oi;
+                    }
+                }
+            } else {
+                for (int s = lane; s < d.cap; s += WARP_SIZE) {
+                    const uint32_t v = s_last[s];
+                    if (v < best) {
+                        best   = v;
+                        best_i = s;
+                    }
+                }
+                for (int off = 16; off > 0; off >>= 1) {
+                    const uint32_t ob = __shfl_xor_sync(0xffffffff, best,   off);
+                    const int      oi = __shfl_xor_sync(0xffffffff, best_i, off);
+                    if (ob < best || (ob == best && oi < best_i)) {
+                        best   = ob;
+                        best_i = oi;
+                    }
                 }
             }
             if (lane == 0) {
@@ -167,6 +291,10 @@ static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_group g, c
                 const int old    = s_exp[victim];
                 if (old >= 0) {
                     d.slot_of[old] = -1;
+                }
+                if (fr) {
+                    s_score[victim]  = INFINITY;
+                    d.win_of[victim] = win;
                 }
                 s_exp[victim]       = id;
                 d.expert_of[victim] = id;
@@ -187,8 +315,19 @@ static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_group g, c
             *d.clock  = clock + 1 + n_ids;
             d.stats[0] += 1;
             d.stats[1] += n_miss;
+            if (fr) {
+                d.win_of[d.cap]     = win;
+                d.win_of[d.cap + 1] = tok;
+            }
         }
         return;
+    }
+
+    if (fr) {
+        // the keys below read only slots this window has not used, whose experts these do not touch
+        for (int i = threadIdx.x; i < n_ids; i += blockDim.x) {
+            expert_cache_fr_add_id(d, ids, n_ids, n_per_row, row_stride, i, tok);
+        }
     }
 
     for (int i = 0; i < n_ids; i++) {
@@ -207,19 +346,44 @@ static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_group g, c
 
         uint32_t best   = 0xffffffffu;
         int      best_i = 0x7fffffff;
-        for (int s = threadIdx.x; s < d.cap; s += blockDim.x) {
-            const uint32_t v = d.last_used[s];
-            if (v < best) {
-                best   = v;
-                best_i = s;
+        float    best_s = INFINITY;
+        if (fr) {
+            for (int s = threadIdx.x; s < d.cap; s += blockDim.x) {
+                if (d.win_of[s] == win) {
+                    continue; // used in this window
+                }
+                const float sc = expert_cache_fr_key(d, d.expert_of[s], d.win_of[s], tok, win);
+                if (expert_cache_fr_less(sc, d.last_used[s], s, best_s, best, best_i)) {
+                    best_s = sc;
+                    best   = d.last_used[s];
+                    best_i = s;
+                }
             }
-        }
-        for (int off = 16; off > 0; off >>= 1) {
-            const uint32_t ob = __shfl_xor_sync(0xffffffff, best,   off);
-            const int      oi = __shfl_xor_sync(0xffffffff, best_i, off);
-            if (ob < best || (ob == best && oi < best_i)) {
-                best   = ob;
-                best_i = oi;
+            for (int off = 16; off > 0; off >>= 1) {
+                const float    os = __shfl_xor_sync(0xffffffff, best_s, off);
+                const uint32_t ob = __shfl_xor_sync(0xffffffff, best,   off);
+                const int      oi = __shfl_xor_sync(0xffffffff, best_i, off);
+                if (expert_cache_fr_less(os, ob, oi, best_s, best, best_i)) {
+                    best_s = os;
+                    best   = ob;
+                    best_i = oi;
+                }
+            }
+        } else {
+            for (int s = threadIdx.x; s < d.cap; s += blockDim.x) {
+                const uint32_t v = d.last_used[s];
+                if (v < best) {
+                    best   = v;
+                    best_i = s;
+                }
+            }
+            for (int off = 16; off > 0; off >>= 1) {
+                const uint32_t ob = __shfl_xor_sync(0xffffffff, best,   off);
+                const int      oi = __shfl_xor_sync(0xffffffff, best_i, off);
+                if (ob < best || (ob == best && oi < best_i)) {
+                    best   = ob;
+                    best_i = oi;
+                }
             }
         }
         const int warp = threadIdx.x / 32;
@@ -227,12 +391,17 @@ static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_group g, c
         if (lane == 0) {
             s_min_val[warp] = best;
             s_min_idx[warp] = best_i;
+            s_min_sc[warp]  = best_s;
         }
         __syncthreads();
         if (threadIdx.x == 0) {
             const int nw = blockDim.x / 32;
             for (int w = 1; w < nw; w++) {
-                if (s_min_val[w] < best || (s_min_val[w] == best && s_min_idx[w] < best_i)) {
+                const bool better = fr ?
+                    expert_cache_fr_less(s_min_sc[w], s_min_val[w], s_min_idx[w], best_s, best, best_i) :
+                    s_min_val[w] < best || (s_min_val[w] == best && s_min_idx[w] < best_i);
+                if (better) {
+                    best_s = s_min_sc[w];
                     best   = s_min_val[w];
                     best_i = s_min_idx[w];
                 }
@@ -241,6 +410,9 @@ static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_group g, c
             const int old    = d.expert_of[victim];
             if (old >= 0) {
                 d.slot_of[old] = -1;
+            }
+            if (fr) {
+                d.win_of[victim] = win;
             }
             d.expert_of[victim] = id;
             d.slot_of[id]       = victim;
@@ -258,6 +430,10 @@ static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_group g, c
         *d.clock  = clock + 1 + n_ids;
         d.stats[0] += 1;
         d.stats[1] += s_n_miss;
+        if (fr) {
+            d.win_of[d.cap]     = win;
+            d.win_of[d.cap + 1] = tok;
+        }
     }
 }
 
@@ -382,7 +558,8 @@ static __global__ void expert_cache_warm_plan(const ggml_cuda_expert_cache_dev d
         }
     }
     __syncthreads();
-    if (n_evict == 0 && s_n_empty == 0) {
+    const bool fr = d.freq != nullptr;
+    if (n_evict == 0 && s_n_empty == 0 && !fr) {
         if (threadIdx.x == 0) {
             *d.n_miss = 0;
         }
@@ -394,6 +571,28 @@ static __global__ void expert_cache_warm_plan(const ggml_cuda_expert_cache_dev d
         atomicAdd(&s_cnt[ids[(i / n_per_row)*row_stride + (i % n_per_row)]], 1);
     }
     __syncthreads();
+
+    // fr: the routings of a wide ubatch count with the mean recency of its tokens, hl*(1 - 2^(-T/hl))/(T ln 2), as if
+    //   they had come one by one (capy-flash T69), so a long prompt does not outweigh the decode after it
+    const uint32_t win = fr ? d.win_of[d.cap] + 1 : 0;
+    const uint32_t tok = fr ? d.win_of[d.cap + 1] + n_rows : 0;
+    if (fr) {
+        const float x      = (float) n_rows*d.inv_hl;
+        const float weight = x > 0.0f ? (1.0f - exp2f(-x))/(x*0.69314718f) : 1.0f;
+        for (int e = threadIdx.x; e < d.n_expert; e += blockDim.x) {
+            if (s_cnt[e] > 0) {
+                expert_cache_fr_add(d, e, weight*(float) s_cnt[e], tok);
+            }
+        }
+        if (n_evict == 0 && s_n_empty == 0) {
+            if (threadIdx.x == 0) {
+                *d.n_miss           = 0;
+                d.win_of[d.cap]     = win;
+                d.win_of[d.cap + 1] = tok;
+            }
+            return;
+        }
+    }
 
     // the rank of a routed expert: how many were routed more often, or as often with a lower id
     for (int e = threadIdx.x; e < d.n_expert; e += blockDim.x) {
@@ -422,6 +621,9 @@ static __global__ void expert_cache_warm_plan(const ggml_cuda_expert_cache_dev d
         if (sl >= 0 && r < n_top) {
             s_last[sl]      = clock + (uint32_t) (n_sel - r);
             d.last_used[sl] = clock + (uint32_t) (n_sel - r);
+            if (fr) {
+                d.win_of[sl] = win;
+            }
         }
     }
     __syncthreads();
@@ -469,6 +671,9 @@ static __global__ void expert_cache_warm_plan(const ggml_cuda_expert_cache_dev d
             d.slot_of[e]          = victim;
             s_last[victim]        = clock + (uint32_t) (n_sel - r);
             d.last_used[victim]   = clock + (uint32_t) (n_sel - r);
+            if (fr) {
+                d.win_of[victim] = win;
+            }
             d.miss_expert[n_miss] = e;
             d.miss_slot[n_miss]   = victim;
         }
@@ -480,6 +685,10 @@ static __global__ void expert_cache_warm_plan(const ggml_cuda_expert_cache_dev d
         *d.clock  = clock + (uint32_t) n_sel + 1;
         d.stats[2] += 1;
         d.stats[3] += n_miss;
+        if (fr) {
+            d.win_of[d.cap]     = win;
+            d.win_of[d.cap + 1] = tok;
+        }
     }
 }
 
@@ -593,7 +802,8 @@ void * ggml_cuda_expert_cache_create(int device, const void * host_buf, size_t h
     c->align = expert_cache_align({(size_t) (uintptr_t) dev_ptr, expert_bytes, chunk_full, chunk_dev, offset_dev, c->d.slot_bytes});
     c->covering = c->align < 4 && expert_cache_align({(size_t) (uintptr_t) dev_ptr, expert_bytes, chunk_full}) >= 8;
 
-    const size_t n_i32 = (size_t) n_expert + 2*cap + 1 + 3*max_ids + 1 + 4;
+    const expert_cache_policy pol = expert_cache_policy_get();
+    const size_t n_i32 = (size_t) n_expert + 2*cap + 1 + 3*max_ids + 1 + 4 + (pol.fr ? 2*(size_t) n_expert + cap + 2 : 0);
     ggml_cuda_set_device(device);
     if (cudaMalloc(&c->state, n_i32*sizeof(int32_t)) != cudaSuccess) {
         (void) cudaGetLastError();
@@ -609,7 +819,21 @@ void * ggml_cuda_expert_cache_create(int device, const void * host_buf, size_t h
     c->d.miss_expert = p; p += max_ids;
     c->d.miss_slot   = p; p += max_ids;
     c->d.n_miss      = p; p += 1;
-    c->d.stats       = (uint32_t *) p;
+    c->d.stats       = (uint32_t *) p; p += 4;
+    c->d.freq        = nullptr;
+    c->d.tok_of      = nullptr;
+    c->d.win_of      = nullptr;
+    c->d.inv_hl      = 0.0f;
+    c->d.inv_tau     = 0.0f;
+    if (pol.fr) {
+        c->d.freq    = (float *) p; p += n_expert;
+        c->d.tok_of  = (uint32_t *) p; p += n_expert;
+        c->d.win_of  = (uint32_t *) p;
+        c->d.inv_hl  = 1.0f/pol.half_life;
+        c->d.inv_tau = pol.tau > 0.0f ? 1.0f/pol.tau : 0.0f;
+        CUDA_CHECK(cudaMemset(c->d.freq,   0, 2*(size_t) n_expert*sizeof(float)));
+        CUDA_CHECK(cudaMemset(c->d.win_of, 0, ((size_t) cap + 2)*sizeof(uint32_t)));
+    }
     CUDA_CHECK(cudaMemset(c->d.stats,     0,    4*sizeof(uint32_t)));
     CUDA_CHECK(cudaMemset(c->d.slot_of,   0xff, (size_t) n_expert*sizeof(int32_t)));
     CUDA_CHECK(cudaMemset(c->d.expert_of, 0xff, (size_t) cap*sizeof(int32_t)));
@@ -696,10 +920,11 @@ void ggml_cuda_expert_cache_gather_group(ggml_backend_cuda_context & ctx, const 
         cap_min = std::min(cap_min, g.d[k].cap);
         cap_max = std::max(cap_max, g.d[k].cap);
     }
+    const bool   fr    = g.d[0].freq != nullptr;
     const int    n_ids = n_rows*n_per_row;
     const bool   fast  = n_ids <= GGML_CUDA_EXPERT_CACHE_PLAN_FAST_IDS && n_ids <= cap_min &&
-                         cap_max <= GGML_CUDA_EXPERT_CACHE_PLAN_FAST_CAP;
-    const size_t smem  = fast ? 2*(size_t) cap_max*sizeof(uint32_t) : 0;
+                         cap_max <= (fr ? GGML_CUDA_EXPERT_CACHE_PLAN_FAST_CAP_FR : GGML_CUDA_EXPERT_CACHE_PLAN_FAST_CAP);
+    const size_t smem  = fast ? (fr ? 3 : 2)*(size_t) cap_max*sizeof(uint32_t) : 0;
     expert_cache_plan<<<n, 512, smem, stream>>>(g, (const int32_t *) ids->data, n_rows, n_per_row, row_stride, fast);
     CUDA_CHECK(cudaGetLastError());
 
