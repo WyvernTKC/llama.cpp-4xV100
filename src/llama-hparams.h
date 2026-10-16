@@ -141,6 +141,9 @@ struct llama_hparams {
     float f_norm_rms_eps;
     float f_norm_group_eps;
 
+    // post norms use their own epsilon
+    float f_post_norm_eps = 0.0f;
+
     float f_attn_logit_softcapping   = 50.0f;
     float f_router_logit_softcapping = 30.0f;
     float f_final_logit_softcapping  = 30.0f;
@@ -267,6 +270,12 @@ struct llama_hparams {
     // DSV4 draft with the V4.1 rules: hyper-connection mixes lag by one sublayer, the last FFN mix
     // collapses the copies (no output_hc_* head), and only the low-rank q is normalized
     bool     dflash_dsv41            = false;
+    uint32_t lilicorr_hidden_size    = 0;
+    uint32_t lilicorr_candidate_topk = 0;
+    uint32_t lilicorr_num_heads      = 0;
+    uint32_t lilicorr_layers         = 0;
+    float    lilicorr_vector_eps     = 0.0f;
+    float    lilicorr_logit_scale    = 0.0f;
 
     // llama4 smallthinker
     uint32_t n_moe_layer_step        = 0;
@@ -274,6 +283,9 @@ struct llama_hparams {
     uint32_t n_attn_temp_floor_scale = 0;
     float    f_attn_temp_scale       = 0.0f;
     float    f_attn_temp_offset      = 0.0f; // offset position index
+
+    // realtime models: number of tokens the output lags behind the audio input
+    uint32_t n_tokens_delay          = 0;
 
     // gemma3n altup
     uint32_t n_altup      = 4; // altup_num_inputs

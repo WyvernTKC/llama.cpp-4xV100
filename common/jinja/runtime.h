@@ -74,14 +74,12 @@ struct context {
     }
     ~context() = default;
 
-    context(const context & parent) : src(parent.src), current_time(parent.current_time), is_get_stats(parent.is_get_stats) {
-        // inherit variables (for example, when entering a new scope): the parent's entries in its order, keys and
-        //   values shared, as inserting each of them into a new context did (its defaults are the parent's first
-        //   entries); an insert allocates its key and hashes it twice, per variable per scope
-        value parent_env = parent.env;
-        env = mk_val<value_object>(parent_env);
-        env->has_builtins = false;
-    }
+    context(const context & parent) :
+        src(parent.src),
+        current_time(parent.current_time),
+        is_get_stats(parent.is_get_stats),
+        // inherit variables (for example, when entering a new scope)
+        env(mk_val<value_object>(*parent.env)) {}
 
     value get_val(const std::string & name) {
         value missing;

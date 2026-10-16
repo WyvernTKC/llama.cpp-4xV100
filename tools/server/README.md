@@ -165,7 +165,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--kv-unified-per-slot N` | context limit per parallel slot (default: unset, behavior unchanged).<br/>when set without -c/--ctx-size, the shared KV pool is sized to n_parallel*N<br/>(env: LLAMA_ARG_KV_UNIFIED_PER_SLOT) |
 | `-ctxcp, --ctx-checkpoints, --swa-checkpoints N` | max number of context checkpoints to create per slot (default: 32)[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)<br/>(env: LLAMA_ARG_CTX_CHECKPOINTS) |
 | `-cms, --checkpoint-min-step N` | minimum spacing between context checkpoints in tokens (default: 8192, 0 = no minimum)<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) |
-| `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
+| `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, 0 for decision models, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
@@ -404,6 +404,10 @@ Recommended `--cors-origins` setting, depending on where the server runs:
 | Same machine | `--cors-origins localhost` (default once `--agent` is set) |
 
 Related flags: `--cors-origins`, `--cors-methods`, `--cors-headers`, `--cors-credentials` / `--no-cors-credentials`. Background and rationale: [#25655](https://github.com/ggml-org/llama.cpp/pull/25655).
+
+### Running behind a proxy
+
+If your host reaches the internet through a corporate proxy, export `HTTP_PROXY` and `HTTPS_PROXY` before running commands that download models (e.g. `export HTTPS_PROXY=http://proxy.example.com:8080`). Hosts listed in `NO_PROXY` and loopback addresses are contacted directly.
 
 ## Build
 
@@ -1719,9 +1723,9 @@ Follows the [TypeSafe API](https://docs.typesafe.ai/api), streaming is not suppo
 
 The questions of a request are answered independently, an answer does not depend on the other questions. The exception is clef: it reads all the questions in one prompt and decides them jointly.
 
-The number of options of a `choice` question is limited by the model, for example: 52 for openjev, 255 for laya, clef, pplx-decider, vllm-decision2, vllm-d3, lfm2-d1 and lfm2-d1-omni. For laya, long questions and options are truncated to the token budget the model was trained with.
+The number of options of a `choice` question is limited by the model, for example: 52 for openjev and granite-switch, 255 for laya, clef, pplx-decider, vllm-decision2, vllm-d3, lfm2-d1 and lfm2-d1-omni. For laya, long questions and options are truncated to the token budget the model was trained with.
 
-For laya, clef, vllm-d3 and lfm2-d1-omni, the whole prompt is evaluated in one batch: it must fit in `--ubatch-size`. An lfm2-d1-omni prompt is cut to 16384 tokens. For vllm-decision2, the options of a question and the end of the prompt must fit in one batch. A server that runs clef only serves this endpoint, text generation is not available.
+For laya, clef, vllm-d3 and lfm2-d1-omni, the whole prompt is evaluated in one batch: it must fit in `--ubatch-size`. An lfm2-d1-omni prompt is cut to 16384 tokens. For vllm-decision2, the options of a question and the end of the prompt must fit in one batch. A server that runs clef only serves this endpoint, text generation is not available. A decision model that is also a text model, such as granite-switch, serves both and reports `["text", "decisions"]`.
 
 *Image input:*
 
