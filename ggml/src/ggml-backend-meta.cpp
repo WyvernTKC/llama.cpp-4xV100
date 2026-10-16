@@ -3809,6 +3809,9 @@ struct ggml_backend_meta_context {
     size_t                      n_reduce_steps;
     int                         max_nnodes    = 0;
     size_t                      max_tmp_size  = 0;
+    // scratch buffers replaced by bigger ones: queued work may still read them and freeing one waits for its device, so
+    //   they go at the next synchronize, where the devices are idle
+    std::vector<ggml_backend_buffer_ptr> tmp_bufs_retired;
     size_t                      max_subgraphs = 0;
     uint64_t                    uid           = 0;
     ggml_backend_meta_stats     stats;
@@ -4966,6 +4969,7 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     }
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
     backend_ctx->synced_gen = gather_gen;
+    backend_ctx->tmp_bufs_retired.clear();
     if (ggml_backend_meta_stats::enabled()) {
         backend_ctx->stats.t_sync_us += ggml_time_us() - t_start_us;
     }
@@ -5405,15 +5409,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         D->n_subgraphs = n_subgraphs;
 
-        if (max_tmp_size > backend_ctx->max_tmp_size) {
-            for (size_t j = 0; j < n_backends; j++) {
-                auto & bcj = backend_ctx->backend_configs[j];
-                for (size_t i = 0; i < backend_ctx->n_reduce_steps; i++) {
-                    bcj.bufs[i].reset(ggml_backend_alloc_buffer(bcj.backend, max_tmp_size));
-                }
-            }
-            backend_ctx->max_tmp_size = max_tmp_size;
-        }
+        // the scratch grows when the generic all-reduce first needs it (set_tmp_data), a backend all-reduce never does:
+        //   regrowing it here freed the old one first, which waited for the devices (26-47 ms idle at a longer ubatch)
+        backend_ctx->max_tmp_size = std::max(backend_ctx->max_tmp_size, max_tmp_size);
 
         if (max_nnodes_raised || n_subgraphs > D->sized_subgraphs) {
             D->sized_subgraphs = std::max(D->sized_subgraphs, n_subgraphs);
@@ -5495,6 +5493,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         auto & bcj = backend_ctx->backend_configs[j];
         ggml_backend_buffer_ptr & buf_ptr = bcj.bufs[i_buf];
         if (!buf_ptr || ggml_backend_buffer_get_size(buf_ptr.get()) < backend_ctx->max_tmp_size) {
+            if (buf_ptr) {
+                backend_ctx->tmp_bufs_retired.push_back(std::move(buf_ptr));
+            }
             buf_ptr.reset(ggml_backend_alloc_buffer(bcj.backend, backend_ctx->max_tmp_size));
         }
         tensor->buffer = buf_ptr.get();
