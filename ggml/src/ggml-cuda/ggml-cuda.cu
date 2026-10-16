@@ -83,6 +83,7 @@
 #include <array>
 #include <atomic>
 #include <charconv>
+#include <chrono>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstddef>
@@ -96,7 +97,9 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -463,6 +466,130 @@ static ggml_cuda_device_info ggml_cuda_init() {
 const ggml_cuda_device_info & ggml_cuda_info() {
     static ggml_cuda_device_info info = ggml_cuda_init();
     return info;
+}
+
+// one kernel per module (common.cuh), registered during static initialization
+static std::vector<const void *> & ggml_cuda_module_anchors() {
+    static std::vector<const void *> anchors;
+    return anchors;
+}
+
+int ggml_cuda_register_module(const void * kernel) {
+    std::vector<const void *> & anchors = ggml_cuda_module_anchors();
+    anchors.push_back(kernel);
+    return (int) anchors.size();
+}
+
+// Load every module of the backend on a device in a background thread, started at the first buffer or backend of the
+// device, i.e. while the model loads. Otherwise the first launch from a module that only big batches use waits for the
+// module to load with the GPUs idle: 25-50 ms per module in the first long prompt on 4 GPUs. Loading all modules takes
+// ~0.85 s on the first device (the fatbins are decompressed once) and ~0.2 s on each other one. The driver does one
+// module load at a time and the weight upload waits behind them, so the devices go one after another with a pause after
+// each module: without it the model load took ~1 s longer, started later (backend creation) it slowed the first requests.
+// The kernel code is still copied to the device at its first use; the modules add a few MiB of data and can raise the
+// local memory reserve to the largest stack of any kernel.
+//
+// Off by default, GGML_CUDA_PRELOAD_MODULES=1 turns it on: Qwen3.6 MoE decoded 0.2% slower with it on 4 V100s (13 of
+// 13 rounds), Ornith not. The preload puts that reserve and the module data between the weights and the KV and compute
+// buffers; a 40 MiB allocation at the same place without the preload cost part of it, CUDA_MODULE_LOADING=EAGER none.
+//
+// The preload ends when the backend starts to compute (ggml_cuda_preload_modules_close): a module load can wait for the
+// device to be idle, and a kernel that spins until the other devices reach it (P2P all-reduce, NCCL) then never ends
+// while the launch of its peer waits behind the load. A 4-device test model hung like that in its first all-reduce.
+struct ggml_cuda_module_preloader {
+    std::mutex               mutex;
+    std::mutex               serial; // one device at a time; held across each module load
+    std::vector<std::thread> threads;
+    std::atomic<bool>        stop{false};
+    bool                     started[GGML_CUDA_MAX_DEVICES] = {};
+
+    ~ggml_cuda_module_preloader() {
+        stop.store(true);
+        for (std::thread & t : threads) {
+            t.join();
+        }
+    }
+};
+
+// constructed at the first preload, after the CUDA runtime, so it is destroyed before it
+static ggml_cuda_module_preloader & ggml_cuda_module_preloader_get() {
+    static ggml_cuda_module_preloader p;
+    return p;
+}
+
+static std::atomic<bool> g_cuda_preload_closed{false};  // the backend computed: no preload starts any more
+static std::atomic<bool> g_cuda_preload_pending{false}; // a preload may run
+
+static void ggml_cuda_preload_modules(int device) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    static const bool enabled = [] {
+        const char * env  = getenv("GGML_CUDA_PRELOAD_MODULES");
+        const char * mode = getenv("CUDA_MODULE_LOADING");
+        // eager loading loaded everything when the context was created
+        return env != nullptr && atoi(env) != 0 && (mode == nullptr || strcmp(mode, "EAGER") != 0);
+    }();
+    if (!enabled || g_cuda_preload_closed.load()) {
+        return;
+    }
+
+    ggml_cuda_module_preloader & p = ggml_cuda_module_preloader_get();
+    const int physical_device = ggml_cuda_get_physical_device(device);
+
+    std::lock_guard<std::mutex> lock(p.mutex);
+    if (p.stop.load() || p.started[physical_device]) {
+        return;
+    }
+    // pending before closed is read again, and the other way round in ggml_cuda_preload_modules_close: one of them sees
+    // the other's store
+    g_cuda_preload_pending.store(true);
+    if (g_cuda_preload_closed.load()) {
+        return;
+    }
+    p.started[physical_device] = true;
+    p.threads.emplace_back([physical_device] {
+        ggml_cuda_module_preloader & p = ggml_cuda_module_preloader_get();
+        const int64_t t_start_us = ggml_time_us();
+        size_t n_loaded = 0;
+        if (cudaSetDevice(physical_device) == cudaSuccess) {
+            for (const void * kernel : ggml_cuda_module_anchors()) {
+                std::lock_guard<std::mutex> serial(p.serial);
+                if (p.stop.load()) {
+                    return;
+                }
+                // loads the module of the kernel on this device
+                cudaFuncAttributes attr;
+                n_loaded += cudaFuncGetAttributes(&attr, kernel) == cudaSuccess;
+                // the pause lets the weight upload in
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        (void) cudaGetLastError();
+        GGML_LOG_DEBUG("ggml_cuda_preload_modules: loaded %zu of %zu modules on device %d in %.1f ms\n",
+            n_loaded, ggml_cuda_module_anchors().size(), physical_device, (ggml_time_us() - t_start_us) / 1000.0);
+    });
+#else
+    GGML_UNUSED(device);
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+}
+
+// Called before the backend computes: stops the preload and waits for the module load in flight.
+static void ggml_cuda_preload_modules_close() {
+    // not relaxed: a closed seen here must come with the pending of a preload the closing thread is still stopping
+    if (g_cuda_preload_closed.load() && !g_cuda_preload_pending.load()) {
+        return;
+    }
+    g_cuda_preload_closed.store(true);
+    if (!g_cuda_preload_pending.load()) {
+        return;
+    }
+    ggml_cuda_module_preloader & p = ggml_cuda_module_preloader_get();
+    {
+        std::lock_guard<std::mutex> lock(p.mutex);
+        p.stop.store(true);
+    }
+    // the threads check stop with serial held, so none loads a module after this
+    { std::lock_guard<std::mutex> serial(p.serial); }
+    g_cuda_preload_pending.store(false);
 }
 
 // #define DEBUG_CUDA_MALLOC
@@ -985,6 +1112,8 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
 
     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
 
+    ggml_cuda_preload_modules(buft_ctx->device);
+
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
 }
 
@@ -1422,6 +1551,7 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
 // any fallback.  Unrecognised env values warn and fall through to the
 // platform default.
 static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_backends) {
+    ggml_cuda_preload_modules_close();
     for (size_t i = 0; i < n_backends; i++) {
         if (!ggml_backend_is_cuda(backends[i])) {
             return nullptr;
@@ -1467,6 +1597,7 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
 // Top-level dispatch -- calls the function pointer chosen by comm_init.
 // Returns false to let the meta-backend's butterfly run.
 static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tensor ** tensors) {
+    ggml_cuda_preload_modules_close();
     if (comm_ctx_v == nullptr) {
         return false;
     }
@@ -1484,6 +1615,7 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
 // Two-step form for the meta backend's launch threads: only the one-shot P2P path can be split by
 // rank, so prepare declines whatever that path declines and the caller uses the one-step form.
 static bool ggml_backend_cuda_comm_allreduce_prepare(void * comm_ctx_v, struct ggml_tensor ** tensors) {
+    ggml_cuda_preload_modules_close();
     if (comm_ctx_v == nullptr) {
         return false;
     }
@@ -1498,6 +1630,7 @@ static void ggml_backend_cuda_comm_allreduce_launch(void * comm_ctx_v, struct gg
 }
 
 static bool ggml_backend_cuda_comm_allgather_tensor(void * comm_ctx_v, struct ggml_tensor ** srcs, struct ggml_tensor ** dsts) {
+    ggml_cuda_preload_modules_close();
     if (comm_ctx_v == nullptr) {
         return false;
     }
@@ -8687,6 +8820,8 @@ static int ggml_cuda_graph_n_warmup() {
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
+    ggml_cuda_preload_modules_close();
+
     ggml_cuda_set_device(cuda_ctx->device);
 
     // every tensor is written again this pass, so no quantized or converted copy from the last one survives
@@ -8778,6 +8913,7 @@ static const void * ggml_cuda_session_key(ggml_cgraph * cgraph) {
 }
 
 static int ggml_backend_cuda_session_plan(ggml_backend_t backend, ggml_cgraph ** cgraphs, int n_cgraphs) {
+    ggml_cuda_preload_modules_close();
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     GGML_ASSERT(cuda_ctx->session_mode == ggml_backend_cuda_context::SESSION_OFF && n_cgraphs > 0);
     ggml_cuda_set_device(cuda_ctx->device);
@@ -10462,6 +10598,8 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
         /* .context = */ ctx,
     };
+
+    ggml_cuda_preload_modules(device);
 
     return cuda_backend;
 }

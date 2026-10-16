@@ -1248,6 +1248,16 @@ const ggml_cuda_device_info & ggml_cuda_info();
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// With lazy module loading (the CUDA 12 default) the driver loads a module, one per .cu file, on a device the first time
+// one of its kernels runs there: 10-45 ms per module and device, one device at a time. A kernel that only big batches
+// use then stalls the first long prompt. Every .cu file registers an empty kernel here so that the modules can be
+// loaded ahead of time (ggml_cuda_preload_modules).
+int ggml_cuda_register_module(const void * kernel);
+static __global__ void ggml_cuda_module_anchor() {}
+[[maybe_unused]] static const int ggml_cuda_module_id = ggml_cuda_register_module((const void *) ggml_cuda_module_anchor);
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
 struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;
 
