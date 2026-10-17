@@ -341,9 +341,9 @@ struct server_slot {
         }
     }
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    server_prompt_cache_state * prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
-            return false;
+            return nullptr;
         }
 
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -358,7 +358,7 @@ struct server_slot {
 
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
-            return false;
+            return nullptr;
         }
 
         const int64_t t_alloc = ggml_time_us();
@@ -370,7 +370,59 @@ struct server_slot {
 
         SRV_TRC(" - saved prompt state: alloc %.2f ms, state %.2f ms\n", (t_alloc - t_start) / 1000.0, (ggml_time_us() - t_alloc) / 1000.0);
 
-        return true;
+        return cur;
+    }
+
+    // The cache keeps host checkpoints only. With a device tier the host ones are --checkpoint-min-step tokens apart, so
+    // a return to this conversation would roll back that far. Before the slot is given to another prompt, restore its
+    // newest device checkpoint into the sequence and add a host copy of it to the cache entry. The sequence is then
+    // rolled back to that checkpoint, so it stays consistent for whatever the slot keeps of it.
+    void ckpt_demote_newest(server_prompt_cache_state & cur) {
+        auto newest = prompt.checkpoints.end();
+        int64_t n_host_max = -1;
+        for (auto it = prompt.checkpoints.begin(); it != prompt.checkpoints.end(); ++it) {
+            if (it->dev_slot < 0) {
+                n_host_max = std::max(n_host_max, it->n_tokens);
+            } else if (newest == prompt.checkpoints.end() || it->n_tokens > newest->n_tokens) {
+                newest = it;
+            }
+        }
+        if (newest == prompt.checkpoints.end() || newest->n_tokens <= n_host_max) {
+            return;
+        }
+
+        const int64_t t_start = ggml_time_us();
+
+        if (!newest->load_tgt(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
+            !newest->load_dft(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+            // the cache entry has the full state; the sequence may be half restored
+            SLT_WRN(*this, "%s", "failed to load the newest device checkpoint, clearing the slot\n");
+            prompt_clear();
+            return;
+        }
+
+        common_prompt_checkpoint host;
+        host.id_task = newest->id_task;
+        host.update_pos(newest->n_tokens, newest->pos_min, newest->pos_max);
+        host.update_tgt(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ASYNC);
+        host.update_dft(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        host.data_spec = newest->data_spec;
+        llama_synchronize(ctx_tgt);
+
+        SLT_TRC(*this, "kept a host copy of device context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, %.2f ms)\n",
+                host.pos_min, host.pos_max, host.n_tokens, (float) host.size() / 1024 / 1024, (ggml_time_us() - t_start) / 1000.0);
+
+        cur.prompt.checkpoints.push_back(std::move(host));
+
+        // roll the sequence back to the checkpoint, as a restore of it does
+        const llama_pos pos_next = std::max(newest->pos_min + 1, newest->pos_max);
+        const size_t    n_past   = std::min(prompt.tokens.size_up_to_pos(pos_next), (size_t) newest->n_tokens);
+        for (auto it = prompt.checkpoints.begin(); it != prompt.checkpoints.end(); ) {
+            it = it->pos_max > pos_next ? ckpt_erase(it) : std::next(it);
+        }
+        prompt.tokens.keep_first(n_past);
+        mem.seq_rm(id, prompt.tokens.pos_next(), -1);
+        n_prompt_gen_start = -1;
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
@@ -1924,7 +1976,9 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                if (auto * saved = ret->prompt_save(*prompt_cache)) {
+                    ret->ckpt_demote_newest(*saved);
+                }
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
