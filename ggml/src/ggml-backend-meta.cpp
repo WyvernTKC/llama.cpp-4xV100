@@ -245,9 +245,10 @@ static bool ggml_backend_meta_moe_offload_always(const ggml_tensor * op, size_t 
             static bool warned = false;
             if (!warned) {
                 warned = true;
-                GGML_LOG_WARN("%s: GGML_META_EXPERT_CACHE=%d must be below this model's expert count "
-                    "(%lld); the expert cache stays off. Set a cap in 1..%lld.\n",
-                    __func__, expert_cache_cap, (long long) op->src[0]->ne[2],
+                // the check is per weight: on a model with per-layer expert counts the larger layers still use the cache
+                GGML_LOG_WARN("%s: GGML_META_EXPERT_CACHE=%d is not below the %lld experts of %s; weights with no "
+                    "more experts than the cap do not use the expert cache. Set a cap in 1..%lld to cache them.\n",
+                    __func__, expert_cache_cap, (long long) op->src[0]->ne[2], op->src[0]->name,
                     (long long) op->src[0]->ne[2] - 1);
             }
         }
