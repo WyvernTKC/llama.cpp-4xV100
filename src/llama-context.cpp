@@ -2099,15 +2099,20 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     llama_memory_context_ptr mctx;
 
-    // LLAMA_SMALL_BATCH_UBATCH=<n>: a batch of at most 4*n tokens runs in ubatches of n tokens, whose graphs the slots
-    //   keep; a short prompt (a chat turn) otherwise builds and allocates a graph of its own length every time. Off by
-    //   default: other ubatch sizes change the rounding of the prompt's KV.
+    // LLAMA_SMALL_BATCH_UBATCH=<n>: a batch of at most LLAMA_SMALL_BATCH_MAX tokens (default 4*n) runs in ubatches of n
+    //   tokens, whose graphs the slots keep; a short prompt (a chat turn) otherwise builds and allocates a graph of its own
+    //   length every time. Off by default: other ubatch sizes change the rounding of the prompt's KV.
     static const uint32_t small_ubatch = [] {
         const char * env = getenv("LLAMA_SMALL_BATCH_UBATCH");
         return env ? (uint32_t) std::max(0, atoi(env)) : 0u;
     }();
+    static const uint32_t small_batch_max = [] {
+        const char * env = getenv("LLAMA_SMALL_BATCH_MAX");
+        return env ? (uint32_t) std::max(0, atoi(env)) : 4*small_ubatch;
+    }();
     uint32_t n_ubatch = cparams.n_ubatch;
-    if (small_ubatch > 0 && balloc->get_n_tokens() <= 4*small_ubatch) {
+    // non-causal and embedding batches stay in one ubatch
+    if (small_ubatch > 0 && !embd_all && balloc->get_n_tokens() <= small_batch_max) {
         n_ubatch = std::min(n_ubatch, small_ubatch);
     }
 
