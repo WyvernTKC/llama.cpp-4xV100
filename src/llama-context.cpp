@@ -3841,6 +3841,22 @@ ggml_backend_t llama_context::state_async_backend(const ggml_tensor * tensor) co
     return nullptr;
 }
 
+// one thread faults in or copies only ~3-5 GB/s on some hosts: a large state goes over several, one per 16 MiB
+// (an 800 MiB SWA checkpoint: fault-in 164 -> 43 ms, copy 126 -> 45 ms with 16 instead of 1 / 4 threads)
+template <typename F>
+static void llama_state_copy_parallel(size_t n_bytes, F && f) {
+    const int n_threads = (int) std::min<size_t>(16, n_bytes/(16u << 20) + 1);
+
+    std::vector<std::thread> workers;
+    for (int ith = 1; ith < n_threads; ++ith) {
+        workers.emplace_back([&f, n_bytes, n_threads, ith] { f(n_bytes*ith/n_threads, n_bytes*(ith + 1)/n_threads); });
+    }
+    f(0, n_bytes/n_threads);
+    for (auto & w : workers) {
+        w.join();
+    }
+}
+
 bool llama_context::state_read_async(const std::vector<state_tensor_read> & reads) {
     // the staging holds one save at a time
     state_read_async_wait();
@@ -3909,11 +3925,19 @@ bool llama_context::state_read_async(const std::vector<state_tensor_read> & read
     state_read_events_used = std::move(events);
 
     // fault the destination pages in now, while the devices work: on fresh memory that is a third of the copy
+    size_t n_dst = 0;
     for (const auto & r : reads) {
-        for (size_t i = 0; i < r.size; i += 4096) {
-            r.dst[i] = 0;
-        }
+        n_dst += r.size;
     }
+    llama_state_copy_parallel(n_dst, [&](size_t lo, size_t hi) {
+        size_t pos = 0;
+        for (const auto & r : reads) {
+            for (size_t i = std::max(lo, pos); i < std::min(hi, pos + r.size); i += 4096) {
+                r.dst[i - pos] = 0;
+            }
+            pos += r.size;
+        }
+    });
 
     return true;
 }
@@ -3933,12 +3957,7 @@ void llama_context::state_read_async_wait() {
         n_bytes += c.size;
     }
 
-    // one thread copies only ~3 GB/s on some hosts: a state of tens of MiB goes over a few, one per 16 MiB
-    const int n_threads = (int) std::min<size_t>(4, n_bytes/(16u << 20) + 1);
-
-    const auto copy_part = [&](int ith) {
-        const size_t lo = n_bytes*ith/n_threads;
-        const size_t hi = n_bytes*(ith + 1)/n_threads;
+    llama_state_copy_parallel(n_bytes, [&](size_t lo, size_t hi) {
         size_t pos = 0;
         for (const auto & c : state_read_copies) {
             const size_t a = std::max(lo, pos);
@@ -3948,16 +3967,7 @@ void llama_context::state_read_async_wait() {
             }
             pos += c.size;
         }
-    };
-
-    std::vector<std::thread> workers;
-    for (int ith = 1; ith < n_threads; ++ith) {
-        workers.emplace_back(copy_part, ith);
-    }
-    copy_part(0);
-    for (auto & w : workers) {
-        w.join();
-    }
+    });
 
     state_read_copies.clear();
     state_read_events_used.clear();
