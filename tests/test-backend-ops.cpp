@@ -15636,6 +15636,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     test_cases.emplace_back(new test_topk_moe({288, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w)); // Used by StepFun 3.7
                     test_cases.emplace_back(new test_topk_moe({384, 22, 1, 1}, 6, with_norm, bias_probs, gate, scale_w)); // Used by DeepSeek-V4.1
                     test_cases.emplace_back(new test_topk_moe({384, 1, 1, 1}, 6, with_norm, bias_probs, gate, scale_w));
+                    // Nemotron 3.5 Bolt: 240..496 experts depending on the layer, none a multiple of the warp size
+                    for (int64_t n_expert : {240, 304, 368, 432, 496}) {
+                        test_cases.emplace_back(new test_topk_moe({n_expert, 22, 1, 1}, 9, with_norm, bias_probs, gate, scale_w));
+                    }
+                    test_cases.emplace_back(new test_topk_moe({240, 1, 1, 1}, 9, with_norm, bias_probs, gate, scale_w));
                     if (bias_probs) {
                         // grouped routing
                         test_cases.emplace_back(new test_topk_moe({256, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w, 8, 4)); // DeepSeek-V3

@@ -22,7 +22,8 @@ static __device__ __forceinline__ void mul_mat_vec_f_topk_moe(const ggml_cuda_mm
     }
     __threadfence();
 
-    constexpr int experts_per_thread = n_experts / WARP_SIZE;
+    constexpr int experts_per_thread = topk_moe_experts_per_thread(n_experts);
+    static_assert(n_experts % WARP_SIZE == 0, "the logits are read in whole warps");
     float wt[experts_per_thread];
 #pragma unroll
     for (int i = 0; i < experts_per_thread; i++) {

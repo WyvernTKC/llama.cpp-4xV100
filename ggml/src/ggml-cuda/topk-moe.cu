@@ -39,7 +39,7 @@ __global__ void topk_moe_cuda(const float *         logits,
     weights += n_expert_used * row;
     ids += n_experts * row;
 
-    constexpr int experts_per_thread = (n_experts > WARP_SIZE) ? n_experts / WARP_SIZE : 1;
+    constexpr int experts_per_thread = topk_moe_experts_per_thread(n_experts);
 
     float wt[experts_per_thread];
 
@@ -130,9 +130,14 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
             TOPK_MOE_CASE(32)
             TOPK_MOE_CASE(64)
             TOPK_MOE_CASE(128)
+            TOPK_MOE_CASE(240) // Nemotron 3.5 Bolt, per layer
             TOPK_MOE_CASE(256)
             TOPK_MOE_CASE(288) // StepFun 3.7
+            TOPK_MOE_CASE(304) // Nemotron 3.5 Bolt
+            TOPK_MOE_CASE(368) // Nemotron 3.5 Bolt
             TOPK_MOE_CASE(384) // DeepSeek-V4.1
+            TOPK_MOE_CASE(432) // Nemotron 3.5 Bolt
+            TOPK_MOE_CASE(496) // Nemotron 3.5 Bolt
             TOPK_MOE_CASE(512)
             TOPK_MOE_CASE(576)
             default:
@@ -210,10 +215,15 @@ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
                                    const ggml_tensor * logits,
                                    const ggml_tensor * ids) {
     // must match an instantiation of launch_topk_moe_cuda: a power of 2 up to 512,
-    // or one of the non-power-of-2 expert counts of supported models (StepFun 3.7, DeepSeek-V4.1)
+    // or one of the non-power-of-2 expert counts of supported models (StepFun 3.7, DeepSeek-V4.1, Nemotron 3.5 Bolt)
     const int n_expert = ids->nb[1] / ids->nb[0];
-    if (((n_expert & (n_expert - 1)) != 0 || n_expert > 512) && n_expert != 288 && n_expert != 384 && n_expert != 576) {
-        return false;
+    switch (n_expert) {
+        case 240: case 288: case 304: case 368: case 384: case 432: case 496: case 576:
+            break;
+        default:
+            if ((n_expert & (n_expert - 1)) != 0 || n_expert > 512) {
+                return false;
+            }
     }
 
     if (!ggml_is_contiguous(weights) || !ggml_is_contiguous(logits)) {

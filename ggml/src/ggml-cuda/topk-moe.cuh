@@ -6,6 +6,11 @@
 // Rows that one CUDA block handles.
 #define TOPK_MOE_ROWS_PER_BLOCK 8
 
+// experts per lane: n_experts in whole warps, the lanes past the last expert hold -INFINITY
+static constexpr __host__ __device__ int topk_moe_experts_per_thread(const int n_experts) {
+    return n_experts > WARP_SIZE ? (n_experts + WARP_SIZE - 1) / WARP_SIZE : 1;
+}
+
 struct ggml_cuda_topk_moe_args {
     bool sigmoid{};
     bool sqrt_softplus{};
@@ -171,11 +176,11 @@ __device__ __forceinline__ void topk_moe_mask_groups(float (&sel)[experts_per_th
 //   the gating, the top n_expert_used experts into ids and their weights
 template <int n_experts, bool has_bias, bool grouped>
 static __device__ __forceinline__ void topk_moe_select(
-        float (&wt)[(n_experts > WARP_SIZE) ? n_experts / WARP_SIZE : 1],
-        const float (&bias_v)[has_bias ? ((n_experts > WARP_SIZE) ? n_experts / WARP_SIZE : 1) : 1],
+        float (&wt)[topk_moe_experts_per_thread(n_experts)],
+        const float (&bias_v)[has_bias ? topk_moe_experts_per_thread(n_experts) : 1],
         float * weights, int32_t * ids, const int n_expert_used, const float clamp_val, const float scale_val,
         const topk_moe_config config) {
-    constexpr int experts_per_thread = (n_experts > WARP_SIZE) ? n_experts / WARP_SIZE : 1;
+    constexpr int experts_per_thread = topk_moe_experts_per_thread(n_experts);
 
     if (!config.delayed_softmax) {
         if (config.use_sigmoid) {
