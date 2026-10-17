@@ -3535,6 +3535,9 @@ struct ggml_backend_meta_stats {
     int64_t t_sync_us    = 0;
     int64_t t_launch_us  = 0; // subset of enqueue: per-device subgraph launches
     int64_t t_comm_us    = 0; // subset of enqueue: collectives
+    // graph of the last counted call: a line prints at the start of the next call, whose graph can be another one
+    int     last_n_nodes     = 0;
+    size_t  last_n_subgraphs = 0;
 
     static int interval() {
         static const int interval = [] {
@@ -3548,10 +3551,12 @@ struct ggml_backend_meta_stats {
         return interval() > 0;
     }
 
-    void report(const char * name, size_t n_subgraphs, int n_nodes) {
+    void report(const char * name, size_t n_decs, size_t dec_bytes) {
         if (n_compute == 0) {
             return;
         }
+        const int    n_nodes     = last_n_nodes;
+        const size_t n_subgraphs = last_n_subgraphs;
         const double inv    = 1e-3 / n_compute;                              // us total -> ms per call
         const double inv_sg = n_subgraphs ? 1.0/(n_compute*n_subgraphs) : 0.0; // us total -> us per subgraph
 
@@ -3559,11 +3564,11 @@ struct ggml_backend_meta_stats {
         // prints at all when GGML_META_STATS asked for it
         GGML_LOG_WARN("%s: %s: %" PRId64 " calls, %" PRId64 " rebuilds (%.1f%%), per call: "
                 "enqueue %.2f ms (launch %.2f, comm %.2f, other %.2f, rebuild %.2f), sync %.2f ms | "
-                "%d nodes, %zu subgraphs, per subgraph: launch %.1f us, comm %.1f us\n",
+                "%d nodes, %zu subgraphs, per subgraph: launch %.1f us, comm %.1f us | %zu decompositions, %.1f MiB\n",
             "ggml_backend_meta", name, n_compute, n_rebuild, 100.0*n_rebuild/n_compute,
             t_enqueue_us*inv, t_launch_us*inv, t_comm_us*inv,
             (t_enqueue_us - t_launch_us - t_comm_us - t_rebuild_us)*inv, t_rebuild_us*inv, t_sync_us*inv,
-            n_nodes, n_subgraphs, t_launch_us*inv_sg, t_comm_us*inv_sg);
+            n_nodes, n_subgraphs, t_launch_us*inv_sg, t_comm_us*inv_sg, n_decs, dec_bytes/1048576.0);
 
         n_compute = n_rebuild = t_enqueue_us = t_rebuild_us = t_sync_us = t_launch_us = t_comm_us = 0;
     }
@@ -3776,7 +3781,8 @@ struct ggml_backend_meta_context {
     // decode time on a 4x V100 expert-offload run - and the result stays valid as long as the graph
     // and the per-device tensor mirrors behind it are unchanged.
     struct decomposition {
-        ggml_context_ptr                ctx;
+        ggml_context_ptr                ctx;           // cgraphs_aux and nodes_aux
+        ggml_context_ptr                ctx_main;      // the cgraph_main of each subgraph, made again by every rebuild
         std::vector<backend_graphs>     graphs;        // [n_backends]
         std::vector<ggml_cgraph *>      cgraphs_aux;
         std::vector<ggml_tensor *>      nodes_aux;
@@ -4990,6 +4996,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // few split graphs round-robin, so a single cached slot missed on every call - keep one per graph.
     // Depends on stable uids from ggml_backend_sched_split_graph; a fresh uid per eval defeats it.
     ggml_backend_meta_context::decomposition * D = nullptr;
+    // an entry of this uid whose mirrors moved on: the generations only grow, so it can never match again
+    ggml_backend_meta_context::decomposition * D_stale = nullptr;
     if (cgraph->uid != 0) {
         for (auto & d : backend_ctx->decs) {
             if (d->uid != cgraph->uid) {
@@ -5022,6 +5030,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 D = d.get();
                 break;
             }
+            D_stale = d.get();
         }
     }
     const bool needs_rebuild = D == nullptr;
@@ -5036,8 +5045,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             const char * env = getenv("GGML_META_DEC_CACHE");
             return (size_t) (env ? std::max(1, atoi(env)) : 256);
         }();
-        for (auto & d : backend_ctx->decs) {
-            if (d->uid == 0) { D = d.get(); break; }
+        D = D_stale;
+        for (size_t k = 0; D == nullptr && k < backend_ctx->decs.size(); k++) {
+            if (backend_ctx->decs[k]->uid == 0) { D = backend_ctx->decs[k].get(); }
         }
         if (D == nullptr && backend_ctx->decs.size() < n_max) {
             backend_ctx->decs.emplace_back(new ggml_backend_meta_context::decomposition());
@@ -5090,7 +5100,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     if (ggml_backend_meta_stats::enabled()) {
         // report for the previous calls, by now their sync time has been accounted for as well
         if (backend_ctx->stats.n_compute >= ggml_backend_meta_stats::interval()) {
-            backend_ctx->stats.report(backend_ctx->name.c_str(), D->n_subgraphs, cgraph->n_nodes);
+            size_t dec_bytes = 0;
+            for (const auto & d : backend_ctx->decs) {
+                dec_bytes += (d->ctx ? ggml_get_mem_size(d->ctx.get()) : 0) + (d->ctx_main ? ggml_get_mem_size(d->ctx_main.get()) : 0);
+            }
+            backend_ctx->stats.report(backend_ctx->name.c_str(), backend_ctx->decs.size(), dec_bytes);
         }
         backend_ctx->stats.n_compute++;
         backend_ctx->stats.n_rebuild += needs_rebuild;
@@ -5098,7 +5112,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
     // sizing is per decomposition now: a recycled entry can be smaller than this graph needs even
     // when the backend has already seen a bigger graph
-    bool max_nnodes_raised = false;
     if (cgraph->n_nodes > D->sized_nnodes) {
         assert(needs_rebuild);
         for (size_t j = 0; j < n_backends; j++) {
@@ -5107,7 +5120,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         D->sized_nnodes = cgraph->n_nodes;
         backend_ctx->max_nnodes = std::max(backend_ctx->max_nnodes, cgraph->n_nodes);
-        max_nnodes_raised = true;
     }
 
     const int64_t t_rebuild_start_us = ggml_backend_meta_stats::enabled() && needs_rebuild ? ggml_time_us() : 0;
@@ -5414,34 +5426,50 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         //   regrowing it here freed the old one first, which waited for the devices (26-47 ms idle at a longer ubatch)
         backend_ctx->max_tmp_size = std::max(backend_ctx->max_tmp_size, max_tmp_size);
 
-        if (max_nnodes_raised || n_subgraphs > D->sized_subgraphs) {
-            D->sized_subgraphs = std::max(D->sized_subgraphs, n_subgraphs);
+        // A graph per subgraph and device, sized for that subgraph and made again by every rebuild. Sized for the whole
+        //   graph (any partition then fits), an entry took n_backends*n_subgraphs*overhead(n_nodes), ~68 MiB for
+        //   gemma-4-31B (2461 nodes, 122 subgraphs): faulted in on every new graph shape, kept until LRU eviction.
+        {
+            auto subgraph_n_nodes = [&](size_t i) -> size_t {
+                const size_t i_stop = i + 1 < n_subgraphs ? D->graphs[0].cgraphs[i + 1].offset : cgraph->n_nodes;
+                return i_stop - D->graphs[0].cgraphs[i].offset;
+            };
+            size_t mem_main = 0;
+            for (size_t i = 0; i < n_subgraphs; i++) {
+                mem_main += ggml_graph_overhead_custom(subgraph_n_nodes(i), /*grads =*/ false);
+            }
+            mem_main *= n_backends;
+            if (!D->ctx_main || ggml_get_mem_size(D->ctx_main.get()) < mem_main) {
+                const ggml_init_params params = {
+                    /*.mem_size   =*/ mem_main,
+                    /*.mem_buffer =*/ nullptr,
+                    /*.no_alloc   =*/ true,
+                };
+                D->ctx_main.reset(ggml_init(params));
+            } else {
+                ggml_reset(D->ctx_main.get());
+            }
+            for (size_t j = 0; j < n_backends; j++) {
+                for (size_t i = 0; i < std::max(n_subgraphs, D->sized_subgraphs); i++) {
+                    D->graphs[j].cgraphs[i].cgraph_main = i < n_subgraphs ?
+                        ggml_new_graph_custom(D->ctx_main.get(), subgraph_n_nodes(i), /*grads =*/ false) : nullptr;
+                }
+            }
+        }
+
+        if (n_subgraphs > D->sized_subgraphs) {
+            D->sized_subgraphs = n_subgraphs;
             backend_ctx->max_subgraphs = std::max(backend_ctx->max_subgraphs, n_subgraphs);
             const size_t n_nodes_per_device = 3 * backend_ctx->n_reduce_steps; // tmp + ADD (+zeroing) graph per step and device
             const size_t n_cgraphs_per_device = 2 * backend_ctx->n_reduce_steps; // ADD ( + zeroing) graph per step and device
-            const size_t mem_per_device_graphs_main = D->sized_subgraphs*ggml_graph_overhead_custom(D->sized_nnodes, cgraph->grads);
             const size_t mem_per_device_graphs_aux = n_cgraphs_per_device*D->sized_subgraphs*ggml_graph_overhead_custom(1, cgraph->grads);
             const size_t mem_per_device_nodes_aux = n_nodes_per_device*D->sized_subgraphs*ggml_tensor_overhead();
             const ggml_init_params params = {
-                /*.mem_size   =*/ n_backends * (mem_per_device_graphs_main + mem_per_device_graphs_aux + mem_per_device_nodes_aux),
+                /*.mem_size   =*/ n_backends * (mem_per_device_graphs_aux + mem_per_device_nodes_aux),
                 /*.mem_buffer =*/ nullptr,
                 /*.no_alloc   =*/ true,
             };
             D->ctx.reset(ggml_init(params));
-            for (size_t j = 0; j < n_backends; j++) {
-                auto & bcj = backend_ctx->backend_configs[j];
-                // D->ctx just replaced the previous arena, so every slot up to the new ceiling needs a
-                // fresh graph here - not just the ones this round uses. A slot left unfilled below
-                // n_subgraphs keeps pointing into the freed arena, and a later call that reuses this
-                // decomposition with a bigger (but still <= D->sized_subgraphs) subgraph count than this
-                // round, without itself growing past the ceiling, would read that dangling pointer.
-                // Each slot is also sized for D->sized_nnodes, what D->ctx was budgeted for, not for this graph: a
-                // round with fewer nodes than an earlier one can regrow the arena (more subgraphs), and a later reuse
-                // with more nodes than that round would overflow a slot sized by it (upstream #30453: max_nnodes).
-                for (size_t i = 0; i < D->sized_subgraphs; i++) {
-                    D->graphs[j].cgraphs[i].cgraph_main = ggml_new_graph_custom(D->ctx.get(), D->sized_nnodes, /*grads =*/ false);
-                }
-            }
             D->cgraphs_aux.resize(n_backends*n_cgraphs_per_device*D->sized_subgraphs);
             for (size_t k = 0; k < D->cgraphs_aux.size(); k++) {
                 D->cgraphs_aux[k] = ggml_new_graph_custom(D->ctx.get(), 1, cgraph->grads);
@@ -5472,8 +5500,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
     }
 
-    if (ggml_backend_meta_stats::enabled() && needs_rebuild) {
-        backend_ctx->stats.t_rebuild_us += ggml_time_us() - t_rebuild_start_us;
+    if (ggml_backend_meta_stats::enabled()) {
+        if (needs_rebuild) {
+            backend_ctx->stats.t_rebuild_us += ggml_time_us() - t_rebuild_start_us;
+        }
+        backend_ctx->stats.last_n_nodes     = cgraph->n_nodes;
+        backend_ctx->stats.last_n_subgraphs = D->n_subgraphs;
     }
 
     size_t iga = 0; // i graph aux
