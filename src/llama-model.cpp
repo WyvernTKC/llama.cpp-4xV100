@@ -2449,15 +2449,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 layer.ffn_up_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
 
-            // MoE expert weight scales (per-expert, shape {n_expert})
+            // MoE expert weight scales (per-expert, shape {n_expert} of the weight, a layer can have fewer experts than n_expert)
             if (!layer.ffn_gate_exps_s && layer.ffn_gate_exps) {
-                layer.ffn_gate_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                layer.ffn_gate_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "scale", i), {layer.ffn_gate_exps->ne[2]}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_down_exps_s && layer.ffn_down_exps) {
-                layer.ffn_down_exps_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_exps_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "scale", i), {layer.ffn_down_exps->ne[2]}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_up_exps_s && layer.ffn_up_exps) {
-                layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {layer.ffn_up_exps->ne[2]}, TENSOR_NOT_REQUIRED);
             }
 
             // recurrent / linear-attention weight scales (per-tensor, shape {1})
@@ -2509,13 +2509,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 layer.ffn_up_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_gate_exps_in_s && layer.ffn_gate_exps) {
-                layer.ffn_gate_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                layer.ffn_gate_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "input_scale", i), {layer.ffn_gate_exps->ne[2]}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_down_exps_in_s && layer.ffn_down_exps) {
-                layer.ffn_down_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "input_scale", i), {layer.ffn_down_exps->ne[2]}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_up_exps_in_s && layer.ffn_up_exps) {
-                layer.ffn_up_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                layer.ffn_up_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "input_scale", i), {layer.ffn_up_exps->ne[2]}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_gate_shexp_in_s && layer.ffn_gate_shexp) {
                 layer.ffn_gate_shexp_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
