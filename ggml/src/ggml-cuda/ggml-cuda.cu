@@ -4855,9 +4855,9 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
     return is_ok;
 }
 
-// The long form spans 2*k + 1 nodes. ggml_can_fuse_subgraph() accepts at most
-// 31 nodes, so k <= 15; larger values use the per-operation path.
-static constexpr int MOE_WEIGHTED_REDUCTION_MAX_EXPERTS = 15;
+// The long form spans 2*k + 1 nodes, more than ggml_can_fuse_subgraph() takes from k = 16 on, so the match passes its
+// own node list to ggml_can_fuse_subgraph_ext(). k is bounded by the kernel's shared arrays.
+static constexpr int MOE_WEIGHTED_REDUCTION_MAX_EXPERTS = 32;
 
 struct ggml_cuda_moe_weighted_reduction_match {
     const ggml_tensor * experts      = nullptr;
@@ -4987,7 +4987,11 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     }
 
     const int output_idx = node_idx + node_count - 1;
-    if (!ggml_can_fuse_subgraph(cgraph, node_idx, node_count, ops.data(), &output_idx, 1)) {
+    std::vector<int> idxs(node_count);
+    for (int i = 0; i < node_count; ++i) {
+        idxs[i] = node_idx + i;
+    }
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs.data(), node_count, ops.data(), &output_idx, 1)) {
         return false;
     }
 

@@ -1,7 +1,7 @@
 #include "moe-weighted-reduction.cuh"
 #include "unary.cuh"
 
-#define MOE_WEIGHTED_REDUCTION_SMEM_EXPERTS 16
+#define MOE_WEIGHTED_REDUCTION_SMEM_EXPERTS 32
 
 // blockIdx.x is the token and blockIdx.y a slice of its columns. A block reads the token's router weights (and expert
 //   scales) before any of its threads writes, so with a single block per token dst may sit on them; each thread reads

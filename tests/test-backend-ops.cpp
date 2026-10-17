@@ -15706,6 +15706,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
+    // more experts than one fusion subgraph takes (22: Nemotron 3.5 Super), up to the kernel's 32
+    test_cases.emplace_back(new test_moe_reduce(4096, 22, 1));
+    test_cases.emplace_back(new test_moe_reduce(4096, 22, 7, false, true));
+    test_cases.emplace_back(new test_moe_reduce(63,   32, 5, true,  true, true));
+    test_cases.emplace_back(new test_moe_reduce(1024, 33, 3));
     // one token, which the CUDA kernel runs as a single block (Ornith, Goetia with expert scales, an odd width)
     test_cases.emplace_back(new test_moe_reduce(2048, 8, 1));
     test_cases.emplace_back(new test_moe_reduce(2816, 8, 1, false, true));
