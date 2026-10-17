@@ -517,6 +517,31 @@ def test_n_probs_stream():
                     assert "bytes" in prob and type(prob["bytes"]) == list
 
 
+def test_n_probs_with_backend_sampler_on_other_slot():
+    global server
+    server.n_slots = 2
+    server.start()
+    # a request without n_probs can leave a backend sampler set on its slot
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "id_slot": 0,
+        "n_predict": 4,
+    })
+    assert res.status_code == 200
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "id_slot": 1,
+        "n_probs": 10,
+        "temperature": 0.0,
+        "n_predict": 5,
+    })
+    assert res.status_code == 200
+    assert len(res.body["completion_probabilities"]) == 5
+    for tok in res.body["completion_probabilities"]:
+        assert len(tok["top_logprobs"]) == 10
+        assert tok["top_logprobs"][0]["id"] == tok["id"]
+
+
 def test_n_probs_post_sampling():
     global server
     server.start()

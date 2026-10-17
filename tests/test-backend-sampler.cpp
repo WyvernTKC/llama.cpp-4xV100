@@ -1645,6 +1645,10 @@ static void test_cpu_mixed(const test_params & params) {
         llama_token backend_token = llama_get_sampled_token_ith(test_ctx.ctx.get(), batch_idx);
         GGML_ASSERT(backend_token == LLAMA_TOKEN_NULL);
 
+        // seq 0 has a backend sampler, but this row still exposes the full logits
+        GGML_ASSERT(llama_get_sampled_logits_ith(test_ctx.ctx.get(), batch_idx) == nullptr);
+        GGML_ASSERT(llama_get_sampled_logits_count_ith(test_ctx.ctx.get(), batch_idx) == (uint32_t) test_ctx.n_vocab);
+
         struct llama_sampler_chain_params chain_params = llama_sampler_chain_default_params();
         llama_sampler_ptr chain(llama_sampler_chain_init(chain_params));
         llama_sampler_chain_add(chain.get(), llama_sampler_init_greedy());

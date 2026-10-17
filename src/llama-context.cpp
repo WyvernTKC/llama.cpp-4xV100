@@ -1344,8 +1344,9 @@ size_t llama_context::get_sampled_logits_count(int32_t idx) {
 
     try {
         const int64_t row = output_resolve_row(idx);
-        if ((size_t) row >= sampling.logits_count.size()) {
-            return 0;
+        // no backend sampled logits for this row: llama_get_logits_ith returns the full vocab
+        if ((size_t) row >= sampling.logits_count.size() || sampling.logits_count[row] == 0) {
+            return model.vocab.n_tokens();
         }
         return sampling.logits_count[row];
     } catch (const std::exception & err) {
