@@ -26,6 +26,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <mutex>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -2354,6 +2355,88 @@ bool common_prompt_batch_decode(
     return true;
 }
 
+// Fresh memory for a large checkpoint costs page faults on every save and a free on every eviction (800 MiB: 50-260 ms
+// and ~65 ms). Released buffers wait here for the next checkpoint of a similar size.
+struct common_state_pool {
+    static constexpr size_t n_max    = 4;
+    static constexpr size_t size_min = 16u << 20; // smaller ones are cheap to allocate
+
+    std::mutex mutex;
+    std::vector<std::pair<uint8_t *, size_t>> bufs; // oldest first
+
+    common_state_pool() { bufs.reserve(n_max); }
+
+    static common_state_pool & get() {
+        // never destroyed: a buffer can be released during static destruction
+        static common_state_pool * pool = new common_state_pool();
+        return *pool;
+    }
+
+    // the smallest buffer that holds n bytes and is at most twice that
+    uint8_t * take(size_t n, size_t & cap) {
+        std::lock_guard<std::mutex> lock(mutex);
+
+        auto best = bufs.end();
+        for (auto it = bufs.begin(); it != bufs.end(); ++it) {
+            if (it->second >= n && it->second/2 <= n && (best == bufs.end() || it->second < best->second)) {
+                best = it;
+            }
+        }
+        if (best == bufs.end()) {
+            return nullptr;
+        }
+
+        uint8_t * p = best->first;
+        cap = best->second;
+        bufs.erase(best);
+
+        return p;
+    }
+
+    void put(uint8_t * p, size_t cap) {
+        uint8_t * p_free = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (bufs.size() == n_max) {
+                p_free = bufs.front().first;
+                bufs.erase(bufs.begin());
+            }
+            bufs.emplace_back(p, cap);
+        }
+        delete[] p_free;
+    }
+};
+
+void common_state_bytes::resize(size_t n_new, bool pooled) {
+    if (ptr && ptr.use_count() == 1 && n_new <= cap) {
+        n = n_new;
+        return;
+    }
+
+    clear();
+
+    if (n_new == 0) {
+        return;
+    }
+
+    if (!pooled || n_new < common_state_pool::size_min) {
+        ptr.reset(new uint8_t[n_new]);
+        n   = n_new;
+        cap = n_new;
+        return;
+    }
+
+    size_t cap_new = n_new;
+    uint8_t * buf = common_state_pool::get().take(n_new, cap_new);
+    if (buf == nullptr) {
+        buf = new uint8_t[n_new];
+    }
+
+    ptr.reset(buf, [cap_new](uint8_t * p) { common_state_pool::get().put(p, cap_new); });
+    n   = n_new;
+    cap = cap_new;
+}
+
 // a checkpoint with a device slot keeps its tensor bytes in device memory; the host blob then holds
 // only the metadata needed to find them again
 static llama_state_seq_flags common_ckpt_flags(llama_state_seq_flags flags, int dev_slot) {
@@ -2415,7 +2498,7 @@ void common_prompt_checkpoint::update_tgt(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags_eff);
 
-    data_tgt.resize(ckpt_size);
+    data_tgt.resize(ckpt_size, /*pooled =*/ true);
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags_eff);
     if (n != ckpt_size) {
@@ -2440,7 +2523,7 @@ void common_prompt_checkpoint::update_dft(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags_eff);
 
-    data_dft.resize(ckpt_size);
+    data_dft.resize(ckpt_size, /*pooled =*/ true);
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags_eff);
     if (n != ckpt_size) {

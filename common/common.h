@@ -1293,15 +1293,9 @@ struct common_state_bytes {
     bool   empty() const { return n == 0; }
     void   clear()       { ptr.reset(); n = 0; cap = 0; }
 
-    void resize(size_t n_new) {
-        if (ptr && ptr.use_count() == 1 && n_new <= cap) {
-            n = n_new;
-            return;
-        }
-        ptr.reset(n_new > 0 ? new uint8_t[n_new] : nullptr);
-        n   = n_new;
-        cap = n_new;
-    }
+    // pooled: a new buffer is taken from a small process-wide pool of released ones, and goes back to it when its
+    //   last owner releases it - for states that are saved again and again (context checkpoints)
+    void resize(size_t n_new, bool pooled = false);
 
           uint8_t * data()       { return ptr.get(); }
     const uint8_t * data() const { return ptr.get(); }
