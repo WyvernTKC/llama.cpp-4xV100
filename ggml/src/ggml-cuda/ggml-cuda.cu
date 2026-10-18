@@ -8992,6 +8992,16 @@ static void ggml_backend_cuda_session_begin(ggml_backend_t backend, ggml_cgraph 
 
     cuda_ctx->session_key  = graph_key;
     cuda_ctx->session_mode = (ggml_backend_cuda_context::session_mode_t) mode;
+
+    // the sums of the all-reduces of a model with hyper-connections go to DSV4_HC_POST, see
+    //   ggml_backend_cuda_session_allreduce_next
+    bool hc = false;
+    for (int k = 0; k < n_cgraphs && !hc; ++k) {
+        for (int n = 0; n < cgraphs[k]->n_nodes && !hc; ++n) {
+            hc = cgraphs[k]->nodes[n]->op == GGML_OP_DSV4_HC_POST;
+        }
+    }
+    cuda_ctx->ar_fold.hc = hc;
 }
 
 // whether the all-reduce of these tensors (one per device) can be part of a session graph
@@ -9002,7 +9012,9 @@ static bool ggml_backend_cuda_session_allreduce_supported(void * comm_ctx_v, str
 
 // The all-reduce of tensors (one per device) after the subgraph about to run: the matmul that writes tensors[rank] may
 //   push its rows as the LL lines of every rank, see ggml_backend_cuda_context::ar_fold. GGML_CUDA_NO_AR_FOLD=1 turns
-//   it off.
+//   it off. Not in a model with hyper-connections (ar_fold.hc): DSV4_HC_POST cannot poll the lines, so the receive kernel
+//   would run, and with the pushing matmul that is two kernels of their own per layer, which costs DeepSeek-V4-Flash
+//   more than the LL kernel they replace.
 static void ggml_backend_cuda_session_allreduce_next(void * comm_ctx_v, struct ggml_tensor ** tensors, size_t rank) {
     static const bool no_fold = getenv("GGML_CUDA_NO_AR_FOLD") != nullptr;
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
@@ -9014,7 +9026,7 @@ static void ggml_backend_cuda_session_allreduce_next(void * comm_ctx_v, struct g
     // the norm that polls the lines keeps the row in registers, up to 8 columns per thread of its 1024-thread layout (see
     //   rms_norm_pre_add_ar_split_f32)
     const int64_t ncols = ggml_nelements(tensors[rank]);
-    if (no_fold || ncols > 8*1024 || comm_ctx->p2p_ar == nullptr ||
+    if (no_fold || f.hc || ncols > 8*1024 || comm_ctx->p2p_ar == nullptr ||
             !ggml_cuda_p2p_ar_fold_args(comm_ctx->p2p_ar, comm_ctx->backends.data(), tensors, rank, f.next_call.args)) {
         return;
     }
