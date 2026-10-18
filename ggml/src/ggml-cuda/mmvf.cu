@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "common.cuh"
+#include "allreduce-p2p.cuh"
 #include "unary.cuh"
 #include "mmvf.cuh"
 #include "mmf.cuh"
@@ -50,14 +51,17 @@ static __device__ __forceinline__ void mul_mat_vec_f_topk_moe(const ggml_cuda_mm
 // load16 (2-byte weights) reads 8 weights per 16-byte load instead of 2 per 4-byte load, which changes the
 // order in which a row sums, so its results can differ in the last bits.
 // topk_n: the expert count of a topk_moe run in the last block (topk_args), see mul_mat_vec_f_topk_moe
+// ar: the two rows of a block go to an LL line of an all-reduce folded into this launch (topk_args holds its
+//   ggml_cuda_ar_fold_args), not to dst; see ggml_cuda_ar_fold_push
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false, int rpb = 1, bool load16 = false,
-          int topk_n = 0>
+          int topk_n = 0, bool ar = false>
 static __global__ void mul_mat_vec_f(
         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const int ncols2, const uint3 nchannels_y, const int stride_row, const int stride_col_y2, const int stride_col_dst,
         const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ids_stride, const std::conditional_t<(topk_n > 0), ggml_cuda_mmvf_topk_args, ggml_cuda_no_args> topk_args) {
+        const int ids_stride,
+        const std::conditional_t<(topk_n > 0), ggml_cuda_mmvf_topk_args, std::conditional_t<ar, ggml_cuda_ar_fold_args, ggml_cuda_no_args>> topk_args) {
     const T       * GGML_CUDA_RESTRICT x   = x_ptr;
     const float   * GGML_CUDA_RESTRICT y   = y_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
@@ -90,6 +94,16 @@ static __global__ void mul_mat_vec_f(
 
     const int sample_x    = fastdiv((uint32_t) sample_dst, sample_ratio);
     const int sample_y    = sample_dst;
+
+    // ar: the sequence number of the call, loaded while the dot product runs
+    static_assert(!ar || (ncols_dst == 1 && rpb == 2 && !has_fusion && !is_multi_token_id && topk_n == 0),
+        "the fold pushes the two rows of one column of a block");
+    [[maybe_unused]] uint32_t ar_seq = 0;
+    if constexpr (ar) {
+        if (tid == 0) {
+            ar_seq = ggml_cuda_ar_seq(topk_args, row/4);
+        }
+    }
 
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
 
@@ -622,6 +636,13 @@ static __global__ void mul_mat_vec_f(
         return;
     }
 
+    if constexpr (ar) {
+        if (tid == 0) {
+            ggml_cuda_ar_fold_push(topk_args, ar_seq, row/4, (row/2) % 2, sumf[0], sumf[1]);
+        }
+        return;
+    }
+
     if (tid >= ncols_dst*rpb) {
         return;
     }
@@ -735,6 +756,16 @@ static void mul_mat_vec_f_switch_fusion(
     }
     if constexpr (ncols_dst == 1 && !is_multi_token_id && sizeof(T) == 2) {
         if (load16) {
+            if (rpb == 2) {
+                // the all-reduce of dst folded in, see launch_mul_mat_vec_f_cuda
+                GGML_ASSERT(fusion.ar_pushed != nullptr && !has_fusion);
+                ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, 2, true, 0, true>, launch_params,
+                    x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
+                    channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, fusion.ar);
+                *fusion.ar_pushed = true;
+                return;
+            }
             if (rpb == 4) {
                 if (has_fusion) {
                     launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, false, 4, true>);
@@ -886,6 +917,13 @@ void launch_mul_mat_vec_f_cuda(
     if (ncols_dst > 1 && fusion.sib_block0 > 0) {
         GGML_ASSERT(load16 && !is_multi_token_id && nrows % 4 == 0);
         rpb = 4;
+    }
+
+    // an all-reduce of dst folded into the launch (ggml_backend_cuda_context::ar_fold): one token, the whole of dst in
+    //   its rows and nothing else fused; two rows per block make an LL line and sum as with one row per block
+    if (fusion.ar_pushed != nullptr && ncols_dst == 1 && ids == nullptr && load16 && !has_fusion && nchannels_dst == 1 &&
+            nsamples_or_ntokens == 1 && nrows % 4 == 0 && nrows == stride_col_dst) {
+        rpb = 2;
     }
 
     // the 16-byte path keeps one partial sum per warp, row and column
@@ -1192,6 +1230,12 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             fusion_local.topk.with_norm       = fusion->topk_with_norm;
             fusion_local.topk.delayed_softmax = fusion->topk_delayed_softmax;
         }
+    }
+
+    // the all-reduce of the output folded into the launch, if it can take it (see ggml_backend_cuda_context::ar_fold)
+    if (ctx.ar_fold.next == dst) {
+        fusion_local.ar        = ctx.ar_fold.next_call.args;
+        fusion_local.ar_pushed = &ctx.ar_fold.pushed;
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
