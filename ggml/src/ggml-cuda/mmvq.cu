@@ -714,12 +714,32 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+// Low bit types load few weight bytes per thread, a second row per block shares the q8_1 loads and adds memory parallelism.
+static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_VOLTA || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING ||
             table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
-                return small_k ? nwarps : 1;
+                if (small_k) {
+                    return nwarps;
+                }
+                if (table_id == MMVQ_PARAMETERS_GB10) {
+                    return type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_S ? 2 : 1;
+                }
+                return table_id == MMVQ_PARAMETERS_GENERIC && mmvq_two_rows_ncols1(type) ? 2 : 1;
             case 2:
             case 3:
             case 4:
@@ -733,6 +753,23 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
         }
     }
     return 1;
+}
+
+// the types of the conv epilogue (ggml_cuda_mmvq_conv_epilogue_pays), the only ones its kernel is compiled for: it needs one
+//   row per block, which the GENERIC and GB10 tables do not keep at one column for some low-bit types
+static constexpr __host__ __device__ bool mmvq_conv_type(const ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_MXFP4:
+            return true;
+        default:
+            return false;
+    }
 }
 
 // the blocks per SM of the conv epilogue: on Volta 9 keep it at the registers of the plain fused kernel where that has 56 or
@@ -797,7 +834,7 @@ static __global__ void mul_mat_vec_q(
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int vdr = wide ? get_vdr_mmvq_wide(type) : get_vdr_mmvq(type);
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = wide ? get_vec_dot_q_cuda_wide(type) : get_vec_dot_q_cuda_cols(type, ncols_dst);
@@ -1688,7 +1725,7 @@ static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
@@ -1719,7 +1756,7 @@ static void mul_mat_vec_q_switch_fusion(
                 grid.y += 1; // the sibling pair, see mul_mat_vec_q
             }
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, block_dims, nbytes_shared, stream);
-            if constexpr (!small_k && !halve_iters && !paired) {
+            if constexpr (!small_k && !halve_iters && !paired && mmvq_conv_type(type)) {
                 if (fusion.conv.w != nullptr) {
                     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, false, false, wide, false, true>, launch_params,
                          vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
@@ -1746,7 +1783,7 @@ static void mul_mat_vec_q_switch_fusion(
 
     // an all-reduce folded into the launch: one column, whole blocks of an even number of rows, nothing else fused
     if constexpr (c_ncols_dst == 1 && small_k && ggml_cuda_mmvq_ar_fold_type(type)) {
-        constexpr int rpb = calc_rows_per_block(c_ncols_dst, MMVQ_PARAMETERS_VOLTA, small_k,
+        constexpr int rpb = calc_rows_per_block(type, c_ncols_dst, MMVQ_PARAMETERS_VOLTA, small_k,
             calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_VOLTA, small_k, halve_iters));
         if (fusion.ar_pushed != nullptr && ids == nullptr && fusion.sib_x == nullptr && fusion.sib2_x == nullptr &&
                 fusion.gdn_x == nullptr && fusion.shared_up == nullptr && block_dims.y == (unsigned) rpb && rpb % 2 == 0 &&
@@ -1961,18 +1998,7 @@ static bool mmvq_small_k_is_slow(const ggml_type type, const int cc, const int64
 //   whose plain kernel fits 56 registers (q4_K, 72 -> 80 registers, a block less per SM: tg -0.3% with the fold)
 bool ggml_cuda_mmvq_conv_epilogue_pays(enum ggml_type type, int cc) {
     const bool is_nvidia_volta = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA && cc < GGML_CUDA_CC_TURING;
-    switch (type) {
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_1:
-        case GGML_TYPE_Q5_0:
-        case GGML_TYPE_Q5_1:
-        case GGML_TYPE_Q8_0:
-        case GGML_TYPE_IQ4_NL:
-        case GGML_TYPE_MXFP4:
-            return is_nvidia_volta;
-        default:
-            return false;
-    }
+    return is_nvidia_volta && mmvq_conv_type(type);
 }
 
 bool ggml_cuda_should_fuse_mmvq_gate(enum ggml_type type, int cc, int64_t nrows_x, int64_t nchannels_dst, int64_t nsamples_dst,
@@ -2091,7 +2117,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
     // the siblings' rows after those of x in a launch of 2 to 8 columns, see mul_mat_vec_q
     const auto sibling_rows = [&](std::pair<dim3, dim3> & dims, const int c_ncols_dst) {
         ggml_cuda_mm_fusion_args_launch fusion_rows = fusion;
-        const int rpb = calc_rows_per_block(c_ncols_dst, table_id);
+        const int rpb = calc_rows_per_block(type, c_ncols_dst, table_id);
         if (!has_ids && fusion.sib_x != nullptr) {
             fusion_rows.sib_block0 = dims.first.x;
             dims.first.x += (fusion.sib_nrows + rpb - 1) / rpb;
@@ -2136,7 +2162,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 }
                 // the sibling's rows after those of x, see mul_mat_vec_q
                 ggml_cuda_mm_fusion_args_launch fusion_rows = fusion;
-                const int rpb = calc_rows_per_block(c_ncols_dst, table_id, c_small_k,
+                const int rpb = calc_rows_per_block(type, c_ncols_dst, table_id, c_small_k,
                     calc_nwarps(type, c_ncols_dst, table_id, c_small_k, c_halve_iters));
                 if (!has_ids && fusion.sib_x != nullptr) {
                     fusion_rows.sib_block0 = dims.first.x;
