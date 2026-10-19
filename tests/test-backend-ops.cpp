@@ -9775,6 +9775,7 @@ struct test_topk_moe : public test_case {
 // The topk_moe of one token's router logits right after the f32 router and the one-row shared expert gate of the same
 //   input (qwen35moe), with an unrelated MUL_MAT of that input between (its shared expert's projections): the expert
 //   selection runs in the router's launch
+// n_layers > 1 repeats it with other weights, so the next launches reuse the slots of mul_mat_vec_f_router.
 struct test_router_topk_moe : public test_case {
     const int64_t       k;
     const int64_t       n_expert;
@@ -9782,10 +9783,8 @@ struct test_router_topk_moe : public test_case {
     const bool          with_norm;
     const MoeGatingFunc gating_func;
     const float         scale_w;
-    ggml_tensor * weights {};
-    ggml_tensor * selected_experts {};
-    ggml_tensor * gate {};
-    ggml_tensor * shexp {};
+    const int           n_layers;
+    std::vector<ggml_tensor *> outs;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -9793,48 +9792,58 @@ struct test_router_topk_moe : public test_case {
     }
 
     bool run_whole_graph() override { return true; }
-    std::vector<ggml_tensor *> fusion_test_nodes() override { return { selected_experts, weights, gate, shexp }; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outs; }
 
     std::string vars() override {
-        return VARS_TO_STR6(k, n_expert, n_expert_used, with_norm, gating_func, scale_w);
+        return VARS_TO_STR7(k, n_expert, n_expert_used, with_norm, gating_func, scale_w, n_layers);
     }
 
     test_router_topk_moe(int64_t k = 2048, int64_t n_expert = 256, int n_expert_used = 8, bool with_norm = true,
-            MoeGatingFunc gating_func = GATING_FUNC_SOFTMAX, float scale_w = 0.0f)
+            MoeGatingFunc gating_func = GATING_FUNC_SOFTMAX, float scale_w = 0.0f, int n_layers = 1)
         : k(k), n_expert(n_expert), n_expert_used(n_expert_used), with_norm(with_norm), gating_func(gating_func),
-          scale_w(scale_w) {}
+          scale_w(scale_w), n_layers(n_layers) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * w   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_expert);
-        ggml_tensor * w_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
-        ggml_tensor * w_x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 64);
-        ggml_tensor * x   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
         ggml_set_name(x, "x");
 
-        ggml_tensor * logits = ggml_mul_mat(ctx, w, x);
-        gate  = ggml_mul_mat(ctx, w_s, x);
-        shexp = ggml_mul_mat(ctx, w_x, x);
-        ggml_set_name(gate, "gate");
-        ggml_set_name(shexp, "shexp");
-        if (mode == MODE_TEST) {
-            ggml_build_forward_expand(gf, logits);
-            ggml_build_forward_expand(gf, gate);
-            ggml_build_forward_expand(gf, shexp);
-        }
+        outs.clear();
+        ggml_tensor * weights = nullptr;
+        for (int il = 0; il < n_layers; il++) {
+            ggml_tensor * w   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_expert);
+            ggml_tensor * w_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+            ggml_tensor * w_x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 64);
 
-        ggml_tensor * probs = gating_func == GATING_FUNC_SIGMOID ? ggml_sigmoid(ctx, logits) : ggml_soft_max(ctx, logits);
-        selected_experts = ggml_argsort_top_k(ctx, probs, n_expert_used);
-        ggml_set_name(selected_experts, "selected_experts");
-        weights = ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, n_expert, 1), selected_experts);
-        if (with_norm) {
-            weights = ggml_reshape_2d(ctx, weights, n_expert_used, 1);
-            ggml_tensor * weights_sum = ggml_clamp(ctx, ggml_sum_rows(ctx, weights), 6.103515625e-5, INFINITY);
-            weights = ggml_reshape_3d(ctx, ggml_div(ctx, weights, weights_sum), 1, n_expert_used, 1);
+            ggml_tensor * logits = ggml_mul_mat(ctx, w, x);
+            ggml_tensor * gate   = ggml_mul_mat(ctx, w_s, x);
+            ggml_tensor * shexp  = ggml_mul_mat(ctx, w_x, x);
+            ggml_set_name(gate, "gate");
+            ggml_set_name(shexp, "shexp");
+            if (mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, logits);
+                ggml_build_forward_expand(gf, gate);
+                ggml_build_forward_expand(gf, shexp);
+            }
+
+            ggml_tensor * probs = gating_func == GATING_FUNC_SIGMOID ? ggml_sigmoid(ctx, logits) : ggml_soft_max(ctx, logits);
+            ggml_tensor * selected_experts = ggml_argsort_top_k(ctx, probs, n_expert_used);
+            ggml_set_name(selected_experts, "selected_experts");
+            weights = ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, n_expert, 1), selected_experts);
+            if (with_norm) {
+                weights = ggml_reshape_2d(ctx, weights, n_expert_used, 1);
+                ggml_tensor * weights_sum = ggml_clamp(ctx, ggml_sum_rows(ctx, weights), 6.103515625e-5, INFINITY);
+                weights = ggml_reshape_3d(ctx, ggml_div(ctx, weights, weights_sum), 1, n_expert_used, 1);
+            }
+            if (scale_w) {
+                weights = ggml_scale(ctx, weights, scale_w);
+            }
+            ggml_set_name(weights, "weights");
+            if (mode == MODE_TEST && il + 1 < n_layers) {
+                ggml_build_forward_expand(gf, selected_experts);
+                ggml_build_forward_expand(gf, weights);
+            }
+            outs.insert(outs.end(), { selected_experts, weights, gate, shexp });
         }
-        if (scale_w) {
-            weights = ggml_scale(ctx, weights, scale_w);
-        }
-        ggml_set_name(weights, "weights");
         return weights;
     }
 
@@ -15659,13 +15668,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // the expert selection in the router's launch (128, 256 and 512 experts), and 64 experts, which keep it apart
+    // the expert selection in the router's launch (128, 256 and 512 experts), and 64 experts, which keep it apart; three
+    //   routers in a row reuse the slots of mul_mat_vec_f_router, rows of 1280 keep the ticket
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID}) {
         for (bool with_norm : {false, true}) {
             for (int64_t n_expert : {64, 128, 256, 512}) {
                 test_cases.emplace_back(new test_router_topk_moe(2048, n_expert, 8, with_norm, gate));
             }
             test_cases.emplace_back(new test_router_topk_moe(1024, 256, 10, with_norm, gate, 2.5f));
+            test_cases.emplace_back(new test_router_topk_moe(2048, 256, 8, with_norm, gate, 0.0f, 3));
+            test_cases.emplace_back(new test_router_topk_moe(1280, 256, 8, with_norm, gate));
         }
     }
 

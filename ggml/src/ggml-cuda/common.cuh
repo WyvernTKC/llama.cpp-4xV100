@@ -188,6 +188,13 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 
 #define GGML_CUDA_MAX_STREAMS 8
 
+// offsets in block_flags (in uints) of the tagged logit slots of mul_mat_vec_f_router, their epoch and the outputs of its first pass
+#define GGML_CUDA_TOPK_SLOTS      512
+#define GGML_CUDA_TOPK_SLOT_COUNT 512
+#define GGML_CUDA_TOPK_EPOCH      (GGML_CUDA_TOPK_SLOTS + 2*GGML_CUDA_TOPK_SLOT_COUNT)
+#define GGML_CUDA_TOPK_WARM       (GGML_CUDA_TOPK_EPOCH + 8)
+#define GGML_CUDA_BLOCK_FLAGS     (GGML_CUDA_TOPK_WARM + 64)
+
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg);
 
@@ -1710,27 +1717,37 @@ struct ggml_backend_cuda_context {
 
     // two flags for a kernel whose blocks wait on its first block (see rms_norm_emit_q8_1), then the ticket of the
     //   topk_moe in a router's launch (ggml_cuda_topk_moe_fold), all zero between launches; then the epoch and the
-    //   tagged slots of a row split over blocks (row_split_reduce in norm.cu)
+    //   tagged slots of a row split over blocks (row_split_reduce in norm.cu); from GGML_CUDA_TOPK_SLOTS the tagged logit
+    //   slots, their epoch and the scratch of a router launch with a waiting block (mul_mat_vec_f_router)
     unsigned int * block_flags[GGML_CUDA_MAX_DEVICES] = { nullptr };
 
     // the tickets of ggml_cuda_ar_fold_moe_args, zero between launches
     unsigned int * ar_tickets[GGML_CUDA_MAX_DEVICES] = { nullptr };
 
-    unsigned int * ar_tickets_get() {
-        if (ar_tickets[device] == nullptr) {
-            ggml_cuda_set_device(device);
-            CUDA_CHECK(cudaMalloc(&ar_tickets[device], 4096*sizeof(unsigned int)));
-            CUDA_CHECK(cudaMemset(ar_tickets[device], 0, 4096*sizeof(unsigned int)));
+    // Called before a capture begins (graph_compute, session_begin): a memset in a capture would run again at every replay.
+    // The zeroing goes on the compute stream, a cudaMemset on the legacy stream is not ordered with it.
+    void flags_alloc() {
+        if (block_flags[device] != nullptr && ar_tickets[device] != nullptr) {
+            return;
         }
+        ggml_cuda_set_device(device);
+        if (block_flags[device] == nullptr) {
+            CUDA_CHECK(cudaMalloc(&block_flags[device], GGML_CUDA_BLOCK_FLAGS*sizeof(unsigned int)));
+            CUDA_CHECK(cudaMemsetAsync(block_flags[device], 0, GGML_CUDA_BLOCK_FLAGS*sizeof(unsigned int), stream()));
+        }
+        if (ar_tickets[device] == nullptr) {
+            CUDA_CHECK(cudaMalloc(&ar_tickets[device], 4096*sizeof(unsigned int)));
+            CUDA_CHECK(cudaMemsetAsync(ar_tickets[device], 0, 4096*sizeof(unsigned int), stream()));
+        }
+    }
+
+    unsigned int * ar_tickets_get() {
+        flags_alloc();
         return ar_tickets[device];
     }
 
     unsigned int * block_flags_get() {
-        if (block_flags[device] == nullptr) {
-            ggml_cuda_set_device(device);
-            CUDA_CHECK(cudaMalloc(&block_flags[device], 512*sizeof(unsigned int)));
-            CUDA_CHECK(cudaMemset(block_flags[device], 0, 512*sizeof(unsigned int)));
-        }
+        flags_alloc();
         return block_flags[device];
     }
 
@@ -1992,9 +2009,11 @@ struct ggml_cuda_mm_fusion_args_host {
     float * conv_slot[2] = { nullptr, nullptr };
     // mmvf, f32, one token: the topk_moe of the expert logits in dst, run by the block of the launch that ends last
     //   (ggml_cuda_topk_moe_fold); topk_ticket is a zeroed counter that block resets
+    // with topk_slots the launch has a block that waits for the tagged logits in them instead (mul_mat_vec_f_router)
     float * topk_weights = nullptr;
     int32_t * topk_ids = nullptr;
     unsigned int * topk_ticket = nullptr;
+    unsigned long long * topk_slots = nullptr;
     int topk_n_expert = 0;
     int topk_n_used = 0;
     float topk_clamp = 0.0f;
@@ -2087,7 +2106,10 @@ struct ggml_cuda_mmvf_topk_args {
     const float *  logits          = nullptr; // see ggml_cuda_mm_fusion_args_host
     float *        weights         = nullptr;
     int32_t *      ids             = nullptr;
-    unsigned int * ticket          = nullptr;
+    union {
+        unsigned int *       ticket = nullptr;
+        unsigned long long * slots; // mul_mat_vec_f_router
+    };
     int            n_expert        = 0;
     int            n_used          = 0;
     float          clamp           = 0.0f;

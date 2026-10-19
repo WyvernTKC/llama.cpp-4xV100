@@ -5751,9 +5751,11 @@ static bool ggml_cuda_topk_moe_launch(ggml_backend_cuda_context * cuda_ctx, cons
 //   mmvf launch (which ends at node last), one launch less per MoE layer: no bias or groups. Its outputs may lie over
 //   the logits, which that block's warp reads first, but not over the launch's inputs or its sibling's output, and no
 //   node in between may touch them. Returns whether it folded; ggml_cuda_try_fuse then skips the topk_moe.
+// With a sibling on Volta, a block of the launch that waits for the logits runs it instead, see mul_mat_vec_f_router.
 static bool ggml_cuda_topk_moe_fold(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i,
                                    const ggml_tensor * sib_dst, const int last, ggml_cuda_mm_fusion_args_host & fusion) {
     static const bool disabled = getenv("GGML_CUDA_NO_TOPK_FOLD") != nullptr;
+    static const bool no_wait  = getenv("GGML_CUDA_NO_ROUTER_WAIT") != nullptr;
     const ggml_tensor * node = cgraph->nodes[i];
     // the gating op that reads the logits; qwen35moe has its shared expert's projections between
     int k = last + 1;
@@ -5812,6 +5814,12 @@ static bool ggml_cuda_topk_moe_fold(ggml_backend_cuda_context * cuda_ctx, const 
     fusion.topk_sqrt_softplus   = p.args.sqrt_softplus;
     fusion.topk_with_norm       = p.clamp != nullptr;
     fusion.topk_delayed_softmax = p.args.delayed_softmax;
+    // on Volta a block of the launch waits for the tagged logits instead of a ticket (mul_mat_vec_f_router); measured on Volta only
+    const int  cc    = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    const bool volta = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA && cc < GGML_CUDA_CC_TURING;
+    if (!no_wait && volta && node->src[0]->ne[0] % 512 == 0 && sib_dst != nullptr) {
+        fusion.topk_slots = (unsigned long long *) (cuda_ctx->block_flags_get() + GGML_CUDA_TOPK_SLOTS);
+    }
     cuda_ctx->topk_folded_node = cgraph->nodes[k];
     cuda_ctx->topk_folded_skip = p.n_ops - 1;
     return true;
@@ -8827,6 +8835,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_preload_modules_close();
 
     ggml_cuda_set_device(cuda_ctx->device);
+    cuda_ctx->flags_alloc();
 
     // every tensor is written again this pass, so no quantized or converted copy from the last one survives
     cuda_ctx->q8_1_input_reset();
@@ -8972,6 +8981,7 @@ static void ggml_backend_cuda_session_begin(ggml_backend_t backend, ggml_cgraph 
     GGML_ASSERT(cuda_ctx->session_mode == ggml_backend_cuda_context::SESSION_OFF && n_cgraphs > 0);
     GGML_ASSERT(mode == ggml_backend_cuda_context::SESSION_EAGER || mode == ggml_backend_cuda_context::SESSION_CAPTURE);
     ggml_cuda_set_device(cuda_ctx->device);
+    cuda_ctx->flags_alloc();
 
     const void * graph_key = ggml_cuda_session_key(cgraphs[0]);
 #ifdef USE_CUDA_GRAPH

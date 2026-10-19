@@ -7,6 +7,17 @@
 #include "convert.cuh"
 #include "topk-moe.cuh"
 
+static __device__ __forceinline__ topk_moe_config mul_mat_vec_f_topk_moe_config(const ggml_cuda_mmvf_topk_args & topk) {
+    topk_moe_config config;
+    config.use_sigmoid       = topk.sigmoid;
+    config.use_sqrt_softplus = topk.sqrt_softplus;
+    config.with_norm         = topk.with_norm;
+    config.delayed_softmax   = topk.delayed_softmax;
+    config.n_groups          = 1;
+    config.n_group_used      = 1;
+    return config;
+}
+
 // The block of a router's launch that writes its logit last selects the experts of all of them (see
 //   ggml_cuda_topk_moe_fold): every block counts itself on the ticket after its write, and the last one reads the logits
 //   from L2 and runs the selection of topk_moe_cuda on them with one warp.
@@ -31,15 +42,8 @@ static __device__ __forceinline__ void mul_mat_vec_f_topk_moe(const ggml_cuda_mm
         wt[i] = __ldcg(topk.logits + i*WARP_SIZE + lane);
     }
     const float bias_v[1] = { 0.0f };
-
-    topk_moe_config config;
-    config.use_sigmoid       = topk.sigmoid;
-    config.use_sqrt_softplus = topk.sqrt_softplus;
-    config.with_norm         = topk.with_norm;
-    config.delayed_softmax   = topk.delayed_softmax;
-    config.n_groups          = 1;
-    config.n_group_used      = 1;
-    topk_moe_select<n_experts, false, false>(wt, bias_v, topk.weights, topk.ids, topk.n_used, topk.clamp, topk.scale, config);
+    topk_moe_select<n_experts, false, false>(wt, bias_v, topk.weights, topk.ids, topk.n_used, topk.clamp, topk.scale,
+        mul_mat_vec_f_topk_moe_config(topk));
 
     if (lane == 0) {
         *topk.ticket = 0;
@@ -1107,6 +1111,135 @@ static void mul_mat_vec_f_cuda(
         stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
 }
 
+// The waiting block of mul_mat_vec_f_router (one warp): once every slot holds a logit with the tag of this launch, it writes the logits to dst and runs the selection of mul_mat_vec_f_topk_moe on them.
+// A launch tags its logits with the epoch plus one and the waiter moves the epoch on after reading them, so a slot from an earlier launch never matches and nothing has to reset the slots.
+// A first pass with one expert runs on whatever the slots hold while the rows are still read: it brings the selection code into this SM.
+template <int n_experts>
+static __device__ __forceinline__ void mul_mat_vec_f_router_wait(const ggml_cuda_mmvf_topk_args & topk, float * dst, const int lane) {
+    constexpr int warp_size          = ggml_cuda_get_physical_warp_size();
+    constexpr int experts_per_thread = topk_moe_experts_per_thread(n_experts);
+    static_assert(n_experts % warp_size == 0 && n_experts <= GGML_CUDA_TOPK_SLOT_COUNT, "the slots are read in whole warps");
+    static_assert(2*warp_size <= GGML_CUDA_BLOCK_FLAGS - GGML_CUDA_TOPK_WARM, "scratch of the first pass");
+    volatile unsigned long long * slots = topk.slots;
+    unsigned int * epoch        = (unsigned int *) (topk.slots + GGML_CUDA_TOPK_SLOT_COUNT);
+    float        * warm_weights = (float *) (epoch + (GGML_CUDA_TOPK_WARM - GGML_CUDA_TOPK_EPOCH));
+    int32_t      * warm_ids     = (int32_t *) (warm_weights + warp_size);
+    const unsigned int tag = *(volatile unsigned int *) epoch + 1;
+
+    const float bias_v[1] = { 0.0f };
+    const topk_moe_config config = mul_mat_vec_f_topk_moe_config(topk);
+
+    float wt[experts_per_thread];
+    bool  warm = true;
+#pragma unroll 1
+    while (true) {
+        bool ready;
+        do {
+            ready = true;
+#pragma unroll
+            for (int i = 0; i < experts_per_thread; i++) {
+                const unsigned long long v = slots[i*warp_size + lane];
+                wt[i] = __uint_as_float((unsigned int) v);
+                ready = ready && (unsigned int) (v >> 32) == tag;
+            }
+            ready = __all_sync(0xFFFFFFFF, ready);
+        } while (!ready && !warm);
+        if (ready) {
+#pragma unroll
+            for (int i = 0; i < experts_per_thread; i++) {
+                dst[i*warp_size + lane] = wt[i];
+            }
+            // every router block read the epoch before it stored its tag
+            if (lane == 0) {
+                *(volatile unsigned int *) epoch = tag;
+            }
+            ggml_cuda_syncwarp();
+        }
+        topk_moe_select<n_experts, false, false>(wt, bias_v, ready ? topk.weights : warm_weights, ready ? topk.ids : warm_ids,
+            ready ? topk.n_used : 1, topk.clamp, topk.scale, config);
+        if (ready) {
+            return;
+        }
+        warm = false;
+    }
+}
+
+// The one-token f32 router of n_experts rows, its one-row sibling and the topk_moe of its logits in one launch (ggml_cuda_topk_moe_fold on Volta).
+// Block n_experts waits for the logits and the last block is the sibling; each router block stores its logit with the tag in one 64-bit store, so no ticket or fence is needed.
+// The rows sum as in mul_mat_vec_f with 256 threads, so the logits are the same.
+template <int n_experts>
+static __global__ void mul_mat_vec_f_router(
+        const float * x_ptr, const float * y_ptr, const float * sib_x, float * dst, float * sib_dst, const int ncols2,
+        const int stride_row, const ggml_cuda_mmvf_topk_args topk) {
+    constexpr int block_size = 256;
+    constexpr int warp_size  = ggml_cuda_get_physical_warp_size();
+    const int tid = threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+    if (blockIdx.x == n_experts) {
+        if (tid < warp_size) {
+            mul_mat_vec_f_router_wait<n_experts>(topk, dst, tid);
+        }
+        return;
+    }
+    const bool sib = blockIdx.x == n_experts + 1;
+    const float2 * GGML_CUDA_RESTRICT x2 = (const float2 *) (sib ? sib_x : x_ptr + blockIdx.x*stride_row);
+    const float2 * GGML_CUDA_RESTRICT y2 = (const float2 *) y_ptr;
+
+    // read early, its latency hides behind the dot product
+    unsigned int tag = 0;
+    if (tid == 0 && !sib) {
+        tag = *(volatile unsigned int *) (topk.slots + GGML_CUDA_TOPK_SLOT_COUNT) + 1;
+    }
+
+    __shared__ float buf_iw[warp_size];
+    if (tid < warp_size) {
+        buf_iw[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    float sumf = 0.0f;
+    for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+        const float2 tmpx = x2[col2];
+        const float2 tmpy = y2[col2];
+        ggml_cuda_mad(sumf, tmpx.x, tmpy.x);
+        ggml_cuda_mad(sumf, tmpx.y, tmpy.y);
+    }
+
+    sumf = warp_reduce_sum<warp_size>(sumf);
+    buf_iw[tid/warp_size] = sumf;
+    __syncthreads();
+    if (tid >= warp_size) {
+        return;
+    }
+    sumf = warp_reduce_sum<warp_size>(buf_iw[tid]);
+    if (tid == 0) {
+        if (sib) {
+            sib_dst[0] = sumf;
+        } else {
+            *(volatile unsigned long long *) (topk.slots + blockIdx.x) = ((unsigned long long) tag << 32) | __float_as_uint(sumf);
+        }
+    }
+}
+
+static void mul_mat_vec_f_router_cuda(const float * x, const float * y, const ggml_cuda_mm_fusion_args_launch & fusion,
+        float * dst, const int64_t ncols, const int64_t stride_row, cudaStream_t stream) {
+    // rows of a multiple of 512 make mul_mat_vec_f take 256 threads
+    GGML_ASSERT(ncols % 512 == 0 && fusion.sib_x != nullptr && fusion.sib_block0 == 0 && !fusion.gate && !fusion.x_bias &&
+        !fusion.gate_bias && !fusion.gdn_beta);
+    const ggml_cuda_kernel_launch_params launch_params = {dim3(fusion.topk.n_expert + 2, 1, 1), dim3(256, 1, 1), 0, stream};
+    const auto launch = [&](auto kernel) {
+        ggml_cuda_kernel_launch(kernel, launch_params, x, y, (const float *) fusion.sib_x, dst, fusion.sib_dst, int(ncols/2),
+            int(stride_row), fusion.topk);
+    };
+    switch (fusion.topk.n_expert) {
+        case 128: launch(mul_mat_vec_f_router<128>); break;
+        case 256: launch(mul_mat_vec_f_router<256>); break;
+        case 512: launch(mul_mat_vec_f_router<512>); break;
+        default: GGML_ABORT("fatal error");
+    }
+}
+
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
@@ -1221,6 +1354,9 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             fusion_local.topk.weights         = fusion->topk_weights;
             fusion_local.topk.ids             = fusion->topk_ids;
             fusion_local.topk.ticket          = fusion->topk_ticket;
+            if (fusion->topk_slots) {
+                fusion_local.topk.slots = fusion->topk_slots;
+            }
             fusion_local.topk.n_expert        = fusion->topk_n_expert;
             fusion_local.topk.n_used          = fusion->topk_n_used;
             fusion_local.topk.clamp           = fusion->topk_clamp;
@@ -1262,6 +1398,10 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     switch (src0->type) {
         case GGML_TYPE_F32: {
             const float * src0_d = (const float *) src0->data;
+            if (fusion && fusion->topk_ids && fusion->topk_slots) {
+                mul_mat_vec_f_router_cuda(src0_d, src1_d, fusion_local, dst_d, ne00, s01, ctx.stream());
+                break;
+            }
             // a sibling row is one more block, sibling rows as many more
             const int64_t nrows = ne01 + (fusion_local.sib_block0 > 0 ? fusion_local.sib_nrows + fusion_local.sib2_nrows + fusion_local.gdn_nrows :
                                           fusion_local.sib_x != nullptr ? 1 : 0);
