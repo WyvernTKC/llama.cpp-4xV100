@@ -41,6 +41,74 @@ static __device__ __forceinline__ void mmvq_prefetch_l2(const void * p) {
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
+// q3_K, 32-lane warps, mul_mat_vec_q_moe (2-8 tokens) only: the loop gives both 16-lane groups of a warp the same trip count,
+//   and the 16 lanes of a block decode its 16 scales together, one each, then fetch the 4 they need with shuffles. Elsewhere
+//   the per-lane 3-int decode of vec_dot_q3_K_q8_1 is faster (V100: 1 token 6-11%, dense 2-4 tokens up to 11%)
+static constexpr __device__ bool mmvq_coop(ggml_type type) {
+    return type == GGML_TYPE_Q3_K && ggml_cuda_get_physical_warp_size() == 32;
+}
+
+struct mmvq_q3_K_scales {
+    int sc[QR3_K];
+};
+
+// all 32 lanes of the warp must call it, with iqs == threadIdx.x % 16 and the same block in each 16 lanes
+static __device__ __forceinline__ mmvq_q3_K_scales mmvq_q3_K_coop_scales(const block_q3_K * bq3_K, const int iqs) {
+    const int sc_low  = (bq3_K->scales[iqs % (QK_K/32)] >> (4*(iqs / (QK_K/32)))) & 0xF;
+    const int sc_high = ((bq3_K->scales[(QK_K/32) + iqs % (QK_K/64)] >> (2*(iqs / (QK_K/64)))) & 3) << 4;
+    const int my_sc   = (sc_low | sc_high) - 32;
+
+    const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1/2);
+    const int src_lane = (threadIdx.x & 16) + scale_offset;
+
+    mmvq_q3_K_scales s;
+#pragma unroll
+    for (int i = 0; i < QR3_K; ++i) {
+        s.sc[i] = __shfl_sync(0xFFFFFFFF, my_sc, src_lane + 2*i);
+    }
+    return s;
+}
+
+// vec_dot_q3_K_q8_1 with the scales of mmvq_q3_K_coop_scales. Not active: returns 0. The scale d3 is zeroed, not the result,
+//   so that the caller's add contracts to the same FFMA as in the plain kernel
+template <bool offset_dp4a>
+static __device__ __forceinline__ float vec_dot_q3_K_q8_1_sc(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs,
+    const mmvq_q3_K_scales & s, const bool active) {
+
+    const block_q3_K * bq3_K = (const block_q3_K *) vbq + kbx;
+
+    const int bq8_offset = QR3_K * (iqs / (QI3_K/2));
+
+    const float d3 = active ? (float) bq3_K->d : 0.0f;
+
+    const int vl = get_int_b2(bq3_K->qs, iqs);
+    const int vh = get_int_b2(bq3_K->hmask, iqs % (QI3_K/2)) >> bq8_offset;
+
+    float sumf = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR3_K; ++i) {
+        const int u  = get_int_b4(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
+        const float d8 = __low2float(bq8_1[bq8_offset + i].ds);
+
+        const int vil = (vl >> (2*i)) & 0x03030303;
+        const int vih = ((vh >> i) << 2) & 0x04040404;
+
+        int sumi;
+        if constexpr (offset_dp4a) {
+            sumi = ggml_cuda_dp4a(vil | vih, u, 0);
+            sumi = ggml_cuda_dp4a(0xFCFCFCFC, u, sumi);
+        } else {
+            sumi = ggml_cuda_dp4a(__vsub4(vil | vih, 0x04040404), u, 0);
+        }
+
+        sumf += d8 * (sumi * s.sc[i]);
+    }
+
+    return d3 * sumf;
+}
+
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
@@ -1496,16 +1564,41 @@ static __global__ void mul_mat_vec_q_moe(
     float tmp[c_rows_per_block] = {0.0f};
     float tmp_gate[c_rows_per_block] = {0.0f};
 
-    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-        const int kby = kbx * (qk/QK8_1);
-        const int kqs = vdr * (threadIdx.x % (qi/vdr));
+    // coop: the group past K reads the last block and adds 0
+    if constexpr (mmvq_coop(type)) {
+        static_assert(qi/vdr == 16, "two 16-lane groups per warp");
+        const int group = threadIdx.x / (qi/vdr);
+        for (int kb = threadIdx.x / (qi/vdr) - group; kb < blocks_per_row_x; kb += blocks_per_iter) {
+            const bool kb_active = kb + group < blocks_per_row_x;
+            const int kbx = kb_active ? kb + group : blocks_per_row_x - 1;
+            const int kby = kbx * (qk/QK8_1);
+            const int kqs = vdr * (threadIdx.x % (qi/vdr));
 
 #pragma unroll
-        for (int i = 0; i < c_rows_per_block; ++i) {
-            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
-            if constexpr (has_fusion) {
-                if (use_gate) {
-                    tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            for (int i = 0; i < c_rows_per_block; ++i) {
+                const int kbx_i = kbx_offset + i*stride_row_x + kbx;
+                const mmvq_q3_K_scales sc = mmvq_q3_K_coop_scales((const block_q3_K *) vx + kbx_i, kqs);
+                tmp[i] += vec_dot_q3_K_q8_1_sc<true>(vx, &y[kby], kbx_i, kqs, sc, kb_active);
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        const mmvq_q3_K_scales sc_gate = mmvq_q3_K_coop_scales((const block_q3_K *) vgate + kbx_i, kqs);
+                        tmp_gate[i] += vec_dot_q3_K_q8_1_sc<true>(vgate, &y[kby], kbx_i, kqs, sc_gate, kb_active);
+                    }
+                }
+            }
+        }
+    } else {
+        for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk/QK8_1);
+            const int kqs = vdr * (threadIdx.x % (qi/vdr));
+
+#pragma unroll
+            for (int i = 0; i < c_rows_per_block; ++i) {
+                tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    }
                 }
             }
         }
