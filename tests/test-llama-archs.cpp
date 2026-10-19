@@ -557,9 +557,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     }
 
     if (arch == LLM_ARCH_BEAM) {
+        // all experts are used, as above: grouped routing cannot use them all (n_group_used < n_expert_groups), test-backend-ops covers it
         ms.add_kv(LLM_KV_EXPERT_COUNT,            uint32_t(8));
-        ms.add_kv(LLM_KV_EXPERT_GROUP_COUNT,      uint32_t(4));
-        ms.add_kv(LLM_KV_EXPERT_GROUP_USED_COUNT, uint32_t(2));
+        ms.add_kv(LLM_KV_EXPERT_USED_COUNT,       uint32_t(8));
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,    2.5f);
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,     true);
     }
