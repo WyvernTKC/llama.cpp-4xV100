@@ -52,7 +52,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_Q8_0:    return vec_dot_q8_0_q8_1;
         case GGML_TYPE_MXFP4:   return vec_dot_mxfp4_q8_1;
         case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
-        case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
+        case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1<true>;
         case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1<true>;
         case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1;
         case GGML_TYPE_Q5_K:    return vec_dot_q5_K_q8_1;
@@ -193,10 +193,12 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda_wide(ggml_type t
 }
 
 // mul_mat_vec_q reuses a thread's weights for its ncols_dst columns: from 2 columns the q3_K / q6_K offsets cost less as one
-//   __vsub4 per int than as a second dp4a per column (V100, 4096 x 14336 at 4 tokens: 3% / 2%)
+//   __vsub4 per int than as a second dp4a per column (V100, 4096 x 14336 at 4 tokens: 3% / 2%), and q2_K keeps its byte
+//   scale loads and 4x m fill
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda_cols(ggml_type type, int ncols_dst) {
     if (ncols_dst > 1) {
         switch (type) {
+            case GGML_TYPE_Q2_K: return vec_dot_q2_K_q8_1<false>;
             case GGML_TYPE_Q3_K: return vec_dot_q3_K_q8_1<false>;
             case GGML_TYPE_Q6_K: return vec_dot_q6_K_q8_1<false>;
             default:             break;

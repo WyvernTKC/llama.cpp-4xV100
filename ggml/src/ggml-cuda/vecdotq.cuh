@@ -418,6 +418,30 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmvq(
     return dm2f.x*sumf_d - dm2f.y*sumf_m;
 }
 
+// the scales of 2*i in the low byte of scales[i/2] >> (16*(i%2)); m times the sum of the q8_1 values instead of a 4x m fill.
+//   The int sums are the same.
+static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmvq(
+    const int & v, const int * __restrict__ u, const int * __restrict__ scales,
+    const half2 & dm2, const float * __restrict__ d8) {
+
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR2_K; ++i) {
+        const int sc = scales[i/2] >> (16*(i%2));
+
+        const int vi = (v >> (2*i)) & 0x03030303;
+
+        sumf_d += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * (sc & 0xF)); // SIMD dot product
+        sumf_m += d8[i] * (ggml_cuda_dp4a(0x01010101, u[i], 0) * ((sc >> 4) & 0xF)); // constant q2_K part times the sum of q8_1 values
+    }
+
+    const float2 dm2f = __half22float2(dm2);
+
+    return dm2f.x*sumf_d - dm2f.y*sumf_m;
+}
+
 // contiguous v/x + u/y values
 template <int ns8>
 static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmq(
@@ -478,24 +502,17 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmq(
 //   The int sums are the same.
 template <bool offset_dp4a>
 static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
-    const int & vl, const int & vh, const int * __restrict__ u, const uint8_t * __restrict__ scales,
-    const int & scale_offset, const float & d3, const float * __restrict__ d8) {
+    const int & vl, const int & vh, const int * __restrict__ u, const int * __restrict__ scales,
+    const float & d3, const float * __restrict__ d8) {
 
     float sumf = 0.0f;
 
 #pragma unroll
     for (int i = 0; i < QR3_K; ++i) {
-        const int isc = scale_offset + 2*i;
-
-        const int isc_low = isc % (QK_K/32);
-        const int sc_shift_low = 4 * (isc / (QK_K/32));
-        const int sc_low  = (scales[isc_low] >> sc_shift_low) & 0xF;
-
-        const int isc_high = isc % (QK_K/64);
-        const int sc_shift_high = 2 * (isc / (QK_K/64));
-        const int sc_high = ((scales[(QK_K/32) + isc_high] >> sc_shift_high) & 3) << 4;
-
-        const int sc = (sc_low | sc_high) - 32;
+        // 4 low bits from scales[0..7], 2 high bits from scales[8..11]
+        const int sc_low  = (scales[i/2] >> (16*(i%2))) & 0x0F;
+        const int sc_high = (scales[2] >> (16*(i%2) + 2*(i/2))) & 0x03;
+        const int sc = (sc_low | (sc_high << 4)) - 32;
 
         const int vil = (vl >> (2*i)) & 0x03030303;
 
@@ -929,15 +946,15 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1_wide(
     return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ_WIDE>(v, u, bq8_0->d, __low2half(bq8_1->ds));
 }
 
+// int_scales: the scales as 2 int loads. Otherwise as byte loads, which mul_mat_vec_q at 2-8 columns keeps: the 2 ints stay
+//   live across its column loop (V100, 2 columns: 80 -> 92 registers; up to +19% at 4 columns and k <= 1280)
+template <bool int_scales = true>
 static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
     const block_q2_K * bq2_K = (const block_q2_K *) vbq + kbx;
 
     const int bq8_offset = QR2_K * (iqs / QI8_1);
-    const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1/2);
-
-    const uint8_t * scales = bq2_K->scales + scale_offset;
 
     const int v = get_int_b4(bq2_K->qs, iqs);
     int    u[QR2_K];
@@ -949,7 +966,19 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
         d8[i] = __low2float(bq8_1[bq8_offset + i].ds);
     }
 
-    return vec_dot_q2_K_q8_1_impl_mmvq(v, u, scales, bq2_K->dm, d8);
+    if constexpr (int_scales) {
+        // the scale of shift i is byte 2*i + (iqs % QI8_1 >= QI8_1/2) of the 8 for this half: bits 16*(i%2) of scales[i/2]
+        const int sc_shift = 8 * ((iqs % QI8_1) / (QI8_1/2));
+        int scales[2];
+        scales[0] = get_int_b4(bq2_K->scales, 2*(iqs / QI8_1) + 0) >> sc_shift;
+        scales[1] = get_int_b4(bq2_K->scales, 2*(iqs / QI8_1) + 1) >> sc_shift;
+
+        return vec_dot_q2_K_q8_1_impl_mmvq(v, u, scales, bq2_K->dm, d8);
+    } else {
+        const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1/2);
+
+        return vec_dot_q2_K_q8_1_impl_mmvq(v, u, bq2_K->scales + scale_offset, bq2_K->dm, d8);
+    }
 }
 
 // 2 ints of the block per thread. iqs is even, so the 2 ints share their scales and y blocks.
@@ -959,9 +988,12 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_wide(
     const block_q2_K * bq2_K = (const block_q2_K *) vbq + kbx;
 
     const int bq8_offset = QR2_K * (iqs / QI8_1);
-    const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1/2);
 
-    const uint8_t * scales = bq2_K->scales + scale_offset;
+    // the scale of shift i is byte 2*i + (iqs % QI8_1 >= QI8_1/2) of the 8 for this half: bits 16*(i%2) of scales[i/2]
+    const int sc_shift = 8 * ((iqs % QI8_1) / (QI8_1/2));
+    int scales[2];
+    scales[0] = get_int_b4(bq2_K->scales, 2*(iqs / QI8_1) + 0) >> sc_shift;
+    scales[1] = get_int_b4(bq2_K->scales, 2*(iqs / QI8_1) + 1) >> sc_shift;
 
     int v[VDR_Q2_K_Q8_1_MMVQ_WIDE];
 #pragma unroll
@@ -975,12 +1007,7 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_wide(
 #pragma unroll
     for (int i = 0; i < QR2_K; ++i) {
         const block_q8_1 * by = bq8_1 + bq8_offset + i;
-        const int sc = scales[2*i];
-
-        // fill int with 4x m
-        int m = sc >> 4;
-        m |= m <<  8;
-        m |= m << 16;
+        const int sc = scales[i/2] >> (16*(i%2));
 
         int sumi_d = 0;
         int sumi_m = 0;
@@ -988,12 +1015,12 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_wide(
         for (int l = 0; l < VDR_Q2_K_Q8_1_MMVQ_WIDE; ++l) {
             const int u = get_int_b4(by->qs, iqs % QI8_1 + l);
             sumi_d = ggml_cuda_dp4a((v[l] >> (2*i)) & 0x03030303, u, sumi_d);
-            sumi_m = ggml_cuda_dp4a(m, u, sumi_m);
+            sumi_m = ggml_cuda_dp4a(0x01010101, u, sumi_m); // sum of q8_1 values
         }
 
         const float d8 = __low2float(by->ds);
         sumf_d += d8 * (sumi_d * (sc & 0xF));
-        sumf_m += d8 * sumi_m;
+        sumf_m += d8 * (sumi_m * ((sc >> 4) & 0xF));
     }
 
     const float2 dm2f = __half22float2(bq2_K->dm);
@@ -1008,7 +1035,15 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
     const block_q3_K * bq3_K = (const block_q3_K *) vbq + kbx;
 
     const int bq8_offset = QR3_K * (iqs / (QI3_K/2));
-    const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1/2);
+
+    // sub-block 8*(iqs/8) + 2*i + (iqs % QI8_1 >= QI8_1/2) for shift i: 4 low bits in nibble iqs/8 of bytes 0..7,
+    //   2 high bits at bit 4*(iqs/8) + 2*(i/2) of bytes 8..11
+    const int sc_shift = 8 * ((iqs % QI8_1) / (QI8_1/2)) + 4 * (iqs / (QI3_K/2));
+    int scales[3];
+#pragma unroll
+    for (int l = 0; l < 3; ++l) {
+        scales[l] = get_int_b2(bq3_K->scales, l) >> sc_shift;
+    }
 
     const float d = bq3_K->d;
 
@@ -1026,7 +1061,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
         d8[i] = __low2float(bq8_1[bq8_offset + i].ds);
     }
 
-    return vec_dot_q3_K_q8_1_impl_mmvq<offset_dp4a>(vl, vh, u, bq3_K->scales, scale_offset, d, d8);
+    return vec_dot_q3_K_q8_1_impl_mmvq<offset_dp4a>(vl, vh, u, scales, d, d8);
 }
 
 static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
