@@ -8080,7 +8080,7 @@ static void test_deepseek_v4_tool_result_ordering() {
     }
 }
 
-// DeepSeek V4.1: extra message keys, reasoning_effort mapping, system-message tools
+// DeepSeek V4.1: extra message keys, "\n\n" between content parts, reasoning_effort mapping, system-message tools
 static void test_deepseek_v4_1_message_fields() {
     LOG_DBG("%s\n", __func__);
 
@@ -8128,6 +8128,9 @@ static void test_deepseek_v4_1_message_fields() {
         assert_equals(std::string("<｜User｜>q<｜action｜>"),
                       render(tmpls, R"([{"role": "user", "content": "q", "task": "action"}])", false));
 
+        assert_equals(std::string("<｜User｜>a\n\n<__media__>\n\nb<｜Assistant｜></think>"),
+                      render(tmpls, R"([{"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "media_marker", "text": "<__media__>"}, {"type": "text", "text": "b"}]}])", true));
+
         assert_contains(render(tmpls, R"([
                 {"role": "user", "content": "q"},
                 {"role": "assistant", "content": "", "tool_calls": [{"type": "function", "namespace": "ns", "function": {"name": "f", "arguments": {"x": 1}}}]}
@@ -8163,6 +8166,13 @@ static void test_deepseek_v4_1_message_fields() {
                 {"role": "assistant", "content": "", "tool_calls": [{"type": "function", "function": {"name": "f", "namespace": "fns", "arguments": {}}}]}
             ])", false),
             "<｜DSML｜ invoke name=\"fns::f\">");
+
+        // content parts are joined with "\n\n", media markers too, as in DeepSeek's encoding.py
+        assert_equals(std::string("<｜User｜>inspect\n\n<__media__><｜Assistant｜></think>"),
+                      render(tmpls, R"([{"role": "user", "content": [{"type": "text", "text": "inspect"}, {"type": "media_marker", "text": "<__media__>"}]}])", true));
+        assert_equals(std::string("<｜User｜><__media__>\n\n<__media__>\n\nWhat changed?\n\nBe brief.<｜Assistant｜></think>"),
+                      render(tmpls, R"([{"role": "user", "content": [{"type": "media_marker", "text": "<__media__>"}, {"type": "media_marker", "text": "<__media__>"},
+                          {"type": "text", "text": "What changed?"}, {"type": "text", "text": "Be brief."}]}])", true));
 
         // the template does not read system-message tools, so they render as top-level tools
         const auto prompt = parse_system_tool_call(tmpls);

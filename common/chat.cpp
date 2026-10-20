@@ -565,8 +565,8 @@ static void restore_extra_keys(json & jmsg, const std::string & extra_json) {
     }
 }
 
-// keep_extra_keys: for templates that read non-OpenAI message keys (DeepSeek V4.1)
-static json render_message_to_json(const std::vector<common_chat_msg> & msgs, const jinja::caps & c, bool keep_extra_keys = false) {
+// deepseek_v4_1: keep non-OpenAI message keys, and join all content parts with "\n\n" (media markers too) like the V4.1 encoding
+static json render_message_to_json(const std::vector<common_chat_msg> & msgs, const jinja::caps & c, bool deepseek_v4_1 = false) {
     if (!c.supports_string_content && !c.supports_typed_content) {
         LOG_WRN("%s: Neither string content nor typed content is supported by the template. This is unexpected and may lead to issues.\n", __func__);
     }
@@ -574,8 +574,20 @@ static json render_message_to_json(const std::vector<common_chat_msg> & msgs, co
     json messages = json::array();
     for (const auto & msg : msgs) {
         json jmsg = msg.to_json_oaicompat(/* concat_typed_text= */ false);
-        if (keep_extra_keys && !msg.extra_json.empty()) {
-            restore_extra_keys(jmsg, msg.extra_json);
+        if (deepseek_v4_1) {
+            if (!msg.content_parts.empty()) {
+                std::string text;
+                for (size_t i = 0; i < msg.content_parts.size(); i++) {
+                    if (i > 0) {
+                        text += "\n\n";
+                    }
+                    text += msg.content_parts[i].text;
+                }
+                jmsg["content"] = text;
+            }
+            if (!msg.extra_json.empty()) {
+                restore_extra_keys(jmsg, msg.extra_json);
+            }
         }
         messages.push_back(std::move(jmsg));
     }
