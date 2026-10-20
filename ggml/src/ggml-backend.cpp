@@ -199,7 +199,7 @@ size_t ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const s
     // get_alloc_size is optional, defaults to ggml_nbytes
     if (buft->iface.get_alloc_size) {
         size_t size = buft->iface.get_alloc_size(buft, tensor);
-        assert(size >= ggml_nbytes(tensor));
+        assert(size >= ggml_nbytes(tensor) || ggml_backend_buft_is_meta(buft)); // a meta buffer holds one slice per device
 
         // [TAG_ALLOC_SIZE_EXPAND]
         // if you hit this assert, update ggml_backend_op_alloc_size_may_expand() accordingly

@@ -427,8 +427,35 @@ ggml_backend_dev_t ggml_backend_meta_device(
 // meta backend buffer type
 //
 
+// A leaf of a compute graph (a graph input, or an input copy the scheduler made of a weight in host memory) gets its
+//   split from the model by name, type and shape, which is all the model reads of it.
+struct ggml_backend_meta_leaf_key {
+    std::string name;
+    ggml_type   type;
+    int64_t     ne[GGML_MAX_DIMS];
+
+    bool operator==(const ggml_backend_meta_leaf_key & other) const {
+        return type == other.type && memcmp(ne, other.ne, sizeof(ne)) == 0 && name == other.name;
+    }
+};
+
+struct ggml_backend_meta_leaf_key_hash {
+    size_t operator()(const ggml_backend_meta_leaf_key & k) const {
+        size_t h = std::hash<std::string>()(k.name) ^ (size_t) k.type;
+        for (int i = 0; i < GGML_MAX_DIMS; i++) {
+            h = h*31 + std::hash<int64_t>()(k.ne[i]);
+        }
+        return h;
+    }
+};
+
 struct ggml_backend_meta_buffer_type_context {
     std::vector<ggml_backend_buffer_type_t> simple_bufts;
+
+    // The splits get_alloc_size sized leaves by. Cleared when a buffer of this type is freed: a model loaded later
+    //   can get the same meta device, and so this cache, with other splits under the same names.
+    std::mutex leaf_ss_mutex;
+    std::unordered_map<ggml_backend_meta_leaf_key, ggml_backend_meta_split_state, ggml_backend_meta_leaf_key_hash> leaf_ss_cache;
 
     std::string name;
 
@@ -491,8 +518,84 @@ static size_t ggml_backend_meta_buffer_type_get_max_size(ggml_backend_buffer_typ
     return max_size;
 }
 
+// The shape of device j's slice of a tensor split along an axis: its share of the split dim, and the strides of the dims
+//   that enclose the split dim scaled to match.
+static void ggml_backend_meta_slice_shape(const ggml_tensor * tensor, const ggml_backend_meta_split_state & split_state,
+        size_t n_bufs, size_t j, int64_t * ne, size_t * nb) {
+    const int split_dim = split_state.axis;
+    GGML_ASSERT(split_dim >= 0 && split_dim < GGML_MAX_DIMS);
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        ne[i] = tensor->ne[i];
+        nb[i] = tensor->nb[i];
+    }
+    ne[split_dim] = 0;
+    for (size_t s = 0; s < split_state.n_segments; s++) {
+        ne[split_dim] += split_state.ne[s*n_bufs + j] * split_state.nr[s];
+    }
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        // the strides of the dims that enclose the split dim scale with it. A dim directly above the
+        //   split dim has the same stride when the split dim has size 1, so comparing strides alone
+        //   would miss it and leave the slice claiming the size of the whole tensor.
+        const bool encloses_split_dim = tensor->nb[i] > tensor->nb[split_dim] ||
+            (i > split_dim && tensor->nb[i] == tensor->nb[split_dim]);
+        if (encloses_split_dim) {
+            nb[i] = tensor->nb[i] * ne[split_dim]/tensor->ne[split_dim];
+        }
+    }
+}
+
+// The split of a leaf as ggml_backend_meta_get_split_state finds it once the leaf is in a buffer of this type, where the
+//   model gives it by name. False for any other tensor: its split comes from the graph, which a buffer type cannot see.
+static bool ggml_backend_meta_leaf_split_state(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor,
+        ggml_backend_meta_split_state & split_state) {
+    if (tensor->op != GGML_OP_NONE || tensor->view_src != nullptr || ggml_nelements(tensor) == 0 ||
+            (tensor->flags & GGML_TENSOR_FLAG_MIRRORED)) {
+        return false;
+    }
+    ggml_backend_meta_buffer_type_context * buft_ctx = (ggml_backend_meta_buffer_type_context *) buft->context;
+    ggml_backend_meta_leaf_key key;
+    key.name = tensor->name;
+    key.type = tensor->type;
+    memcpy(key.ne, tensor->ne, sizeof(key.ne));
+
+    std::lock_guard<std::mutex> lock(buft_ctx->leaf_ss_mutex);
+    auto it = buft_ctx->leaf_ss_cache.find(key);
+    if (it == buft_ctx->leaf_ss_cache.end()) {
+        const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) buft->device->context;
+        it = buft_ctx->leaf_ss_cache.emplace(std::move(key), dev_ctx->get_split_state(tensor, dev_ctx->get_split_state_ud)).first;
+    }
+    split_state = it->second;
+    return true;
+}
+
 static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
+
+    // Every device puts its slice at the tensor's offset, so a leaf, whose split is known before it has a buffer, needs
+    //   only its largest slice. Sized whole, an input copy of a host expert weight left 3/4 of it unused on every device.
+    //   GGML_META_LEAF_FULL_SIZE=1 sizes leaves whole again.
+    static const bool leaf_full_size = getenv("GGML_META_LEAF_FULL_SIZE") != nullptr;
+    ggml_backend_meta_split_state split_state;
+    if (!leaf_full_size && ggml_backend_meta_leaf_split_state(buft, tensor, split_state) &&
+            split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
+        int64_t ne_sum = 0;
+        for (size_t s = 0; s < split_state.n_segments; s++) {
+            for (size_t j = 0; j < n_simple_bufts; j++) {
+                ne_sum += split_state.ne[s*n_simple_bufts + j] * split_state.nr[s];
+            }
+        }
+        if (ne_sum == tensor->ne[split_state.axis]) {
+            size_t max_alloc_size = 0;
+            for (size_t j = 0; j < n_simple_bufts; j++) {
+                ggml_tensor slice = *tensor;
+                ggml_backend_meta_slice_shape(tensor, split_state, n_simple_bufts, j, slice.ne, slice.nb);
+                max_alloc_size = std::max(max_alloc_size,
+                    ggml_backend_buft_get_alloc_size(ggml_backend_meta_buft_simple_buft(buft, j), &slice));
+            }
+            return max_alloc_size;
+        }
+    }
+
     size_t max_alloc_size = 0;
     for (size_t i = 0; i < n_simple_bufts; i++) {
         const size_t alloc_size = ggml_backend_buft_get_alloc_size(ggml_backend_meta_buft_simple_buft(buft, i), tensor);
@@ -701,25 +804,8 @@ struct ggml_backend_meta_buffer_context {
     //   its rules (~60 regexes), and split_state_cache above starts over whenever a new graph puts another tensor at a
     //   cached address: a Qwen3.8-Flash prefill asked again for every input copy of every ubatch, ~20 ms of host time at
     //   each ubatch boundary with the GPUs drained. GGML_META_LEAF_SS_CACHE=0 asks every time.
-    struct leaf_ss_key {
-        std::string name;
-        ggml_type   type;
-        int64_t     ne[GGML_MAX_DIMS];
-
-        bool operator==(const leaf_ss_key & other) const {
-            return type == other.type && memcmp(ne, other.ne, sizeof(ne)) == 0 && name == other.name;
-        }
-    };
-    struct leaf_ss_key_hash {
-        size_t operator()(const leaf_ss_key & k) const {
-            size_t h = std::hash<std::string>()(k.name) ^ (size_t) k.type;
-            for (int i = 0; i < GGML_MAX_DIMS; i++) {
-                h = h*31 + std::hash<int64_t>()(k.ne[i]);
-            }
-            return h;
-        }
-    };
-    std::unordered_map<leaf_ss_key, ggml_backend_meta_split_state, leaf_ss_key_hash> leaf_ss_cache;
+    using leaf_ss_key = ggml_backend_meta_leaf_key;
+    std::unordered_map<leaf_ss_key, ggml_backend_meta_split_state, ggml_backend_meta_leaf_key_hash> leaf_ss_cache;
 
     // pinned host memory for large mirrored copies, see ggml_backend_meta_buffer_stage
     ggml_backend_buffer_ptr stage;
@@ -757,6 +843,10 @@ static void ggml_backend_meta_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
     delete buf_ctx;
+
+    ggml_backend_meta_buffer_type_context * buft_ctx = (ggml_backend_meta_buffer_type_context *) buffer->buft->context;
+    std::lock_guard<std::mutex> lock(buft_ctx->leaf_ss_mutex);
+    buft_ctx->leaf_ss_cache.clear();
 }
 
 static size_t ggml_backend_meta_buffer_n_bufs(ggml_backend_buffer_t meta_buf) {
@@ -2584,20 +2674,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         if (split_dim >= 0 && split_dim < GGML_MAX_DIMS) {
             // TODO: the following assert fails for llama-parallel even though the results are correct:
             // GGML_ASSERT(ggml_is_contiguously_allocated(tensor));
-            ne[split_dim] = 0;
-            for (size_t s = 0; s < split_state.n_segments; s++) {
-                ne[split_dim] += split_state.ne[s*n_simple_bufs + j] * split_state.nr[s];
-            }
-            for (int i = 0; i < GGML_MAX_DIMS; i++) {
-                // the strides of the dims that enclose the split dim scale with it. A dim directly above the
-                //   split dim has the same stride when the split dim has size 1, so comparing strides alone
-                //   would miss it and leave the slice claiming the size of the whole tensor.
-                const bool encloses_split_dim = tensor->nb[i] > tensor->nb[split_dim] ||
-                    (i > split_dim && tensor->nb[i] == tensor->nb[split_dim]);
-                if (encloses_split_dim) {
-                    nb[i] = tensor->nb[i] * ne[split_dim]/tensor->ne[split_dim];
-                }
-            }
+            ggml_backend_meta_slice_shape(tensor, split_state, n_simple_bufs, j, ne, nb);
         }
 
         ggml_tensor * t_ij = ggml_new_tensor(simple_ctx, tensor->type, GGML_MAX_DIMS, ne);

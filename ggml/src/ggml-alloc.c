@@ -601,6 +601,13 @@ static size_t ggml_gallocr_alloc_size(ggml_backend_buffer_type_t buft, const str
     return MAX(ggml_backend_buft_get_alloc_size(buft, t), 1);
 }
 
+// a buffer type can size two tensors of the same layout differently: the meta backend sizes a graph input by its largest
+// per-device slice, a node by the whole tensor
+static bool ggml_gallocr_fits(ggml_gallocr_t galloc, struct ggml_tensor * node, struct ggml_tensor * parent) {
+    ggml_backend_buffer_type_t buft = galloc->bufts[ggml_gallocr_hash_get(galloc, parent)->buffer_id];
+    return ggml_gallocr_alloc_size(buft, node) <= ggml_gallocr_alloc_size(buft, parent);
+}
+
 // free the extra space at the end if the new tensor is smaller
 static void ggml_gallocr_free_extra_space(ggml_gallocr_t galloc, struct ggml_tensor * node, struct ggml_tensor * parent) {
     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
@@ -663,7 +670,8 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                     if (ggml_impl_is_view(parent)) {
                         struct ggml_tensor * view_src = parent->view_src;
                         struct hash_node * view_src_hn = ggml_gallocr_hash_get(galloc, view_src);
-                        if (view_src_hn->n_views == 1 && view_src_hn->n_children == 0 && view_src->data == parent->data) {
+                        if (view_src_hn->n_views == 1 && view_src_hn->n_children == 0 && view_src->data == parent->data &&
+                                ggml_gallocr_fits(galloc, node, view_src)) {
                             AT_PRINTF("reusing view parent %s (%s) for %s\n", parent->name, view_src->name, node->name);
                             assert(view_src_hn->addr.chunk == p_hn->addr.chunk && view_src_hn->addr.offset == p_hn->addr.offset);
                             hn->buffer_id = p_hn->buffer_id;
@@ -673,7 +681,7 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                             ggml_gallocr_free_extra_space(galloc, node, view_src);
                             return;
                         }
-                    } else {
+                    } else if (ggml_gallocr_fits(galloc, node, parent)) {
                         AT_PRINTF("reusing parent %s for %s\n", parent->name, node->name);
                         hn->buffer_id = p_hn->buffer_id;
                         hn->addr = p_hn->addr;
