@@ -2133,6 +2133,18 @@ static void test_object_methods(testing & t) {
         "True True"
     );
 
+    test_template(t, "object key named like a filter",
+        "{% set ns = namespace(list=none) %}{{ ns.list is none }}{% set ns.list = [1, 2] %}{% if ns.list %} {{ ns.list|length }}{% endif %}",
+        json::object(),
+        "True 2"
+    );
+
+    test_template(t, "missing object key named like a filter",
+        "{{ obj.length is undefined }} {{ obj['list'] is undefined }} {{ obj.items is defined }} {{ obj['get'] is defined }}",
+        {{"obj", {{"a", "b"}}}},
+        "True True True True"
+    );
+
     test_template(t, "expression as object key",
         "{% set d = {'ab': 123} %}{{ d['a' + 'b'] == 123 }}",
         json::object(),

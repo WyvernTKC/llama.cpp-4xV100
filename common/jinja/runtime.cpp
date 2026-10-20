@@ -321,6 +321,12 @@ static value try_builtin_func(context & ctx, const std::string & name, value & i
     throw std::runtime_error("Unknown (built-in) filter '" + name + "' for type " + input->type());
 }
 
+// jinja2 looks up obj.prop and obj['prop'] as an attribute too, and the only attributes of a dict are its methods:
+// the other object built-ins (list, length, tojson, ...) are filters, so they never stand in for a key
+static bool is_dict_method(const std::string & name) {
+    return name == "get" || name == "items" || name == "keys" || name == "values";
+}
+
 static value apply_filter(context & ctx, const statement_ptr & filter, value input) {
     JJ_DEBUG("Applying filter to %s", input->type().c_str());
 
@@ -894,10 +900,13 @@ value member_expression::execute_impl(context & ctx) const {
         // then obj.prop returns the built-in function, not the property value.
         // while obj['prop'] returns the property value.
         // example: {"obj": {"items": 123}} -> obj.items is the built-in function, obj['items'] is 123
+        // for an object that only holds for the dict methods: {"obj": {"list": 123}} -> obj.list is 123
 
-        value val = try_builtin_func(ctx, prop, object, true);
-        if (!is_val<value_undefined>(val)) {
-            return val;
+        if (!is_val<value_object>(object) || is_dict_method(prop)) {
+            value val = try_builtin_func(ctx, prop, object, true);
+            if (!is_val<value_undefined>(val)) {
+                return val;
+            }
         }
         // else, fallthrough to normal property access below
     }
@@ -919,7 +928,7 @@ value member_expression::execute_impl(context & ctx) const {
     } else if (is_val<value_object>(object)) {
         auto key = property->as_string().str();
         val = object->at(property, val);
-        if (is_val<value_undefined>(val)) {
+        if (is_val<value_undefined>(val) && is_dict_method(key)) {
             val = try_builtin_func(ctx, key, object, true);
         }
         JJ_DEBUG("Accessed property '%s' value, got type: %s", key.c_str(), val->type().c_str());
