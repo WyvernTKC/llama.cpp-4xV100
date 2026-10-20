@@ -486,6 +486,7 @@ private:
     std::array<graph_slot, 8> gf_slots_noout;
     uint32_t gf_slots_max = 0; // the token counts up to this one take a slot
     uint32_t gf_slots_noout_max = 0;
+    bool     gf_slots_host_experts = false; // some expert weights are in host memory
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

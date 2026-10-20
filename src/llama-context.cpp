@@ -793,6 +793,13 @@ void llama_context::sched_reserve() {
         // LLAMA_GRAPH_SLOTS_NOOUT=0: the prompt chunks without an output share the main graph
         const char * env_noout = getenv("LLAMA_GRAPH_SLOTS_NOOUT");
         gf_slots_noout_max = env_noout == nullptr || atoi(env_noout) != 0 ? gf_slots_max : 0;
+
+        gf_slots_host_experts = false;
+        for (const auto & layer : model.layers) {
+            for (const ggml_tensor * w : { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps, layer.ffn_gate_up_exps }) {
+                gf_slots_host_experts = gf_slots_host_experts || (w && w->buffer && ggml_backend_buffer_is_host(w->buffer));
+            }
+        }
     }
 
     sched_new(max_nodes, cparams.pipeline_parallel);
@@ -2767,6 +2774,15 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 llama_context::graph_slot * llama_context::get_gf_slot(const llama_ubatch & ubatch) {
     const bool noout = n_outputs == 0;
     if (ubatch.n_tokens == 0 || ubatch.n_tokens > (noout ? gf_slots_noout_max : gf_slots_max)) {
+        return nullptr;
+    }
+    // a ubatch the expert cache cannot gather puts a full-size copy of a host expert weight in its scheduler's compute
+    //   buffer on every device (1.7 GB for DeepSeek-V4.1 IQ3_XXS); the main graph has that copy already, a slot would add
+    //   one more. LLAMA_GRAPH_SLOTS_WIDE=1 gives these ubatches a slot again
+    static const bool slots_wide = getenv("LLAMA_GRAPH_SLOTS_WIDE") != nullptr;
+    const int expert_cache_cap = ggml_backend_expert_cache_cap();
+    if (!slots_wide && gf_slots_host_experts && expert_cache_cap > 0 &&
+            (int64_t) ubatch.n_tokens*model.hparams.n_expert_used() > expert_cache_cap) {
         return nullptr;
     }
     auto & slot = (noout ? gf_slots_noout : gf_slots)[ubatch.n_tokens - 1];
