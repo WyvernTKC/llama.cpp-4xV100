@@ -1104,6 +1104,47 @@ class DeepseekV4FlashVisionModel(MmprojModel):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
+@ModelBase.register("DeepseekV41ForCausalLM")
+@ModelBase.example("deepseek-ai/DeepSeek-V4.1-Flash-1017")
+class DeepseekV41VisionModel(DeepseekV4FlashVisionModel):
+    """V4.1 vision tower (projector deepseek41v): same ViT + 3x3 aligner as V4-Flash-Vision, no image_pad.
+    The config is HF-style (vision_config). ref: inference/vision.py, inference/image_processor.py"""
+
+    def get_vision_config(self) -> dict[str, Any] | None:
+        vc = self.global_config.get("vision_config")
+        if not vc or vc.get("num_hidden_layers", 0) == 0:
+            raise ValueError("DeepseekV41VisionModel requires vision_config.num_hidden_layers > 0")
+        return {
+            "num_hidden_layers":   vc["num_hidden_layers"],
+            "hidden_size":         vc["hidden_size"],
+            "num_attention_heads": vc["num_attention_heads"],
+            "intermediate_size":   vc["intermediate_size"],
+            "patch_size":          vc["patch_size"],
+            # dynamic resolution; only used for compat / warmup
+            "image_size":          vc["patch_size"] * vc["downsample_ratio"] * 16,
+            "rope_theta":          vc.get("rope_theta", 10000.0),
+            "downsample_ratio":    vc["downsample_ratio"],
+            "min_pixels":          vc["min_pixels"],
+            "max_image_tokens":    vc["max_image_tokens"],
+            "max_wh_ratio":        vc.get("max_wh_ratio"),
+        }
+
+    def set_gguf_parameters(self):
+        assert self.hparams_vision is not None
+        # skip the V4 parent: it writes deepseek4v and asserts the V4 token limits
+        super(DeepseekV4FlashVisionModel, self).set_gguf_parameters()
+        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.DEEPSEEK41V)
+        # pytorch default eps (vision.py), not the LLM rms_norm_eps (1e-20)
+        self.gguf_writer.add_vision_attention_layernorm_eps(1e-6)
+        self.gguf_writer.add_vision_use_silu(True)
+        self.gguf_writer.add_vision_projector_scale_factor(self.hparams_vision["downsample_ratio"])
+        self.gguf_writer.add_vision_min_pixels(self.hparams_vision["min_pixels"])
+        # these are the clip.cpp defaults for deepseek41v; add GGUF keys if a later model differs
+        assert self.hparams_vision["max_image_tokens"] == 1024, self.hparams_vision["max_image_tokens"]
+        assert self.hparams_vision["max_wh_ratio"] is None, self.hparams_vision["max_wh_ratio"]
+        assert self.hparams_vision["rope_theta"] == 10000, self.hparams_vision["rope_theta"]
+
+
 def _v41_is_prime(n: int) -> bool:
     """Trial division, deliberately not sympy.
 
