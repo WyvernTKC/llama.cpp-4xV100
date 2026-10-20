@@ -1,4 +1,12 @@
 #include "parsers.h"
+#include "log.h"
+
+// DeepSeek V4.1 format detection: DSML tag names have a leading space, e.g. <｜DSML｜ calls>.
+// Some templates have the tag as a literal, others build it as '<' + dsml_token + ' calls>'.
+bool is_deepseek_v4_1_template(const std::string & src) {
+    return src.find("DSML") != std::string::npos &&
+           src.find(" calls>") != std::string::npos;
+}
 
 // The DeepSeek V4 reference implementation renders consecutive tool results into a single
 // user block, ordered by the tool call order of the preceding assistant message (matched
@@ -74,14 +82,37 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
     // instead of "function_calls", renders tool results in tool call order and its
     // non-thinking generation prompt ends with a bare </think> instead of an empty
     // <think></think> pair.
-    const bool is_v4 = tmpl.source().find("function_calls") == std::string::npos;
+    const bool is_v4  = tmpl.source().find("function_calls") == std::string::npos;
+    const bool is_v41 = is_v4 && is_deepseek_v4_1_template(tmpl.source());
 
     std::optional<json> adjusted_messages;
     if (is_v4) {
         adjusted_messages = deepseek_v4_sort_tool_results(inputs.messages);
     }
 
-    auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+    // V4.1 can declare tools on a system message instead of top-level "tools": parse calls to those too.
+    json tools = inputs.tools;
+    std::optional<json> tools_override;
+    if (is_v41 && !(tools.is_array() && !tools.empty()) && inputs.messages.is_array()) {
+        for (const auto & msg : inputs.messages) {
+            if (msg.value("role", "") == "system" && msg.contains("tools") && msg.at("tools").is_array()) {
+                if (!tools.is_array()) {
+                    tools = json::array();
+                }
+                for (const auto & tool : msg.at("tools")) {
+                    tools.push_back(tool);
+                }
+            }
+        }
+        // a template that reads only top-level tools would not show these to the model
+        const auto & src = tmpl.source();
+        if (tools.is_array() && !tools.empty() &&
+            src.find("['tools']") == std::string::npos && src.find(".tools") == std::string::npos) {
+            tools_override = tools;
+        }
+    }
+
+    auto has_tools           = tools.is_array() && !tools.empty();
     auto has_response_format = !inputs.json_schema.is_null() && inputs.json_schema.is_object();
     auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
     auto include_grammar     = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
@@ -89,6 +120,27 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
     std::optional<json> additional_context;
     if (is_v4 && has_response_format) {
         additional_context = json{ { "response_format", inputs.json_schema } };
+    }
+    // V4.1 raises on anything but low/high/max or 1-100: map minimal -> low, xhigh -> max, medium -> default
+    if (is_v41 && inputs.extra_context.is_object() && inputs.extra_context.contains("reasoning_effort") &&
+        inputs.extra_context.at("reasoning_effort").is_string()) {
+        const std::string effort = inputs.extra_context.at("reasoning_effort").get<std::string>();
+        json mapped;
+        if (effort == "minimal") {
+            mapped = "low";
+        } else if (effort == "xhigh") {
+            mapped = "max";
+        } else if (effort == "medium") {
+            mapped = nullptr;
+        }
+        if (effort == "minimal" || effort == "xhigh" || effort == "medium") {
+            LOG_DBG("%s: DeepSeek V4.1 reasoning_effort '%s' -> %s\n", __func__, effort.c_str(),
+                    mapped.is_null() ? "unset (template default)" : mapped.get<std::string>().c_str());
+            if (!additional_context.has_value()) {
+                additional_context = json::object();
+            }
+            (*additional_context)["reasoning_effort"] = mapped;
+        }
     }
 
     const std::string DSML         = "｜DSML｜";
@@ -151,9 +203,9 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
     };
 
     data.prompt = common_chat_template_direct_apply_impl(
-        tmpl, inputs, adjusted_messages, std::nullopt, additional_context);
+        tmpl, inputs, adjusted_messages, tools_override, additional_context);
     data.generation_prompt = common_chat_template_generation_prompt_impl(
-        tmpl, inputs, adjusted_messages, std::nullopt, additional_context);
+        tmpl, inputs, adjusted_messages, tools_override, additional_context);
     data.format             = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.supports_thinking  = true;
     data.thinking_start_tag = THINK_START;
@@ -203,7 +255,7 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
         // build tool call section first since we might need it in reasoning
         auto tool_choice = p.choice();
         if (has_tool_calls) {
-            foreach_function(inputs.tools, [&](size_t tool_index, const json & tool) {
+            foreach_function(tools, [&](size_t tool_index, const json & tool) {
                 const auto & function = tool.at("function");
                 std::string  name     = function.at("name");
 
@@ -274,7 +326,10 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
         }
 
         if (extract_reasoning && inputs.enable_thinking) {
-            reasoning = p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
+            // V4.1 renders a continuation without reasoning as "<｜Assistant｜></think>" even in thinking mode,
+            // so consume the bare THINK_END too or it leaks into the content
+            reasoning = is_v41 ? p.optional((THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END) | p.literal(THINK_END))
+                               : p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
             reasoning_with_tc = THINK_START +
                 p.reasoning(p.until_one_of(REASONING_STOPS)) +
                 p.space() + obligatory_tool_calls;

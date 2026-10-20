@@ -41,6 +41,8 @@ std::string common_chat_template_generation_prompt_impl(
 
 bool is_lfm2_template(const std::string & src);
 
+bool is_deepseek_v4_1_template(const std::string & src);
+
 namespace workaround {
 
 void convert_tool_responses_gemma4(json & messages);
