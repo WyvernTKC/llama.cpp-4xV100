@@ -165,10 +165,6 @@ static int ggml_cuda_env_int(const char * name, int default_value) {
     return env != nullptr ? std::atoi(env) : default_value;
 }
 
-static bool ggml_cuda_env_set(const char * name) {
-    return getenv(name) != nullptr;
-}
-
 static bool ggml_cuda_unified_memory_enabled() {
     static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_ENABLE_UNIFIED_MEMORY");
     return enabled;
@@ -189,8 +185,9 @@ static bool ggml_cuda_fusion_disabled() {
     return disabled;
 }
 
+// peer access between every pair of devices at init: on by default, GGML_CUDA_P2P=0 turns it off
 static bool ggml_cuda_p2p_enabled() {
-    static const bool enabled = ggml_cuda_env_set("GGML_CUDA_P2P");
+    static const bool enabled = ggml_cuda_env_int("GGML_CUDA_P2P", 1) != 0;
     return enabled;
 }
 
@@ -1586,12 +1583,14 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
 
     const char * env = getenv("GGML_CUDA_ALLREDUCE");
     if (!env) {
-        // Platform default: Linux uses NCCL, otherwise (generally Windows) internal
-#if defined(__linux__)
+        // Default: NCCL where it is compiled in, on every platform (its init falls back to internal itself). The internal
+        //   pipeline takes 2 devices only, so with more it ends on the meta-backend butterfly: on Windows at 4 GPUs that
+        //   cost prefill 37-53% (Qwen3.8-27B F16, gemma-4-31B, Muse-Glimmer).
+#if defined(GGML_USE_NCCL)
         ggml_backend_cuda_comm_init_nccl(ret);
 #else
         ggml_backend_cuda_comm_init_internal(ret);
-#endif // defined(__linux__)
+#endif // defined(GGML_USE_NCCL)
     } else {
         std::string env_str(env);
         if (env_str == "nccl") {
