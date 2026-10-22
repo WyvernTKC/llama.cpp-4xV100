@@ -233,6 +233,26 @@ static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
 }
 
 
+// LLAMA_GLM5_GATHER_K=0 keeps the cache-wide selection mask for decode, LLAMA_GLM5_GATHER_K_MIN sets the smallest n_kv that gathers
+static uint32_t glm5_gather_k_min() {
+    static const uint32_t n_kv_min = [] {
+        const char * on = getenv("LLAMA_GLM5_GATHER_K");
+        if (on != nullptr && atoi(on) == 0) {
+            return UINT32_MAX;
+        }
+        const char * s = getenv("LLAMA_GLM5_GATHER_K_MIN");
+        return s != nullptr ? (uint32_t) atoi(s) : 0u;
+    }();
+    return n_kv_min;
+}
+
+// A single decode token attends over its selected cells gathered into a short K, instead of the whole cache under a
+//   scattered mask. Only when every selected pool is visible: the pools then need no mask and no ordering.
+static bool glm5_gather_k(const llama_memory_hybrid_idx_context * mctx, const llama_ubatch & ubatch, bool flash_attn, uint32_t n_top) {
+    return flash_attn && ubatch.n_tokens == 1 && mctx->get_idx()->get_n_kv() >= glm5_gather_k_min() &&
+        mctx->get_n_kpool_visible(ubatch, 0) >= n_top;
+}
+
 // K-pool indexer inputs
 class llama_model_glm5_next::llm_graph_input_kpool : public llm_graph_input_i {
 public:
@@ -242,6 +262,31 @@ public:
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
         mctx->set_input_kpool(pool_cells, pool_idxs, pool_mask, tail_idxs, sel_mask, new_pool_idxs, new_pool_rep, ubatch);
+
+        if (gather) {
+            GGML_ASSERT(ubatch->n_tokens == 1 && mctx->get_n_kpool_visible(*ubatch, 0) >= n_top);
+            GGML_ASSERT(ggml_backend_buffer_is_host(g_mask->buffer));
+
+            // the tail row continues with the padding: tail cells past the sequence hold the n_kv sentinel, they and
+            //   the padding read cell 0 under -inf
+            const int32_t  sentinel = (int32_t) mctx->get_idx()->get_n_kv();
+            const uint32_t n_pool_g = kpool*n_top;
+            const uint32_t n_tail   = select_tail ? kpool - 1 : 0;
+            GGML_ASSERT(n_sel_g == n_pool_g || tail_idxs->ne[0] == (int64_t) (n_sel_g - n_pool_g));
+
+            int32_t     * tidx = (int32_t *) tail_idxs->data;
+            ggml_fp16_t * gm   = (ggml_fp16_t *) g_mask->data;
+
+            const ggml_fp16_t keep = ggml_fp32_to_fp16(0.0f);
+            const ggml_fp16_t drop = ggml_fp32_to_fp16(-INFINITY);
+
+            std::fill(gm, gm + n_pool_g, keep);
+            for (uint32_t k = 0; k < n_sel_g - n_pool_g; ++k) {
+                const bool real = k < n_tail && tidx[k] != sentinel;
+                tidx[k]          = real ? tidx[k] : 0;
+                gm[n_pool_g + k] = real ? keep : drop;
+            }
+        }
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -261,6 +306,7 @@ public:
         // The scatter mask shape follows n_kv.
         res &= n_kv              == idx->get_n_kv();
         res &= n_new             == std::max(mctx->get_n_kpool_new(), 1u);
+        res &= gather            == glm5_gather_k(mctx, params.ubatch, flash_attn, n_top);
 
         return res;
     }
@@ -269,9 +315,10 @@ public:
     ggml_tensor * pool_cells    = nullptr; // I32     [n_pool]         cell caching each pool's pooled key
     ggml_tensor * pool_idxs     = nullptr; // I32     [kpool, n_pool]  member cells per pool, n_kv sentinel for the padded pools
     ggml_tensor * pool_mask     = nullptr; // F32/F16 [n_pool, n_tokens]
-    ggml_tensor * tail_idxs     = nullptr; // I32     [kpool - 1, n_tokens]
+    ggml_tensor * tail_idxs     = nullptr; // I32     [kpool - 1, n_tokens], gathering: [n_sel_g - kpool*n_top, 1] with the padding
     ggml_tensor * sel_mask      = nullptr; // F32     [n_sel, 1, 1, n_tokens] 0 for live selection slots, -inf for dead ones
     ggml_tensor * sel_mask_2d   = nullptr; // F32     [n_sel, n_tokens] view of sel_mask, shared by the layers
+    ggml_tensor * g_mask        = nullptr; // F16     [n_sel_g, 1, 1, 1] gathering: -inf for the missing tail cells and the padding
     // n_new is never below 1, see build_inp_kpool
     ggml_tensor * new_pool_idxs = nullptr; // I32     [kpool, n_new]   members of the pools completed this ubatch
     ggml_tensor * new_pool_flat = nullptr; // I32     [kpool*n_new]    view of new_pool_idxs, shared by the layers
@@ -282,6 +329,13 @@ public:
     uint32_t n_new = 0;
     uint32_t n_sel = 0;
     uint32_t n_kv  = 0;
+
+    // decode with a gathered K, see glm5_gather_k
+    bool     gather      = false;
+    bool     flash_attn  = false;
+    bool     select_tail = false;
+    uint32_t n_top       = 0; // pools per token in the selection
+    uint32_t n_sel_g     = 0; // gathered cells, padded to the FA KV stride
 };
 
 llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb) {
@@ -304,16 +358,13 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
     inp->pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
     inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
     inp->pool_mask  = ggml_new_tensor_2d(ctx0, type_mask, n_pool, n_tokens);
-    inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
     ggml_set_input(inp->pool_cells);
     ggml_set_input(inp->pool_idxs);
     ggml_set_input(inp->pool_mask);
-    ggml_set_input(inp->tail_idxs);
 
     ggml_build_forward_expand(gf, inp->pool_cells);
     ggml_build_forward_expand(gf, inp->pool_idxs);
     ggml_build_forward_expand(gf, inp->pool_mask);
-    ggml_build_forward_expand(gf, inp->tail_idxs);
 
     inp->n_kv = n_kv;
 
@@ -323,13 +374,39 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
         const int64_t n_sel      = kpool*n_top_pool + (hparams.indexer_kpool_select_tail ? kpool - 1 : 0);
         inp->n_sel = (uint32_t) n_sel;
 
-        // the scatter maps the dead slots of this mask to dump rows
-        inp->sel_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_sel, 1, 1, n_tokens);
-        ggml_set_input(inp->sel_mask);
-        // set_input_kpool always fills the mask, so it stays allocated in every graph
-        ggml_build_forward_expand(gf, inp->sel_mask);
-        // one view for all layers: each view of a host input is a separate upload
-        inp->sel_mask_2d = ggml_reshape_2d(ctx0, inp->sel_mask, n_sel, n_tokens);
+        inp->n_top       = (uint32_t) n_top_pool;
+        inp->flash_attn  = cparams.flash_attn;
+        inp->select_tail = hparams.indexer_kpool_select_tail;
+        inp->gather      = glm5_gather_k(mctx_hyb, ubatch, cparams.flash_attn, inp->n_top);
+
+        // only inputs that a node reads are allocated, so the gathering graph has neither the selection mask nor
+        //   a tail row of its own: the tail row carries the padding up to the FA KV stride of 256
+        if (inp->gather) {
+            inp->n_sel_g = (uint32_t) GGML_PAD(n_sel, 256);
+            // set_input_kpool fills the first kpool - 1 cells of the tail row: a padded row is never narrower (4*n_top
+            //   cells of pools), and with no padding the row is not read but kept allocated for it
+            const int64_t n_extra = inp->n_sel_g - kpool*n_top_pool;
+            GGML_ASSERT(n_extra == 0 || n_extra >= (int64_t) kpool - 1);
+            inp->tail_idxs = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_extra > 0 ? n_extra : kpool - 1, n_tokens);
+            inp->g_mask    = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, inp->n_sel_g, 1, 1, 1);
+            ggml_set_input(inp->tail_idxs);
+            ggml_set_input(inp->g_mask);
+            if (n_extra == 0) {
+                ggml_build_forward_expand(gf, inp->tail_idxs);
+            }
+        } else {
+            inp->tail_idxs = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
+            ggml_set_input(inp->tail_idxs);
+            ggml_build_forward_expand(gf, inp->tail_idxs);
+
+            // the scatter maps the dead slots of this mask to dump rows
+            inp->sel_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_sel, 1, 1, n_tokens);
+            ggml_set_input(inp->sel_mask);
+            // set_input_kpool always fills the mask, so it stays allocated in every graph
+            ggml_build_forward_expand(gf, inp->sel_mask);
+            // one view for all layers: each view of a host input is a separate upload
+            inp->sel_mask_2d = ggml_reshape_2d(ctx0, inp->sel_mask, n_sel, n_tokens);
+        }
     }
 
     inp->n_new = n_new;
@@ -886,7 +963,8 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     return cur;
 }
 
-// Scores pools of kpool consecutive tokens, expands the selected pools and the incomplete tail into an additive mask
+// Scores pools of kpool consecutive tokens, expands the selected pools and the incomplete tail into an additive mask,
+// or with a gathered K (decode) into the list of the selected cells
 
 ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
         ggml_tensor * cur, ggml_tensor * qr, ggml_tensor * kq_mask, const llama_layer & layer,
@@ -972,6 +1050,18 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
 
         const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
         ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, n_tokens], UNORDERED
+
+        if (inp_kpool->gather) {
+            // every selected pool is visible, so the cells need no order: the pools, then the tail and the padding
+            GGML_ASSERT(n_top_pool == (int64_t) inp_kpool->n_top);
+            ggml_tensor * cells = ggml_get_rows(ctx0, inp_kpool->pool_idxs, top_k); // [kpool, n_top_pool, 1]
+            cells = ggml_reshape_1d(ctx0, cells, kpool*n_top_pool);
+            if (inp_kpool->n_sel_g > kpool*n_top_pool) {
+                cells = ggml_concat(ctx0, cells, inp_kpool->tail_idxs, 0);
+            }
+            cb(cells, "indexer_sel_cells", il);
+            return cells;
+        }
 
         // The selection mask marks the first min(nv, n_top_pool) slots as the visible pools, so order the set by descending score.
         ggml_tensor * sel_score = ggml_get_rows(ctx0,
@@ -1084,14 +1174,27 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
     ggml_build_forward_expand(gf, kv_cmpr);
     ggml_build_forward_expand(gf, mctx_mla->cpy_k(ctx0, kv_cmpr, inp_attn->get_k_idxs(), il));
 
-    // The scatter selection already includes the causal mask, and it comes in the mask layout
-    GGML_ASSERT(ggml_are_same_shape(sel, kq_mask));
-    cb(sel, "kq_mask_dsa", il);
-
     ggml_tensor * k = mctx_mla->get_k(ctx0, il);
-    ggml_tensor * v = ggml_view_4d(ctx0, k, kv_lora_rank, k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * out = build_attn_mha(q_absorbed, k, v, nullptr, sel, nullptr, layer.wv_b, inp_kpool->n_sel, kq_scale, il);
+    ggml_tensor * out = nullptr;
+    if (inp_kpool->gather) {
+        // sel holds the selected cells: copy their latent rows out and attend over those alone
+        GGML_ASSERT(k->ne[0] == kv_lora_rank && k->ne[1] == 1 && k->ne[3] == 1);
+        ggml_tensor * rows  = ggml_view_2d(ctx0, k, k->ne[0], k->ne[2], k->nb[2], 0);
+        ggml_tensor * k_sel = ggml_get_rows_same_type(ctx0, rows, sel);
+        k_sel = ggml_reshape_4d(ctx0, k_sel, kv_lora_rank, 1, sel->ne[0], 1);
+        cb(k_sel, "k_sel", il);
+
+        out = build_attn_mha(q_absorbed, k_sel, k_sel, nullptr, inp_kpool->g_mask, nullptr, layer.wv_b, inp_kpool->n_sel, kq_scale, il);
+    } else {
+        // The scatter selection already includes the causal mask, and it comes in the mask layout
+        GGML_ASSERT(ggml_are_same_shape(sel, kq_mask));
+        cb(sel, "kq_mask_dsa", il);
+
+        ggml_tensor * v = ggml_view_4d(ctx0, k, kv_lora_rank, k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+
+        out = build_attn_mha(q_absorbed, k, v, nullptr, sel, nullptr, layer.wv_b, inp_kpool->n_sel, kq_scale, il);
+    }
     cb(out, "kqv_out", il);
 
     out = ggml_mul_mat(ctx0, layer.wo, out);
