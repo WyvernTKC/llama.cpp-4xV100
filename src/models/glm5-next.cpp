@@ -190,10 +190,10 @@ std::unique_ptr<llm_graph_context> llama_model_glm5_next::build_arch_graph(const
     return std::make_unique<graph>(*this, params);
 }
 
-// Causal conv1d over one of Q/K/V
+// Causal conv1d over one of the Q/K/V projections
 static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
                                  ggml_tensor * conv_states_all, ggml_tensor * conv_state_all,
-                                 int64_t qkv, ggml_tensor * x, ggml_tensor * proj_w, ggml_tensor * conv_w,
+                                 int64_t qkv, ggml_tensor * x_proj, ggml_tensor * conv_w,
                                  int64_t d_conv, int64_t head_dim, int64_t n_head,
                                  int64_t n_seq_tokens, int64_t n_seqs, int64_t n_tokens, int64_t kv_head,
                                  int64_t mem_size, int64_t K_rs) {
@@ -206,7 +206,6 @@ static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
         n_embd_r_total * ggml_element_size(conv_state_all),
         qkv * conv_state_size * ggml_element_size(conv_state_all));
 
-    ggml_tensor * x_proj = ggml_mul_mat(ctx0, proj_w, x);
     ggml_tensor * x_3d   = ggml_reshape_3d(ctx0, x_proj, d_inner, n_seq_tokens, n_seqs);
     ggml_tensor * conv_x = ggml_concat(ctx0, conv_state_x, ggml_transpose(ctx0, x_3d), 0);
 
@@ -244,6 +243,12 @@ static uint32_t glm5_gather_k_min() {
         return s != nullptr ? (uint32_t) atoi(s) : 0u;
     }();
     return n_kv_min;
+}
+
+// The node orders that let the backend fuse the ops of a few tokens (sibling rows of one launch, convolution, l2 and
+//   gated norm folds, the shared expert as a channel of the routed experts); prefill keeps the order the ops are built in
+static bool glm5_fused_order(int64_t n_tokens) {
+    return n_tokens <= 8;
 }
 
 // A single decode token attends over its selected cells gathered into a short K, instead of the whole cache under a
@@ -899,16 +904,41 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     const int64_t mem_size = mctx_cur->get_size();
     const int64_t K_rs     = (int64_t) cparams.n_rs_seq + 1;
 
-    ggml_tensor * Qcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, cur, layer.wq, layer.ssm_q_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
-    ggml_tensor * Kcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, cur, layer.wk, layer.ssm_k_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
-    ggml_tensor * Vcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, cur, layer.wv, layer.ssm_v_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
+    // At a few tokens the projections of cur come first, side by side: q, k, v and then f_a, g_a, beta share the
+    //   weight type and width, and the backend runs each three as the sibling rows of one launch. Prefill keeps the
+    //   order of the ops as they are built (the fusions are for a few tokens).
+    const bool fused_order = glm5_fused_order(n_tokens);
+    ggml_tensor * q_proj = ggml_mul_mat(ctx0, layer.wq,       cur);
+    ggml_tensor * k_proj = ggml_mul_mat(ctx0, layer.wk,       cur);
+    ggml_tensor * v_proj = ggml_mul_mat(ctx0, layer.wv,       cur);
+    ggml_tensor * f_a    = ggml_mul_mat(ctx0, layer.ssm_f_a,  cur);
+    ggml_tensor * g_a    = ggml_mul_mat(ctx0, layer.ssm_g_a,  cur);
+    ggml_tensor * beta   = ggml_mul_mat(ctx0, layer.ssm_beta, cur);
+    if (fused_order) {
+        for (ggml_tensor * t : { q_proj, k_proj, v_proj, f_a, g_a, beta }) {
+            ggml_build_forward_expand(gf, t);
+        }
+    }
+
+    // each convolution right after the copies of its window, where the backend runs the whole chain in one kernel
+    ggml_tensor * qkv_cur[3];
+    ggml_tensor * const qkv_proj[3] = { q_proj, k_proj, v_proj };
+    ggml_tensor * const qkv_conv[3] = { layer.ssm_q_conv, layer.ssm_k_conv, layer.ssm_v_conv };
+    for (int64_t i = 0; i < 3; ++i) {
+        qkv_cur[i] = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, i, qkv_proj[i], qkv_conv[i], d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
+        if (fused_order) {
+            ggml_build_forward_expand(gf, qkv_cur[i]);
+        }
+    }
+    ggml_tensor * Qcur = qkv_cur[0];
+    ggml_tensor * Kcur = qkv_cur[1];
+    ggml_tensor * Vcur = qkv_cur[2];
     cb(Qcur, "kda_q_conv", il);
     cb(Kcur, "kda_k_conv", il);
     cb(Vcur, "kda_v_conv", il);
 
     // Decay gate, ssm_a holds -exp(A_log)
-    ggml_tensor * f_a = ggml_mul_mat(ctx0, layer.ssm_f_a, cur);
-    ggml_tensor * g1  = ggml_mul_mat(ctx0, layer.ssm_f_b, f_a);
+    ggml_tensor * g1 = ggml_mul_mat(ctx0, layer.ssm_f_b, f_a);
     g1 = ggml_add(ctx0, g1, layer.ssm_dt_b);
 
     ggml_tensor * A = ggml_reshape_3d(ctx0, layer.ssm_a, 1, n_head_kda, 1);
@@ -927,14 +957,26 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
 
     g1 = ggml_reshape_4d(ctx0, g1, head_dim, n_head_kda, n_seq_tokens, n_seqs);
 
-    ggml_tensor * beta = ggml_mul_mat(ctx0, layer.ssm_beta, cur);
     beta = ggml_reshape_4d(ctx0, beta, 1, n_head_kda, n_seq_tokens, n_seqs);
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "kda_beta", il);
 
+    // the output gate ahead of the scan, so that the output norm, the gate's sigmoid and the gating MUL are adjacent
+    ggml_tensor * g2 = ggml_mul_mat(ctx0, layer.ssm_g_b, g_a);
+    g2 = ggml_reshape_3d(ctx0, g2, head_dim, n_head_kda, n_tokens);
+    cb(g2, "kda_g2", il);
+
     ggml_tensor * ssm_states_all = mctx_cur->get_s_l(il);
     ggml_tensor * state = build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_dim, head_dim, n_head_kda, n_seqs);
+
+    // everything else the scan reads before the l2 norms of q and k: only the norms then run between the
+    //   convolutions' outputs and the scan, which can apply them itself
+    if (fused_order) {
+        for (ggml_tensor * t : { g1, beta, g2, state }) {
+            ggml_build_forward_expand(gf, t);
+        }
+    }
 
     // Match FLA l2 norm
     constexpr float l2_eps = 1e-6f;
@@ -945,18 +987,14 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     output = ggml_cont(ctx0, output);
     cb(output, "kda_scan_out", il);
 
-    // output gate, then RMSNorm(o) * Sigmoid(g2)
-    ggml_tensor * g_a = ggml_mul_mat(ctx0, layer.ssm_g_a, cur);
-    ggml_tensor * g2  = ggml_mul_mat(ctx0, layer.ssm_g_b, g_a);
-    g2 = ggml_reshape_3d(ctx0, g2, head_dim, n_head_kda, n_tokens);
-
+    // RMSNorm(o) * Sigmoid(g2)
     ggml_tensor * o      = ggml_reshape_3d(ctx0, output, head_dim, n_head_kda, n_tokens);
     ggml_tensor * normed = build_norm(o, layer.ssm_o_norm, nullptr, LLM_NORM_RMS, il);
-    cb(g2, "kda_g2", il);
     cb(normed, "kda_normed", il);
     ggml_tensor * gated = ggml_mul(ctx0, normed, ggml_sigmoid(ctx0, g2));
 
-    gated = ggml_cont_2d(ctx0, gated, d_inner, n_tokens);
+    // a view of the contiguous MUL, so that the output projection reads the q8_1 copy the gated norm writes
+    gated = ggml_reshape_2d(ctx0, gated, d_inner, n_tokens);
     cur   = ggml_mul_mat(ctx0, layer.wo, gated);
     cb(cur, "kda_out", il);
 
