@@ -77,6 +77,7 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/dsv4-compress.cuh"
+#include "ggml-cuda/spin.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -118,6 +119,8 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
     fprintf(stderr, "%s error: %s\n  current device: %d, in function %s at %s:%d\n  %s\n",
         GGML_CUDA_NAME, msg, id, func, file, line, stmt);
     fflush(stderr);
+    // a kernel that trapped after a spin wait passed its limit left a record of it
+    ggml_cuda_spin_print();
 
     GGML_LOG_ERROR(GGML_CUDA_NAME " error: %s\n", msg);
     GGML_LOG_ERROR("  current device: %d, in function %s at %s:%d\n", id, func, file, line);
@@ -10786,6 +10789,88 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
     return &reg;
 }
 
+// the records of the spin waits that timed out, one per device (see spin.cuh), in pinned host memory; nullptr if it
+//   could not be allocated, then the waits only trap
+static ggml_cuda_spin_record * ggml_cuda_spin_records = nullptr;
+
+// GGML_CUDA_SPIN_TIMEOUT_S: the limit of the kernels' spin waits in seconds, 0 = none (see spin.cuh)
+void ggml_cuda_spin_init(int device) {
+    static std::once_flag once[GGML_CUDA_MAX_DEVICES];
+    std::call_once(once[device], [device]() {
+        static const char * env = getenv("GGML_CUDA_SPIN_TIMEOUT_S");
+        ggml_cuda_set_device(device);
+        static std::once_flag once_alloc;
+        std::call_once(once_alloc, []() {
+            void * p = nullptr;
+            if (cudaHostAlloc(&p, GGML_CUDA_MAX_DEVICES*sizeof(ggml_cuda_spin_record), cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess) {
+                (void) cudaGetLastError();
+                return;
+            }
+            memset(p, 0, GGML_CUDA_MAX_DEVICES*sizeof(ggml_cuda_spin_record));
+            ggml_cuda_spin_records = (ggml_cuda_spin_record *) p;
+        });
+        ggml_cuda_spin_config cfg = { GGML_CUDA_SPIN_LIMIT_DEFAULT, nullptr };
+        if (env != nullptr) {
+            const double s = atof(env);
+            cfg.limit = 0;
+            if (s > 0.0) {
+                const double units = s*1e9 / (double) (1ull << GGML_CUDA_SPIN_SHIFT);
+                cfg.limit = units >= GGML_CUDA_SPIN_LIMIT_MAX ? GGML_CUDA_SPIN_LIMIT_MAX : std::max(1u, (unsigned int) units);
+            }
+            if (cfg.limit == 0) {
+                GGML_LOG_INFO("%s: device %d: no limit on spin waits (GGML_CUDA_SPIN_TIMEOUT_S=%s)\n", __func__, device, env);
+            } else {
+                GGML_LOG_INFO("%s: device %d: spin waits abort after %.1f s (GGML_CUDA_SPIN_TIMEOUT_S=%s)\n", __func__, device,
+                    cfg.limit * (double) (1ull << GGML_CUDA_SPIN_SHIFT) * 1e-9, env);
+            }
+        }
+        if (ggml_cuda_spin_records != nullptr) {
+            void * dev = nullptr;
+            if (cudaHostGetDevicePointer(&dev, ggml_cuda_spin_records + device, 0) == cudaSuccess) {
+                cfg.record = (ggml_cuda_spin_record *) dev;
+            } else {
+                (void) cudaGetLastError();
+            }
+        }
+        ggml_cuda_spin_set_allreduce(cfg);
+        ggml_cuda_spin_set_allreduce_p2p(cfg);
+        ggml_cuda_spin_set_mmvf(cfg);
+        ggml_cuda_spin_set_norm(cfg);
+    });
+}
+
+void ggml_cuda_spin_print() {
+    static const char * names[GGML_CUDA_SPIN_SITE_COUNT] = {
+        "ggml_cuda_p2p_ar_kernel", "ggml_cuda_p2p_ag_kernel", "ggml_cuda_p2p_ar_ll_kernel", "ggml_cuda_p2p_ar_ll_kernel_n",
+        "ggml_cuda_p2p_ar_ll_kernel_n (receive)", "ggml_cuda_p2p_ar_ll_moe_reduce_kernel", "rms_norm_pre_add_ar_f32",
+        "rms_norm_pre_add_ar_f32 (q8_1 blocks)", "rms_norm_pre_add_ar_split_f32", "ggml_cuda_ar_kernel", "mul_mat_vec_f_router",
+        "hc_post_blocks_sync", "row_split_reduce", "rms_norm_pre_add_f32 (q8_1 blocks)", "rms_norm_add_rms_norm_f32 (q8_1 blocks)",
+    };
+    if (ggml_cuda_spin_records == nullptr) {
+        return;
+    }
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+        const volatile ggml_cuda_spin_record & r = ggml_cuda_spin_records[d];
+        const unsigned int site = r.site;
+        if (site == 0 || site > GGML_CUDA_SPIN_SITE_COUNT) {
+            continue;
+        }
+        const char * name = names[site - 1];
+        const double s    = r.limit * (double) (1ull << GGML_CUDA_SPIN_SHIFT) * 1e-9;
+        if (r.peer >= 0) {
+            fprintf(stderr, "%s%d: %s (rank %d) waited %.1f s for rank %d, which faulted or stopped "
+                "(GGML_CUDA_SPIN_TIMEOUT_S sets the limit, 0 = none)\n", GGML_CUDA_NAME, d, name, r.rank, s, r.peer);
+        } else if (r.peer == GGML_CUDA_SPIN_PEER_DEVICE) {
+            fprintf(stderr, "%s%d: %s waited %.1f s for another device, which faulted or stopped "
+                "(GGML_CUDA_SPIN_TIMEOUT_S sets the limit, 0 = none)\n", GGML_CUDA_NAME, d, name, s);
+        } else {
+            fprintf(stderr, "%s%d: %s waited %.1f s for the other blocks of its launch "
+                "(GGML_CUDA_SPIN_TIMEOUT_S sets the limit, 0 = none)\n", GGML_CUDA_NAME, d, name, s);
+        }
+    }
+    fflush(stderr);
+}
+
 ggml_backend_t ggml_backend_cuda_init(int device) {
     if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
         GGML_LOG_ERROR("%s: invalid device %d\n", __func__, device);
@@ -10805,6 +10890,7 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         /* .context = */ ctx,
     };
 
+    ggml_cuda_spin_init(device);
     ggml_cuda_preload_modules(device);
 
     return cuda_backend;

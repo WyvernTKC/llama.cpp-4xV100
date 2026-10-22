@@ -1,4 +1,7 @@
 #include "allreduce.cuh"
+#include "spin.cuh"
+
+GGML_CUDA_SPIN_SETTER(allreduce)
 
 #if !defined(GGML_USE_MUSA)
 
@@ -162,7 +165,10 @@ static __global__ void ggml_cuda_ar_kernel(
         ggml_cuda_ar_signal_set(my_slot, token);
         __threadfence_system(); // make our signal visible system-wide
 
-        while (ggml_cuda_ar_signal_get(other_slot) != token) {
+        const bool arrived = ggml_cuda_spin_until([&]() {
+            if (ggml_cuda_ar_signal_get(other_slot) == token) {
+                return true;
+            }
 #ifdef GGML_USE_HIP
             // Equals ~100ns at 2500 MHz (sleeps for n * [1,64] clock cycles)
             __builtin_amdgcn_s_sleep(4);
@@ -171,6 +177,10 @@ static __global__ void ggml_cuda_ar_kernel(
 #else
             NO_DEVICE_CODE;
 #endif // GGML_USE_HIP
+            return false;
+        });
+        if (!arrived) {
+            ggml_cuda_spin_trap(GGML_CUDA_SPIN_SITE_AR_2, -1, GGML_CUDA_SPIN_PEER_DEVICE);
         }
     }
 

@@ -1,8 +1,11 @@
 #include "allreduce-p2p.cuh"
+#include "spin.cuh"
 #include "unary.cuh"
 
 #include <algorithm>
 #include <cstdlib>
+
+GGML_CUDA_SPIN_SETTER(allreduce_p2p)
 
 // One block index is the unit of cross-device synchronisation: block b on every rank exchanges
 // the same slice, so a per-block-index barrier is enough and no grid-wide sync is needed.
@@ -95,10 +98,17 @@ static __global__ void ggml_cuda_p2p_ar_kernel(const ggml_cuda_p2p_ar_args a) {
         for (int j = 0; j < a.n_devs; ++j) {
             volatile const unsigned long long * f =
                 a.flag[a.rank] + (((int64_t) a.slot * a.n_devs + j) * nblocks + bid);
-            while (*f < a.seq) {
+            const bool arrived = ggml_cuda_spin_until([&]() {
+                if (*f >= a.seq) {
+                    return true;
+                }
 #if __CUDA_ARCH__ >= 700
                 __nanosleep(32);
 #endif // __CUDA_ARCH__ >= 700
+                return false;
+            });
+            if (!arrived) {
+                ggml_cuda_spin_trap(GGML_CUDA_SPIN_SITE_P2P_AR, a.rank, j);
             }
         }
         __threadfence_system();
@@ -161,10 +171,17 @@ static __global__ void ggml_cuda_p2p_ag_kernel(const ggml_cuda_p2p_ar_args a) {
         for (int j = 0; j < a.n_devs; ++j) {
             volatile const unsigned long long * f =
                 a.flag[a.rank] + (((int64_t) a.slot * a.n_devs + j) * nblocks + bid);
-            while (*f < a.seq) {
+            const bool arrived = ggml_cuda_spin_until([&]() {
+                if (*f >= a.seq) {
+                    return true;
+                }
 #if __CUDA_ARCH__ >= 700
                 __nanosleep(32);
 #endif // __CUDA_ARCH__ >= 700
+                return false;
+            });
+            if (!arrived) {
+                ggml_cuda_spin_trap(GGML_CUDA_SPIN_SITE_P2P_AG, a.rank, j);
             }
         }
         __threadfence_system();
@@ -224,12 +241,12 @@ static __global__ void ggml_cuda_p2p_ar_ll_kernel(const ggml_cuda_p2p_ar_args a)
         const uint4 * p = src + (int64_t) j * a.ll_stride;
         uint4 r0;
         uint4 r1;
-        do {
-            r0 = ggml_cuda_p2p_ar_ld_ll(p + 0);
-        } while (r0.y != flag || r0.w != flag);
-        do {
-            r1 = ggml_cuda_p2p_ar_ld_ll(p + 1);
-        } while (r1.y != flag || r1.w != flag);
+        if (!ggml_cuda_spin_until([&]() { r0 = ggml_cuda_p2p_ar_ld_ll(p + 0); return r0.y == flag && r0.w == flag; })) {
+            ggml_cuda_spin_trap(GGML_CUDA_SPIN_SITE_P2P_LL, a.rank, j);
+        }
+        if (!ggml_cuda_spin_until([&]() { r1 = ggml_cuda_p2p_ar_ld_ll(p + 1); return r1.y == flag && r1.w == flag; })) {
+            ggml_cuda_spin_trap(GGML_CUDA_SPIN_SITE_P2P_LL, a.rank, j);
+        }
         if (((a.contrib_mask >> j) & 1u) == 0) {
             continue;
         }
@@ -280,9 +297,10 @@ static __device__ __forceinline__ float2 ggml_cuda_p2p_ar_unpack2(const uint32_t
 //   512 contiguous bytes, which cross the link to a peer in large packets.
 // push = false: only the sums, the lines of this rank having been pushed by the kernel that made v (a fold, see
 //   ggml_cuda_ar_fold_push)
+// site: the wait, for the record of one that timed out (see spin.cuh)
 template <int n_devs, int payload, bool push = true>
 static __device__ __forceinline__ float4 ggml_cuda_p2p_ar_ll_exchange(const ggml_cuda_p2p_ar_args & a, const float4 v,
-        const int64_t i, const uint32_t flag, const int64_t slot_base) {
+        const int64_t i, const uint32_t flag, const int64_t slot_base, const ggml_cuda_spin_site site) {
     constexpr int nl = payload == 0 ? 2 : 1; // lines per float4
     const int64_t line0 = (i & ~(int64_t) (WARP_SIZE - 1))*nl + (i & (WARP_SIZE - 1)); // its line k is line0 + k*32
     if constexpr (push) {
@@ -314,9 +332,8 @@ static __device__ __forceinline__ float4 ggml_cuda_p2p_ar_ll_exchange(const ggml
             r[j][k] = ggml_cuda_p2p_ar_ld_ll(src + (int64_t) j * a.ll_stride + k*WARP_SIZE);
         }
     }
-    bool done;
-    do {
-        done = true;
+    const bool arrived = ggml_cuda_spin_until([&]() {
+        bool done = true;
 #pragma unroll
         for (int j = 0; j < n_devs; ++j) {
 #pragma unroll
@@ -327,7 +344,18 @@ static __device__ __forceinline__ float4 ggml_cuda_p2p_ar_ll_exchange(const ggml
                 }
             }
         }
-    } while (!done);
+        return done;
+    });
+    if (!arrived) {
+        // the first rank whose first line has not come (loaded again: reading r here costs registers)
+        int peer = GGML_CUDA_SPIN_PEER_DEVICE;
+#pragma unroll 1
+        for (int j = n_devs - 1; j >= 0; --j) {
+            const uint4 l = ggml_cuda_p2p_ar_ld_ll(src + (int64_t) j * a.ll_stride);
+            peer = l.y != flag || l.w != flag ? j : peer;
+        }
+        ggml_cuda_spin_trap(site, a.rank, peer);
+    }
 
     // in rank order, as the kernels above
     float4 sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -370,7 +398,8 @@ static __global__ void ggml_cuda_p2p_ar_ll_kernel_n(const ggml_cuda_p2p_ar_args 
                 v = a.src[i];
             }
         }
-        a.dst[i] = ggml_cuda_p2p_ar_ll_exchange<n_devs, payload, push>(a, v, i, flag, slot_base);
+        a.dst[i] = ggml_cuda_p2p_ar_ll_exchange<n_devs, payload, push>(a, v, i, flag, slot_base,
+            push ? GGML_CUDA_SPIN_SITE_P2P_LL_N : GGML_CUDA_SPIN_SITE_P2P_LL_RECV);
     }
 
     __syncthreads();
@@ -438,7 +467,7 @@ static __global__ void ggml_cuda_p2p_ar_ll_moe_reduce_kernel(const ggml_cuda_p2p
                                 __fadd_rn(v.z, __fmul_rn(xa.z, sig)), __fadd_rn(v.w, __fmul_rn(xa.w, sig)));
             }
         }
-        a.dst[i] = ggml_cuda_p2p_ar_ll_exchange<n_devs, payload>(a, v, i, flag, slot_base);
+        a.dst[i] = ggml_cuda_p2p_ar_ll_exchange<n_devs, payload>(a, v, i, flag, slot_base, GGML_CUDA_SPIN_SITE_P2P_LL_MOE);
     }
 
     __syncthreads();

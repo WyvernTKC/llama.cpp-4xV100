@@ -2,6 +2,7 @@
 
 #include "common.cuh"
 #include "ggml-backend-impl.h"
+#include "spin.cuh"
 
 #include <cstddef>
 
@@ -109,10 +110,11 @@ static __device__ __forceinline__ void ggml_cuda_ar_fold_push(const ggml_cuda_ar
 }
 
 // the sums of the n values cols[0..n-1] over the ranks, in rank order from 0 as the LL kernels add them; the lines of
-//   all of them are loaded at once and only those that have not arrived are loaded again
+//   all of them are loaded at once and only those that have not arrived are loaded again. site: the wait, for the
+//   record of one that timed out (see spin.cuh)
 template <int n>
 static __device__ __forceinline__ void ggml_cuda_ar_fold_sum(const ggml_cuda_ar_fold_args & a, const int64_t * cols,
-        const bool * valid, float * sums) {
+        const bool * valid, float * sums, const ggml_cuda_spin_site site) {
     uint32_t       flag[n];
     const uint4 *  p[n];
     uint4          r[n][4];
@@ -132,9 +134,8 @@ static __device__ __forceinline__ void ggml_cuda_ar_fold_sum(const ggml_cuda_ar_
             }
         }
     }
-    bool done;
-    do {
-        done = true;
+    const bool arrived = ggml_cuda_spin_until([&]() {
+        bool done = true;
 #pragma unroll
         for (int c = 0; c < n; ++c) {
 #pragma unroll
@@ -145,7 +146,18 @@ static __device__ __forceinline__ void ggml_cuda_ar_fold_sum(const ggml_cuda_ar_
                 }
             }
         }
-    } while (!done);
+        return done;
+    });
+    if (!arrived) {
+        // the first rank whose line of the first column has not come (loaded again: reading r here costs registers)
+        int peer = GGML_CUDA_SPIN_PEER_DEVICE;
+#pragma unroll 1
+        for (int j = a.n_devs - 1; j >= 0; --j) {
+            const uint4 l = ggml_cuda_ar_ld_ll(p[0] + j*a.ll_stride);
+            peer = l.y != flag[0] || l.w != flag[0] ? j : peer;
+        }
+        ggml_cuda_spin_trap(site, a.rank, peer);
+    }
 #pragma unroll
     for (int c = 0; c < n; ++c) {
         float s = 0.0f;

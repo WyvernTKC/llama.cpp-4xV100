@@ -1,8 +1,11 @@
 #include "norm.cuh"
 #include "allreduce-p2p.cuh"
+#include "spin.cuh"
 #include "unary.cuh"
 #include "dsv4-hc.cuh"
 #include <cstdint>
+
+GGML_CUDA_SPIN_SETTER(norm)
 
 template <int block_size>
 static __global__ void norm_f32(
@@ -360,7 +363,8 @@ static __device__ __forceinline__ void hc_post_blocks_sync(unsigned int * flags)
             __threadfence();
             atomicAdd(flags + HC_POST_SYNC_GEN, 1u);
         } else {
-            while (*(volatile unsigned int *) (flags + HC_POST_SYNC_GEN) == gen) {
+            if (!ggml_cuda_spin_until([&]() { return *(volatile unsigned int *) (flags + HC_POST_SYNC_GEN) != gen; })) {
+                ggml_cuda_spin_trap(GGML_CUDA_SPIN_SITE_HC_POST, -1, GGML_CUDA_SPIN_PEER_BLOCKS);
             }
         }
     }
@@ -567,7 +571,8 @@ static __global__ void __launch_bounds__(block_size) rms_norm_pre_add_f32(const 
         // the other blocks have read the inputs, which the outputs may sit on; lower the flag for the next launch
         if (q8_dst != nullptr && flags != nullptr) {
             if (tid == 0) {
-                while (atomicAdd(flags, 0u) < gridDim.x - 1) {
+                if (!ggml_cuda_spin_until([&]() { return atomicAdd(flags, 0u) >= gridDim.x - 1; })) {
+                    ggml_cuda_spin_trap(GGML_CUDA_SPIN_SITE_NORM_Q8, -1, GGML_CUDA_SPIN_PEER_BLOCKS);
                 }
                 atomicExch(flags, 0u);
             }
@@ -631,7 +636,7 @@ static __global__ void __launch_bounds__(block_size) rms_norm_pre_add_ar_f32(con
         bv[i] = valid[i] ? b[cols[i]]   : 0.0f;
     }
     float sv[cols_per_thread];
-    ggml_cuda_ar_fold_sum<cols_per_thread>(ar, cols, valid, sv);
+    ggml_cuda_ar_fold_sum<cols_per_thread>(ar, cols, valid, sv, GGML_CUDA_SPIN_SITE_FOLD_NORM);
 
     float xv[cols_per_thread];
 #pragma unroll
@@ -680,7 +685,8 @@ static __global__ void __launch_bounds__(block_size) rms_norm_pre_add_ar_f32(con
     // every block has polled its lines and read b, which the outputs may sit on; lower the flag for the next launch
     if (q8_dst != nullptr) {
         if (tid == 0) {
-            while (atomicAdd(flags, 0u) < gridDim.x - 1) {
+            if (!ggml_cuda_spin_until([&]() { return atomicAdd(flags, 0u) >= gridDim.x - 1; })) {
+                ggml_cuda_spin_trap(GGML_CUDA_SPIN_SITE_FOLD_NORM_Q8, -1, GGML_CUDA_SPIN_PEER_BLOCKS);
             }
             atomicExch(flags, 0u);
         }
@@ -712,10 +718,13 @@ static __device__ __forceinline__ void row_split_put(uint4 * slot, const float2 
 
 static __device__ __forceinline__ float2 row_split_get(const uint4 * slot, const unsigned int tag) {
     unsigned int x, tx, y, ty;
-    do {
-        asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];" :
-            "=r"(x), "=r"(tx), "=r"(y), "=r"(ty) : "l"(slot) : "memory");
-    } while (tx != tag || ty != tag);
+    if (!ggml_cuda_spin_until([&]() {
+            asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];" :
+                "=r"(x), "=r"(tx), "=r"(y), "=r"(ty) : "l"(slot) : "memory");
+            return tx == tag && ty == tag;
+        })) {
+        ggml_cuda_spin_trap(GGML_CUDA_SPIN_SITE_ROW_SPLIT, -1, GGML_CUDA_SPIN_PEER_BLOCKS);
+    }
     return make_float2(__uint_as_float(x), __uint_as_float(y));
 }
 
@@ -784,7 +793,7 @@ static __global__ void __launch_bounds__(row_threads/nsplit) rms_norm_pre_add_ar
         bv[i] = valid[i] ? b[cols[i]]   : 0.0f;
     }
     float sv[cols_per_thread];
-    ggml_cuda_ar_fold_sum<cols_per_thread>(ar, cols, valid, sv);
+    ggml_cuda_ar_fold_sum<cols_per_thread>(ar, cols, valid, sv, GGML_CUDA_SPIN_SITE_FOLD_NORM_SPLIT);
 
     float xv[cols_per_thread];
 #pragma unroll
@@ -1001,7 +1010,8 @@ static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
     // the other blocks have read the inputs; lower the flag for the next launch
     if (q8_dst != nullptr && !emitter && flags != nullptr) {
         if (tid == 0) {
-            while (atomicAdd(flags, 0u) < gridDim.x - 1) {
+            if (!ggml_cuda_spin_until([&]() { return atomicAdd(flags, 0u) >= gridDim.x - 1; })) {
+                ggml_cuda_spin_trap(GGML_CUDA_SPIN_SITE_NORM_PAIR_Q8, -1, GGML_CUDA_SPIN_PEER_BLOCKS);
             }
             atomicExch(flags, 0u);
         }

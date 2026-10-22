@@ -5,7 +5,10 @@
 #include "mmvf.cuh"
 #include "mmf.cuh"
 #include "convert.cuh"
+#include "spin.cuh"
 #include "topk-moe.cuh"
+
+GGML_CUDA_SPIN_SETTER(mmvf)
 
 static __device__ __forceinline__ topk_moe_config mul_mat_vec_f_topk_moe_config(const ggml_cuda_mmvf_topk_args & topk) {
     topk_moe_config config;
@@ -1133,17 +1136,20 @@ static __device__ __forceinline__ void mul_mat_vec_f_router_wait(const ggml_cuda
     bool  warm = true;
 #pragma unroll 1
     while (true) {
-        bool ready;
-        do {
-            ready = true;
+        // the first pass polls once
+        const bool ready = ggml_cuda_spin_until([&]() {
+            bool ready = true;
 #pragma unroll
             for (int i = 0; i < experts_per_thread; i++) {
                 const unsigned long long v = slots[i*warp_size + lane];
                 wt[i] = __uint_as_float((unsigned int) v);
                 ready = ready && (unsigned int) (v >> 32) == tag;
             }
-            ready = __all_sync(0xFFFFFFFF, ready);
-        } while (!ready && !warm);
+            return __all_sync(0xFFFFFFFF, ready);
+        }, warm);
+        if (!ready && !warm) {
+            ggml_cuda_spin_trap(GGML_CUDA_SPIN_SITE_ROUTER, -1, GGML_CUDA_SPIN_PEER_BLOCKS);
+        }
         if (ready) {
 #pragma unroll
             for (int i = 0; i < experts_per_thread; i++) {
