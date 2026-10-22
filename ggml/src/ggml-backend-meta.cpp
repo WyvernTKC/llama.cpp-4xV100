@@ -1990,6 +1990,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
         }
+        // batched rows: dims 2 and 3 of src0 are dims 1 and 2 of src1, a batch split the same way in both stays split
+        if ((src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_3) &&
+                int(src_ss[1].axis) == int(src_ss[0].axis) - 1) {
+            ggml_backend_meta_split_state ss1 = src_ss[1];
+            ss1.axis = src_ss[0].axis;
+            if (split_states_equal(src_ss[0], ss1)) {
+                return src_ss[0];
+            }
+        }
         return handle_generic(src_ss, /*scalar_only =*/ true);
     };
 

@@ -983,8 +983,14 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
         top_k = ggml_cast(ctx0, ggml_cont(ctx0, ggml_reshape_2d(ctx0, top_k, n_top_pool, n_tokens)), GGML_TYPE_I32);
         cb(top_k, "indexer_top_k", il);
 
-        sel_idx = ggml_get_rows(ctx0, inp_kpool->pool_idxs,
-                ggml_reshape_1d(ctx0, top_k, n_top_pool*n_tokens));  // [kpool, n_top_pool*n_tokens]
+        // Under -sm tensor the indexer may score a slice of the queries per device (see handle_lightning_indexer in
+        //   the meta backend) and every device needs all rows for the mask. The all-gather concatenates along dim 0,
+        //   so hand it the token-major flattening. On one device, or when the indexer stayed mirrored, this is a copy.
+        ggml_tensor * top_k_flat = ggml_cont(ctx0, ggml_reshape_1d(ctx0, top_k, n_top_pool*n_tokens));
+        top_k_flat->flags |= GGML_TENSOR_FLAG_MIRRORED;
+        cb(top_k_flat, "indexer_top_k_gathered", il);
+
+        sel_idx = ggml_get_rows(ctx0, inp_kpool->pool_idxs, top_k_flat);  // [kpool, n_top_pool*n_tokens]
         sel_idx = ggml_reshape_2d(ctx0, sel_idx, kpool*n_top_pool, n_tokens);
 
         if (hparams.indexer_kpool_select_tail) {

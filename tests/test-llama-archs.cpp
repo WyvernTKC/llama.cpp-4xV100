@@ -217,8 +217,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_embd = 128;
         // more than one head so that the per-head split of tensor parallelism is actually exercised;
         //   with a single head the strides of the q views are ambiguous and nothing gets distributed.
-        //   glm5-next is not split (deny list) and upstream sized its fixture for one head.
-        n_head = arch == LLM_ARCH_GLM5_NEXT ? 1 : 8;
+        //   glm5-next needs 4 MLA heads per device (flash attention GQA) on up to 4 devices.
+        n_head = arch == LLM_ARCH_GLM5_NEXT ? 16 : 8;
         n_ff   = 192;
     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         n_layer = 3;
@@ -244,7 +244,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             || arch == LLM_ARCH_HY_V4;
 
     uint32_t n_head_kv = n_head;
-    if (is_mla || arch == LLM_ARCH_QWEN3) {
+    if (is_mla || arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_GLM5_NEXT) {
         n_head_kv = 1; // MLA shares one latent kv head; QWEN3 gives MQA coverage
     } else if (arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_MUSE_SPARK || arch == LLM_ARCH_AFMOE || arch == LLM_ARCH_MAION_CODER ||
             arch == LLM_ARCH_KOLIBRI1) {
