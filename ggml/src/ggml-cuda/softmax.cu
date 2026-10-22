@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "ggml.h"
 #include "softmax.cuh"
+#include "convert.cuh"
 
 #ifdef GGML_USE_HIP
 #include <hip/hip_cooperative_groups.h>
@@ -477,4 +478,62 @@ void ggml_cuda_op_soft_max_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
     GGML_ASSERT(max_bias == 0.0f);
 
     soft_max_back_f32_cuda(src0_d, src1_d, dst_d, ncols, nrows, scale, stream);
+}
+
+// The k-pool compression of glm5-next's indexer, see ggml_cuda_try_fuse_kpool_pool: for each new pool p and column d,
+//   pooled = sum_k softmax_k(gate_k + ape_k) * key_k over the pool's kpool member rows of the cache, written into the
+//   pooled slot of the pool's rep row. A warp per column with member k in lane k: the max and sums are the warp
+//   reductions of soft_max_f32 and reduce_rows_f32 on the same lanes (the other lanes add zeros), so the values are
+//   those of the ops apart.
+template <typename T>
+static __global__ void kpool_pool_f32(
+        const char * cache, const int32_t * members, const float * ape, const int64_t * rep, char * pooled,
+        const size_t row_bytes, const int n_embd, const int kpool) {
+    const int lane = threadIdx.x;
+    const int d    = blockIdx.x*blockDim.y + threadIdx.y;
+    const int p    = blockIdx.y;
+    if (d >= n_embd) {
+        return;
+    }
+
+    float key   = 0.0f;
+    float logit = -INFINITY;
+    if (lane < kpool) {
+        const T * row = (const T *) (cache + (size_t) members[p*kpool + lane]*row_bytes);
+        key   = ggml_cuda_cast<float>(row[d]);
+        logit = ggml_cuda_cast<float>(row[n_embd + d]) + ape[lane*n_embd + d];
+    }
+
+    const float max_val = block_reduce<block_reduce_method::MAX, WARP_SIZE>(logit, (float *) nullptr);
+    const float e       = lane < kpool ? expf(logit - max_val) : 0.0f;
+    const float sum     = block_reduce<block_reduce_method::SUM, WARP_SIZE>(e, (float *) nullptr);
+    const float inv_sum = 1.0f / sum;
+    const float prob    = e * inv_sum;
+    const float pooled_d = block_reduce<block_reduce_method::SUM, WARP_SIZE>(lane < kpool ? prob * key : 0.0f, (float *) nullptr);
+
+    if (lane == 0) {
+        ((T *) (pooled + (size_t) rep[p]*row_bytes))[d] = ggml_cuda_cast<T>(pooled_d);
+    }
+}
+
+void ggml_cuda_kpool_pool(ggml_backend_cuda_context & ctx, const ggml_tensor * cache, const ggml_tensor * members,
+        const ggml_tensor * ape, const ggml_tensor * rep, const ggml_tensor * pooled, const int kpool) {
+    const int     n_embd = (int) ape->ne[0];
+    const int64_t n_new  = ggml_nelements(rep);
+    GGML_ASSERT(kpool <= WARP_SIZE && ggml_nelements(members) == kpool*n_new && cache->nb[1] == pooled->nb[1]);
+
+    constexpr int warps = 4;
+    const dim3 block_dims(WARP_SIZE, warps, 1);
+    const dim3 block_nums((n_embd + warps - 1)/warps, (unsigned) n_new, 1);
+    const auto launch = [&](auto kernel) {
+        kernel<<<block_nums, block_dims, 0, ctx.stream()>>>((const char *) cache->data, (const int32_t *) members->data,
+            (const float *) ape->data, (const int64_t *) rep->data, (char *) pooled->data, cache->nb[1], n_embd, kpool);
+    };
+    if (cache->type == GGML_TYPE_F16) {
+        launch(kpool_pool_f32<half>);
+    } else {
+        GGML_ASSERT(cache->type == GGML_TYPE_F32);
+        launch(kpool_pool_f32<float>);
+    }
+    CUDA_CHECK(cudaGetLastError());
 }

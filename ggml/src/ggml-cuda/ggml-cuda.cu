@@ -6147,6 +6147,120 @@ static int ggml_cuda_try_fuse_moe_down_shexp(ggml_backend_cuda_context * cuda_ct
     return add_idx - i;
 }
 
+// glm5-next's k-pool compression (build_kpool_select), from the GET_ROWS at i of the new pools' key | gate rows:
+//   pooled = SUM_ROWS(SOFT_MAX(CONT(PERMUTE(gate + ape))) * CONT(PERMUTE(key))), SET_ROWS into the pooled slots of the
+//   same cache. Eight launches in one (ggml_cuda_kpool_pool), with the values of the ops apart. Returns the nodes to skip.
+static int ggml_cuda_try_fuse_kpool_pool(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_KPOOL_FUSION") != nullptr;
+    const ggml_tensor * gr = cgraph->nodes[i];
+    if (disabled || gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || !cuda_ctx->stream_context().concurrent_events.empty()) {
+        return 0;
+    }
+    const ggml_tensor * kg      = gr->src[0];
+    const ggml_tensor * members = gr->src[1];
+    if ((kg->type != GGML_TYPE_F16 && kg->type != GGML_TYPE_F32) || kg->nb[0] != ggml_type_size(kg->type) || ggml_nrows(kg) != kg->ne[1] ||
+            members->type != GGML_TYPE_I32 || !ggml_is_contiguous(members) || ggml_nrows(gr) != gr->ne[1] || gr->ne[0] % 2 != 0) {
+        return 0;
+    }
+    const int64_t n_embd = gr->ne[0] / 2;
+
+    // the SET_ROWS that ends the chain, and its sources back to gr
+    int s = -1;
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 32; j++) {
+        if (cgraph->nodes[j]->op == GGML_OP_SET_ROWS) {
+            s = j;
+            break;
+        }
+    }
+    if (s < 0) {
+        return 0;
+    }
+    const ggml_tensor * set = cgraph->nodes[s];
+    const ggml_tensor * rep = set->src[1];
+    const ggml_tensor * dst = set->src[2];
+    const auto through = [](const ggml_tensor * t, ggml_op op) { return t != nullptr && t->op == op ? t->src[0] : nullptr; };
+    const ggml_tensor * sr  = through(set->src[0], GGML_OP_RESHAPE);
+    const ggml_tensor * mul = sr != nullptr && sr->op == GGML_OP_SUM_ROWS ? sr->src[0] : nullptr;
+    if (mul == nullptr || mul->op != GGML_OP_MUL || rep->type != GGML_TYPE_I64 || !ggml_is_contiguous(rep) ||
+            dst->type != kg->type || dst->nb[1] != kg->nb[1] || dst->ne[0] != n_embd) {
+        return 0;
+    }
+    const ggml_tensor * sm   = through(mul->src[0], GGML_OP_RESHAPE);
+    const ggml_tensor * pkc  = mul->src[1];
+    const ggml_tensor * lc   = sm != nullptr && sm->op == GGML_OP_SOFT_MAX ? through(sm->src[0], GGML_OP_RESHAPE) : nullptr;
+    const ggml_tensor * addp = through(lc, GGML_OP_CONT);
+    const ggml_tensor * add  = through(addp, GGML_OP_PERMUTE);
+    const ggml_tensor * pkp  = through(pkc, GGML_OP_CONT);
+    const ggml_tensor * pk   = through(pkp, GGML_OP_PERMUTE);
+    if (add == nullptr || add->op != GGML_OP_ADD || pk == nullptr || pk->op != GGML_OP_VIEW || sm->src[1] != nullptr || sm->src[2] != nullptr) {
+        return 0;
+    }
+    float sm_scale, sm_max_bias;
+    memcpy(&sm_scale,    (const float *) sm->op_params + 0, sizeof(float));
+    memcpy(&sm_max_bias, (const float *) sm->op_params + 1, sizeof(float));
+    const ggml_tensor * pg  = add->src[0];
+    const ggml_tensor * ape = add->src[1];
+    const ggml_tensor * rows = pk->src[0];
+    const int64_t kpool = add->ne[1];
+    const int64_t n_new = add->ne[2];
+    const size_t  ts    = sizeof(float);
+    // gr reshaped to [2*n_embd, kpool, n_new], key the first half of a row and gate the second
+    if (sm_scale != 1.0f || sm_max_bias != 0.0f || rows->op != GGML_OP_RESHAPE || rows->src[0] != gr ||
+            pg->op != GGML_OP_VIEW || pg->src[0] != rows || pg->view_offs != n_embd*ts || pk->view_offs != 0 ||
+            !ggml_are_same_shape(pg, pk) || !ggml_are_same_stride(pg, pk) || pg->ne[0] != n_embd || pg->nb[1] != 2*n_embd*ts ||
+            ape->type != GGML_TYPE_F32 || !ggml_is_contiguous(ape) || ape->ne[0] != n_embd || ape->ne[1] != kpool || ggml_nrows(ape) != kpool ||
+            kpool > WARP_SIZE || ggml_nelements(members) != kpool*n_new || ggml_nelements(rep) != n_new ||
+            sr->ne[0] != 1 || ggml_nelements(sr) != n_embd*n_new || sm->ne[0] != kpool) {
+        return 0;
+    }
+    // both permutes swap the first two axes
+    for (const ggml_tensor * p : { addp, pkp }) {
+        const int32_t * axes = (const int32_t *) p->op_params;
+        if (axes[0] != 1 || axes[1] != 0 || axes[2] != 2 || axes[3] != 3) {
+            return 0;
+        }
+    }
+    // kg and dst are views of one cache, its key | gate and its pooled slot
+    const ggml_tensor * cache = kg->view_src;
+    if (cache == nullptr || dst->view_src != cache || dst->view_offs != kg->view_offs + 2*n_embd*ggml_type_size(kg->type)) {
+        return 0;
+    }
+    // the compute nodes from gr to the SET_ROWS are this chain, and only the chain reads its intermediate results
+    const ggml_tensor * chain[] = { gr, add, lc, sm, pkc, mul, sr, set };
+    int n_compute = 0;
+    for (int j = i; j <= s; j++) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (std::find(std::begin(chain), std::end(chain), n) == std::end(chain)) {
+            return 0;
+        }
+        n_compute++;
+    }
+    if (n_compute != 8) {
+        return 0;
+    }
+    const ggml_tensor * inner[] = { gr, rows, add, addp, lc, sm, sm->src[0], mul->src[0], pkp, pkc, pk, pg, mul, sr, set->src[0] };
+    for (const ggml_tensor * t : inner) {
+        if ((t->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+            return 0;
+        }
+    }
+    const ggml_tensor * once[] = { gr, add, lc, sm, pkc, mul, sr };
+    for (const ggml_tensor * t : once) {
+        if (ggml_cuda_graph_use_count(cgraph, t) != 1) {
+            return 0;
+        }
+    }
+    if (ggml_cuda_graph_use_count(cgraph, rows) != 2) {
+        return 0;
+    }
+
+    ggml_cuda_kpool_pool(*cuda_ctx, kg, members, ape, rep, dst, (int) kpool);
+    return s - i;
+}
+
 // the reduction left by ggml_cuda_try_fuse_moe_down_shexp on its own
 static void ggml_cuda_session_reduction_flush(ggml_backend_cuda_context * cuda_ctx) {
     ggml_backend_cuda_context::session_reduction_t & red = cuda_ctx->session_red;
@@ -7063,6 +7177,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_MUL_MAT_ID) {
         const int n_skip = ggml_cuda_try_fuse_moe_down_shexp(cuda_ctx, cgraph, i);
+        if (n_skip != 0) {
+            return n_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_GET_ROWS) {
+        const int n_skip = ggml_cuda_try_fuse_kpool_pool(cuda_ctx, cgraph, i);
         if (n_skip != 0) {
             return n_skip;
         }
