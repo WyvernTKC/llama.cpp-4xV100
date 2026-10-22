@@ -4398,9 +4398,55 @@ static bool ggml_cuda_ssm_conv_state_is_folded(ggml_backend_cuda_context * cuda_
                 gr = gr->src[0];
             }
             if (gr == node) {
-                return ggml_cuda_ssm_conv_state_fusion_match(cuda_ctx, cgraph, j, f) && f.gr_idx == i && !f.gr_shared;
+                if (!ggml_cuda_ssm_conv_state_fusion_match(cuda_ctx, cgraph, j, f) || f.gr_idx != i) {
+                    return false;
+                }
+                break;
             }
         }
+        if (f.gr_idx != i) {
+            return false;
+        }
+        if (!f.gr_shared) {
+            return true;
+        }
+        // a row of several convolution states (glm5-next's q, k and v): the GET_ROWS does not run either when each of
+        //   its readers, through views and reshapes, is a CONCAT that runs fused (they read the cache row themselves).
+        //   Every reader of the GET_ROWS and of the views on the way must be among the next 256 nodes.
+        std::vector<std::pair<const ggml_tensor *, int>> parents = { { node, 0 } }; // and their readers found
+        for (int j = i + 1; j < cgraph->n_nodes && j <= i + 256; j++) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                if (n->src[s] == nullptr) {
+                    continue;
+                }
+                for (size_t p = 0; p < parents.size(); p++) {
+                    if (n->src[s] != parents[p].first) {
+                        continue;
+                    }
+                    parents[p].second++;
+                    // a view of no elements (build_rs's extra states of a single sequence) reads nothing
+                    if (ggml_nelements(n) == 0 && (n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW)) {
+                        break;
+                    }
+                    if (n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW) {
+                        parents.push_back({ n, 0 });
+                        break;
+                    }
+                    ggml_cuda_ssm_conv_state_fusion g;
+                    if (n->op != GGML_OP_CONCAT || !ggml_cuda_ssm_conv_state_fusion_match(cuda_ctx, cgraph, j, g) || g.gr_idx != i) {
+                        return false;
+                    }
+                    break;
+                }
+            }
+        }
+        for (const auto & p : parents) {
+            if (p.second != ggml_cuda_graph_use_count(cgraph, p.first)) {
+                return false;
+            }
+        }
+        return true;
     }
     // the TRANSPOSE that reads the MUL comes right after it
     if (node->op == GGML_OP_MUL && node->ne[1] <= GGML_CUDA_SSM_CONV_STATE_MAX_TOKENS && i + 2 < cgraph->n_nodes &&
