@@ -1012,7 +1012,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
 // or with a gathered K (decode) into the list of the selected cells
 
 ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
-        ggml_tensor * cur, ggml_tensor * qr, ggml_tensor * kq_mask, const llama_layer & layer,
+        ggml_tensor * cur, ggml_tensor * iq, ggml_tensor * ik, ggml_tensor * ig, ggml_tensor * kq_mask, const llama_layer & layer,
         const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_kpool * inp_kpool, int il) {
 
     const auto * mctx_lid = mctx_hyb->get_idx();
@@ -1023,16 +1023,12 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     const int64_t n_pool         = inp_kpool->pool_cells->ne[0];
     const int64_t n_new          = inp_kpool->n_new;
 
-    ggml_tensor * iq = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr);
     iq = ggml_reshape_3d(ctx0, iq, n_embd_indexer, n_indexer_head, n_tokens);
     cb(iq, "indexer_q", il);
 
-    // Per-token key and pool gate scores, cached together
-    ggml_tensor * ik = ggml_mul_mat(ctx0, layer.indexer_attn_k, cur);
+    // Per-token key and pool gate scores (the projections of cur, see build_dsa_layer), cached together
     ik = build_norm(ik, layer.indexer_k_norm, layer.indexer_k_norm_b, LLM_NORM, il);
     cb(ik, "indexer_k", il);
-
-    ggml_tensor * ig = ggml_mul_mat(ctx0, layer.indexer_kpool_gate, cur);
     cb(ig, "indexer_gate", il);
 
     // Cache rows store key | gate | pooled
@@ -1072,7 +1068,13 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     ggml_tensor * sel_idx = nullptr;
     {
         ggml_tensor * weights = ggml_mul_mat(ctx0, layer.indexer_proj, cur);
-        weights = ggml_scale(ctx0, weights, 1.0f / sqrtf(float(n_embd_indexer * n_indexer_head)));
+        // the scores only rank the pools: a scale by a power of two scales every product and sum exactly, so it
+        //   cannot change the order and is left out
+        const float w_scale = 1.0f / sqrtf(float(n_embd_indexer * n_indexer_head));
+        int w_exp = 0;
+        if (std::frexp(w_scale, &w_exp) != 0.5f) {
+            weights = ggml_scale(ctx0, weights, w_scale);
+        }
         cb(weights, "indexer_weights", il);
 
         ggml_tensor * score = nullptr;
@@ -1186,14 +1188,35 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
 
     GGML_ASSERT(hparams.n_rot() == 0 && "GLM5-Next MLA is nope-only");
 
-    ggml_tensor * qr = ggml_mul_mat(ctx0, layer.wq_a, cur);
+    const bool full_indexer = il >= (int) hparams.n_layer() || hparams.is_indexer_full(il); // the NextN block always has one
+
+    // At a few tokens the projections of cur come first, side by side: with weights of one type and width the
+    //   backend runs them as the sibling rows of fewer launches
+    const bool fused_order = glm5_fused_order(n_tokens);
+    ggml_tensor * qr      = ggml_mul_mat(ctx0, layer.wq_a, cur);
+    ggml_tensor * kv_cmpr = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
+    ggml_tensor * ik      = full_indexer ? ggml_mul_mat(ctx0, layer.indexer_attn_k, cur) : nullptr;
+    ggml_tensor * ig      = full_indexer ? ggml_mul_mat(ctx0, layer.indexer_kpool_gate, cur) : nullptr;
+    for (ggml_tensor * t : { qr, kv_cmpr, ik, ig }) {
+        if (fused_order && t != nullptr) {
+            ggml_build_forward_expand(gf, t);
+        }
+    }
+
     qr = build_norm(qr, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
     cb(qr, "q_resid", il);
 
-    ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq_b, qr);
+    // and the indexer's query projection of qr right after q's, a sibling of the same type and width
+    ggml_tensor * q  = ggml_mul_mat(ctx0, layer.wq_b, qr);
+    ggml_tensor * iq = full_indexer ? ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr) : nullptr;
+    if (fused_order) {
+        ggml_build_forward_expand(gf, q);
+        if (iq != nullptr) {
+            ggml_build_forward_expand(gf, iq);
+        }
+    }
     q = ggml_reshape_3d(ctx0, q, n_embd_head_qk_nope, n_head, n_tokens);
 
-    ggml_tensor * kv_cmpr = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
     kv_cmpr = build_norm(kv_cmpr, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
     kv_cmpr = ggml_reshape_3d(ctx0, kv_cmpr, kv_lora_rank, 1, n_tokens);
     cb(kv_cmpr, "kv_cmpr", il);
@@ -1207,8 +1230,8 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
     ggml_tensor * kq_mask = inp_attn->get_kq_mask();
 
     ggml_tensor * sel = nullptr;
-    if (il >= (int) hparams.n_layer() || hparams.is_indexer_full(il)) { // the NextN block always has a full indexer
-        sel = build_kpool_select(cur, qr, kq_mask, layer, mctx_hyb, inp_kpool, il);
+    if (full_indexer) {
+        sel = build_kpool_select(cur, iq, ik, ig, kq_mask, layer, mctx_hyb, inp_kpool, il);
         *prev_sel = sel;
     } else {
         GGML_ASSERT(*prev_sel != nullptr && "shared indexer layer must follow a full indexer layer");

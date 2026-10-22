@@ -3024,8 +3024,10 @@ struct llama_model_glm5_next : public llama_model_base {
                                       int64_t d_conv, int64_t head_dim, int64_t n_head_kda,
                                       int64_t d_inner, int64_t n_seq_tokens, int64_t n_seqs, int il);
 
-        ggml_tensor * build_kpool_select(ggml_tensor * cur, ggml_tensor * qr, ggml_tensor * kq_mask, const llama_layer & layer,
-                                         const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_kpool * inp_kpool, int il);
+        // iq: the indexer query projection of qr; ik, ig: the indexer key and pool gate projections of cur
+        ggml_tensor * build_kpool_select(ggml_tensor * cur, ggml_tensor * iq, ggml_tensor * ik, ggml_tensor * ig, ggml_tensor * kq_mask,
+                                         const llama_layer & layer, const llama_memory_hybrid_idx_context * mctx_hyb,
+                                         llm_graph_input_kpool * inp_kpool, int il);
 
         ggml_tensor * build_dsa_layer(ggml_tensor * cur, const llama_layer & layer,
                                       const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_attn_k * inp_attn,
