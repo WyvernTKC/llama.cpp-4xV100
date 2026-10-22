@@ -6031,9 +6031,9 @@ static bool ggml_cuda_moe_sum_to_allreduce(const ggml_backend_cuda_context * cud
 }
 
 // At one token: the MUL_MAT_ID of the routed experts' down projection, their weighted sum, and a shared expert's down
-//   projection gated by sigmoid(g) and added to the sum (Qwen3.5-MoE builds them in this order): the shared expert runs
-//   in the experts' launch as one more channel and the sum adds it, two launches instead of three. Returns the nodes
-//   to skip.
+//   projection added to the sum, gated by sigmoid(g) (Qwen3.5-MoE builds them in this order) or not (glm5-next, whose
+//   shared expert's GLU runs before the routed experts): the shared expert runs in the experts' launch as one more
+//   channel and the sum adds it, two launches instead of three. Returns the nodes to skip.
 static int ggml_cuda_try_fuse_moe_down_shexp(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i) {
     static const bool disabled = getenv("GGML_CUDA_NO_SHEXP_MERGE") != nullptr;
     ggml_tensor * down = cgraph->nodes[i];
@@ -6045,39 +6045,56 @@ static int ggml_cuda_try_fuse_moe_down_shexp(ggml_backend_cuda_context * cuda_ct
         return 0;
     }
     const int t = i + 1 + match.node_count;
-    if (t + 3 >= cgraph->n_nodes) {
+    if (t + 1 >= cgraph->n_nodes) {
         return 0;
     }
-    const ggml_tensor * mm  = cgraph->nodes[t];
-    const ggml_tensor * sig = cgraph->nodes[t + 1];
-    const ggml_tensor * mul = cgraph->nodes[t + 2];
-    ggml_tensor *       add = cgraph->nodes[t + 3];
-    if (mm->op != GGML_OP_MUL_MAT || sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID ||
-            mul->op != GGML_OP_MUL || add->op != GGML_OP_ADD) {
+    const ggml_tensor * mm = cgraph->nodes[t];
+    if (mm->op != GGML_OP_MUL_MAT) {
         return 0;
     }
-    const ggml_tensor * g = sig->src[0];
-    if (!((mul->src[0] == mm && mul->src[1] == sig) || (mul->src[0] == sig && mul->src[1] == mm)) ||
-            !((add->src[0] == match.dst && add->src[1] == mul) || (add->src[0] == mul && add->src[1] == match.dst)) ||
-            g->type != GGML_TYPE_F32 || ggml_nelements(g) != 1 || add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) ||
+    // the gated tail MUL_MAT -> SIGMOID(g) -> MUL -> ADD, or MUL_MAT -> ADD
+    const bool gated = t + 3 < cgraph->n_nodes && cgraph->nodes[t + 1]->op == GGML_OP_UNARY;
+    const ggml_tensor * g   = nullptr;
+    const ggml_tensor * sum = mm; // what the ADD adds to the weighted sum
+    if (gated) {
+        const ggml_tensor * sig = cgraph->nodes[t + 1];
+        const ggml_tensor * mul = cgraph->nodes[t + 2];
+        if (ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || mul->op != GGML_OP_MUL ||
+                !((mul->src[0] == mm && mul->src[1] == sig) || (mul->src[0] == sig && mul->src[1] == mm))) {
+            return 0;
+        }
+        g   = sig->src[0];
+        sum = mul;
+        if (g->type != GGML_TYPE_F32 || ggml_nelements(g) != 1) {
+            return 0;
+        }
+    }
+    const int     add_idx = t + (gated ? 3 : 1);
+    ggml_tensor * add     = cgraph->nodes[add_idx];
+    // the gated shared expert runs in the short q8_0 kernel, which quantizes its input itself; the plain mmvq kernel
+    //   reads the ungated one's q8_1 row after those of the experts
+    if (add->op != GGML_OP_ADD ||
+            !((add->src[0] == match.dst && add->src[1] == sum) || (add->src[0] == sum && add->src[1] == match.dst)) ||
+            add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) ||
             !ggml_are_same_shape(add, match.dst) || !ggml_are_same_shape(mm, match.dst) ||
-            !ggml_cuda_mul_mat_vec_q_short_sibling(down->src[0], down->src[1], down->src[2], mm->src[0], mm->src[1])) {
+            !(gated ? ggml_cuda_mul_mat_vec_q_short_sibling(down->src[0], down->src[1], down->src[2], mm->src[0], mm->src[1]) :
+                      ggml_cuda_mul_mat_vec_q_moe_sibling(down->src[0], down->src[1], down->src[2], mm->src[0], mm->src[1]))) {
         return 0;
     }
 
     // one fusion: nothing past it reads the sum or the shared expert's partial results
     std::vector<ggml_op> ops;
-    for (int k = i; k <= t + 3; k++) {
+    for (int k = i; k <= add_idx; k++) {
         ops.push_back(cgraph->nodes[k]->op);
     }
-    const int out = t + 3;
+    const int out = add_idx;
     if (ops.size() >= 32 || !ggml_can_fuse_subgraph(cgraph, i, (int) ops.size(), ops.data(), &out, 1)) {
         return 0;
     }
 
     // as for the weighted sum alone (see ggml_cuda_try_fuse), with the add as dst; every block reads the gate, and the
     //   shared expert's input is read in the launch that writes the experts
-    if (ggml_cuda_tensors_overlap(add, g) || ggml_cuda_tensors_overlap(down, mm->src[1])) {
+    if ((g != nullptr && ggml_cuda_tensors_overlap(add, g)) || ggml_cuda_tensors_overlap(down, mm->src[1])) {
         return 0;
     }
     if (ggml_cuda_tensors_overlap(add, down)) {
@@ -6095,16 +6112,17 @@ static int ggml_cuda_try_fuse_moe_down_shexp(ggml_backend_cuda_context * cuda_ct
         ids = &ids_remap;
     }
 
-    const bool last = ggml_cuda_moe_sum_to_allreduce(cuda_ctx, cgraph, t + 4, match, add);
+    const bool last = ggml_cuda_moe_sum_to_allreduce(cuda_ctx, cgraph, add_idx + 1, match, add);
 
     auto shexp = std::make_unique<ggml_cuda_pool_alloc<float>>(cuda_ctx->pool(), ggml_nelements(mm));
     ggml_cuda_mm_fusion_args_host fusion_data{};
     fusion_data.sib     = mm->src[0];
     fusion_data.sib_y   = mm->src[1];
     fusion_data.sib_out = shexp->get();
-    // the all-reduce of the sum folded into the launch (ggml_cuda_ar_fold_moe_args): the sum is not written anywhere
+    // the all-reduce of the sum folded into the launch (ggml_cuda_ar_fold_moe_args, gated only): the sum is not
+    //   written anywhere
     static const bool no_moe_fold = getenv("GGML_CUDA_NO_AR_FOLD_MOE") != nullptr;
-    const bool fold = last && !no_moe_fold && cuda_ctx->ar_fold.next == add && ggml_are_same_shape(match.experts, down) &&
+    const bool fold = last && gated && !no_moe_fold && cuda_ctx->ar_fold.next == add && ggml_are_same_shape(match.experts, down) &&
         match.experts->data == down->data && match.experts->ne[1] <= 8;
     if (fold) {
         fusion_data.ar_weights = match.weights;
@@ -6112,7 +6130,7 @@ static int ggml_cuda_try_fuse_moe_down_shexp(ggml_backend_cuda_context * cuda_ct
     }
     ggml_cuda_mul_mat_vec_q(*cuda_ctx, down->src[0], down->src[1], ids, down, &fusion_data);
     if (fold && cuda_ctx->ar_fold.pushed) {
-        return t + 3 - i;
+        return add_idx - i;
     }
 
     if (last) {
@@ -6123,10 +6141,10 @@ static int ggml_cuda_try_fuse_moe_down_shexp(ggml_backend_cuda_context * cuda_ct
         red.add_g   = g;
         red.dst     = add;
         red.add_x   = std::move(shexp);
-        return t + 3 - i;
+        return add_idx - i;
     }
     ggml_cuda_op_moe_weighted_reduction(*cuda_ctx, match.experts, nullptr, match.weights, add, false, shexp->get(), g);
-    return t + 3 - i;
+    return add_idx - i;
 }
 
 // the reduction left by ggml_cuda_try_fuse_moe_down_shexp on its own

@@ -831,6 +831,17 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
                     nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
         } else {
+            // at a few tokens the shared expert's GLU first: its down projection, after the routed experts' weighted
+            //   sum, can then run as one more channel of their down launch
+            ggml_tensor * shexp_glu = build_ffn(cur,
+                    layer.ffn_up_shexp,   nullptr, nullptr,
+                    layer.ffn_gate_shexp, nullptr, nullptr,
+                    nullptr,              nullptr, nullptr,
+                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+            if (glm5_fused_order(n_tokens)) {
+                ggml_build_forward_expand(gf, shexp_glu);
+            }
+
             ggml_tensor * moe_out = build_moe_ffn(cur,
                     layer.ffn_gate_inp,
                     layer.ffn_up_exps,
@@ -844,11 +855,7 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
                     il);
             cb(moe_out, "ffn_moe_out", il);
 
-            ggml_tensor * ffn_shexp = build_ffn(cur,
-                    layer.ffn_up_shexp,   nullptr, nullptr,
-                    layer.ffn_gate_shexp, nullptr, nullptr,
-                    layer.ffn_down_shexp, nullptr, nullptr,
-                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+            ggml_tensor * ffn_shexp = build_lora_mm(layer.ffn_down_shexp, shexp_glu);
             cb(ffn_shexp, "ffn_shexp", il);
 
             cur = ggml_add(ctx0, moe_out, ffn_shexp);

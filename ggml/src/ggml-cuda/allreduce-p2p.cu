@@ -380,7 +380,7 @@ static __global__ void ggml_cuda_p2p_ar_ll_kernel_n(const ggml_cuda_p2p_ar_args 
 }
 
 // ggml_cuda_p2p_ar_ll_kernel_n with its input computed on the way: the MoE weighted sum of the token's n_used expert
-// rows (and add_x times sigmoid(add_g) after it), as moe_weighted_reduction_f32 sums each column, so the values are
+// rows (and add_x times sigmoid(add_g) after it, add_x alone without add_g), as moe_weighted_reduction_f32 sums each column, so the values are
 // those of the two kernels apart. Same blocks, sequence numbers and slots, so a peer may run either kernel.
 template <int n_devs, int payload = 0>
 static __global__ void ggml_cuda_p2p_ar_ll_moe_reduce_kernel(const ggml_cuda_p2p_ar_args a, const float * experts,
@@ -410,7 +410,7 @@ static __global__ void ggml_cuda_p2p_ar_ll_moe_reduce_kernel(const ggml_cuda_p2p
             float  ga = 0.0f;
             if (add_x != nullptr) {
                 xa = ((const float4 *) add_x)[i];
-                ga = *add_g;
+                ga = add_g != nullptr ? *add_g : 0.0f;
             }
             for (int e0 = 0; e0 < n_used; e0 += ne_pf) {
                 if (e0 > 0) {
@@ -432,10 +432,13 @@ static __global__ void ggml_cuda_p2p_ar_ll_moe_reduce_kernel(const ggml_cuda_p2p
                     }
                 }
             }
-            if (add_x != nullptr) {
+            if (add_x != nullptr && add_g != nullptr) {
                 const float sig = ggml_cuda_op_sigmoid_single(ga);
                 v = make_float4(__fadd_rn(v.x, __fmul_rn(xa.x, sig)), __fadd_rn(v.y, __fmul_rn(xa.y, sig)),
                                 __fadd_rn(v.z, __fmul_rn(xa.z, sig)), __fadd_rn(v.w, __fmul_rn(xa.w, sig)));
+            } else if (add_x != nullptr) {
+                // an ungated shared expert
+                v = make_float4(__fadd_rn(v.x, xa.x), __fadd_rn(v.y, xa.y), __fadd_rn(v.z, xa.z), __fadd_rn(v.w, xa.w));
             }
         }
         a.dst[i] = ggml_cuda_p2p_ar_ll_exchange<n_devs, payload>(a, v, i, flag, slot_base);
