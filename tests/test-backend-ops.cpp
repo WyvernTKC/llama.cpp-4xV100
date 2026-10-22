@@ -5645,12 +5645,14 @@ struct test_sigmoid_mul_add : public test_case {
     }
 };
 
-// GGML_OP_MUL + GGML_OP_UNARY(SIGMOID) + GGML_OP_SCALE, the forget gate of bailingmoe3 (m per head)
+// GGML_OP_MUL + GGML_OP_UNARY(SIGMOID) + GGML_OP_SCALE, the forget gate of bailingmoe3 (m per head); with pre a SCALE
+//   by pre before the sigmoid, the decay gate of GLM-5.3's KDA layers (lb * sigmoid(-(g * A)))
 struct test_mul_sigmoid_scale : public test_case {
     const std::array<int64_t, 4> ne;
     const std::array<int64_t, 4> ne_m;
     const float s;
     const float b;
+    const float pre;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5660,12 +5662,12 @@ struct test_mul_sigmoid_scale : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR4(ne, ne_m, s, b);
+        return VARS_TO_STR5(ne, ne_m, s, b, pre);
     }
 
     test_mul_sigmoid_scale(std::array<int64_t, 4> ne = { 128, 32, 1, 1 }, std::array<int64_t, 4> ne_m = { 1, 32, 1, 1 },
-                           float s = -5.0f, float b = 0.0f)
-        : ne(ne), ne_m(ne_m), s(s), b(b) {}
+                           float s = -5.0f, float b = 0.0f, float pre = 0.0f)
+        : ne(ne), ne_m(ne_m), s(s), b(b), pre(pre) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
@@ -5673,7 +5675,11 @@ struct test_mul_sigmoid_scale : public test_case {
         ggml_set_name(x, "x");
         ggml_set_name(m, "m");
 
-        ggml_tensor * out = ggml_scale_bias(ctx, ggml_sigmoid(ctx, ggml_mul(ctx, x, m)), s, b);
+        ggml_tensor * cur = ggml_mul(ctx, x, m);
+        if (pre != 0.0f) {
+            cur = ggml_scale(ctx, cur, pre);
+        }
+        ggml_tensor * out = ggml_scale_bias(ctx, ggml_sigmoid(ctx, cur), s, b);
         ggml_set_name(out, "out");
         return out;
     }
@@ -14154,6 +14160,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_sigmoid_scale({128, 32, 7, 1}, {1, 32, 1, 1}, -5.0f, 0.0f));
             test_cases.emplace_back(new test_mul_sigmoid_scale({64, 6, 3, 2}, {64, 1, 3, 1}, 0.5f, 0.25f));
             test_cases.emplace_back(new test_mul_sigmoid_scale({100, 5, 1, 1}, {100, 5, 1, 1}, 2.0f, -1.0f));
+            // GLM-5.3 KDA decay gate: 128 x 64 heads (16 heads a device at 4), one token and a batch
+            test_cases.emplace_back(new test_mul_sigmoid_scale({128, 16, 1, 1}, {1, 16, 1, 1}, -5.0f, 0.0f, -1.0f));
+            test_cases.emplace_back(new test_mul_sigmoid_scale({128, 64, 5, 1}, {1, 64, 1, 1}, -5.0f, 0.0f, -1.0f));
+            test_cases.emplace_back(new test_mul_sigmoid_scale({64, 6, 3, 2}, {64, 1, 3, 1}, 0.5f, 0.25f, 0.75f));
         }
         test_cases.emplace_back(new test_scale_silu(320, 3, 0.25f, 0.0f, with_mm));
         test_cases.emplace_back(new test_scale_silu(1024, 1, 0.5f, 0.125f, with_mm));

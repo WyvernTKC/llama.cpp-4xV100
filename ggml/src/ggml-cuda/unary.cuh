@@ -122,8 +122,11 @@ bool ggml_cuda_should_fuse_sigmoid_mul_add(const ggml_tensor * sigmoid, const gg
 void ggml_cuda_op_sigmoid_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * sigmoid, ggml_tensor * mul, ggml_tensor * add);
 
 // scale(sigmoid(x * m)) with m broadcast as by the MUL, the forget gate of bailingmoe3 (m per head)
-bool ggml_cuda_should_fuse_mul_sigmoid_scale(const ggml_tensor * mul, const ggml_tensor * sigmoid, const ggml_tensor * scale);
-void ggml_cuda_op_mul_sigmoid_scale(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * scale);
+// pre: a SCALE between the MUL and the SIGMOID, or nullptr
+bool ggml_cuda_should_fuse_mul_sigmoid_scale(const ggml_tensor * mul, const ggml_tensor * pre, const ggml_tensor * sigmoid,
+        const ggml_tensor * scale);
+void ggml_cuda_op_mul_sigmoid_scale(ggml_backend_cuda_context & ctx, ggml_tensor * mul, const ggml_tensor * pre,
+        ggml_tensor * scale);
 
 // the op kernels use these too, so a fused kernel gets the values the op's own kernel would
 __device__ __forceinline__ float ggml_cuda_op_sigmoid_single(float x) {

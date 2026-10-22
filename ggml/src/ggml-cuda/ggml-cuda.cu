@@ -8588,11 +8588,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // the forget gate of bailingmoe3: scale * sigmoid(gate * a), a per head
+    // the forget gate of bailingmoe3: scale * sigmoid(gate * a), a per head; the decay gate of a KDA layer (GLM-5.3):
+    //   lb * sigmoid(-(g * A)), a SCALE before the sigmoid
     if (ggml_can_fuse(cgraph, i, { GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_SCALE }) &&
-            ggml_cuda_should_fuse_mul_sigmoid_scale(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
-        ggml_cuda_op_mul_sigmoid_scale(*cuda_ctx, node, cgraph->nodes[i + 2]);
+            ggml_cuda_should_fuse_mul_sigmoid_scale(node, nullptr, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+        ggml_cuda_op_mul_sigmoid_scale(*cuda_ctx, node, nullptr, cgraph->nodes[i + 2]);
         return 2;
+    }
+    if (ggml_can_fuse(cgraph, i, { GGML_OP_MUL, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }) &&
+            ggml_cuda_should_fuse_mul_sigmoid_scale(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3])) {
+        ggml_cuda_op_mul_sigmoid_scale(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 3]);
+        return 3;
     }
 
     // qwen4exp, 1 to 4 tokens: SCALE -> SILU of a hyper-connection mix, its up projection and the gated DSV4_HC_PRE that

@@ -1172,10 +1172,12 @@ void ggml_cuda_op_sigmoid_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor *
 
 /* fused mul + sigmoid + scale */
 
-// each step rounds like its own kernel: m is read as the MUL broadcasts it
+// each step rounds like its own kernel: m is read as the MUL broadcasts it. pre: a SCALE between the MUL and the
+//   SIGMOID (the decay gate of a KDA layer, lb * sigmoid(-(g * A))), an FFMA as scale_f32 rounds it.
+template <bool pre>
 static __global__ void mul_sigmoid_scale_f32(const float * x, const float * m, float * dst, const int k,
         const int ne0, const int ne1, const int ne2, const int m0, const int m1, const int m2, const int m3,
-        const float scale, const float bias) {
+        const float scale, const float bias, const float pre_scale, const float pre_bias) {
     ggml_cuda_pdl_lc();
     const int i = blockDim.x*blockIdx.x + threadIdx.x;
 
@@ -1189,14 +1191,24 @@ static __global__ void mul_sigmoid_scale_f32(const float * x, const float * m, f
     const int i2 = (i / (ne0*ne1)) % ne2;
     const int i3 = i / (ne0*ne1*ne2);
     const float mv = m[((i3 % m3)*m2 + i2 % m2)*m1*m0 + (i1 % m1)*m0 + i0 % m0];
-    const float v  = op_sigmoid(__fmul_rn(x[i], mv));
+    float t = __fmul_rn(x[i], mv);
+    if constexpr (pre) {
+        t = __fmaf_rn(pre_scale, t, pre_bias);
+    }
+    const float v  = op_sigmoid(t);
     dst[i] = scale * v + bias;
 }
 
-bool ggml_cuda_should_fuse_mul_sigmoid_scale(const ggml_tensor * mul, const ggml_tensor * sigmoid, const ggml_tensor * scale) {
+bool ggml_cuda_should_fuse_mul_sigmoid_scale(const ggml_tensor * mul, const ggml_tensor * pre, const ggml_tensor * sigmoid,
+        const ggml_tensor * scale) {
     const ggml_tensor * x = mul->src[0];
     const ggml_tensor * m = mul->src[1];
-    if (sigmoid->src[0] != mul || scale->src[0] != sigmoid || ggml_get_unary_op(sigmoid) != GGML_UNARY_OP_SIGMOID ||
+    static const bool no_pre = getenv("GGML_CUDA_NO_MUL_SCALE_SIGMOID_SCALE") != nullptr;
+    if (pre != nullptr && (no_pre || pre->op != GGML_OP_SCALE || pre->src[0] != mul || pre->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(pre, mul))) {
+        return false;
+    }
+    if (sigmoid->src[0] != (pre ? pre : mul) || scale->src[0] != sigmoid || ggml_get_unary_op(sigmoid) != GGML_UNARY_OP_SIGMOID ||
             x->type != GGML_TYPE_F32 || m->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
             sigmoid->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 ||
             !ggml_is_contiguous(x) || !ggml_is_contiguous(m) || !ggml_is_contiguous(scale) ||
@@ -1208,7 +1220,8 @@ bool ggml_cuda_should_fuse_mul_sigmoid_scale(const ggml_tensor * mul, const ggml
     return !ggml_cuda_tensors_overlap(scale, m) && (!ggml_cuda_tensors_overlap(scale, x) || scale->data == x->data);
 }
 
-void ggml_cuda_op_mul_sigmoid_scale(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * scale_node) {
+void ggml_cuda_op_mul_sigmoid_scale(ggml_backend_cuda_context & ctx, ggml_tensor * mul, const ggml_tensor * pre,
+        ggml_tensor * scale_node) {
     const ggml_tensor * x = mul->src[0];
     const ggml_tensor * m = mul->src[1];
 
@@ -1216,12 +1229,18 @@ void ggml_cuda_op_mul_sigmoid_scale(ggml_backend_cuda_context & ctx, ggml_tensor
     float bias;
     memcpy(&scale, (const float *) scale_node->op_params + 0, sizeof(float));
     memcpy(&bias,  (const float *) scale_node->op_params + 1, sizeof(float));
+    float pre_scale = 1.0f;
+    float pre_bias  = 0.0f;
+    if (pre) {
+        memcpy(&pre_scale, (const float *) pre->op_params + 0, sizeof(float));
+        memcpy(&pre_bias,  (const float *) pre->op_params + 1, sizeof(float));
+    }
 
     const int k = ggml_nelements(scale_node);
     const int num_blocks = (k + CUDA_SIGMOID_BLOCK_SIZE - 1) / CUDA_SIGMOID_BLOCK_SIZE;
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_SIGMOID_BLOCK_SIZE, 0, ctx.stream());
-    ggml_cuda_kernel_launch(mul_sigmoid_scale_f32, launch_params,
+    ggml_cuda_kernel_launch(pre ? mul_sigmoid_scale_f32<true> : mul_sigmoid_scale_f32<false>, launch_params,
         (const float *) x->data, (const float *) m->data, (float *) scale_node->data, k,
         (int) x->ne[0], (int) x->ne[1], (int) x->ne[2], (int) m->ne[0], (int) m->ne[1], (int) m->ne[2], (int) m->ne[3],
-        scale, bias);
+        scale, bias, pre_scale, pre_bias);
 }
