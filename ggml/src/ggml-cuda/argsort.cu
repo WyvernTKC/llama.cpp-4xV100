@@ -171,21 +171,52 @@ static inline __device__ void bitonic_step(const float * x_row, int * dst_row, c
     }
 }
 
+// bitonic_step with the keys in shared memory beside the indices, moved with them: the same comparisons of the same
+//   values, so the same network and permutation, without a dependent global load in each of the log2(n)^2/2 steps
+template<ggml_sort_order order>
+static inline __device__ void bitonic_step_kv(float * key_row, int * dst_row, const int ncols, const int col, const int k, const int j) {
+    const int ixj = col ^ j;
+    if (ixj <= col) {
+        return;
+    }
+    const int   a  = dst_row[col];
+    const int   b  = dst_row[ixj];
+    const float ka = key_row[col];
+    const float kb = key_row[ixj];
+    bool swap;
+    if ((col & k) == 0) {
+        swap = a >= ncols || (b < ncols && (order == GGML_SORT_ORDER_ASC ? ka > kb : ka < kb));
+    } else {
+        swap = b >= ncols || (a < ncols && (order == GGML_SORT_ORDER_ASC ? ka < kb : ka > kb));
+    }
+    if (swap) {
+        dst_row[col] = b;
+        dst_row[ixj] = a;
+        key_row[col] = kb;
+        key_row[ixj] = ka;
+    }
+}
+
 // Bitonic sort of one row per block. Each thread owns the columns
 // threadIdx.x + i * blockDim.x, so rows wider than the block (up to the
 // shared memory limit) sort with several columns per thread. Every
 // (k, j) stage runs all owned columns before the barrier; a pair
 // (col, col ^ j) is exchanged by the owner of its lower index only.
-template<ggml_sort_order order>
+// With kv the keys are copied to shared memory after the indices (bitonic_step_kv).
+template<ggml_sort_order order, bool kv>
 static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int ncols, int ncols_pad) {
     const int row = blockIdx.x;
 
     const float * x_row = x + row * ncols;
     extern __shared__ int dst_row[];
+    float * key_row = (float *) (dst_row + ncols_pad);
 
     // initialize indices
     for (int col = threadIdx.x; col < ncols_pad; col += blockDim.x) {
         dst_row[col] = col;
+        if constexpr (kv) {
+            key_row[col] = col < ncols ? x_row[col] : 0.0f;
+        }
     }
 
     __syncthreads();
@@ -193,7 +224,11 @@ static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int n
     for (int k = 2; k <= ncols_pad; k *= 2) {
         for (int j = k / 2; j > 0; j /= 2) {
             for (int col = threadIdx.x; col < ncols_pad; col += blockDim.x) {
-                bitonic_step<order>(x_row, dst_row, ncols, col, k, j);
+                if constexpr (kv) {
+                    bitonic_step_kv<order>(key_row, dst_row, ncols, col, k, j);
+                } else {
+                    bitonic_step<order>(x_row, dst_row, ncols, col, k, j);
+                }
             }
             __syncthreads();
         }
@@ -227,16 +262,21 @@ void argsort_f32_i32_cuda_bitonic(const float *   x,
     const dim3 block_dims(ncols_pad < CUDA_ARGSORT_BLOCK_SIZE ? ncols_pad : CUDA_ARGSORT_BLOCK_SIZE, 1, 1);
     const dim3 block_nums(nrows, 1, 1);
     const size_t shared_mem = ncols_pad * sizeof(int);
+    const size_t smpb       = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
 
     // FIXME: this limit could be raised by ~2-4x on Ampere or newer
-    GGML_ASSERT(shared_mem <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
+    GGML_ASSERT(shared_mem <= smpb);
+
+    // the keys beside the indices when both fit
+    static const bool no_kv = getenv("GGML_CUDA_ARGSORT_NO_KV") != nullptr;
+    const bool kv = !no_kv && 2*shared_mem <= smpb;
 
     if (order == GGML_SORT_ORDER_ASC) {
-        k_argsort_f32_i32<GGML_SORT_ORDER_ASC>
-            <<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad);
+        (kv ? k_argsort_f32_i32<GGML_SORT_ORDER_ASC, true> : k_argsort_f32_i32<GGML_SORT_ORDER_ASC, false>)
+            <<<block_nums, block_dims, kv ? 2*shared_mem : shared_mem, stream>>>(x, dst, ncols, ncols_pad);
     } else if (order == GGML_SORT_ORDER_DESC) {
-        k_argsort_f32_i32<GGML_SORT_ORDER_DESC>
-            <<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad);
+        (kv ? k_argsort_f32_i32<GGML_SORT_ORDER_DESC, true> : k_argsort_f32_i32<GGML_SORT_ORDER_DESC, false>)
+            <<<block_nums, block_dims, kv ? 2*shared_mem : shared_mem, stream>>>(x, dst, ncols, ncols_pad);
     } else {
         GGML_ABORT("fatal error");
     }
