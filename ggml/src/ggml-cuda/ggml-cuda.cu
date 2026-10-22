@@ -7296,6 +7296,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion.dst);
             return nodes_to_skip;
         }
+
+        // a layer norm with weight and bias (the glm5-next indexer key): three launches in one
+        static const bool no_norm_mul_add = getenv("GGML_CUDA_NO_NORM_MUL_ADD") != nullptr;
+        if (!no_norm_mul_add && i + 2 < cgraph->n_nodes &&
+                ggml_cuda_should_fuse_norm_mul_add(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+            const enum ggml_op ops[3] = { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD };
+            const int outputs[1] = { i + 2 };
+            if (ggml_can_fuse_subgraph(cgraph, i, 3, ops, outputs, 1)) {
+                ggml_cuda_op_norm_mul_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+                return 2;
+            }
+        }
     }
 
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
