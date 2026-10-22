@@ -14,6 +14,75 @@ static __device__ __forceinline__ float dsv4_hc_post_weight(float p, const float
     return p;
 }
 
+static constexpr int DSV4_HC = 4;
+
+// The comb math is written with the rounding intrinsics as dsv4_hc_comb_f32 was compiled (an FFMA for the two affine
+//   steps, products and sums rounded apart elsewhere), so that it rounds the same in any kernel that inlines it.
+static __device__ __forceinline__ void dsv4_hc_comb_norm_cols(float * comb, float eps) {
+    for (int idst = 0; idst < DSV4_HC; ++idst) {
+        float sum = eps;
+        for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
+            sum = __fadd_rn(sum, comb[idst + DSV4_HC*isrc]);
+        }
+
+        const float inv_sum = 1.0f / sum;
+        for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
+            comb[idst + DSV4_HC*isrc] = __fmul_rn(comb[idst + DSV4_HC*isrc], inv_sum);
+        }
+    }
+}
+
+static __device__ __forceinline__ void dsv4_hc_comb_norm_rows(float * comb, float eps) {
+    for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
+        float sum = eps;
+        for (int idst = 0; idst < DSV4_HC; ++idst) {
+            sum = __fadd_rn(sum, comb[idst + DSV4_HC*isrc]);
+        }
+
+        const float inv_sum = 1.0f / sum;
+        for (int idst = 0; idst < DSV4_HC; ++idst) {
+            comb[idst + DSV4_HC*isrc] = __fmul_rn(comb[idst + DSV4_HC*isrc], inv_sum);
+        }
+    }
+}
+
+// The DSV4_HC_COMB of one token: its mixes at stride sm0 (the comb from row 2*DSV4_HC), comb[idst + DSV4_HC*isrc]. The
+//   op's kernel and the fused kernels that compute it in place share this.
+static __device__ __forceinline__ void dsv4_hc_comb_one(const float * mixes, const int64_t sm0, const float scale_comb,
+        const float * base, const int64_t sb0, const float eps, const int32_t n_iter, float * comb) {
+    constexpr int comb_offset = 2*DSV4_HC;
+
+    for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
+        float max = -INFINITY;
+        for (int idst = 0; idst < DSV4_HC; ++idst) {
+            const int idx = idst + DSV4_HC*isrc;
+            const float v = __fmaf_rn(mixes[(comb_offset + idx)*sm0], scale_comb, base[(comb_offset + idx)*sb0]);
+            comb[idx] = v;
+            max = fmaxf(max, v);
+        }
+
+        float sum = 0.0f;
+        for (int idst = 0; idst < DSV4_HC; ++idst) {
+            const int idx = idst + DSV4_HC*isrc;
+            const float v = expf(__fsub_rn(comb[idx], max));
+            comb[idx] = v;
+            sum = __fadd_rn(sum, v);
+        }
+
+        const float inv_sum = 1.0f / sum;
+        for (int idst = 0; idst < DSV4_HC; ++idst) {
+            const int idx = idst + DSV4_HC*isrc;
+            comb[idx] = __fmaf_rn(comb[idx], inv_sum, eps);
+        }
+    }
+
+    dsv4_hc_comb_norm_cols(comb, eps);
+    for (int32_t i = 1; i < n_iter; ++i) {
+        dsv4_hc_comb_norm_rows(comb, eps);
+        dsv4_hc_comb_norm_cols(comb, eps);
+    }
+}
+
 // one value of an identity-comb hyper-connection combine: x * p + the stream's residual
 static __device__ __forceinline__ float dsv4_hc_post_identity(const float x, const float p, const float r) {
     float sum = x * p;

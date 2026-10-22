@@ -5839,10 +5839,16 @@ struct test_relu_sqr : public test_case {
 
 // GGML_OP_MUL + GGML_OP_ADD + GGML_OP_UNARY(SIGMOID) + GGML_OP_SCALE (fused operation), the DeepSeek V4
 // hyper-connection coefficients: a column slice of the mixes times a weight scalar plus a weight vector.
-// MUL_MAT(w, RMS_NORM(x)), one token and a few f32 rows (DeepSeek-V4's hyper-connection mixes: 24 rows of 4 x 5120)
+// MUL_MAT(w, RMS_NORM(x)), one token and a few f32 rows (DeepSeek-V4's hyper-connection mixes: 24 rows of 4 x 5120), or
+//   q8_0 rows (GLM-5.3's); with hc the x of the norm is the DSV4_HC_POST (with comb) of hc streams of ncols/hc before it
 struct test_rms_norm_mul_mat : public test_case {
-    const int64_t ncols;
-    const int64_t nrows;
+    const int64_t   ncols;
+    const int64_t   nrows;
+    const ggml_type type;
+    const int64_t   hc;
+
+    ggml_tensor * post = nullptr;
+    ggml_tensor * out  = nullptr;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5851,23 +5857,183 @@ struct test_rms_norm_mul_mat : public test_case {
 
     bool run_whole_graph() override { return true; }
 
-    std::string vars() override {
-        return VARS_TO_STR2(ncols, nrows);
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (post) {
+            return { post, out };
+        }
+        return {};
     }
 
-    // the scale meets the sum instead of each value
-    double max_nmse_err() override { return 1e-6; }
+    std::string vars() override {
+        return VARS_TO_STR4(ncols, nrows, type, hc);
+    }
 
-    test_rms_norm_mul_mat(int64_t ncols = 20480, int64_t nrows = 24) : ncols(ncols), nrows(nrows) {}
+    // the scale meets the sum instead of each value; a q8_0 w meets the f32 x where the reference quantizes x
+    double max_nmse_err() override { return type == GGML_TYPE_F32 ? 1e-6 : 5e-4; }
+
+    test_rms_norm_mul_mat(int64_t ncols = 20480, int64_t nrows = 24, ggml_type type = GGML_TYPE_F32, int64_t hc = 0)
+        : ncols(ncols), nrows(nrows), type(type), hc(hc) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ncols, 1);
-        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ncols, nrows);
-        ggml_set_name(x, "x");
+        ggml_tensor * x;
+        if (hc > 0) {
+            ggml_tensor * cur      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ncols/hc, 1);
+            ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ncols/hc, hc, 1);
+            ggml_tensor * p        = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, 1);
+            ggml_tensor * comb     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, 1);
+            ggml_set_name(cur, "cur");
+            ggml_set_name(residual, "residual");
+            ggml_set_name(p, "p");
+            ggml_set_name(comb, "comb");
+            post = ggml_dsv4_hc_post(ctx, cur, residual, p, comb);
+            ggml_set_name(post, "post");
+            ggml_set_output(post);
+            x = ggml_reshape_2d(ctx, post, ncols, 1);
+        } else {
+            x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ncols, 1);
+            ggml_set_name(x, "x");
+        }
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, type, ncols, nrows);
         ggml_set_name(w, "w");
         ggml_tensor * norm = ggml_rms_norm(ctx, x, 1e-6f);
         ggml_set_name(norm, "norm");
-        ggml_tensor * out = ggml_mul_mat(ctx, w, norm);
+        out = ggml_mul_mat(ctx, w, norm);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// DeepSeek-V4 / GLM-5.3 between two blocks, one token: DSV4_HC_POST -> RMS_NORM -> MUL_MAT (the 24 mixes, f32 or q8_0
+//   rows) -> the stream weights (MUL -> ADD -> SIGMOID -> SCALE of a slice of the mixes) -> DSV4_HC_PRE -> RMS_NORM -> MUL,
+//   and with mm a q8_0 matmul of that. With fold the combine's post weights (the same chain, 2*sigmoid) and comb
+//   (DSV4_HC_COMB) come from the mixes of the block before, as the model builds them.
+struct test_dsv4_hc_post_pre : public test_case {
+    const int64_t   n_embd;
+    const ggml_type type;
+    const bool      pre_out;
+    const bool      mm;
+    const bool      fold;
+
+    ggml_tensor * post   = nullptr;
+    ggml_tensor * mixes  = nullptr;
+    ggml_tensor * pre    = nullptr;
+    ggml_tensor * normed = nullptr;
+    ggml_tensor * out    = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_POST_PRE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    // the scale and base are model weights, and the fusion only accepts views of constant tensors
+    bool use_weight_context() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_embd, type, pre_out, mm, fold);
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        std::vector<ggml_tensor *> nodes = { post, mixes };
+        if (pre_out) {
+            nodes.push_back(pre);
+        }
+        nodes.push_back(normed);
+        if (mm) {
+            nodes.push_back(out);
+        }
+        return nodes;
+    }
+
+    double max_nmse_err() override { return type == GGML_TYPE_F32 && !mm ? 1e-6 : 5e-4; }
+
+    // the mixes at the size of a model's (|mix| ~ 1): with w in [-1, 1] they are ~70, the stream weights' sigmoids sit
+    //   on their steep part or saturate, and the reference's q8_0 copy of the normed x moves them by percent
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(ggml_get_name(t), "w") == 0) {
+                init_tensor_uniform(t, -0.02f, 0.02f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    test_dsv4_hc_post_pre(int64_t n_embd = 4096, ggml_type type = GGML_TYPE_Q8_0, bool pre_out = false, bool mm = true,
+            bool fold = false)
+        : n_embd(n_embd), type(type), pre_out(pre_out), mm(mm), fold(fold) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_ASSERT(!use_weight_context());
+        return build_graph(ctx, nullptr);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        GGML_ASSERT(ctx_weights);
+        const int64_t hc     = 4;
+        const int64_t n_mix  = (2 + hc)*hc;
+
+        ggml_tensor * cur      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, 1);
+        ggml_set_name(cur, "cur");
+        ggml_set_name(residual, "residual");
+        ggml_tensor * p;
+        ggml_tensor * comb;
+        if (fold) {
+            ggml_tensor * mixes_prev = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_mix, 1);
+            ggml_tensor * scale_prev = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, 3);
+            ggml_tensor * base_prev  = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, n_mix);
+            ggml_set_name(mixes_prev, "mixes_prev");
+            ggml_set_name(scale_prev, "scale_prev");
+            ggml_set_name(base_prev,  "base_prev");
+            p = ggml_mul(ctx, ggml_view_2d(ctx, mixes_prev, hc, 1, mixes_prev->nb[1], hc*sizeof(float)),
+                ggml_view_1d(ctx, scale_prev, 1, sizeof(float)));
+            p = ggml_add(ctx, p, ggml_view_1d(ctx, base_prev, hc, hc*sizeof(float)));
+            p = ggml_scale(ctx, ggml_sigmoid(ctx, p), 2.0f);
+            comb = ggml_dsv4_hc_comb(ctx, mixes_prev, scale_prev, base_prev, 1e-6f, 20);
+        } else {
+            p    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, 1);
+            comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, 1);
+            ggml_set_name(p, "p");
+            ggml_set_name(comb, "comb");
+        }
+        post = ggml_dsv4_hc_post(ctx, cur, residual, p, comb);
+        ggml_set_name(post, "post");
+        ggml_set_output(post);
+
+        ggml_tensor * w = ggml_new_tensor_2d(ctx_weights, type, n_embd*hc, n_mix);
+        ggml_set_name(w, "w");
+        mixes = ggml_mul_mat(ctx, w, ggml_rms_norm(ctx, ggml_reshape_2d(ctx, post, n_embd*hc, 1), 1e-6f));
+        ggml_set_name(mixes, "mixes");
+        ggml_set_output(mixes);
+
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, 3);
+        ggml_tensor * base  = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, n_mix);
+        ggml_set_name(scale, "scale");
+        ggml_set_name(base,  "base");
+        ggml_tensor * wts = ggml_mul(ctx, ggml_view_2d(ctx, mixes, hc, 1, mixes->nb[1], 0), ggml_view_1d(ctx, scale, 1, 0));
+        wts = ggml_add(ctx, wts, ggml_view_1d(ctx, base, hc, 0));
+        wts = ggml_sigmoid(ctx, wts);
+        wts = ggml_scale_bias(ctx, wts, 1.0f, 1e-6f);
+
+        pre = ggml_dsv4_hc_pre(ctx, post, wts);
+        ggml_set_name(pre, "pre");
+        if (pre_out) {
+            ggml_set_output(pre);
+        }
+        ggml_tensor * w_norm = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, n_embd);
+        ggml_set_name(w_norm, "w_norm");
+        normed = ggml_mul(ctx, ggml_rms_norm(ctx, pre, 1e-6f), w_norm);
+        ggml_set_name(normed, "normed");
+        out = normed;
+        if (!mm) {
+            return normed;
+        }
+        ggml_set_output(normed);
+        ggml_tensor * wq = ggml_new_tensor_2d(ctx_weights, GGML_TYPE_Q8_0, n_embd, 64);
+        ggml_set_name(wq, "wq");
+        out = ggml_mul_mat(ctx, wq, normed);
         ggml_set_name(out, "out");
         return out;
     }
@@ -14318,6 +14484,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // the hyper-connection mixes of DeepSeek-V4 (24 rows of 4 x 4096 / 4 x 5120), a ragged last slice, the 31-row and 128-slice limits
     for (auto [ncols, nrows] : std::vector<std::pair<int64_t, int64_t>>{{16384, 24}, {20480, 24}, {20480, 4}, {5000, 31}, {32768, 31}, {1030, 1}}) {
         test_cases.emplace_back(new test_rms_norm_mul_mat(ncols, nrows));
+    }
+    // GLM-5.3's q8_0 mixes (24 rows of 4 x 4096), and with the hyper-connection combine before the norm
+    for (auto [ncols, nrows] : std::vector<std::pair<int64_t, int64_t>>{{16384, 24}, {20480, 24}, {32768, 31}, {1056, 1}}) {
+        test_cases.emplace_back(new test_rms_norm_mul_mat(ncols, nrows, GGML_TYPE_Q8_0));
+    }
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
+        for (auto [ncols, nrows] : std::vector<std::pair<int64_t, int64_t>>{{16384, 24}, {20480, 24}, {1024, 3}, {1152, 24}}) {
+            test_cases.emplace_back(new test_rms_norm_mul_mat(ncols, nrows, type, 4));
+        }
+    }
+    // and the next block's stream weights, mix and norm after them (GLM-5.3 4096, DeepSeek-V4-Flash 5120, the padded q8_1
+    //   row of 2304, one column per thread of the 1024-thread norm at 1024)
+    for (auto [n_embd, type, pre_out, mm] : std::vector<std::tuple<int64_t, ggml_type, bool, bool>>{
+            {4096, GGML_TYPE_Q8_0, false, true}, {4096, GGML_TYPE_Q8_0, true, true}, {4096, GGML_TYPE_F32, false, false},
+            {5120, GGML_TYPE_F32, false, true}, {5120, GGML_TYPE_Q8_0, true, false}, {1024, GGML_TYPE_Q8_0, false, true},
+            {2304, GGML_TYPE_Q8_0, false, true}, {2304, GGML_TYPE_F32, true, false}}) {
+        test_cases.emplace_back(new test_dsv4_hc_post_pre(n_embd, type, pre_out, mm));
+    }
+    // and with the post weights and comb of the combine made from the mixes before it, as the models build them
+    for (auto [n_embd, type, mm] : std::vector<std::tuple<int64_t, ggml_type, bool>>{
+            {4096, GGML_TYPE_Q8_0, true}, {4096, GGML_TYPE_F32, false}, {5120, GGML_TYPE_F32, true}, {1024, GGML_TYPE_Q8_0, true}}) {
+        test_cases.emplace_back(new test_dsv4_hc_post_pre(n_embd, type, false, mm, true));
     }
     // a K-quant slice of 2-3 super-blocks (DeepSeek-V4.1's 2304-column experts split in four): a warp per row, one token
     for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {

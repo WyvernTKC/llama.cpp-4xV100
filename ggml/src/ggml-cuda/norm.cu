@@ -2393,25 +2393,350 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
 //   partial dot products with the raw x, and the last block to finish (a ticket in block_flags) adds the slices in order
 //   and scales the sums, rms_norm(x)*w = (x*w)*rsqrt(mean(x*x) + eps). The scale meets the sum, not each x, so this
 //   rounds differently from the two ops.
+// A q8_0 w (GLM-5.3's) is dequantized as dequantize_q8_0 does, q*d, and meets the raw f32 x: the matvec of the two ops
+//   would read the q8_1 copy of the normalized x instead.
+// With hc_post, x is the DSV4_HC_POST (with comb, not gated) of one token right before the norm, n_embd*hc values as one
+//   row: each block forms its slice as dsv4_hc_post_f32 does and writes it to that op's dst. n_embd % RMS_NORM_MM_CHUNK
+//   == 0, so a block is in one stream.
+// With fold, the post weights and the comb of the combine are not read but computed in every block from the mixes of the
+//   block's own DSV4_HC_PRE, as the MUL -> ADD -> SIGMOID -> SCALE (mul_add_sigmoid_scale_f32) and the DSV4_HC_COMB
+//   before the combine would (dsv4_hc_comb_one, one thread while the weight loads are in flight), and those launches go.
+// With hc_pre as well, the launch goes on to the input of the next block: the stream weights of its DSV4_HC_PRE from
+//   their slice of the mixes (dsv4_hc_pre_coef_f32), the mix of the streams the blocks wrote and its RMS_NORM -> MUL with
+//   the q8_1 copy for the matmul after it, rounded as rms_norm_mul_q8_f32<1024> rounds them. Not in one block (an SM
+//   pulls ~10 bytes a cycle, and the streams are 64 KB): every block goes on past a barrier of the whole grid, sums the
+//   slices itself and stands in for its share of the threads of that block's layout, whose sums of squares meet past a
+//   second barrier in that block's order; then it writes its share of the output. Every block must be resident at once.
 #define RMS_NORM_MM_MAX_ROWS 31  // the sum of squares of a slice goes after them, 32 floats a slice
 #define RMS_NORM_MM_CHUNK    256
 #define RMS_NORM_MM_MAX_BLOCKS 128 // 16 slices for each of the 8 threads of a sum in the last block
 #define RMS_NORM_MM_TICKET   3 // in block_flags, after the topk_moe ticket; zero between launches
 
-static __global__ void rms_norm_mul_mat_f32(const float * __restrict__ x, const float * __restrict__ w, const int64_t stride_w,
-        float * __restrict__ partial, float * __restrict__ dst, const int ncols, const int nrows, const float eps,
-        unsigned int * __restrict__ ticket) {
+struct rms_norm_mm_hc_post {
+    const float * x;        // [n_embd]      the output of the block
+    const float * residual; // [n_embd, hc]  the streams before it
+    const float * post;     // [hc]
+    const float * comb;     // [hc, hc]
+    float       * dst;      // [n_embd, hc]
+    int64_t sx0, sr0, sr1, sp0, sc0, sc1, sd0, sd1;
+    int     n_embd;
+    int     hc;
+
+    // fold (hc == DSV4_HC): post and comb from the mixes instead
+    bool          fold;
+    const float * f_x;      // the slice of the mixes the post weights come from [hc]
+    const float * f_m;      // its MUL weight, f_ne_m values
+    const float * f_a;      // its ADD weight, f_ne_a values
+    int           f_ne_m;
+    int           f_ne_a;
+    float         f_ps;     // the SCALE
+    float         f_pb;
+    const float * f_mixes;  // the mixes of the DSV4_HC_COMB, at stride f_sm0
+    int64_t       f_sm0;
+    const float * f_cscale; // its scale, the comb's at 2*f_ss0
+    int64_t       f_ss0;
+    const float * f_cbase;  // its base, at stride f_sb0
+    int64_t       f_sb0;
+    float         f_eps;
+    int           f_iter;
+};
+
+// DSV4_HC_PRE (its weights MUL -> ADD -> SIGMOID -> SCALE of a slice of the mixes) -> RMS_NORM -> MUL of one token
+struct rms_norm_mm_hc_pre {
+    const float * m;         // the MUL weight of the mixes, ne_m values
+    const float * a;         // the ADD weight, ne_a values
+    int           ne_m;
+    int           ne_a;
+    int           off;       // the mixes row of the first stream weight
+    float         ws;        // the SCALE
+    float         wb;
+    float         scale;     // of the DSV4_HC_PRE
+    float       * pre;       // its dst, or nullptr when only the norm reads it
+    float         eps;       // of the RMS_NORM
+    const float * nw;        // the MUL weight [n_embd]
+    float       * dst;       // the MUL dst [n_embd]
+    block_q8_1  * q8;        // its q8_1 copy, or nullptr
+    int           ne_padded; // the q8_1 row length
+    int           nc;        // columns per thread of rms_norm_mul_q8_f32<1024>, the template's pre_nc
+};
+
+#define RMS_NORM_MM_PRE_BLOCK 1024 // the block of rms_norm_mul_q8_f32 the tail rounds as
+#define RMS_NORM_MM_PRE_VIRT  (RMS_NORM_MM_PRE_BLOCK/RMS_NORM_MM_CHUNK)
+
+// 8 threads per sum of the slices (the rows, then the squares at RMS_NORM_MM_MAX_ROWS), each over every 8th slice with all
+//   its loads in flight at once, then a fixed tree; a warp per sum with its loads in turn took 5 us more
+//   rows [r0, r1) only, and the squares
+static __device__ __forceinline__ void rms_norm_mm_slice_sums(const float * __restrict__ partial, const int r0, const int r1,
+        float * __restrict__ sum_s) {
+    static_assert(RMS_NORM_MM_CHUNK == 8*(RMS_NORM_MM_MAX_ROWS + 1), "8 threads per sum");
+    const int r   = threadIdx.x / 8;
+    const int sub = threadIdx.x % 8;
+    float t = 0.0f;
+    if ((r >= r0 && r < r1) || r == RMS_NORM_MM_MAX_ROWS) {
+        float v[RMS_NORM_MM_MAX_BLOCKS/8];
+#pragma unroll
+        for (int j = 0; j < RMS_NORM_MM_MAX_BLOCKS/8; ++j) {
+            const int b = sub + 8*j;
+            v[j] = b < (int) gridDim.x ? __ldcg(partial + (size_t) b*(RMS_NORM_MM_MAX_ROWS + 1) + r) : 0.0f;
+        }
+#pragma unroll
+        for (int j = 0; j < RMS_NORM_MM_MAX_BLOCKS/8; ++j) {
+            t += v[j];
+        }
+    }
+#pragma unroll
+    for (int offset = 4; offset > 0; offset >>= 1) {
+        t += __shfl_xor_sync(0xffffffff, t, offset, WARP_SIZE);
+    }
+    if (sub == 0) {
+        sum_s[r] = t;
+    }
+}
+
+// one column of the DSV4_HC_PRE mix of the streams the blocks wrote (through L2), as dsv4_hc_pre_coef_f32 forms it
+static __device__ __forceinline__ float rms_norm_mm_pre_mix(const rms_norm_mm_hc_post & hp, const rms_norm_mm_hc_pre & hq,
+        const float * wpre, const int c) {
+    float x[DSV4_HC];
+#pragma unroll
+    for (int ih = 0; ih < DSV4_HC; ++ih) {
+        x[ih] = ih < hp.hc ? __ldcg(hp.dst + c*hp.sd0 + ih*hp.sd1) : 0.0f;
+    }
+    float sum = 0.0f;
+#pragma unroll
+    for (int ih = 0; ih < DSV4_HC; ++ih) {
+        if (ih < hp.hc) {
+            sum += x[ih] * wpre[ih];
+        }
+    }
+    return hq.scale * sum;
+}
+
+// The hc_pre part of rms_norm_mul_mat_f32 in every block, see there. The partials of the launch follow the slices' in
+//   the scratch: the sum of squares of each of the RMS_NORM_MM_PRE_BLOCK threads of rms_norm_mul_q8_f32's layout.
+template <int pre_nc>
+static __device__ __forceinline__ void rms_norm_mm_pre_grid(const float * __restrict__ partial, float * __restrict__ dst,
+        const int ncols, const int nrows, const float eps, unsigned int * __restrict__ flags,
+        const rms_norm_mm_hc_post & hp, const rms_norm_mm_hc_pre & hq) {
     constexpr int nwarps = RMS_NORM_MM_CHUNK/WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    float * vsum_g = (float *) partial + (size_t) gridDim.x*(RMS_NORM_MM_MAX_ROWS + 1);
+
+    __threadfence();
+    hc_post_blocks_sync(flags);
+
+    __shared__ float sum_s[RMS_NORM_MM_MAX_ROWS + 1];
+    __shared__ float wpre_s[DSV4_HC];
+    __shared__ float red_s[RMS_NORM_MM_PRE_BLOCK/WARP_SIZE];
+    // block 0 writes the mixes, the others want the stream weights' rows
+    rms_norm_mm_slice_sums(partial, blockIdx.x == 0 ? 0 : hq.off, blockIdx.x == 0 ? nrows : hq.off + hp.hc, sum_s);
+    __syncthreads();
+    const float scale = rsqrtf(sum_s[RMS_NORM_MM_MAX_ROWS]/ncols + eps);
+    if (blockIdx.x == 0 && threadIdx.x < nrows) {
+        dst[threadIdx.x] = sum_s[threadIdx.x]*scale;
+    }
+    // the stream weights from the mixes as written
+    if (threadIdx.x < hp.hc) {
+        const int   ih  = threadIdx.x;
+        const float mix = sum_s[hq.off + ih]*scale;
+        const float sv  = ggml_cuda_op_sigmoid_single(__fadd_rn(__fmul_rn(mix, hq.m[ih % hq.ne_m]), hq.a[ih % hq.ne_a]));
+        wpre_s[ih] = hq.ws * sv + hq.wb;
+    }
+    __syncthreads();
+
+    const int n_embd = hp.n_embd;
+    const int n_out  = hq.q8 ? hq.ne_padded : n_embd;
+    // this block's output columns, whole q8_1 blocks, and its threads of rms_norm_mul_q8_f32's layout
+    const int opb = ((n_out/QK8_1 + gridDim.x - 1)/gridDim.x)*QK8_1;
+    const int vpb = (RMS_NORM_MM_PRE_BLOCK + gridDim.x - 1)/gridDim.x;
+    float o_h = 0.0f;
+    float o_w = 0.0f;
+    const int c_out = blockIdx.x*opb + threadIdx.x;
+    if (threadIdx.x < opb && c_out < n_embd) {
+        o_h = rms_norm_mm_pre_mix(hp, hq, wpre_s, c_out);
+        o_w = hq.nw[c_out];
+    }
+    // the columns vt + i*RMS_NORM_MM_PRE_BLOCK of the layout's threads vt, a thread each, then each one's sum of squares
+    //   over them in order
+    __shared__ float hv_s[RMS_NORM_MM_CHUNK/2];
+    const int iv = threadIdx.x - RMS_NORM_MM_CHUNK/2;
+    if (iv >= 0 && iv < vpb*pre_nc) {
+        const int vt = blockIdx.x*vpb + iv/pre_nc;
+        const int c  = vt + (iv % pre_nc)*RMS_NORM_MM_PRE_BLOCK;
+        float h = 0.0f;
+        if (vt < RMS_NORM_MM_PRE_BLOCK && c < n_embd) {
+            h = rms_norm_mm_pre_mix(hp, hq, wpre_s, c);
+            if (hq.pre) {
+                hq.pre[c] = h;
+            }
+        }
+        hv_s[iv] = h;
+    }
+    __syncthreads();
+    const int vt = blockIdx.x*vpb + threadIdx.x;
+    if (threadIdx.x < vpb && vt < RMS_NORM_MM_PRE_BLOCK) {
+        float tmp = 0.0f;
+#pragma unroll
+        for (int i = 0; i < pre_nc; ++i) {
+            if (vt + i*RMS_NORM_MM_PRE_BLOCK < n_embd) {
+                const float h = hv_s[threadIdx.x*pre_nc + i];
+                tmp += h * h;
+            }
+        }
+        vsum_g[vt] = tmp;
+    }
+    static_assert(RMS_NORM_MM_CHUNK/2 >= 64, "room for the output columns and the layout's columns");
+
+    __threadfence();
+    hc_post_blocks_sync(flags);
+
+    // block_reduce<SUM, RMS_NORM_MM_PRE_BLOCK> of those sums: each warp of that block (v*nwarps + warp here) sums its
+    //   lanes, then one warp sums the warps in order
+#pragma unroll
+    for (int v = 0; v < RMS_NORM_MM_PRE_VIRT; ++v) {
+        const float t = warp_reduce_sum(__ldcg(vsum_g + v*RMS_NORM_MM_CHUNK + threadIdx.x));
+        if (lane == 0) {
+            red_s[v*nwarps + warp] = t;
+        }
+    }
+    __syncthreads();
+    const float ss   = warp_reduce_sum(red_s[lane]);
+    const float mean = ss / n_embd;
+    const float nrm  = rsqrtf(mean + hq.eps);
+
+    // the outputs, a warp per q8_1 block; zero blocks past the row up to the padded length
+    if (threadIdx.x < opb && blockIdx.x*opb + warp*WARP_SIZE < n_out) {
+        if (c_out < n_embd) {
+            const float o = nrm * o_h * o_w;
+            hq.dst[c_out] = o;
+            if (hq.q8) {
+                quantize_q8_1_lane(o, hq.q8 + c_out/QK8_1, lane);
+            }
+        } else {
+            quantize_q8_1_lane(0.0f, hq.q8 + c_out/QK8_1, lane);
+        }
+    }
+}
+
+template <ggml_type wtype, bool hc_post, int pre_nc>
+static __global__ void __launch_bounds__(RMS_NORM_MM_CHUNK) rms_norm_mul_mat_f32(const float * __restrict__ x,
+        const char * __restrict__ w, const int64_t stride_w, float * __restrict__ partial, float * __restrict__ dst,
+        const int ncols, const int nrows, const float eps, unsigned int * __restrict__ flags,
+        const rms_norm_mm_hc_post hp, const rms_norm_mm_hc_pre hq) {
+    static_assert(wtype == GGML_TYPE_F32 || wtype == GGML_TYPE_Q8_0, "f32 or q8_0 rows");
+    static_assert(hc_post || pre_nc == 0, "the mix reads the streams of the combine");
+    constexpr bool hc_pre = pre_nc > 0;
+    constexpr int nwarps        = RMS_NORM_MM_CHUNK/WARP_SIZE;
+    constexpr int rows_per_warp = (RMS_NORM_MM_MAX_ROWS + nwarps - 1)/nwarps;
+    constexpr int nk            = RMS_NORM_MM_CHUNK/WARP_SIZE;
     const int warp = threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
     const int col0 = blockIdx.x*RMS_NORM_MM_CHUNK;
     const int col  = col0 + threadIdx.x;
 
+    // the slice of a q8_0 row, RMS_NORM_MM_CHUNK/QK8_0 blocks of 34 bytes: 272 = 17*16 bytes from a 16-byte aligned start
+    constexpr int q8_vecs = (RMS_NORM_MM_CHUNK/QK8_0)*sizeof(block_q8_0)/sizeof(uint4);
+    static_assert(q8_vecs*sizeof(uint4) == (RMS_NORM_MM_CHUNK/QK8_0)*sizeof(block_q8_0), "whole uint4s");
+
     __shared__ float x_s[RMS_NORM_MM_CHUNK];
     __shared__ float sq_s[nwarps];
     __shared__ bool  last;
+    __shared__ uint4 wq_s[wtype == GGML_TYPE_Q8_0 ? RMS_NORM_MM_MAX_ROWS : 1][q8_vecs];
 
-    const float xv = col < ncols ? x[col] : 0.0f;
+    // a warp per row of w, its lanes over the slice. The weights first: they do not depend on x, so their loads are in
+    //   flight while x is formed. An f32 row goes to registers. A q8_0 row goes to shared memory as uint4s, the slices
+    //   of the warp's rows spread over its lanes: a few wide requests (an SM keeps only so many in flight, and a
+    //   one-sector load per block and lane took most of the launch), read after the barrier below.
+    [[maybe_unused]] float wv[wtype == GGML_TYPE_F32 ? rows_per_warp : 1][nk];
+    constexpr int q8_n_vecs  = rows_per_warp*q8_vecs;
+    constexpr int q8_rounds  = (q8_n_vecs + WARP_SIZE - 1)/WARP_SIZE;
+    [[maybe_unused]] uint4 wq_r[wtype == GGML_TYPE_Q8_0 ? q8_rounds : 1];
+    if constexpr (wtype == GGML_TYPE_F32) {
+#pragma unroll
+        for (int j = 0; j < nk; ++j) {
+            const int k = j*WARP_SIZE + lane;
+#pragma unroll
+            for (int i = 0; i < rows_per_warp; ++i) {
+                const int r = warp + i*nwarps;
+                wv[i][j] = r < nrows && col0 + k < ncols ? ((const float *) (w + r*stride_w))[col0 + k] : 0.0f;
+            }
+        }
+    } else {
+#pragma unroll
+        for (int m = 0; m < q8_rounds; ++m) {
+            const int it = lane + m*WARP_SIZE;
+            const int r  = warp + (it / q8_vecs)*nwarps;
+            if (it < q8_n_vecs && r < nrows) {
+                wq_r[m] = ((const uint4 *) (w + r*stride_w + (col0/QK8_0)*sizeof(block_q8_0)))[it % q8_vecs];
+            }
+        }
+    }
+
+    // the combine's inputs, then with fold its weights (their loads and the comb's serial math overlap the above)
+    [[maybe_unused]] int   idst = 0;
+    [[maybe_unused]] int   i0   = 0;
+    [[maybe_unused]] float xin  = 0.0f;
+    [[maybe_unused]] float rin[DSV4_HC];
+    __shared__ float post_s[DSV4_HC];
+    __shared__ float comb_s[DSV4_HC*DSV4_HC];
+    if constexpr (hc_post) {
+        idst = col0 / hp.n_embd;
+        i0   = col - idst*hp.n_embd;
+        xin  = hp.x[i0*hp.sx0];
+        if (hp.fold) {
+#pragma unroll
+            for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
+                rin[isrc] = hp.residual[i0*hp.sr0 + isrc*hp.sr1];
+            }
+            if (threadIdx.x == 0) {
+                float comb[DSV4_HC*DSV4_HC];
+                dsv4_hc_comb_one(hp.f_mixes, hp.f_sm0, hp.f_cscale[2*hp.f_ss0], hp.f_cbase, hp.f_sb0, hp.f_eps, hp.f_iter, comb);
+#pragma unroll
+                for (int k = 0; k < DSV4_HC*DSV4_HC; ++k) {
+                    comb_s[k] = comb[k];
+                }
+            } else if (threadIdx.x >= WARP_SIZE && threadIdx.x < WARP_SIZE + DSV4_HC) {
+                // mul_add_sigmoid_scale_f32
+                const int   ih = threadIdx.x - WARP_SIZE;
+                const float v  = ggml_cuda_op_sigmoid_single(__fadd_rn(__fmul_rn(hp.f_x[ih], hp.f_m[ih % hp.f_ne_m]), hp.f_a[ih % hp.f_ne_a]));
+                post_s[ih] = hp.f_ps * v + hp.f_pb;
+            }
+            __syncthreads();
+        }
+    }
+    if constexpr (wtype == GGML_TYPE_Q8_0) {
+#pragma unroll
+        for (int m = 0; m < q8_rounds; ++m) {
+            const int it = lane + m*WARP_SIZE;
+            const int r  = warp + (it / q8_vecs)*nwarps;
+            if (it < q8_n_vecs && r < nrows) {
+                wq_s[r][it % q8_vecs] = wq_r[m];
+            }
+        }
+    }
+
+    float xv;
+    if constexpr (hc_post) {
+        // dsv4_hc_post_f32<true, false>: x*p, then the residual streams times their comb weights in order, an FMUL and an
+        //   FFMA chain as that kernel compiles (written out: unrolled, the compiler may contract x*p instead)
+        float sum;
+        if (hp.fold) {
+            sum = __fmul_rn(xin, post_s[idst]);
+#pragma unroll
+            for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
+                sum = __fmaf_rn(rin[isrc], comb_s[idst + DSV4_HC*isrc], sum);
+            }
+        } else {
+            sum = __fmul_rn(xin, hp.post[idst*hp.sp0]);
+            for (int isrc = 0; isrc < hp.hc; ++isrc) {
+                sum = __fmaf_rn(hp.residual[i0*hp.sr0 + isrc*hp.sr1], hp.comb[idst*hp.sc0 + isrc*hp.sc1], sum);
+            }
+        }
+        hp.dst[i0*hp.sd0 + idst*hp.sd1] = sum;
+        xv = sum;
+    } else {
+        xv = col < ncols ? x[col] : 0.0f;
+    }
     x_s[threadIdx.x] = xv;
     const float sq = warp_reduce_sum(xv*xv);
     if (lane == 0) {
@@ -2420,16 +2745,21 @@ static __global__ void rms_norm_mul_mat_f32(const float * __restrict__ x, const 
     __syncthreads();
 
     float * partial_b = partial + (size_t) blockIdx.x*(RMS_NORM_MM_MAX_ROWS + 1);
-    // a warp per row of w, its lanes over the slice; the rows of a warp unrolled so that all their loads are in flight
-    constexpr int rows_per_warp = (RMS_NORM_MM_MAX_ROWS + nwarps - 1)/nwarps;
     float acc[rows_per_warp] = { 0.0f };
 #pragma unroll
-    for (int k = lane; k < RMS_NORM_MM_CHUNK; k += WARP_SIZE) {
+    for (int j = 0; j < nk; ++j) {
+        const int k = j*WARP_SIZE + lane;
 #pragma unroll
         for (int i = 0; i < rows_per_warp; ++i) {
             const int r = warp + i*nwarps;
             if (r < nrows && col0 + k < ncols) {
-                acc[i] += x_s[k]*w[r*stride_w + col0 + k];
+                if constexpr (wtype == GGML_TYPE_F32) {
+                    acc[i] += x_s[k]*wv[i][j];
+                } else {
+                    // lane = the value of block j, as dequantize_q8_0 forms it
+                    const block_q8_0 * b = (const block_q8_0 *) wq_s[r] + j;
+                    acc[i] += x_s[k]*(b->qs[lane]*__half2float(b->d));
+                }
             }
         }
     }
@@ -2450,11 +2780,16 @@ static __global__ void rms_norm_mul_mat_f32(const float * __restrict__ x, const 
         partial_b[RMS_NORM_MM_MAX_ROWS] = t;
     }
 
+    if constexpr (hc_pre) {
+        rms_norm_mm_pre_grid<pre_nc>(partial, dst, ncols, nrows, eps, flags, hp, hq);
+        return;
+    }
+
     // the last block sums the slices
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) {
-        last = atomicAdd(ticket, 1u) == gridDim.x - 1;
+        last = atomicAdd(flags + RMS_NORM_MM_TICKET, 1u) == gridDim.x - 1;
     }
     __syncthreads();
     if (!last) {
@@ -2462,71 +2797,230 @@ static __global__ void rms_norm_mul_mat_f32(const float * __restrict__ x, const 
     }
     __threadfence();
 
-    // 8 threads per sum (the rows, then the squares at RMS_NORM_MM_MAX_ROWS), each over every 8th slice with all its
-    //   loads in flight at once, then a fixed tree; a warp per sum with its loads in turn took 5 us more
-    static_assert(RMS_NORM_MM_CHUNK == 8*(RMS_NORM_MM_MAX_ROWS + 1), "8 threads per sum");
     __shared__ float sum_s[RMS_NORM_MM_MAX_ROWS + 1];
-    {
-        const int r   = threadIdx.x / 8;
-        const int sub = threadIdx.x % 8;
-        float t = 0.0f;
-        if (r < nrows || r == RMS_NORM_MM_MAX_ROWS) {
-            float v[RMS_NORM_MM_MAX_BLOCKS/8];
-#pragma unroll
-            for (int j = 0; j < RMS_NORM_MM_MAX_BLOCKS/8; ++j) {
-                const int b = sub + 8*j;
-                v[j] = b < (int) gridDim.x ? __ldcg(partial + (size_t) b*(RMS_NORM_MM_MAX_ROWS + 1) + r) : 0.0f;
-            }
-#pragma unroll
-            for (int j = 0; j < RMS_NORM_MM_MAX_BLOCKS/8; ++j) {
-                t += v[j];
-            }
-        }
-#pragma unroll
-        for (int offset = 4; offset > 0; offset >>= 1) {
-            t += __shfl_xor_sync(0xffffffff, t, offset, WARP_SIZE);
-        }
-        if (sub == 0) {
-            sum_s[r] = t;
-        }
-    }
+    rms_norm_mm_slice_sums(partial, 0, nrows, sum_s);
     __syncthreads();
+    const float scale = rsqrtf(sum_s[RMS_NORM_MM_MAX_ROWS]/ncols + eps);
     if (threadIdx.x < nrows) {
-        const float scale = rsqrtf(sum_s[RMS_NORM_MM_MAX_ROWS]/ncols + eps);
         dst[threadIdx.x] = sum_s[threadIdx.x]*scale;
     }
     if (threadIdx.x == 0) {
-        *ticket = 0;
+        flags[RMS_NORM_MM_TICKET] = 0;
+    }
+}
+
+static bool ggml_cuda_rms_norm_mul_mat_w_ok(const ggml_tensor * w) {
+    switch (w->type) {
+        case GGML_TYPE_F32:
+            return w->nb[0] == sizeof(float) && w->nb[1] % sizeof(float) == 0;
+        case GGML_TYPE_Q8_0:
+            // whole slices of 16-byte aligned uint4s, see rms_norm_mul_mat_f32
+            return w->nb[0] == sizeof(block_q8_0) && w->ne[0] % RMS_NORM_MM_CHUNK == 0 && w->nb[1] % 16 == 0 &&
+                (uintptr_t) w->data % 16 == 0;
+        default:
+            return false;
     }
 }
 
 bool ggml_cuda_should_fuse_rms_norm_mul_mat(const ggml_tensor * rms_norm, const ggml_tensor * mul_mat) {
-    static const bool off = getenv("GGML_CUDA_NO_NORM_MUL_MAT") != nullptr;
+    static const bool off    = getenv("GGML_CUDA_NO_NORM_MUL_MAT") != nullptr;
+    static const bool no_q80 = getenv("GGML_CUDA_NO_NORM_MUL_MAT_Q8_0") != nullptr;
     const ggml_tensor * x = rms_norm->src[0];
     const ggml_tensor * w = mul_mat->src[0];
     return !off && GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
         rms_norm->op == GGML_OP_RMS_NORM && mul_mat->op == GGML_OP_MUL_MAT && mul_mat->src[1] == rms_norm &&
-        x->type == GGML_TYPE_F32 && rms_norm->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && mul_mat->type == GGML_TYPE_F32 &&
+        x->type == GGML_TYPE_F32 && rms_norm->type == GGML_TYPE_F32 && mul_mat->type == GGML_TYPE_F32 &&
+        ggml_cuda_rms_norm_mul_mat_w_ok(w) && !(no_q80 && w->type == GGML_TYPE_Q8_0) &&
         ggml_is_contiguous(x) && ggml_is_contiguous(rms_norm) && ggml_nrows(x) == 1 &&
         w->ne[0] == x->ne[0] && w->ne[1] <= RMS_NORM_MM_MAX_ROWS && w->ne[2] == 1 && w->ne[3] == 1 &&
-        w->nb[0] == sizeof(float) && w->nb[1] % sizeof(float) == 0 &&
         ggml_is_contiguous(mul_mat) && ggml_nrows(mul_mat) == 1 &&
         x->ne[0] >= 4*RMS_NORM_MM_CHUNK && x->ne[0] <= RMS_NORM_MM_MAX_BLOCKS*RMS_NORM_MM_CHUNK;
 }
 
-void ggml_cuda_op_rms_norm_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul_mat) {
+bool ggml_cuda_should_fuse_dsv4_hc_post_rms_norm_mul_mat(const ggml_tensor * post, const ggml_tensor * rms_norm,
+        const ggml_tensor * mul_mat) {
+    static const bool off = getenv("GGML_CUDA_NO_HC_POST_NORM_MUL_MAT") != nullptr;
+    if (off || post->op != GGML_OP_DSV4_HC_POST || !ggml_cuda_should_fuse_rms_norm_mul_mat(rms_norm, mul_mat)) {
+        return false;
+    }
+    const ggml_tensor * x        = post->src[0];
+    const ggml_tensor * residual = post->src[1];
+    const ggml_tensor * p        = post->src[2];
+    const ggml_tensor * comb     = post->src[3];
+    const ggml_tensor * flat     = rms_norm->src[0];
+    // the norm reads the dst of the combine as one row, through a view of it or the dst itself
+    const bool reads_post = flat == post || (flat->view_src == post && flat->view_offs == 0);
+    return reads_post && comb != nullptr && comb->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 &&
+        residual->type == GGML_TYPE_F32 && p->type == GGML_TYPE_F32 && post->type == GGML_TYPE_F32 &&
+        x->ne[1] == 1 && ggml_is_contiguous(post) && ggml_nelements(flat) == ggml_nelements(post) &&
+        x->ne[0] % RMS_NORM_MM_CHUNK == 0 && residual->ne[1] <= 8 &&
+        !ggml_cuda_tensors_overlap(post, x) && !ggml_cuda_tensors_overlap(post, residual) &&
+        !ggml_cuda_tensors_overlap(post, p) && !ggml_cuda_tensors_overlap(post, comb) &&
+        !ggml_cuda_tensors_overlap(mul_mat, post);
+}
+
+bool ggml_cuda_should_fuse_dsv4_hc_post_pre(const ggml_tensor * post, const ggml_tensor * mul_mat, const ggml_tensor * mul_w,
+        const ggml_tensor * add_w, const ggml_tensor * scale_w, const ggml_tensor * pre, const ggml_tensor * norm,
+        const ggml_tensor * mul, const bool pre_out) {
+    static const bool off = getenv("GGML_CUDA_NO_HC_POST_PRE") != nullptr;
+    if (off) {
+        return false;
+    }
+    const ggml_tensor * mixes = mul_w->src[0];
+    const ggml_tensor * nw    = mul->src[1];
+    const int64_t n_embd = post->ne[0];
+    const int64_t hc     = post->ne[1];
+    // rms_norm_mul_q8_f32<1024, nc> with nc = ceil(n_embd / 1024) is what the tail rounds as, nc <= 6 in registers
+    return mixes->view_src == mul_mat && mixes->view_offs % sizeof(float) == 0 && mixes->ne[0] == hc &&
+        (uintptr_t) post->data % 16 == 0 && post->nb[1] % 16 == 0 && (!pre_out || (uintptr_t) pre->data % 16 == 0) &&
+        (uintptr_t) mul->data % 16 == 0 && (uintptr_t) mul->src[1]->data % 16 == 0 &&
+        (int64_t) (mixes->view_offs/sizeof(float)) + hc <= mul_mat->ne[0] && pre->src[0] == post &&
+        ggml_get_op_params_i32(pre, 1) == 0 && pre->type == GGML_TYPE_F32 && ggml_is_contiguous(pre) && pre->ne[2] == 1 &&
+        norm->op == GGML_OP_RMS_NORM && norm->src[0] == pre && norm->type == GGML_TYPE_F32 &&
+        mul->op == GGML_OP_MUL && mul->src[0] == norm && mul->type == GGML_TYPE_F32 && ggml_is_contiguous(mul) &&
+        nw->type == GGML_TYPE_F32 && ggml_is_contiguous(nw) && ggml_nelements(nw) == n_embd &&
+        ggml_nelements(mul) == n_embd && n_embd >= RMS_NORM_MM_PRE_BLOCK && n_embd <= 6*RMS_NORM_MM_PRE_BLOCK && hc <= 4 &&
+        n_embd % QK8_1 == 0 && !ggml_cuda_tensors_overlap(mul, post) &&
+        // the norm and its weight run in place on the DSV4_HC_PRE dst when only the norm reads it, which is then not written
+        (!pre_out || !ggml_cuda_tensors_overlap(mul, pre)) &&
+        !ggml_cuda_tensors_overlap(pre, post) && !ggml_cuda_tensors_overlap(mul, mul_mat);
+}
+
+bool ggml_cuda_should_fold_dsv4_hc_post(const ggml_tensor * post, const ggml_tensor * mul_p, const ggml_tensor * add_p,
+        const ggml_tensor * scale_p, const ggml_tensor * comb) {
+    static const bool off = getenv("GGML_CUDA_NO_HC_POST_FOLD") != nullptr;
+    if (off) {
+        return false;
+    }
+    const ggml_tensor * x     = mul_p->src[0];
+    const ggml_tensor * mixes = comb->src[0];
+    return post->src[2] == scale_p && post->src[3] == comb && comb->op == GGML_OP_DSV4_HC_COMB &&
+        post->src[1]->ne[1] == DSV4_HC && post->ne[2] == 1 && x->ne[0] == DSV4_HC && x->ne[1] == 1 &&
+        mixes->type == GGML_TYPE_F32 && mixes->ne[0] == (2 + DSV4_HC)*DSV4_HC && mixes->ne[1] == 1 &&
+        comb->src[1]->type == GGML_TYPE_F32 && comb->src[1]->ne[0] >= 3 && comb->src[2]->type == GGML_TYPE_F32 &&
+        comb->src[2]->ne[0] == mixes->ne[0] && add_p->src[0] == mul_p && scale_p->src[0]->src[0] == add_p;
+}
+
+static void ggml_cuda_rms_norm_mul_mat_launch(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul_mat,
+        const ggml_tensor * post, const ggml_tensor * mul_w, const ggml_tensor * add_w, const ggml_tensor * scale_w,
+        ggml_tensor * pre, const bool pre_out, ggml_tensor * norm2, ggml_tensor * mul2, const ggml_tensor * const * fold) {
     const ggml_tensor * x = rms_norm->src[0];
     const ggml_tensor * w = mul_mat->src[0];
     float eps;
     memcpy(&eps, rms_norm->op_params, sizeof(float));
 
+    rms_norm_mm_hc_post hp = {};
+    if (post) {
+        const ggml_tensor * px       = post->src[0];
+        const ggml_tensor * residual = post->src[1];
+        const ggml_tensor * p        = post->src[2];
+        const ggml_tensor * comb     = post->src[3];
+        hp.x        = (const float *) px->data;
+        hp.residual = (const float *) residual->data;
+        hp.post     = (const float *) p->data;
+        hp.comb     = (const float *) comb->data;
+        hp.dst      = (float *) post->data;
+        hp.sx0      = px->nb[0]/sizeof(float);
+        hp.sr0      = residual->nb[0]/sizeof(float);
+        hp.sr1      = residual->nb[1]/sizeof(float);
+        hp.sp0      = p->nb[0]/sizeof(float);
+        hp.sc0      = comb->nb[0]/sizeof(float);
+        hp.sc1      = comb->nb[1]/sizeof(float);
+        hp.sd0      = post->nb[0]/sizeof(float);
+        hp.sd1      = post->nb[1]/sizeof(float);
+        hp.n_embd   = (int) px->ne[0];
+        hp.hc       = (int) residual->ne[1];
+        if (fold) {
+            // fold = { MUL, ADD, SCALE, DSV4_HC_COMB } before the combine, see ggml_cuda_should_fold_dsv4_hc_post
+            const ggml_tensor * mul_p   = fold[0];
+            const ggml_tensor * add_p   = fold[1];
+            const ggml_tensor * scale_p = fold[2];
+            const ggml_tensor * cb      = fold[3];
+            hp.fold     = true;
+            hp.f_x      = (const float *) mul_p->src[0]->data;
+            hp.f_m      = (const float *) mul_p->src[1]->data;
+            hp.f_a      = (const float *) add_p->src[1]->data;
+            hp.f_ne_m   = (int) mul_p->src[1]->ne[0];
+            hp.f_ne_a   = (int) add_p->src[1]->ne[0];
+            memcpy(&hp.f_ps, (const float *) scale_p->op_params + 0, sizeof(float));
+            memcpy(&hp.f_pb, (const float *) scale_p->op_params + 1, sizeof(float));
+            hp.f_mixes  = (const float *) cb->src[0]->data;
+            hp.f_sm0    = cb->src[0]->nb[0]/sizeof(float);
+            hp.f_cscale = (const float *) cb->src[1]->data;
+            hp.f_ss0    = cb->src[1]->nb[0]/sizeof(float);
+            hp.f_cbase  = (const float *) cb->src[2]->data;
+            hp.f_sb0    = cb->src[2]->nb[0]/sizeof(float);
+            hp.f_eps    = ggml_get_op_params_f32(cb, 0);
+            hp.f_iter   = ggml_get_op_params_i32(cb, 1);
+        }
+    }
+
+    rms_norm_mm_hc_pre hq = {};
+    if (pre) {
+        const ggml_tensor * m = mul_w->src[1];
+        const ggml_tensor * a = add_w->src[1];
+        hq.m     = (const float *) m->data;
+        hq.a     = (const float *) a->data;
+        hq.ne_m  = (int) m->ne[0];
+        hq.ne_a  = (int) a->ne[0];
+        hq.off   = (int) (mul_w->src[0]->view_offs/sizeof(float));
+        memcpy(&hq.ws, (const float *) scale_w->op_params + 0, sizeof(float));
+        memcpy(&hq.wb, (const float *) scale_w->op_params + 1, sizeof(float));
+        hq.scale = ggml_get_op_params_f32(pre, 0);
+        hq.pre   = pre_out ? (float *) pre->data : nullptr;
+        memcpy(&hq.eps, norm2->op_params, sizeof(float));
+        hq.nw    = (const float *) mul2->src[1]->data;
+        hq.dst   = (float *) mul2->data;
+        int64_t ne_padded = 0;
+        hq.q8        = (block_q8_1 *) ctx.q8_1_emit_alloc(mul2, ne_padded);
+        hq.ne_padded = (int) ne_padded;
+        hq.nc        = (int) ((pre->ne[0] + RMS_NORM_MM_PRE_BLOCK - 1)/RMS_NORM_MM_PRE_BLOCK);
+    }
+
     const int ncols   = (int) x->ne[0];
     const int nblocks = (ncols + RMS_NORM_MM_CHUNK - 1)/RMS_NORM_MM_CHUNK;
-    ggml_cuda_pool_alloc<float> partial(ctx.pool(), (size_t) nblocks*(RMS_NORM_MM_MAX_ROWS + 1));
-    rms_norm_mul_mat_f32<<<nblocks, RMS_NORM_MM_CHUNK, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data,
-        w->nb[1]/sizeof(float), partial.get(), (float *) mul_mat->data, ncols, (int) w->ne[1], eps,
-        ctx.block_flags_get() + RMS_NORM_MM_TICKET);
+    ggml_cuda_pool_alloc<float> partial(ctx.pool(), (size_t) nblocks*(RMS_NORM_MM_MAX_ROWS + 1) + (pre ? RMS_NORM_MM_PRE_BLOCK : 0));
+    const auto launch = [&](auto kernel) {
+        kernel<<<nblocks, RMS_NORM_MM_CHUNK, 0, ctx.stream()>>>((const float *) x->data, (const char *) w->data,
+            w->nb[1], partial.get(), (float *) mul_mat->data, ncols, (int) w->ne[1], eps, ctx.block_flags_get(), hp, hq);
+    };
+    const auto launch_type = [&](auto wtype) {
+        constexpr ggml_type t = decltype(wtype)::value;
+        if (!pre) {
+            post ? launch(rms_norm_mul_mat_f32<t, true, 0>) : launch(rms_norm_mul_mat_f32<t, false, 0>);
+            return;
+        }
+        switch (hq.nc) {
+            case 1: launch(rms_norm_mul_mat_f32<t, true, 1>); break;
+            case 2: launch(rms_norm_mul_mat_f32<t, true, 2>); break;
+            case 3: launch(rms_norm_mul_mat_f32<t, true, 3>); break;
+            case 4: launch(rms_norm_mul_mat_f32<t, true, 4>); break;
+            case 5: launch(rms_norm_mul_mat_f32<t, true, 5>); break;
+            case 6: launch(rms_norm_mul_mat_f32<t, true, 6>); break;
+            default: GGML_ABORT("fatal error");
+        }
+    };
+    if (w->type == GGML_TYPE_Q8_0) {
+        launch_type(std::integral_constant<ggml_type, GGML_TYPE_Q8_0>());
+    } else {
+        launch_type(std::integral_constant<ggml_type, GGML_TYPE_F32>());
+    }
     CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_op_rms_norm_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul_mat) {
+    ggml_cuda_rms_norm_mul_mat_launch(ctx, rms_norm, mul_mat, nullptr, nullptr, nullptr, nullptr, nullptr, false, nullptr, nullptr, nullptr);
+}
+
+void ggml_cuda_op_dsv4_hc_post_rms_norm_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * post, ggml_tensor * rms_norm,
+        ggml_tensor * mul_mat, const ggml_tensor * const * fold) {
+    ggml_cuda_rms_norm_mul_mat_launch(ctx, rms_norm, mul_mat, post, nullptr, nullptr, nullptr, nullptr, false, nullptr, nullptr, fold);
+}
+
+void ggml_cuda_op_dsv4_hc_post_pre(ggml_backend_cuda_context & ctx, ggml_tensor * post, ggml_tensor * rms_norm,
+        ggml_tensor * mul_mat, const ggml_tensor * mul_w, const ggml_tensor * add_w, const ggml_tensor * scale_w,
+        ggml_tensor * pre, const bool pre_out, ggml_tensor * norm2, ggml_tensor * mul2, const ggml_tensor * const * fold) {
+    ggml_cuda_rms_norm_mul_mat_launch(ctx, rms_norm, mul_mat, post, mul_w, add_w, scale_w, pre, pre_out, norm2, mul2, fold);
 }
 
 void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
