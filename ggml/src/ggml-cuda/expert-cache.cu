@@ -33,6 +33,8 @@ struct ggml_cuda_expert_cache_dev {
     int          n_expert;
     int          cap;
     int          max_ids;
+    int          cpu_slot;  // what the ids of an expert the CPU computes read: cap, the zeroed slot past the pool, when the
+                            //   pool has one (a whole slot of headroom: split by rows), else 0 (its input must be zero)
 
     int32_t  * slot_of;     // [n_expert] pool slot of an expert, -1 when absent
     int32_t  * expert_of;   // [cap]
@@ -42,7 +44,8 @@ struct ggml_cuda_expert_cache_dev {
     int32_t  * miss_expert; // [max_ids]
     int32_t  * miss_slot;   // [max_ids]
     int32_t  * n_miss;      // [1]
-    uint32_t * stats;       // [4] calls, misses, warms, warm misses - GGML_META_EXPERT_CACHE_STATS
+    uint32_t * stats;       // [7] calls, misses, warms, warm misses, CPU experts, one-row calls, their misses
+                            //   - GGML_META_EXPERT_CACHE_STATS
 
     // GGML_META_EXPERT_CACHE_POLICY=fr, see expert_cache_policy; nullptr with the LRU
     float    * freq;        // [n_expert] routings, decayed with a half-life in tokens up to tok_of
@@ -61,7 +64,12 @@ struct ggml_cuda_expert_cache {
     ggml_cuda_expert_cache_dev d;
     void *                     state = nullptr;
     expert_cache_warm_tag      warm;
+    const char *               host_cpu = nullptr; // host address of expert 0, the same for the caches of every device
 };
+
+// the live caches, so the CPU can find every device's slice of a weight (ggml_cuda_expert_cache_cpu_mat)
+static std::vector<const ggml_cuda_expert_cache *> g_caches;
+static std::mutex                                  g_caches_mutex;
 
 // The caches of one launch: the experts of a MoE layer routed by the same ids (gate, up, down), each with its own
 //   LRU, planned by a block each and copied by one grid.
@@ -150,13 +158,108 @@ static __device__ __forceinline__ void expert_cache_fr_add_id(const ggml_cuda_ex
     expert_cache_fr_add(d, id, (float) c, tok);
 }
 
+// The misses of a one-token window the CPU computes (see expert-cpu.cuh), lowest priority (decayed frequency before this
+//   window, then id) first: as few as keep the layer time within the slack of the best split. s_cpu[i] = the place of
+//   miss i in the CPU's list, -1 = copied. Returns how many. A repeated miss in the row turns it off.
+static __device__ int expert_cache_cpu_choose(const ggml_cuda_expert_cpu_args & cpu, const int * s_remap, const int * s_id,
+        const float * s_pri, int * s_cpu, const int n_ids) {
+    int m[GGML_CUDA_EXPERT_CACHE_PLAN_FAST_IDS];
+    int nm = 0;
+    bool repeat = false;
+    for (int i = 0; i < n_ids; i++) {
+        s_cpu[i] = -1;
+        if (s_remap[i] >= 0) {
+            continue;
+        }
+        int q = nm;
+        for (int a = 0; a < nm; a++) {
+            repeat = repeat || s_id[m[a]] == s_id[i];
+        }
+        while (q > 0 && (s_pri[m[q - 1]] > s_pri[i] || (s_pri[m[q - 1]] == s_pri[i] && s_id[m[q - 1]] > s_id[i]))) {
+            m[q] = m[q - 1];
+            q--;
+        }
+        m[q] = i;
+        nm++;
+    }
+    if (repeat || nm == 0) {
+        return 0;
+    }
+    auto t = [&](const int k) {
+        const float tc = (float) (nm - k)*cpu.copy_us;
+        const float tk = k > 0 ? cpu.cpu_a_us + (float) k*cpu.cpu_b_us : 0.0f;
+        return fmaxf(tc, tk) + (k > 0 ? cpu.post_us : 0.0f);
+    };
+    float best = INFINITY;
+    for (int k = 0; k <= nm; k++) {
+        best = fminf(best, t(k));
+    }
+    int n_cpu = nm;
+    for (int k = 0; k <= nm; k++) {
+        if (t(k) <= best*(1.0f + cpu.slack_rel) + cpu.slack_us) {
+            n_cpu = k;
+            break;
+        }
+    }
+    n_cpu = min(n_cpu, max(0, nm - cpu.min_copy));
+    n_cpu = min(n_cpu, GGML_CUDA_EXPERT_CPU_MAX_K);
+    for (int q = 0; q < n_cpu; q++) {
+        s_cpu[m[q]] = q;
+    }
+    return n_cpu;
+}
+
+// The publishing device's request to the CPU, by warp 0 of the plan's first block: the ids and routing weights of the
+//   misses it takes and the layer's input; state[1] = the request's sequence number, 0 = none; the time of the request in
+//   state[4..5] (ggml_cuda_expert_cpu_args).
+static __device__ void expert_cache_cpu_publish(const ggml_cuda_expert_cpu_args & cpu, const int * s_id, const int * s_cpu,
+        const int n_ids, const int n_cpu) {
+    const int lane = threadIdx.x;
+    ggml_cuda_expert_cpu_mbox * mb = cpu.mbox;
+    if (n_cpu == 0) {
+        if (lane == 0) {
+            cpu.state[1] = 0;
+        }
+        return;
+    }
+    for (int i = lane; i < n_ids; i += WARP_SIZE) {
+        if (s_cpu[i] >= 0) {
+            mb->ids[s_cpu[i]] = s_id[i];
+            mb->w[s_cpu[i]]   = cpu.w[i];
+        }
+    }
+    const float4 * x4 = (const float4 *) cpu.x;
+    float4 *       d4 = (float4 *) mb->x;
+    for (int j = lane; j < cpu.n_embd/4; j += WARP_SIZE) {
+        d4[j] = x4[j];
+    }
+    if (lane == 0) {
+        mb->group = cpu.group;
+        mb->k     = n_cpu;
+    }
+    __threadfence_system();
+    __syncwarp();
+    if (lane == 0) {
+        uint32_t seq = cpu.state[0] + 1;
+        seq = seq == 0 ? 1 : seq;
+        cpu.state[0] = seq;
+        cpu.state[1] = seq;
+        unsigned long long t;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        ((unsigned long long *) (cpu.state + 4))[0] = t;
+        mb->request  = seq;
+    }
+}
+
 // The scheduler and the LRU run in one block. Hits are marked in parallel, misses are then taken one by one
 // so the victim of one is never the slot another still needs: the argmin over last_used cannot return a
 // slot touched by this batch, its stamp is the newest. Same ids on every device give the same slots.
 // fast (a few ids, decode): the same loop by warp 0 alone on a shared copy of last_used and expert_of, with the misses
 //   so far in shared memory instead of slot_of: no block barrier and no global round trip per miss, same victims.
+// cpu.on: a one-token window (fast, fr) may send misses to the CPU, see expert_cache_cpu_choose; their ids read
+//   cpu_slot and they do not enter the pool.
 static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_group g, const int32_t * ids,
-        const int n_rows, const int n_per_row, const int row_stride, const bool fast) {
+        const int n_rows, const int n_per_row, const int row_stride, const bool fast, const ggml_cuda_expert_cpu_args cpu) {
     const ggml_cuda_expert_cache_dev & d = g.d[blockIdx.x];
     __shared__ int      s_n_miss;
     __shared__ uint32_t s_min_val[32];
@@ -165,6 +268,8 @@ static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_group g, c
     __shared__ int      s_id[GGML_CUDA_EXPERT_CACHE_PLAN_FAST_IDS];
     __shared__ int      s_miss_expert[GGML_CUDA_EXPERT_CACHE_PLAN_FAST_IDS];
     __shared__ int      s_miss_slot[GGML_CUDA_EXPERT_CACHE_PLAN_FAST_IDS];
+    __shared__ float    s_pri[GGML_CUDA_EXPERT_CACHE_PLAN_FAST_IDS];
+    __shared__ int      s_cpu[GGML_CUDA_EXPERT_CACHE_PLAN_FAST_IDS];
     __shared__ float    s_min_sc[32];
     extern __shared__ uint32_t s_lru[]; // fast: last_used [cap], then expert_of [cap], then with fr the keys [cap]
 
@@ -173,6 +278,11 @@ static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_group g, c
     const bool     fr    = d.freq != nullptr;
     const uint32_t win   = fr ? d.win_of[d.cap] + 1 : 0;           // this window
     const uint32_t tok   = fr ? d.win_of[d.cap + 1] + n_rows : 0;  // the token count after it
+    const bool     use_cpu = cpu.on && fast && fr && n_rows == 1;
+    const bool     publish = cpu.on && cpu.mbox != nullptr && blockIdx.x == 0;
+    if (publish && !use_cpu && threadIdx.x == 0) {
+        cpu.state[1] = 0;
+    }
 
     uint32_t * s_last  = s_lru;
     int32_t  * s_exp   = (int32_t *) (s_lru + d.cap);
@@ -196,6 +306,10 @@ static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_group g, c
         if (fast) {
             s_remap[i] = sl;
             s_id[i]    = id;
+            if (use_cpu) {
+                // a miss's priority: its frequency before this window, decayed to its end (warps 1+ add the window later)
+                s_pri[i] = sl < 0 ? d.freq[id]*exp2f(-(float) (tok - d.tok_of[id])*d.inv_hl) : 0.0f;
+            }
         }
         if (sl >= 0) {
             // several tokens of one ubatch may route to the same expert; max keeps the stamp deterministic
@@ -231,8 +345,27 @@ static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_group g, c
         }
         const int lane   = threadIdx.x;
         int       n_miss = 0;
+        int       n_cpu  = 0;
+        if (use_cpu) {
+            if (lane == 0) {
+                n_cpu = expert_cache_cpu_choose(cpu, s_remap, s_id, s_pri, s_cpu, n_ids);
+                d.stats[4] += n_cpu;
+            }
+            n_cpu = __shfl_sync(0xffffffff, n_cpu, 0);
+            __syncwarp();
+            if (publish) {
+                expert_cache_cpu_publish(cpu, s_id, s_cpu, n_ids, n_cpu);
+            }
+        }
         for (int i = 0; i < n_ids; i++) {
             if (s_remap[i] >= 0) {
+                continue;
+            }
+            if (n_cpu > 0 && s_cpu[i] >= 0) {
+                // the CPU computes it: nothing copied or evicted, see cpu_slot
+                if (lane == 0) {
+                    d.remap[i] = d.cpu_slot;
+                }
                 continue;
             }
             const int id = s_id[i];
@@ -315,6 +448,10 @@ static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_group g, c
             *d.clock  = clock + 1 + n_ids;
             d.stats[0] += 1;
             d.stats[1] += n_miss;
+            if (n_rows == 1) {
+                d.stats[5] += 1;
+                d.stats[6] += n_miss;
+            }
             if (fr) {
                 d.win_of[d.cap]     = win;
                 d.win_of[d.cap + 1] = tok;
@@ -719,37 +856,18 @@ struct expert_cache_host_reg {
     const char * base;
     size_t       size;
     const char * dev_base;
+    bool         owned; // registered here
 };
 static std::vector<expert_cache_host_reg> g_host_regs;
 static std::mutex                         g_host_regs_mutex;
 
-static const char * expert_cache_register_host(const void * buf, size_t size) {
-    static const size_t page = 4096;
-    const char * base = (const char *) ((uintptr_t) buf & ~(page - 1));
-    size_t       len  = (((const char *) buf + size) - base + page - 1) & ~(page - 1);
-
-    std::lock_guard<std::mutex> lock(g_host_regs_mutex);
-    for (const expert_cache_host_reg & r : g_host_regs) {
-        if (r.base == base && r.size == len) {
-            return r.dev_base;
-        }
-    }
-
-    // memory that is already page-locked (a cudaMallocHost buffer, or registered by someone else) cannot be
-    // registered again, but already has a device address
-    cudaPointerAttributes attr;
-    if (cudaPointerGetAttributes(&attr, buf) == cudaSuccess && attr.type == cudaMemoryTypeHost && attr.devicePointer != nullptr) {
-        const char * dev_base = (const char *) attr.devicePointer - ((const char *) buf - base);
-        g_host_regs.push_back({base, len, dev_base});
-        return dev_base;
-    }
-    (void) cudaGetLastError();
-
+// cudaHostRegister of [base, base + len), page aligned; its device address or nullptr
+static const char * expert_cache_register_range(const char * base, size_t len) {
     cudaError_t err = cudaHostRegister((void *) base, len, cudaHostRegisterPortable | cudaHostRegisterMapped);
     if (err != cudaSuccess) {
         (void) cudaGetLastError();
-        GGML_LOG_WARN("%s: could not register %.0f MiB of host memory at %p (buffer %p + %zu) for device access: %s\n",
-            __func__, len/1024.0/1024.0, (const void *) base, buf, size, cudaGetErrorString(err));
+        GGML_LOG_WARN("%s: could not register %.0f MiB of host memory at %p for device access: %s\n",
+            __func__, len/1024.0/1024.0, (const void *) base, cudaGetErrorString(err));
         return nullptr;
     }
     void * dev_base = nullptr;
@@ -759,8 +877,59 @@ static const char * expert_cache_register_host(const void * buf, size_t size) {
         cudaHostUnregister((void *) base);
         return nullptr;
     }
-    g_host_regs.push_back({base, len, (const char *) dev_base});
+    g_host_regs.push_back({base, len, (const char *) dev_base, true});
     return (const char *) dev_base;
+}
+
+// The device address of the weight at ptr (ptr_size bytes) in the host buffer buf: the whole buffer is registered once,
+//   or if that fails (a large pageable buffer, see ggml_cuda_expert_cpu_host_alloc) the weight's own range.
+static const char * expert_cache_register_host(const void * buf, size_t size, const void * ptr, size_t ptr_size) {
+    static const size_t page = 4096;
+    const char * base  = (const char *) ((uintptr_t) buf & ~(page - 1));
+    size_t       len   = (((const char *) buf + size) - base + page - 1) & ~(page - 1);
+    const char * p     = (const char *) ptr;
+
+    std::lock_guard<std::mutex> lock(g_host_regs_mutex);
+    for (const expert_cache_host_reg & r : g_host_regs) {
+        if (r.base <= p && p + ptr_size <= r.base + r.size) {
+            return r.dev_base + (p - r.base);
+        }
+    }
+
+    // memory that is already page-locked (a cudaMallocHost buffer, or registered by someone else) cannot be
+    // registered again, but already has a device address
+    cudaPointerAttributes attr;
+    if (cudaPointerGetAttributes(&attr, buf) == cudaSuccess && attr.type == cudaMemoryTypeHost && attr.devicePointer != nullptr) {
+        const char * dev_base = (const char *) attr.devicePointer - ((const char *) buf - base);
+        g_host_regs.push_back({base, len, dev_base, false});
+        return dev_base + (p - base);
+    }
+    (void) cudaGetLastError();
+
+    const char * dev_base = expert_cache_register_range(base, len);
+    if (dev_base != nullptr) {
+        return dev_base + (p - base);
+    }
+    const char * wbase = (const char *) ((uintptr_t) p & ~(page - 1));
+    const size_t wlen  = ((p + ptr_size) - wbase + page - 1) & ~(page - 1);
+    dev_base = wlen < len ? expert_cache_register_range(wbase, wlen) : nullptr;
+    return dev_base != nullptr ? dev_base + (p - wbase) : nullptr;
+}
+
+bool ggml_cuda_expert_cache_unregister_host(const void * base, size_t size) {
+    std::lock_guard<std::mutex> lock(g_host_regs_mutex);
+    bool any = false;
+    for (size_t i = 0; i < g_host_regs.size(); ) {
+        const expert_cache_host_reg & r = g_host_regs[i];
+        if (r.base >= (const char *) base && r.base < (const char *) base + size && r.owned) {
+            CUDA_CHECK(cudaHostUnregister((void *) r.base));
+            g_host_regs.erase(g_host_regs.begin() + i);
+            any = true;
+        } else {
+            i++;
+        }
+    }
+    return any;
 }
 
 static int expert_cache_align(std::initializer_list<size_t> values) {
@@ -780,11 +949,10 @@ void * ggml_cuda_expert_cache_create(int device, const void * host_buf, size_t h
         return nullptr;
     }
 
-    const char * dev_buf = expert_cache_register_host(host_buf, host_buf_size);
-    if (dev_buf == nullptr) {
+    const char * dev_ptr = expert_cache_register_host(host_buf, host_buf_size, host_ptr, (size_t) n_expert*expert_bytes);
+    if (dev_ptr == nullptr) {
         return nullptr;
     }
-    const char * dev_ptr = dev_buf + ((const char *) host_ptr - (const char *) ((uintptr_t) host_buf & ~(size_t) 4095));
 
     ggml_cuda_expert_cache * c = new ggml_cuda_expert_cache();
     c->device = device;
@@ -798,12 +966,16 @@ void * ggml_cuda_expert_cache_create(int device, const void * host_buf, size_t h
     c->d.n_expert     = (int) n_expert;
     c->d.cap          = cap;
     c->d.max_ids      = max_ids;
+    // the meta backend leaves one chunk of zeroed headroom past the pool (ggml_backend_meta_gathered_weight_get): a whole
+    //   slot when the weight is split by rows
+    c->d.cpu_slot     = n_chunks == 1 && chunk_full == expert_bytes ? cap : 0;
     c->warm.cache     = c;
+    c->host_cpu       = (const char *) host_ptr;
     c->align = expert_cache_align({(size_t) (uintptr_t) dev_ptr, expert_bytes, chunk_full, chunk_dev, offset_dev, c->d.slot_bytes});
     c->covering = c->align < 4 && expert_cache_align({(size_t) (uintptr_t) dev_ptr, expert_bytes, chunk_full}) >= 8;
 
     const expert_cache_policy pol = expert_cache_policy_get();
-    const size_t n_i32 = (size_t) n_expert + 2*cap + 1 + 3*max_ids + 1 + 4 + (pol.fr ? 2*(size_t) n_expert + cap + 2 : 0);
+    const size_t n_i32 = (size_t) n_expert + 2*cap + 1 + 3*max_ids + 1 + 7 + (pol.fr ? 2*(size_t) n_expert + cap + 2 : 0);
     ggml_cuda_set_device(device);
     if (cudaMalloc(&c->state, n_i32*sizeof(int32_t)) != cudaSuccess) {
         (void) cudaGetLastError();
@@ -819,7 +991,7 @@ void * ggml_cuda_expert_cache_create(int device, const void * host_buf, size_t h
     c->d.miss_expert = p; p += max_ids;
     c->d.miss_slot   = p; p += max_ids;
     c->d.n_miss      = p; p += 1;
-    c->d.stats       = (uint32_t *) p; p += 4;
+    c->d.stats       = (uint32_t *) p; p += 7;
     c->d.freq        = nullptr;
     c->d.tok_of      = nullptr;
     c->d.win_of      = nullptr;
@@ -834,7 +1006,7 @@ void * ggml_cuda_expert_cache_create(int device, const void * host_buf, size_t h
         CUDA_CHECK(cudaMemset(c->d.freq,   0, 2*(size_t) n_expert*sizeof(float)));
         CUDA_CHECK(cudaMemset(c->d.win_of, 0, ((size_t) cap + 2)*sizeof(uint32_t)));
     }
-    CUDA_CHECK(cudaMemset(c->d.stats,     0,    4*sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemset(c->d.stats,     0,    7*sizeof(uint32_t)));
     CUDA_CHECK(cudaMemset(c->d.slot_of,   0xff, (size_t) n_expert*sizeof(int32_t)));
     CUDA_CHECK(cudaMemset(c->d.expert_of, 0xff, (size_t) cap*sizeof(int32_t)));
     CUDA_CHECK(cudaMemset(c->d.last_used, 0,    (size_t) cap*sizeof(uint32_t)));
@@ -843,6 +1015,12 @@ void * ggml_cuda_expert_cache_create(int device, const void * host_buf, size_t h
     // the meta backend may lay the host weight out anew once its caches exist (ggml_backend_meta_dm_apply): nothing
     //   queued before may still read it
     CUDA_CHECK(cudaDeviceSynchronize());
+    {
+        std::lock_guard<std::mutex> lock(g_caches_mutex);
+        g_caches.push_back(c);
+    }
+    // outside any graph capture: the CPU threads and their mailbox, if asked for
+    ggml_cuda_expert_cpu_init();
     return c;
 }
 
@@ -852,16 +1030,22 @@ void ggml_cuda_expert_cache_free(void * cache) {
         return;
     }
     ggml_cuda_set_device(c->device);
+    {
+        std::lock_guard<std::mutex> lock(g_caches_mutex);
+        g_caches.erase(std::remove(g_caches.begin(), g_caches.end(), c), g_caches.end());
+    }
     // nothing may still copy from the host weight: the meta backend puts its rows back after this (ggml_backend_meta_dm_drop)
     cudaDeviceSynchronize();
     static const bool stats = getenv("GGML_META_EXPERT_CACHE_STATS") != nullptr;
     if (stats) {
-        uint32_t st[4] = {0, 0, 0, 0};
+        static std::once_flag cpu_once;
+        std::call_once(cpu_once, ggml_cuda_expert_cpu_stats_print);
+        uint32_t st[7] = {0, 0, 0, 0, 0, 0, 0};
         if (cudaMemcpy(st, c->d.stats, sizeof(st), cudaMemcpyDeviceToHost) == cudaSuccess && (st[0] > 0 || st[2] > 0)) {
             fprintf(stderr, "expert-cache-dev: dev %d cap %d n_expert %d slot_bytes %zu calls %u misses %u miss/call %.4f MiB/call %.3f"
-                " warms %u warm misses %u\n",
+                " warms %u warm misses %u cpu experts %u one-row calls %u one-row misses %u\n",
                 c->device, c->d.cap, c->d.n_expert, c->d.slot_bytes, st[0], st[1], st[0] > 0 ? (double) st[1]/st[0] : 0.0,
-                st[0] > 0 ? (double) st[1]/st[0]*c->d.slot_bytes/1048576.0 : 0.0, st[2], st[3]);
+                st[0] > 0 ? (double) st[1]/st[0]*c->d.slot_bytes/1048576.0 : 0.0, st[2], st[3], st[4], st[5], st[6]);
         }
         (void) cudaGetLastError();
     }
@@ -889,7 +1073,7 @@ bool ggml_cuda_expert_cache_is(const ggml_tensor * pool) {
 }
 
 void ggml_cuda_expert_cache_gather_group(ggml_backend_cuda_context & ctx, const ggml_tensor * const * pools, const int n,
-        const ggml_tensor * ids, ggml_tensor * ids_remap) {
+        const ggml_tensor * ids, ggml_tensor * ids_remap, const ggml_cuda_expert_cpu_args * cpu) {
     GGML_ASSERT(n >= 1 && n <= GGML_CUDA_EXPERT_CACHE_GROUP_MAX);
     cudaStream_t stream = ctx.stream();
 
@@ -925,7 +1109,11 @@ void ggml_cuda_expert_cache_gather_group(ggml_backend_cuda_context & ctx, const 
     const bool   fast  = n_ids <= GGML_CUDA_EXPERT_CACHE_PLAN_FAST_IDS && n_ids <= cap_min &&
                          cap_max <= (fr ? GGML_CUDA_EXPERT_CACHE_PLAN_FAST_CAP_FR : GGML_CUDA_EXPERT_CACHE_PLAN_FAST_CAP);
     const size_t smem  = fast ? (fr ? 3 : 2)*(size_t) cap_max*sizeof(uint32_t) : 0;
-    expert_cache_plan<<<n, 512, smem, stream>>>(g, (const int32_t *) ids->data, n_rows, n_per_row, row_stride, fast);
+    ggml_cuda_expert_cpu_args cpu_args = {};
+    if (cpu != nullptr) {
+        cpu_args = *cpu;
+    }
+    expert_cache_plan<<<n, 512, smem, stream>>>(g, (const int32_t *) ids->data, n_rows, n_per_row, row_stride, fast, cpu_args);
     CUDA_CHECK(cudaGetLastError());
 
     // A decode step misses few experts, and most of its launches none: Qwen3.8-Flash ~28 of 36 a token. Blocks for every
@@ -1044,4 +1232,71 @@ void ggml_cuda_expert_cache_warm(ggml_backend_cuda_context & ctx, const ggml_ten
     const int nbx      = (int) std::min<size_t>(64, (d.slot_bytes/g.align[0] + nthreads - 1)/nthreads);
     expert_cache_copy<<<dim3(std::max(nbx, 1), d.cap, 1), nthreads, 0, stream>>>(g);
     CUDA_CHECK(cudaGetLastError());
+}
+
+bool ggml_cuda_expert_cache_cpu_mat(const ggml_tensor * pool, ggml_cuda_expert_cpu_mat & m) {
+    if (!ggml_cuda_expert_cache_is(pool)) {
+        return false;
+    }
+    const ggml_cuda_expert_cache * c = (const ggml_cuda_expert_cache *) pool->extra;
+    const ggml_type t = pool->type;
+    if (c->d.n_chunks != 1 || c->d.chunk_dev != c->d.slot_bytes) {
+        return false;
+    }
+    m = {};
+    m.type         = t;
+    m.base         = c->host_cpu;
+    m.expert_bytes = c->d.expert_bytes;
+    if (c->d.chunk_full == c->d.expert_bytes) {
+        // split by rows: the expert is plain rows
+        const size_t row_bytes = ggml_row_size(t, pool->ne[0]);
+        if (m.expert_bytes % row_bytes != 0) {
+            return false;
+        }
+        m.n_rows             = (int64_t) (m.expert_bytes / row_bytes);
+        m.k                  = pool->ne[0];
+        m.n_pieces           = 1;
+        m.piece_row_bytes[0] = row_bytes;
+        m.piece_k[0]         = m.k;
+        return true;
+    }
+    // split by K, device by device (ggml_backend_meta_dm): each device's slice is one piece of n_rows rows
+    std::vector<std::pair<size_t, size_t>> pieces; // offset, bytes
+    {
+        std::lock_guard<std::mutex> lock(g_caches_mutex);
+        for (const ggml_cuda_expert_cache * o : g_caches) {
+            if (o->host_cpu == c->host_cpu) {
+                if (o->d.expert_bytes != m.expert_bytes || o->d.n_chunks != 1 || o->d.chunk_full != o->d.chunk_dev) {
+                    return false;
+                }
+                pieces.push_back({o->d.offset_dev, o->d.slot_bytes});
+            }
+        }
+    }
+    std::sort(pieces.begin(), pieces.end());
+    m.n_rows = pool->ne[1];
+    size_t off = 0;
+    for (const auto & pc : pieces) {
+        if (pc.first != off || m.n_pieces >= GGML_CUDA_MAX_DEVICES || pc.second % m.n_rows != 0) {
+            return false;
+        }
+        const size_t  rb = pc.second / m.n_rows;
+        const int64_t kp = (int64_t) (rb / ggml_type_size(t))*ggml_blck_size(t);
+        if (ggml_row_size(t, kp) != rb) {
+            return false;
+        }
+        m.piece_off[m.n_pieces]       = off;
+        m.piece_row_bytes[m.n_pieces] = rb;
+        m.piece_k0[m.n_pieces]        = m.k;
+        m.piece_k[m.n_pieces]         = kp;
+        m.k   += kp;
+        off   += pc.second;
+        m.n_pieces++;
+    }
+    return off == m.expert_bytes;
+}
+
+bool ggml_cuda_expert_cache_zero_slot(const ggml_tensor * pool) {
+    return ggml_cuda_expert_cache_is(pool) && ((const ggml_cuda_expert_cache *) pool->extra)->d.cpu_slot ==
+        ((const ggml_cuda_expert_cache *) pool->extra)->d.cap;
 }

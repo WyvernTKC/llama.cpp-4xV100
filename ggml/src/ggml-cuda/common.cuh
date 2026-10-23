@@ -1820,6 +1820,11 @@ struct ggml_backend_cuda_context {
     };
     std::vector<expert_cache_gathered> expert_cache_ahead;
 
+    // GGML_CUDA_EXPERT_CPU: a gather of this subgraph may have asked the CPU for experts, whose sum is added to the input
+    //   of the all-reduce that ends it (n_embd floats), see ggml_cuda_expert_cpu_merge
+    bool expert_cpu_merge  = false;
+    int  expert_cpu_n_embd = 0;
+
     // A one-token gate/up GLU deferred to the MUL_MAT_ID gate/up GLU of the same input that follows it (node target),
     //   which runs it as one more channel; see ggml_cuda_try_defer_glu. Launched on its own if that does not happen.
     struct deferred_glu {

@@ -1689,7 +1689,19 @@ static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
 }
 
 static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
-    CUDA_CHECK(cudaFreeHost(buffer->context));
+    if (!ggml_cuda_expert_cpu_host_free(buffer->context)) {
+        CUDA_CHECK(cudaFreeHost(buffer->context));
+    }
+}
+
+// a buffer from ggml_cuda_expert_cpu_host_alloc: its expert weights go on the NUMA nodes before anything writes them
+static enum ggml_status ggml_backend_cuda_host_buffer_place_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+    if (tensor->view_src == nullptr) {
+        ggml_cuda_expert_cpu_place(tensor);
+    }
+    return GGML_STATUS_SUCCESS;
+
+    GGML_UNUSED(buffer);
 }
 
 static void * ggml_cuda_host_malloc(size_t size) {
@@ -1711,7 +1723,12 @@ static void * ggml_cuda_host_malloc(size_t size) {
 }
 
 static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    void * ptr = ggml_cuda_host_malloc(size);
+    // GGML_CUDA_EXPERT_CPU: the host experts are placed on the NUMA nodes first and pinned later, see expert-cpu.cuh
+    void * ptr = ggml_cuda_expert_cpu_host_alloc(size);
+    const bool place = ptr != nullptr;
+    if (!place) {
+        ptr = ggml_cuda_host_malloc(size);
+    }
 
     if (ptr == nullptr) {
         // fallback to cpu buffer
@@ -1721,6 +1738,9 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
     buffer->buft = buft;
     buffer->iface.free_buffer = ggml_backend_cuda_host_buffer_free_buffer;
+    if (place) {
+        buffer->iface.init_tensor = ggml_backend_cuda_host_buffer_place_tensor;
+    }
 
     return buffer;
 }
@@ -6111,6 +6131,121 @@ static void ggml_cuda_flush_deferred_glu(ggml_backend_cuda_context * cuda_ctx) {
     d = {};
 }
 
+// GGML_CUDA_EXPERT_CPU: the CPU split of a one-token MoE layer whose gate, up and down pools are gathered as one group
+//   (mm: their MUL_MAT_IDs, the first is node i), see expert-cpu.cuh. The CPU computes the GLU between them and the
+//   routing weights the down outputs are multiplied by, so both must be what it knows; the publishing device adds the
+//   CPU's weighted sum to the input of the all-reduce that ends the subgraph (ggml_cuda_expert_cpu_merge_pending).
+static bool ggml_cuda_expert_cpu_try_args(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i,
+        const ggml_tensor * const * mm, const int n, ggml_cuda_expert_cpu_args & args) {
+    args = {};
+    const ggml_tensor * ids = mm[0]->src[2];
+    if (!ggml_cuda_expert_cpu_enabled() || n != 3 || ids->ne[1] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1) {
+        return false;
+    }
+    // gate and up read the layer input, down the GLU of their outputs
+    const ggml_tensor * x     = mm[0]->src[1];
+    const ggml_tensor * gu[2] = { nullptr, nullptr };
+    const ggml_tensor * down  = nullptr;
+    int n_gu = 0;
+    for (int k = 0; k < 3; k++) {
+        if (mm[k]->src[1] == x && n_gu < 2) {
+            gu[n_gu++] = mm[k];
+        } else {
+            down = mm[k];
+        }
+    }
+    if (n_gu != 2 || down == nullptr) {
+        return false;
+    }
+    const ggml_tensor * glu = down->src[1];
+    if (glu->op != GGML_OP_GLU || glu->src[1] == nullptr || ggml_get_op_params_i32(glu, 1) != 0) {
+        return false;
+    }
+    const int glu_op = (int) ggml_get_glu_op(glu);
+    if (glu_op != GGML_GLU_OP_SWIGLU && glu_op != GGML_GLU_OP_SWIGLU_CLAMP) {
+        return false;
+    }
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up   = glu->src[1];
+    if (!((gate == gu[0] && up == gu[1]) || (gate == gu[1] && up == gu[0]))) {
+        return false;
+    }
+    const float limit = glu_op == GGML_GLU_OP_SWIGLU_CLAMP ? ggml_get_op_params_f32(glu, 3) : 0.0f;
+
+    // the routing weights: the MUL of the down outputs right after them, computed before node i
+    int j_down = -1;
+    for (int j = i; j < cgraph->n_nodes && j <= i + 64; j++) {
+        if (cgraph->nodes[j] == down) {
+            j_down = j;
+            break;
+        }
+    }
+    const ggml_tensor * w = nullptr;
+    for (int j = j_down + 1; j_down >= 0 && j < cgraph->n_nodes && j <= j_down + 8; j++) {
+        const ggml_tensor * m = cgraph->nodes[j];
+        if (m->op == GGML_OP_MUL && m->src[0] == down) {
+            w = m->src[1];
+            break;
+        }
+    }
+    if (w == nullptr || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || ggml_nelements(w) != ids->ne[0]) {
+        return false;
+    }
+    for (int j = i; j < cgraph->n_nodes; j++) {
+        if (cgraph->nodes[j] == w || (w->view_src != nullptr && cgraph->nodes[j] == w->view_src)) {
+            return false;
+        }
+    }
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || ggml_nrows(x) != 1 || (uintptr_t) x->data % 16 != 0) {
+        return false;
+    }
+
+    const int group = ggml_cuda_expert_cpu_group(gate->src[0], up->src[0], down->src[0], glu_op, limit, x->ne[0]);
+    if (group < 0) {
+        return false;
+    }
+    ggml_cuda_expert_cpu_args_get(cuda_ctx->device, group, (const float *) x->data, (const float *) w->data, (int) x->ne[0], args);
+    if (!args.on) {
+        return false;
+    }
+    if (args.mbox != nullptr) {
+        cuda_ctx->expert_cpu_merge  = true;
+        cuda_ctx->expert_cpu_n_embd = (int) x->ne[0];
+    }
+    return true;
+}
+
+// The CPU's sum (see ggml_cuda_expert_cpu_try_args) added to the input of the all-reduce that ends the subgraph: its last
+//   compute node. A MoE sum left for that all-reduce to compute is computed first.
+static void ggml_cuda_expert_cpu_merge_pending(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph) {
+    if (!cuda_ctx->expert_cpu_merge) {
+        return;
+    }
+    cuda_ctx->expert_cpu_merge = false;
+    ggml_tensor * dst = nullptr;
+    for (int k = cgraph->n_nodes - 1; k >= 0 && dst == nullptr; k--) {
+        ggml_tensor * node = cgraph->nodes[k];
+        if (!ggml_cuda_is_view_or_noop(node) && (node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            dst = node;
+        }
+    }
+    GGML_ASSERT(dst != nullptr && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) &&
+        dst->ne[0] == cuda_ctx->expert_cpu_n_embd && ggml_nrows(dst) == 1);
+    static bool reported = false;
+    if (!reported) {
+        reported = true;
+        GGML_LOG_INFO("%s: the CPU experts are added to %s (%s)\n", __func__, dst->name, ggml_op_desc(dst));
+    }
+    if (cuda_ctx->session_red.dst != nullptr && cuda_ctx->session_red.dst->data == dst->data) {
+        ggml_cuda_session_reduction_flush(cuda_ctx);
+    }
+    GGML_ASSERT(!(cuda_ctx->ar_fold.pushed && cuda_ctx->ar_fold.next == dst) && "an all-reduce fold already sent the lines");
+    static const bool no_merge = getenv("GGML_CUDA_EXPERT_CPU_NO_MERGE") != nullptr; // debug: drop the CPU experts
+    if (!no_merge) {
+        ggml_cuda_expert_cpu_merge(cuda_ctx->stream(), (float *) dst->data, cuda_ctx->expert_cpu_n_embd);
+    }
+}
+
 // The expert-cache pools of the MUL_MAT_IDs after node i that read the same ids (the up and down experts of the layer
 //   whose gate is i) are gathered with i's in one plan and one copy launch, two launches instead of six. Nothing between
 //   may write the ids; a pool's own MUL_MAT_ID is the only reader of its slots, so moving its copy ahead is safe.
@@ -6127,11 +6262,13 @@ static void ggml_cuda_try_gather_expert_group(ggml_backend_cuda_context * cuda_c
         }
     }
     const ggml_tensor * pools[3] = { node->src[0], nullptr, nullptr };
+    const ggml_tensor * mm[3]    = { node, nullptr, nullptr };
     int n = 1;
     for (int j = i + 1; j < cgraph->n_nodes && j <= i + 64 && n < 3; j++) {
         const ggml_tensor * m = cgraph->nodes[j];
         if (m->op == GGML_OP_MUL_MAT_ID && m->src[2] == ids && ggml_cuda_expert_cache_is(m->src[0]) &&
                 m->src[0] != pools[0] && m->src[0] != pools[1]) {
+            mm[n]      = m;
             pools[n++] = m->src[0];
             continue;
         }
@@ -6142,8 +6279,10 @@ static void ggml_cuda_try_gather_expert_group(ggml_backend_cuda_context * cuda_c
     if (n < 2) {
         return;
     }
+    ggml_cuda_expert_cpu_args cpu;
+    const bool use_cpu = ggml_cuda_expert_cpu_try_args(cuda_ctx, cgraph, i, mm, n, cpu);
     ggml_tensor remap[3];
-    ggml_cuda_expert_cache_gather_group(*cuda_ctx, pools, n, ids, remap);
+    ggml_cuda_expert_cache_gather_group(*cuda_ctx, pools, n, ids, remap, use_cpu ? &cpu : nullptr);
     for (int k = 0; k < n; k++) {
         cuda_ctx->expert_cache_ahead.push_back({ pools[k], ids, remap[k] });
     }
@@ -8941,6 +9080,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                }
             }
             ggml_cuda_flush_deferred_glu(cuda_ctx);
+            ggml_cuda_expert_cpu_merge_pending(cuda_ctx, cgraph);
         }
 
 #ifdef USE_CUDA_GRAPH
@@ -9021,7 +9161,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cuda_ctx->q8_1_input_reset();
     cuda_ctx->cublas_input_reset();
     cuda_ctx->expert_cache_ahead.clear();
+    cuda_ctx->expert_cpu_merge = false;
     cuda_ctx->dsv4_fold = {};
+    if (cuda_ctx->device == ggml_cuda_expert_cpu_device()) {
+        ggml_cuda_expert_cpu_kick();
+    }
 
     // in a session the subgraph is one part of the session's graph, see ggml_backend_cuda_session_plan
     if (cuda_ctx->session_mode != ggml_backend_cuda_context::SESSION_OFF) {
@@ -9162,6 +9306,9 @@ static void ggml_backend_cuda_session_begin(ggml_backend_t backend, ggml_cgraph 
     GGML_ASSERT(mode == ggml_backend_cuda_context::SESSION_EAGER || mode == ggml_backend_cuda_context::SESSION_CAPTURE);
     ggml_cuda_set_device(cuda_ctx->device);
     cuda_ctx->flags_alloc();
+    if (cuda_ctx->device == ggml_cuda_expert_cpu_device()) {
+        ggml_cuda_expert_cpu_kick();
+    }
 
     const void * graph_key = ggml_cuda_session_key(cgraphs[0]);
 #ifdef USE_CUDA_GRAPH
@@ -9308,6 +9455,9 @@ static void ggml_backend_cuda_session_launch(ggml_backend_t backend, ggml_cgraph
     ggml_cuda_set_device(cuda_ctx->device);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(ggml_cuda_session_key(cgraphs[0]));
     GGML_ASSERT(graph->instance != nullptr);
+    if (cuda_ctx->device == ggml_cuda_expert_cpu_device()) {
+        ggml_cuda_expert_cpu_kick();
+    }
     CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
 #else
     GGML_UNUSED(cgraphs);
@@ -10836,6 +10986,7 @@ void ggml_cuda_spin_init(int device) {
         ggml_cuda_spin_set_allreduce_p2p(cfg);
         ggml_cuda_spin_set_mmvf(cfg);
         ggml_cuda_spin_set_norm(cfg);
+        ggml_cuda_spin_set_expert_cpu(cfg);
     });
 }
 
@@ -10845,6 +10996,7 @@ void ggml_cuda_spin_print() {
         "ggml_cuda_p2p_ar_ll_kernel_n (receive)", "ggml_cuda_p2p_ar_ll_moe_reduce_kernel", "rms_norm_pre_add_ar_f32",
         "rms_norm_pre_add_ar_f32 (q8_1 blocks)", "rms_norm_pre_add_ar_split_f32", "ggml_cuda_ar_kernel", "mul_mat_vec_f_router",
         "hc_post_blocks_sync", "row_split_reduce", "rms_norm_pre_add_f32 (q8_1 blocks)", "rms_norm_add_rms_norm_f32 (q8_1 blocks)",
+        "expert_cpu_wait_add",
     };
     if (ggml_cuda_spin_records == nullptr) {
         return;
@@ -10860,6 +11012,9 @@ void ggml_cuda_spin_print() {
         if (r.peer >= 0) {
             fprintf(stderr, "%s%d: %s (rank %d) waited %.1f s for rank %d, which faulted or stopped "
                 "(GGML_CUDA_SPIN_TIMEOUT_S sets the limit, 0 = none)\n", GGML_CUDA_NAME, d, name, r.rank, s, r.peer);
+        } else if (r.peer == GGML_CUDA_SPIN_PEER_HOST) {
+            fprintf(stderr, "%s%d: %s waited %.1f s for the CPU threads (GGML_CUDA_SPIN_TIMEOUT_S sets the limit, 0 = none)\n",
+                GGML_CUDA_NAME, d, name, s);
         } else if (r.peer == GGML_CUDA_SPIN_PEER_DEVICE) {
             fprintf(stderr, "%s%d: %s waited %.1f s for another device, which faulted or stopped "
                 "(GGML_CUDA_SPIN_TIMEOUT_S sets the limit, 0 = none)\n", GGML_CUDA_NAME, d, name, s);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "expert-cpu.cuh"
 #include "ggml-backend-impl.h"
 
 // Expert cache in device memory for MoE weights that stay in host memory.
@@ -29,8 +30,13 @@ bool ggml_cuda_expert_cache_is(const ggml_tensor * pool);
 void ggml_cuda_expert_cache_gather(ggml_backend_cuda_context & ctx, const ggml_tensor * pool, const ggml_tensor * ids, ggml_tensor * ids_remap);
 
 // The same for up to 3 pools routed by the same ids (the experts of one MoE layer) in two launches; ids_remap[n].
+//   cpu (optional): the plan sends some misses of a one-token layer to the CPU, see expert-cpu.cuh.
 void ggml_cuda_expert_cache_gather_group(ggml_backend_cuda_context & ctx, const ggml_tensor * const * pools, int n,
-    const ggml_tensor * ids, ggml_tensor * ids_remap);
+    const ggml_tensor * ids, ggml_tensor * ids_remap, const ggml_cuda_expert_cpu_args * cpu = nullptr);
+
+// Host memory in [base, base + size) that ggml_cuda_expert_cache_create registered for device access: unregistered and
+//   forgotten (its buffer is going away). False if it registered none.
+bool ggml_cuda_expert_cache_unregister_host(const void * base, size_t size);
 
 // Copies the experts the pool holds from pool_data into dst, a whole staged copy of this device's slice of the
 // weight laid out with one slot-sized stride per expert, on the stream of ctx. The caller copies the others.
