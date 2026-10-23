@@ -9,30 +9,36 @@
 //   the CPU (a cost model, see ggml_cuda_expert_cpu_args). Every device makes the same choice from the same ids and
 //   frequencies. The publishing device (0) writes x, the ids and their routing weights to a mailbox in mapped host
 //   memory; a pool of pinned CPU threads computes those experts with the CPU vec_dot and writes their weighted sum; that
-//   device adds it to the input of the all-reduce that ends the layer (ggml_cuda_expert_cpu_merge). The rows of every
-//   host expert matrix are split between the two NUMA nodes (ggml_cuda_expert_cpu_place), each socket reads its half.
+//   device adds it to the input of the all-reduce that ends the layer (ggml_cuda_expert_cpu_merge). The host experts are
+//   split between the two NUMA nodes (ggml_cuda_expert_cpu_place): gate/up by rows, down by K, so each socket computes
+//   half of the hidden and its part of down from its own memory, without waiting for the other (expert_cpu_work_k).
 
 #define GGML_CUDA_EXPERT_CPU_MAX_K    16
 #define GGML_CUDA_EXPERT_CPU_MAX_EMBD 16384
 
-// in mapped pinned host memory, written by the GPU (request side) and the CPU (result side)
+// in mapped pinned host memory, written by the GPU (request side) and the CPU (result side). With the sockets split by K
+//   (the default, see expert_cpu_work_k) each socket writes its partial sum and its own completion: socket 0 out and
+//   completed, socket 1 out1 and completed1; the GPU adds both.
 struct ggml_cuda_expert_cpu_mbox {
-    alignas(64) volatile uint32_t request;   // sequence number of the last request
-    alignas(64) volatile uint32_t completed; // sequence number of the last result
-    alignas(64) int32_t group;               // ggml_cuda_expert_cpu_group index
+    alignas(64) volatile uint32_t request;    // sequence number of the last request
+    alignas(64) volatile uint32_t completed;  // sequence number of the last result (of socket 0)
+    alignas(64) volatile uint32_t completed1; // of socket 1
+    alignas(64) volatile unsigned long long t_pub; // GGML_CUDA_EXPERT_CPU_PROF: %globaltimer of the request
+    alignas(64) int32_t group;                // ggml_cuda_expert_cpu_group index
     int32_t k;
     int32_t ids[GGML_CUDA_EXPERT_CPU_MAX_K];
     float   w[GGML_CUDA_EXPERT_CPU_MAX_K];
     alignas(64) float x[GGML_CUDA_EXPERT_CPU_MAX_EMBD];
     alignas(64) float out[GGML_CUDA_EXPERT_CPU_MAX_EMBD];
+    alignas(64) float out1[GGML_CUDA_EXPERT_CPU_MAX_EMBD];
 };
 
 // What the plan of one gather group needs. on = 0: the plan copies every miss as before.
 struct ggml_cuda_expert_cpu_args {
     ggml_cuda_expert_cpu_mbox * mbox;  // device address on the publishing device, nullptr elsewhere (decide only)
     uint32_t *                  state; // publishing device: [0] last sequence number, [1] the one to wait for (0 = none),
-                                       //   u64 at [4]: time of the request, sums of GPU work before the wait and of the
-                                       //   wait (ns), waits
+                                       //   [2] with prof the split (CPU experts | copies << 8), u64 from [4]: time of the
+                                       //   request and the waiter's stats (expert_cpu_wait_add)
     const float *               x;     // the experts' input, n_embd
     const float *               w;     // the routing weights of the row
     int   group;
@@ -48,6 +54,7 @@ struct ggml_cuda_expert_cpu_args {
     float slack_us;
     int   min_copy;
     int   on;
+    int   prof; // GGML_CUDA_EXPERT_CPU_PROF: the request's time in the mailbox (t_pub) and the split in state[2]
 };
 
 // One expert matrix in host memory as the CPU reads it: n_rows output rows over k inputs, the k range stored as n_pieces

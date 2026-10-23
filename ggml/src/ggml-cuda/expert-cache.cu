@@ -247,6 +247,10 @@ static __device__ void expert_cache_cpu_publish(const ggml_cuda_expert_cpu_args 
         unsigned long long t;
         asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
         ((unsigned long long *) (cpu.state + 4))[0] = t;
+        if (cpu.prof) {
+            mb->t_pub = t;
+            __threadfence_system();
+        }
         mb->request  = seq;
     }
 }
@@ -444,6 +448,9 @@ static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_group g, c
             __syncwarp();
         }
         if (lane == 0) {
+            if (publish && n_cpu > 0 && cpu.prof) {
+                cpu.state[2] = (uint32_t) n_cpu | ((uint32_t) n_miss << 8); // for the waiter's stats
+            }
             *d.n_miss = n_miss;
             *d.clock  = clock + 1 + n_ids;
             d.stats[0] += 1;
