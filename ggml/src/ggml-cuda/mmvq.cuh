@@ -23,6 +23,10 @@ bool ggml_cuda_mmvq_conv_epilogue_pays(enum ggml_type type, int cc);
 bool ggml_cuda_mul_mat_vec_q_short_sibling(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
         const ggml_tensor * sib, const ggml_tensor * sib_y);
 
+// the same through the plain q8_0 kernel, where it does not: sib_y's q8_1 row goes after the experts' rows
+bool ggml_cuda_mul_mat_vec_q_moe_sibling(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        const ggml_tensor * sib, const ggml_tensor * sib_y);
+
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 

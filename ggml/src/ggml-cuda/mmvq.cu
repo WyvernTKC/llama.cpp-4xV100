@@ -812,8 +812,10 @@ static constexpr __host__ __device__ int mmvq_paired_min_blocks(const ggml_type 
 // conv: the convolution of build_conv_state in the epilogue of the rows of x (conv_args), one row per block
 // ar: the rows go to the LL lines of an all-reduce folded into this launch (conv_args holds its ggml_cuda_ar_fold_args),
 //   not to dst; see ggml_cuda_ar_fold_push
+// sib_ch: with ids and nothing fused, the channel past the used experts is the sibling sib_x (with its own y channel, see
+//   ggml_cuda_mul_mat_vec_q_moe_sibling); has_fusion's variant takes the sibling with a gate
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool wide = false,
-          bool paired = false, bool conv = false, bool ar = false>
+          bool paired = false, bool conv = false, bool ar = false, bool sib_ch = false>
 __launch_bounds__((paired ? 2 : 1)*calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(),
     conv ? mmvq_conv_min_blocks(type) : paired ? mmvq_paired_min_blocks(type, wide) : 1)
 static __global__ void mul_mat_vec_q(
@@ -884,6 +886,13 @@ static __global__ void mul_mat_vec_q(
     bool sib = false;
     if constexpr (has_fusion && ncols_dst == 1) {
         sib = ids && fusion.sib_x != nullptr && channel_dst == gridDim.y - 1;
+    }
+    static_assert(!sib_ch || (!has_fusion && ncols_dst == 1 && !paired && !conv && !ar), "sib_ch is the plain one-column kernel");
+    if constexpr (sib_ch) {
+        sib = channel_dst == gridDim.y - 1;
+        if (sib) {
+            vx = fusion.sib_x;
+        }
     }
 
     uint32_t channel_x;
@@ -1779,6 +1788,21 @@ static void mul_mat_vec_q_switch_fusion(
         GGML_ABORT("the paired layout needs a fused gate");
     }
 
+    // an ungated sibling of the experts (the shared expert of a q8_0 down projection) as one more channel
+    if constexpr (c_ncols_dst == 1 && type == GGML_TYPE_Q8_0) {
+        if (ids && fusion.sib_x != nullptr) {
+            dim3 grid = block_nums;
+            grid.y += 1;
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, block_dims, nbytes_shared, stream);
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, wide, false, false, false, true>,
+                launch_params, vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, fusion.conv);
+            return;
+        }
+    }
+    GGML_ASSERT(!(ids && fusion.sib_x != nullptr));
+
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
 
     // an all-reduce folded into the launch: one column, whole blocks of an even number of rows, nothing else fused
@@ -2447,6 +2471,9 @@ static void ggml_cuda_mul_mat_vec_q_impl(
 
     ggml_cuda_mm_fusion_args_launch fusion_local{};
 
+    // with ids, the input of a sibling channel read by the plain kernel (ggml_cuda_mul_mat_vec_q_moe_sibling)
+    const ggml_tensor * sib_y_row = nullptr;
+
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
@@ -2559,11 +2586,16 @@ static void ggml_cuda_mul_mat_vec_q_impl(
             fusion_local.sib2_nrows = (uint32_t) fusion->sib2->ne[1];
         }
         if (fusion->sib_y) {
-            GGML_ASSERT(ggml_cuda_mul_mat_vec_q_short_sibling(src0, src1, ids, fusion->sib, fusion->sib_y) && fusion->sib_out);
-            GGML_ASSERT(!fusion->gate && !fusion->x_bias && !fusion->x_scale && !fusion->x_sigmoid && !fusion->sib_gate);
+            GGML_ASSERT(fusion->sib_out && !fusion->gate && !fusion->x_bias && !fusion->x_scale && !fusion->x_sigmoid && !fusion->sib_gate);
             fusion_local.sib_x   = fusion->sib->data;
-            fusion_local.sib_y   = (const float *) fusion->sib_y->data;
             fusion_local.sib_dst = fusion->sib_out;
+            if (ggml_cuda_mul_mat_vec_q_short_sibling(src0, src1, ids, fusion->sib, fusion->sib_y)) {
+                fusion_local.sib_y = (const float *) fusion->sib_y->data;
+            } else {
+                // its q8_1 row goes after those of src1, see below
+                GGML_ASSERT(ggml_cuda_mul_mat_vec_q_moe_sibling(src0, src1, ids, fusion->sib, fusion->sib_y));
+                sib_y_row = fusion->sib_y;
+            }
         }
         if (fusion->gdn_beta) {
             GGML_ASSERT(!ids && fusion->gate && !fusion->x_bias && !fusion->gate_bias && !fusion->x_scale && !fusion->gate_scale);
@@ -2655,7 +2687,18 @@ static void ggml_cuda_mul_mat_vec_q_impl(
     ggml_cuda_pool_alloc<char> src1_q8_1_rot(ctx.pool());
     const char * src1_q8_1;
 
-    if (src1_rot != 0) {
+    if (sib_y_row != nullptr) {
+        // one more q8_1 row past those of src1 (one token, the used experts' rows): the sibling channel's input, which
+        //   the channel past the used experts reads at channel ne11 (nchannels_y below)
+        GGML_ASSERT(ids && src1_rot == 0 && ne12 == 1 && ne13 == 1);
+        const size_t row_q8_1 = ne10_padded * sizeof(block_q8_1)/QK8_1;
+        char * buf = src1_q8_1_rot.alloc(nbytes_src1_q8_1 + row_q8_1);
+        quantize_row_q8_1_cuda(src1_d, nullptr, buf, src0->type, ne10, src1->nb[1] / ts_src1, src1->nb[2] / ts_src1,
+            src1->nb[3] / ts_src1, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda((const float *) sib_y_row->data, nullptr, buf + nbytes_src1_q8_1, src0->type, ne10,
+            ne10, ne10, ne10, ne10_padded, 1, 1, 1, stream);
+        src1_q8_1 = buf;
+    } else if (src1_rot != 0) {
         // src1 is rotated on the way into q8_1, so the copy is not that of src1 and is not kept for reuse
         GGML_ASSERT(!ids);
         const int64_t s11 = src1->nb[1] / ts_src1;
@@ -2714,7 +2757,8 @@ static void ggml_cuda_mul_mat_vec_q_impl(
 
     // For MUL_MAT_ID the memory layout is different than for MUL_MAT:
     const int64_t ncols_dst          = ids ? ne2  : ne1;
-    const int64_t nchannels_y        = ids ? ne11 : ne12;
+    // the sibling channel past the used experts reads the extra row: the kernel takes its y channel modulo this
+    const int64_t nchannels_y        = ids ? ne11 + (sib_y_row != nullptr ? 1 : 0) : ne12;
     const int64_t nchannels_dst      = ids ? ne1  : ne2;
     const int64_t stride_col_dst     = ids ? s2   : s1;
     const int64_t stride_col_y       = ids ? s12  : s11;
@@ -2728,6 +2772,18 @@ static void ggml_cuda_mul_mat_vec_q_impl(
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+}
+
+bool ggml_cuda_mul_mat_vec_q_moe_sibling(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        const ggml_tensor * sib, const ggml_tensor * sib_y) {
+    // one token of q8_0 through the plain kernel (not the short one, which quantizes its own input), its rows one per
+    //   expert; see sib_ch of mul_mat_vec_q
+    return ids && src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F32 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        ids->ne[1] == 1 && src1->ne[1] == ids->ne[0] && src1->nb[0] == sizeof(float) &&
+        sib->type == src0->type && sib->ne[0] == src0->ne[0] && sib->ne[1] == src0->ne[1] && sib->nb[1] == src0->nb[1] &&
+        ggml_nrows(sib) == sib->ne[1] &&
+        sib_y->type == GGML_TYPE_F32 && ggml_is_contiguous(sib_y) && ggml_nelements(sib_y) == src0->ne[0] &&
+        !ggml_cuda_mul_mat_vec_q_short_sibling(src0, src1, ids, sib, sib_y);
 }
 
 bool ggml_cuda_mul_mat_vec_q_short_sibling(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,

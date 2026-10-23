@@ -2,6 +2,10 @@
 
 void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+// NORM -> MUL(weight row) -> ADD(bias row) of rows under 1024 columns, one launch with the values of the three ops
+bool ggml_cuda_should_fuse_norm_mul_add(const ggml_tensor * norm, const ggml_tensor * mul, const ggml_tensor * add);
+void ggml_cuda_op_norm_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * add);
+
 void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

@@ -1100,6 +1100,20 @@ uint32_t llama_memory_hybrid_idx_context::get_n_kpool_new() const {
     return kpool_cur().n_new_g;
 }
 
+uint32_t llama_memory_hybrid_idx_context::get_n_kpool_visible(const llama_ubatch & ubatch, uint32_t i) const {
+    if (!kpool_track() || mem->get_kpool_by_order() || i >= ubatch.n_tokens) {
+        return 0;
+    }
+
+    const uint32_t kpool = mem->get_kpool();
+    const auto &   sq    = mem->kpool_layout_get().seqs[ubatch.seq_id[i][0]];
+
+    // the same count as set_input_kpool's mask: pools are sorted by position, the visible ones are a prefix
+    const auto it = std::upper_bound(sq.pools.begin(), sq.pools.end(), ubatch.pos[i],
+            [&](llama_pos p, uint32_t j) { return p < sq.cells[j + kpool - 1].first; });
+    return (uint32_t) (it - sq.pools.begin());
+}
+
 void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
         ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
         const llama_ubatch * ubatch, ggml_tensor * new_pool_pos) const {
@@ -1126,7 +1140,8 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     GGML_ASSERT(n_pool == kpool_pad(st.n_pool_real));
     GGML_ASSERT(st.is_new.size() == st.n_pool_real);
     GGML_ASSERT(pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens);
-    GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
+    // a wider tail row is the caller's padding, left alone here
+    GGML_ASSERT(tail_idxs->ne[0] >= (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(pool_idxs->ne[0] == (int64_t) kpool && pool_idxs->ne[1] == (int64_t) n_pool);
     GGML_ASSERT(ggml_backend_buffer_is_host(new_pool_idxs->buffer));
     GGML_ASSERT(new_pool_idxs->ne[0] == (int64_t) kpool && new_pool_idxs->ne[1] == (int64_t) n_new_g);
@@ -1337,7 +1352,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
                     real = true;
                 }
             }
-            tidx[(size_t) i*(kpool - 1) + k] = cell;
+            tidx[(size_t) i*tail_idxs->ne[0] + k] = cell;
 
             if (gm != nullptr && n_sel % kpool != 0) {
                 gm[(size_t) i*n_sel + (size_t) n_top*kpool + k] = real ? 0.0f : -INFINITY;

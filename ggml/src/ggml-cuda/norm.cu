@@ -52,6 +52,44 @@ static __global__ void norm_f32(
     }
 }
 
+// norm_f32 of one warp, then the MUL by a weight row and the ADD of a bias row (a layer norm with both), each rounded
+//   as the op apart. A thread writes only the columns it read, so dst may sit exactly on x.
+static __global__ void norm_mul_add_f32(
+        const float * x, const float * w, const float * b, float * dst, const int ncols, const int nchannels, const int nsamples,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps) {
+    const int nrows = gridDim.x;
+    const int row   = blockIdx.x;
+    const int tid   = threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+
+    for (int sample = blockIdx.z; sample < nsamples; sample += gridDim.z) {
+        for (int channel = blockIdx.y; channel < nchannels; channel += gridDim.y) {
+            const float * xc   = x   + sample*stride_sample + channel*stride_channel + row*stride_row;
+            float       * dstc = dst + ((sample*nchannels + channel)*nrows + row)*ncols;
+
+            float2 mean_var = make_float2(0.0f, 0.0f);
+
+            for (int col = tid; col < ncols; col += WARP_SIZE) {
+                const float xi = xc[col];
+                mean_var.x += xi;
+                mean_var.y += xi * xi;
+            }
+
+            mean_var = block_reduce<block_reduce_method::SUM, WARP_SIZE>(mean_var, (float2 *) nullptr);
+
+            const float mean = mean_var.x / ncols;
+            const float var = mean_var.y / ncols - mean * mean;
+            const float inv_std = rsqrtf(var + eps);
+
+            for (int col = tid; col < ncols; col += WARP_SIZE) {
+                const float v = (xc[col] - mean) * inv_std;
+                dstc[col] = __fadd_rn(__fmul_rn(v, w[col]), b[col]);
+            }
+        }
+    }
+}
+
 template <int block_size>
 static __global__ void group_norm_f32(const float * x, float * dst, const int group_size, const int ne_elements, const float eps) {
     // blockIdx.x: num_groups idx
@@ -1482,6 +1520,48 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+bool ggml_cuda_should_fuse_norm_mul_add(const ggml_tensor * norm, const ggml_tensor * mul, const ggml_tensor * add) {
+    if (norm->op != GGML_OP_NORM || mul->op != GGML_OP_MUL || add->op != GGML_OP_ADD) {
+        return false;
+    }
+    const ggml_tensor * x = norm->src[0];
+    const ggml_tensor * w = mul->src[0] == norm ? mul->src[1] : (mul->src[1] == norm ? mul->src[0] : nullptr);
+    const ggml_tensor * b = add->src[0] == mul  ? add->src[1] : (add->src[1] == mul  ? add->src[0] : nullptr);
+    if (w == nullptr || b == nullptr || w == norm || b == mul) {
+        return false;
+    }
+    for (const ggml_tensor * t : { x, w, b, norm, mul, add }) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    // one warp per row, weight and bias one row each; dst may sit exactly on x, not partly
+    const int64_t ncols = norm->ne[0];
+    return ncols < 1024 && x->nb[0] == sizeof(float) && ggml_is_contiguous(w) && ggml_is_contiguous(b) &&
+        w->ne[0] == ncols && ggml_nrows(w) == 1 && b->ne[0] == ncols && ggml_nrows(b) == 1 &&
+        ggml_are_same_shape(norm, mul) && ggml_are_same_shape(norm, add) && ggml_is_contiguous(add) &&
+        ggml_cuda_same_or_disjoint(add, x) && (add->data != x->data || ggml_is_contiguous(x)) &&
+        !ggml_cuda_tensors_overlap(add, w) && !ggml_cuda_tensors_overlap(add, b) &&
+        norm->ne[1] <= INT_MAX && norm->ne[2] <= INT_MAX && norm->ne[3] <= INT_MAX;
+}
+
+void ggml_cuda_op_norm_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * add) {
+    const ggml_tensor * x = norm->src[0];
+    const ggml_tensor * w = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    const ggml_tensor * b = add->src[0] == mul  ? add->src[1] : add->src[0];
+
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const size_t ts0 = ggml_type_size(x->type);
+    const dim3 blocks_num(norm->ne[1], MIN(norm->ne[2], UINT16_MAX), MIN(norm->ne[3], UINT16_MAX));
+    norm_mul_add_f32<<<blocks_num, WARP_SIZE, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data,
+        (const float *) b->data, (float *) add->data, (int) norm->ne[0], (int) norm->ne[2], (int) norm->ne[3],
+        x->nb[1] / ts0, x->nb[2] / ts0, x->nb[3] / ts0, eps);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
