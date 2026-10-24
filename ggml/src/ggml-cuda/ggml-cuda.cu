@@ -9110,6 +9110,30 @@ static bool ggml_cuda_get_rows_is_identity(const ggml_cgraph * cgraph, const ggm
         !(g->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_cuda_graph_use_count(cgraph, g) == 1;
 }
 
+// The weights of the one-token f32 matmuls that read y, the output of the norm at node i_y, right after it (a MoE router
+//   and the shared expert gate row of its launch), at most 1.5 MB of each: the folded norm prefetches them into L2 while it
+//   waits for the lines. A kernel ends only once its prefetches have landed, so only what DRAM brings in the norm's own
+//   time pays (harness: the first 1.5 of a router's 2 MB was best at every wait, all 2 MB lost 0.07 us/launch at no wait).
+static bool ggml_cuda_ar_fold_l2_prefetch(const ggml_cgraph * cgraph, const int i_y, ggml_cuda_l2_prefetch_args & pf) {
+    const ggml_tensor * y = cgraph->nodes[i_y];
+    int n = 0;
+    for (int j = i_y + 1; j < cgraph->n_nodes && j <= i_y + 4 && n < 2; j++) {
+        const ggml_tensor * m = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(m)) {
+            continue;
+        }
+        const ggml_tensor * w = m->src[0];
+        if (m->op != GGML_OP_MUL_MAT || m->src[1] != y || ggml_nrows(y) != 1 || w->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(w) || ggml_nbytes(w) > 4*1024*1024) {
+            break;
+        }
+        pf.ptr[n]   = (const char *) w->data;
+        pf.bytes[n] = (int) std::min<size_t>(ggml_nbytes(w), 1536*1024);
+        n++;
+    }
+    return n > 0;
+}
+
 // The all-reduce whose lines the matmul before it pushed (ggml_backend_cuda_context::ar_fold), at node i, the first
 //   compute node of the next subgraph: if that is the residual add of the reduced tensor with the norm after it, they
 //   run as one launch that polls the lines (3 nodes done); otherwise the receive half of the LL kernel runs first (0).
@@ -9133,7 +9157,11 @@ static int ggml_cuda_ar_fold_consume(ggml_backend_cuda_context * cuda_ctx, ggml_
         if (add->op == GGML_OP_ADD && norm->op == GGML_OP_RMS_NORM && mul->op == GGML_OP_MUL &&
                 ggml_cuda_rms_norm_pre_add_ar_supported(add, norm, mul, t) && ggml_can_fuse_subgraph(cgraph, i, 3, ops, outputs, 2)) {
             ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + 2);
-            ggml_cuda_op_rms_norm_pre_add_ar(*cuda_ctx, add, norm, mul, c.args, t);
+            ggml_cuda_l2_prefetch_args pf;
+            if (f.l2pf) {
+                ggml_cuda_ar_fold_l2_prefetch(cgraph, i + 2, pf);
+            }
+            ggml_cuda_op_rms_norm_pre_add_ar(*cuda_ctx, add, norm, mul, c.args, t, f.l2pf ? &pf : nullptr);
             return 3;
         }
     }
@@ -9163,7 +9191,11 @@ static int ggml_cuda_ar_fold_consume(ggml_backend_cuda_context * cuda_ctx, ggml_
                 if (cuda_ctx->q8_1_emit == mul) {
                     cuda_ctx->q8_1_emit = &mul_s;
                 }
-                ggml_cuda_op_rms_norm_pre_add_ar(*cuda_ctx, &add_s, &norm_s, &mul_s, c.args, t);
+                ggml_cuda_l2_prefetch_args pf;
+                if (f.l2pf) {
+                    ggml_cuda_ar_fold_l2_prefetch(cgraph, i + 4, pf);
+                }
+                ggml_cuda_op_rms_norm_pre_add_ar(*cuda_ctx, &add_s, &norm_s, &mul_s, c.args, t, f.l2pf ? &pf : nullptr);
                 return 5;
             }
         }
@@ -9669,6 +9701,21 @@ static void ggml_backend_cuda_session_begin(ggml_backend_t backend, ggml_cgraph 
         }
     }
     cuda_ctx->ar_fold.hc = hc;
+
+    // on Volta (measured there), once a session has a folded norm that feeds a router, every folded norm takes the
+    //   instance that prefetches (ggml_cuda_ar_fold_l2_prefetch), the others with nothing to prefetch: two functions of
+    //   that kernel in one token made Ornith decode 1.5-2.9% slower. GGML_CUDA_NO_NORM_L2_PREFETCH=1 turns it off.
+    static const bool no_l2pf = getenv("GGML_CUDA_NO_NORM_L2_PREFETCH") != nullptr;
+    const int  cc    = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    const bool volta = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA && cc < GGML_CUDA_CC_TURING;
+    bool l2pf = cuda_ctx->ar_fold.l2pf;
+    for (int k = 0; k < n_cgraphs && volta && !no_l2pf && !l2pf; ++k) {
+        for (int n = 0; n < cgraphs[k]->n_nodes && !l2pf; ++n) {
+            ggml_cuda_l2_prefetch_args pf;
+            l2pf = cgraphs[k]->nodes[n]->op == GGML_OP_MUL && ggml_cuda_ar_fold_l2_prefetch(cgraphs[k], n, pf);
+        }
+    }
+    cuda_ctx->ar_fold.l2pf = l2pf;
 }
 
 // whether the all-reduce of these tensors (one per device) can be part of a session graph

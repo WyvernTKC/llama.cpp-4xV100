@@ -1672,6 +1672,7 @@ struct ggml_backend_cuda_context {
         ar_fold_call_t      recv_call;
         bool                recv   = false;
         bool                hc     = false; // the session has hyper-connection posts, see ggml_backend_cuda_session_begin
+        bool                l2pf   = false; // the folded norms prefetch the router after them, see ggml_backend_cuda_session_begin
     } ar_fold;
 
     // the CONCAT of a build_conv_state whose chain the qkv projection already ran (ggml_cuda_gdn_conv_fold), and the

@@ -802,10 +802,12 @@ static __device__ __forceinline__ T row_split_reduce(T val, uint4 * slots, const
 //   columns it has in that layout and the sums of row_split_reduce keep its order, so the results are the same. Each warp
 //   writes the q8_1 blocks of its own columns. Block 0 moves the sequence numbers on after its reduction, when every
 //   block has polled its lines (its sums came after them). Every block must be resident at once.
-template <int row_threads, int cols_per_thread, int nsplit>
+// l2pf: first prefetch the weights of pf into L2, DRAM being idle while the lines come
+template <int row_threads, int cols_per_thread, int nsplit, bool l2pf>
 static __global__ void __launch_bounds__(row_threads/nsplit) rms_norm_pre_add_ar_split_f32(const ggml_cuda_ar_fold_args ar,
         const float * b, float * sum, float * dst, float * t, const int ncols, const float eps, const float * mul,
-        block_q8_1 * q8_dst, const int nq8, unsigned int * flags) {
+        block_q8_1 * q8_dst, const int nq8, unsigned int * flags,
+        const std::conditional_t<l2pf, ggml_cuda_l2_prefetch_args, ggml_cuda_no_args> pf) {
     constexpr int block_size = row_threads/nsplit;
     constexpr int nwarps_row = row_threads/WARP_SIZE;
     ggml_cuda_pdl_lc();
@@ -829,6 +831,15 @@ static __global__ void __launch_bounds__(row_threads/nsplit) rms_norm_pre_add_ar
     for (int i = 0; i < cols_per_thread; ++i) {
         mv[i] = valid[i] ? mul[cols[i]] : 0.0f;
         bv[i] = valid[i] ? b[cols[i]]   : 0.0f;
+    }
+    if constexpr (l2pf) {
+        // prefetch.global.L2 fetches 64 bytes on Volta
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            for (int off = tid*64; off < pf.bytes[k]; off += nsplit*block_size*64) {
+                asm volatile("prefetch.global.L2 [%0];" :: "l"(pf.ptr[k] + off));
+            }
+        }
     }
     float sv[cols_per_thread];
     ggml_cuda_ar_fold_sum<cols_per_thread>(ar, cols, valid, sv, GGML_CUDA_SPIN_SITE_FOLD_NORM_SPLIT);
@@ -1993,7 +2004,7 @@ bool ggml_cuda_rms_norm_pre_add_ar_supported(const ggml_tensor * add, const ggml
 }
 
 void ggml_cuda_op_rms_norm_pre_add_ar(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * rms_norm, ggml_tensor * mul,
-        const ggml_cuda_ar_fold_args & ar, ggml_tensor * t) {
+        const ggml_cuda_ar_fold_args & ar, ggml_tensor * t, const ggml_cuda_l2_prefetch_args * pf) {
     const ggml_tensor * b = add->src[0]->data == t->data ? add->src[1] : add->src[0];
     const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
 
@@ -2024,9 +2035,16 @@ void ggml_cuda_op_rms_norm_pre_add_ar(ggml_backend_cuda_context & ctx, ggml_tens
         GGML_ASSERT(ncols <= 8*block_size);
         const ggml_cuda_kernel_launch_params launch_params{dim3(nsplit, 1, 1), dim3(block_size/nsplit, 1, 1), 0, ctx.stream()};
         rms_norm_pre_add_ar_cols<1024, 8>(ncols, [&](auto cols) {
-            ggml_cuda_kernel_launch(rms_norm_pre_add_ar_split_f32<1024, decltype(cols)::value, nsplit>, launch_params, ar,
-                (const float *) b->data, (float *) add->data, (float *) mul->data, t_d, ncols, eps, (const float *) w->data,
-                q8_d, nq8, ctx.block_flags_get());
+            constexpr int n = decltype(cols)::value;
+            if (pf != nullptr) {
+                ggml_cuda_kernel_launch(rms_norm_pre_add_ar_split_f32<1024, n, nsplit, true>, launch_params, ar,
+                    (const float *) b->data, (float *) add->data, (float *) mul->data, t_d, ncols, eps, (const float *) w->data,
+                    q8_d, nq8, ctx.block_flags_get(), *pf);
+            } else {
+                ggml_cuda_kernel_launch(rms_norm_pre_add_ar_split_f32<1024, n, nsplit, false>, launch_params, ar,
+                    (const float *) b->data, (float *) add->data, (float *) mul->data, t_d, ncols, eps, (const float *) w->data,
+                    q8_d, nq8, ctx.block_flags_get(), ggml_cuda_no_args{});
+            }
         });
         return;
     }
