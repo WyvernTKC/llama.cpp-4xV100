@@ -14125,6 +14125,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // q8_0 rows of 17-32 lanes (a warp per row) quantize their own input too: Qwen3.8-Flash's 160 columns a device
     test_cases.emplace_back(new test_moe_shexp(GGML_TYPE_Q8_0, 32, 10, 2560, 160, 1));
     test_cases.emplace_back(new test_moe_shexp(GGML_TYPE_Q8_0, 16, 8, 2048, 192, 1));
+    // 2-byte float experts at one token: the shared expert's down projection is one more channel of mul_mat_vec_f
+    for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+        for (int64_t n_ff : { 128, 512 }) {
+            for (int64_t n_tokens : { 1, 2 }) {
+                test_cases.emplace_back(new test_moe_shexp(type, 16, 8, 2048, n_ff, n_tokens));
+            }
+        }
+    }
     for (ggml_unary_op op : { GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SILU }) {
         for (int64_t n_tokens : { 1, 6, 32 }) {
             test_cases.emplace_back(new test_cont_unary_mul(256, 4,  n_tokens, op));

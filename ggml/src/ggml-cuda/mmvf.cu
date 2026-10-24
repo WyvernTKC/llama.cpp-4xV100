@@ -60,8 +60,10 @@ static __device__ __forceinline__ void mul_mat_vec_f_topk_moe(const ggml_cuda_mm
 // topk_n: the expert count of a topk_moe run in the last block (topk_args), see mul_mat_vec_f_topk_moe
 // ar: the two rows of a block go to an LL line of an all-reduce folded into this launch (topk_args holds its
 //   ggml_cuda_ar_fold_args), not to dst; see ggml_cuda_ar_fold_push
+// sib_ch: with ids and one token, the channel past the used experts (the last of the grid) is the sibling sib_x of one
+//   expert's layout with its own input sib_y, written to sib_dst; see ggml_cuda_mul_mat_vec_f_moe_sibling
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false, int rpb = 1, bool load16 = false,
-          int topk_n = 0, bool ar = false>
+          int topk_n = 0, bool ar = false, bool sib_ch = false>
 static __global__ void mul_mat_vec_f(
         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const int ncols2, const uint3 nchannels_y, const int stride_row, const int stride_col_y2, const int stride_col_dst,
@@ -93,8 +95,11 @@ static __global__ void mul_mat_vec_f(
         channel_y  = fastmodulo(channel_dst, nchannels_y);
         sample_dst = 0;
     } else {
+        static_assert(!sib_ch || (ncols_dst == 1 && !has_fusion && topk_n == 0 && !ar), "the sibling channel is one token, nothing else fused");
+        // the sibling channel has no id
+        const bool sib_blk = sib_ch && blockIdx.y == gridDim.y - 1;
         token_idx  = ids ? blockIdx.z                                          : 0;
-        channel_x  = ids ? ids[blockIdx.y + token_idx * ids_stride]            : fastdiv((uint32_t) channel_dst, channel_ratio);
+        channel_x  = ids ? (sib_blk ? 0 : ids[blockIdx.y + token_idx * ids_stride]) : fastdiv((uint32_t) channel_dst, channel_ratio);
         channel_y  = ids ? fastmodulo(blockIdx.y, nchannels_y)                 : channel_dst;
         sample_dst = ids ? 0                                                   : blockIdx.z;
     }
@@ -120,6 +125,13 @@ static __global__ void mul_mat_vec_f(
     if constexpr (is_multi_token_id) {
         y   += token_idx*stride_col_y2*2;
         dst += token_idx*stride_col_dst;
+    }
+    if constexpr (sib_ch) {
+        if (blockIdx.y == gridDim.y - 1) {
+            x   = (const T *) fusion.sib_x + row*stride_row;
+            y   = fusion.sib_y;
+            dst = fusion.sib_dst;
+        }
     }
     // the column stride of the dst this block writes
     int stride_col_dst_blk = stride_col_dst;
@@ -738,8 +750,9 @@ static void mul_mat_vec_f_switch_fusion(
             sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, fusion.topk);
     };
 
+    const bool sib_ch     = ids != nullptr && fusion.sib_y != nullptr;
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
-        fusion.sib_x != nullptr;
+        (fusion.sib_x != nullptr && !sib_ch);
     if constexpr (ncols_dst > 1 && !is_multi_token_id && sizeof(T) == 2) {
         if (load16) {
             if (fusion.sib_block0 > 0) {
@@ -762,6 +775,17 @@ static void mul_mat_vec_f_switch_fusion(
         }
     }
     if constexpr (ncols_dst == 1 && !is_multi_token_id && sizeof(T) == 2) {
+        if (load16 && sib_ch) {
+            // the sibling channel past the used experts, nothing else fused
+            GGML_ASSERT(!has_fusion);
+            switch (rpb) {
+                case 1: launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, 1, true, 0, false, true>); break;
+                case 4: launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, 4, true, 0, false, true>); break;
+                case 8: launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, 8, true, 0, false, true>); break;
+                default: GGML_ABORT("fatal error");
+            }
+            return;
+        }
         if (load16) {
             if (rpb == 2) {
                 // the all-reduce of dst folded in, see launch_mul_mat_vec_f_cuda
@@ -793,7 +817,7 @@ static void mul_mat_vec_f_switch_fusion(
             return;
         }
     }
-    GGML_ASSERT(!load16);
+    GGML_ASSERT(!load16 && !sib_ch);
     if constexpr (ncols_dst == 1 && !is_multi_token_id) {
         if (rpb == 4) {
             if (has_fusion) {
@@ -850,7 +874,8 @@ static bool mmvf_use_load16(
 
 // the sibling rows of a launch (see mul_mat_vec_f) read their own matrices
 static bool mmvf_siblings_aligned16(const ggml_cuda_mm_fusion_args_device & fusion) {
-    return (uintptr_t) fusion.sib_x % 16 == 0 && (uintptr_t) fusion.sib2_x % 16 == 0 && (uintptr_t) fusion.gdn_x % 16 == 0;
+    return (uintptr_t) fusion.sib_x % 16 == 0 && (uintptr_t) fusion.sib2_x % 16 == 0 && (uintptr_t) fusion.gdn_x % 16 == 0 &&
+        (uintptr_t) fusion.sib_y % 16 == 0;
 }
 
 template <typename T, typename type_acc, int ncols_dst, bool is_multi_token_id = false>
@@ -894,8 +919,11 @@ void launch_mul_mat_vec_f_cuda(
         }
     }
 
+    // the sibling channel past the used experts (see ggml_cuda_mul_mat_vec_f_moe_sibling) is one more channel of the grid
+    const bool sib_ch     = ids != nullptr && fusion.sib_y != nullptr;
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
-        fusion.sib_x != nullptr;
+        (fusion.sib_x != nullptr && !sib_ch);
+    GGML_ASSERT(!sib_ch || (load16 && ncols_dst == 1 && !is_multi_token_id && !has_fusion));
 
     // On Volta four rows per block share the y loads and keep more loads in flight. With the 16-byte loads
     // that pays for one token only for rows of <= 512 (bf16 4096x512 -10%, 8192x1024 +4%), and for 2-6 tokens for
@@ -905,7 +933,7 @@ void launch_mul_mat_vec_f_cuda(
     // very tall matrices (f16 62080x5120 -10%), rows of 2k-17k are within +-3%, and below ~8 blocks per SM it
     // loses.
     int rpb = 1;
-    if (ncols_dst == 1 && !is_multi_token_id && is_volta && fusion.sib_x == nullptr && fusion.topk.ids == nullptr &&
+    if (ncols_dst == 1 && !is_multi_token_id && is_volta && (fusion.sib_x == nullptr || sib_ch) && fusion.topk.ids == nullptr &&
             (load16 ? ncols <= 512 : (ncols <= 1024 || nrows >= 16384)) &&
             nrows % 4 == 0 && (nrows/4)*nchannels_dst*nsamples_or_ntokens >= 8*ggml_cuda_info().devices[device].nsm) {
         rpb = 4;
@@ -946,7 +974,7 @@ void launch_mul_mat_vec_f_cuda(
     const int nsums_red     = load16 ? int(ncols_dst*rpb*(block_size_best/warp_size)) : 0;
     const int nbytes_shared = std::max(warp_size, nsums_red)*(has_fusion ? 2 : 1)*sizeof(float);
 
-    const dim3 block_nums(nrows/rpb, nchannels_dst, nsamples_or_ntokens);
+    const dim3 block_nums(nrows/rpb, nchannels_dst + (sib_ch ? 1 : 0), nsamples_or_ntokens);
     const dim3 block_dims(block_size_best, 1, 1);
     switch (block_size_best) {
         case   32: {
@@ -1318,7 +1346,15 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             fusion_local.gdn_a    = (const float *) fusion->gdn_a->data;
             fusion_local.gdn_beta = (float *) fusion->gdn_beta->data;
         }
-        if (fusion->sib && !fusion->sib_rows) {
+        if (fusion->sib && fusion->sib_y) {
+            // with ids: the sibling channel past the used experts, nothing else fused
+            GGML_ASSERT(ggml_cuda_mul_mat_vec_f_moe_sibling(src0, src1, ids, fusion->sib, fusion->sib_y) && fusion->sib_out &&
+                !fusion->gate && !fusion->x_bias && !fusion->gate_bias && !fusion->gdn_beta && !fusion->sib_rows);
+            fusion_local.sib_x   = fusion->sib->data;
+            fusion_local.sib_y   = (const float *) fusion->sib_y->data;
+            fusion_local.sib_dst = fusion->sib_out;
+        }
+        if (fusion->sib && !fusion->sib_rows && !fusion->sib_y) {
             GGML_ASSERT(!ids && !fusion->gate && !fusion->x_bias && !fusion->gate_bias && !fusion->gdn_beta);
             GGML_ASSERT(src0->type == GGML_TYPE_F32 && fusion->sib->type == GGML_TYPE_F32);
             GGML_ASSERT(fusion->sib->ne[0] == ne00 && ggml_nrows(fusion->sib) == 1 && ggml_is_contiguous(fusion->sib));
@@ -1514,6 +1550,24 @@ bool ggml_cuda_mmvf_fuses_tokens(const ggml_tensor * src0, const ggml_tensor * s
     return src1->type == GGML_TYPE_F32 && src1->ne[1] <= MMVF_MAX_BATCH_SIZE && mmvf_use_load16(ts_src0 == 2, cc, src1->ne[1],
         src0->ne[0], src0->nb[1]/ts_src0, src1->nb[1]/ts_src1, src0->nb[2]/ts_src0, src0->nb[3]/ts_src0,
         src1->nb[2]/ts_src1, src1->nb[3]/ts_src1, src0->data, src1->data, gate ? gate->data : nullptr);
+}
+
+bool ggml_cuda_mul_mat_vec_f_moe_sibling(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        const ggml_tensor * sib, const ggml_tensor * sib_y) {
+    // one token of 2-byte experts with the 16-byte loads; the sibling has one expert's layout and its own f32 input
+    if (!ids || (src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_BF16) || src1->type != GGML_TYPE_F32 ||
+            src1->ne[2] != 1 || src1->ne[3] != 1 || ids->ne[1] != 1 || src1->ne[1] != ids->ne[0] || src0->ne[3] != 1 ||
+            sib->type != src0->type || sib->ne[0] != src0->ne[0] || sib->ne[1] != src0->ne[1] || sib->nb[1] != src0->nb[1] ||
+            ggml_nrows(sib) != sib->ne[1] || sib_y->type != GGML_TYPE_F32 || !ggml_is_contiguous(sib_y) ||
+            ggml_nelements(sib_y) != src0->ne[0] || (uintptr_t) sib->data % 16 != 0 || (uintptr_t) sib_y->data % 16 != 0) {
+        return false;
+    }
+    const int    cc      = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const size_t ts_src0 = ggml_type_size(src0->type);
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    return src0->nb[0] == ts_src0 && src1->nb[0] == ts_src1 &&
+        mmvf_use_load16(true, cc, 1, src0->ne[0], src0->nb[1]/ts_src0, src1->nb[2]/ts_src1, src0->nb[2]/ts_src0,
+            src0->nb[3]/ts_src0, src1->nb[1]/ts_src1, src1->nb[3]/ts_src1, src0->data, src1->data, nullptr);
 }
 
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {

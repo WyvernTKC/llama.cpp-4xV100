@@ -6117,13 +6117,17 @@ static int ggml_cuda_try_fuse_moe_down_shexp(ggml_backend_cuda_context * cuda_ct
     const int     add_idx = t + (gated ? 3 : 1);
     ggml_tensor * add     = cgraph->nodes[add_idx];
     // the gated shared expert runs in the short q8_0 kernel, which quantizes its input itself; the plain mmvq kernel
-    //   reads the ungated one's q8_1 row after those of the experts
+    //   reads the ungated one's q8_1 row after those of the experts; 2-byte float experts run in mul_mat_vec_f
+    const int  cc       = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    const bool use_mmvf = ggml_cuda_mul_mat_id_use_mmvf(down->src[0], 1, cc) &&
+        ggml_cuda_mul_mat_vec_f_moe_sibling(down->src[0], down->src[1], down->src[2], mm->src[0], mm->src[1]);
     if (add->op != GGML_OP_ADD ||
             !((add->src[0] == match.dst && add->src[1] == sum) || (add->src[0] == sum && add->src[1] == match.dst)) ||
             add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) ||
             !ggml_are_same_shape(add, match.dst) || !ggml_are_same_shape(mm, match.dst) ||
-            !(gated ? ggml_cuda_mul_mat_vec_q_short_sibling(down->src[0], down->src[1], down->src[2], mm->src[0], mm->src[1]) :
-                      ggml_cuda_mul_mat_vec_q_moe_sibling(down->src[0], down->src[1], down->src[2], mm->src[0], mm->src[1]))) {
+            !(use_mmvf ||
+              (gated ? ggml_cuda_mul_mat_vec_q_short_sibling(down->src[0], down->src[1], down->src[2], mm->src[0], mm->src[1]) :
+                       ggml_cuda_mul_mat_vec_q_moe_sibling(down->src[0], down->src[1], down->src[2], mm->src[0], mm->src[1])))) {
         return 0;
     }
 
@@ -6167,13 +6171,17 @@ static int ggml_cuda_try_fuse_moe_down_shexp(ggml_backend_cuda_context * cuda_ct
     // the all-reduce of the sum folded into the launch (ggml_cuda_ar_fold_moe_args, gated only): the sum is not
     //   written anywhere
     static const bool no_moe_fold = getenv("GGML_CUDA_NO_AR_FOLD_MOE") != nullptr;
-    const bool fold = last && gated && !no_moe_fold && cuda_ctx->ar_fold.next == add && ggml_are_same_shape(match.experts, down) &&
+    const bool fold = !use_mmvf && last && gated && !no_moe_fold && cuda_ctx->ar_fold.next == add && ggml_are_same_shape(match.experts, down) &&
         match.experts->data == down->data && match.experts->ne[1] <= 8;
     if (fold) {
         fusion_data.ar_weights = match.weights;
         fusion_data.ar_gate    = g;
     }
-    ggml_cuda_mul_mat_vec_q(*cuda_ctx, down->src[0], down->src[1], ids, down, &fusion_data);
+    if (use_mmvf) {
+        ggml_cuda_mul_mat_vec_f(*cuda_ctx, down->src[0], down->src[1], ids, down, &fusion_data);
+    } else {
+        ggml_cuda_mul_mat_vec_q(*cuda_ctx, down->src[0], down->src[1], ids, down, &fusion_data);
+    }
     if (fold && cuda_ctx->ar_fold.pushed) {
         return add_idx - i;
     }

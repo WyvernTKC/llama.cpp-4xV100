@@ -16,3 +16,8 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
 // whether ggml_cuda_mul_mat_vec_f can fuse a gate over src1->ne[1] tokens: at one token always, at several only
 //   on the 16-byte loads
 bool ggml_cuda_mmvf_fuses_tokens(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * gate);
+
+// whether ggml_cuda_mul_mat_vec_f can run sib (the shared expert's down projection, of one expert's layout) on its own
+//   input sib_y as one more channel past the used experts of a one-token MUL_MAT_ID (fusion sib, sib_y and sib_out)
+bool ggml_cuda_mul_mat_vec_f_moe_sibling(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+    const ggml_tensor * sib, const ggml_tensor * sib_y);
