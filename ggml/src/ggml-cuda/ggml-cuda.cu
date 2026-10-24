@@ -2683,9 +2683,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int64_t n_expert_used = ids->ne[0];
     const int64_t ne_get_rows = ne12 * n_expert_used;
 
-    std::vector<int32_t> ids_to_sorted_host;
-    ids_to_sorted_host.reserve(2*ne_get_rows);
-    std::vector<int32_t> ids_from_sorted_host(ne_get_rows);
+    // the gather indices for the sorted src1 rows, then the scatter indices back to dst
+    std::vector<int32_t> ids_to_sorted_host(2*ne_get_rows);
+    int32_t * ids_from_sorted_host = ids_to_sorted_host.data() + ne_get_rows;
 
     ggml_cuda_pool_alloc<int32_t> ids_buf_dev(ctx.pool(), 2*ne_get_rows);
 
@@ -2698,23 +2698,30 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // every slot of a token that names the expert gets a row of its own, also when an expert repeats within the row
-    for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
-        for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
-            for (int64_t iex = 0; iex < n_expert_used; ++iex) {
-                const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-                assert(expert_to_use >= 0 && expert_to_use < ne02);
-                if (expert_to_use == i02) {
-                    ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
-                    ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
-                    tokens_per_expert[i02]++;
-                }
-            }
+    // every slot of a token that names the expert gets a row of its own, also when an expert repeats within the row.
+    //   A counting sort: count the rows of each expert, then place the slots in (token, slot) order, so the rows of an
+    //   expert keep that order. A scan of experts x tokens x slots took 24 ms for 4096 tokens of 8 of 256 experts.
+    const auto expert_of = [&](const int64_t i12, const int64_t iex) {
+        return *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
+    };
+    for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
+        for (int64_t iex = 0; iex < n_expert_used; ++iex) {
+            const int32_t expert_to_use = expert_of(i12, iex);
+            GGML_ASSERT(expert_to_use >= 0 && expert_to_use < ne02);
+            tokens_per_expert[expert_to_use]++;
         }
     }
-    GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
-
-    ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
+    std::vector<int32_t> expert_next_row(ne02);
+    for (int64_t i02 = 1; i02 < ne02; ++i02) {
+        expert_next_row[i02] = expert_next_row[i02 - 1] + tokens_per_expert[i02 - 1];
+    }
+    for (int64_t i12 = 0; i12 < ne12; ++i12) {
+        for (int64_t iex = 0; iex < n_expert_used; ++iex) {
+            const int32_t row = expert_next_row[expert_of(i12, iex)]++;
+            ids_from_sorted_host[i12*n_expert_used + iex] = row;
+            ids_to_sorted_host[row] = i12*ne11 + iex % ne11;
+        }
+    }
 
     CUDA_CHECK(cudaMemcpyAsync(ids_buf_dev.ptr, ids_to_sorted_host.data(), 2*ne_get_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
