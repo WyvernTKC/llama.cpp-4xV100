@@ -13690,6 +13690,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gdn_qkv_conv(GGML_TYPE_Q8_0, 2048,  8, 2048, 1024, 1, 0, 2));
     test_cases.emplace_back(new test_gdn_qkv_conv(GGML_TYPE_Q8_0, 2048,  8, 2048, 1024, 2, 1, 1));
     test_cases.emplace_back(new test_gdn_qkv_conv(GGML_TYPE_Q4_K, 2048, 12, 2560, 1536, 1, 2, 0));
+    // 2-byte float rows run them on mul_mat_vec_f (Sage-A1.5 F16 on 4 devices: 2048 qkv, 1024 z, 8 alpha rows a device)
+    test_cases.emplace_back(new test_gdn_qkv_conv(GGML_TYPE_F16,  2048,  8, 2048, 1024, 1, 1, 1));
+    test_cases.emplace_back(new test_gdn_qkv_conv(GGML_TYPE_F16,  2048,  8, 2048, 1024, 1, 0, 2));
+    test_cases.emplace_back(new test_gdn_qkv_conv(GGML_TYPE_F16,  2048,  8, 2048, 1024, 2, 1, 1));
+    test_cases.emplace_back(new test_gdn_qkv_conv(GGML_TYPE_BF16, 2048, 12, 2560, 1536, 1, 2, 0));
+    test_cases.emplace_back(new test_gdn_qkv_conv(GGML_TYPE_F16,  1024, 32, 8192, 4096, 1, 1, 1));
     test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_Q8_0, 2048, 32, 6));
     test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_Q8_0, 2048,  8, 4));
     test_cases.emplace_back(new test_gdn_gate(GGML_TYPE_F16,  5120, 12, 4));
@@ -14125,7 +14131,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // q8_0 rows of 17-32 lanes (a warp per row) quantize their own input too: Qwen3.8-Flash's 160 columns a device
     test_cases.emplace_back(new test_moe_shexp(GGML_TYPE_Q8_0, 32, 10, 2560, 160, 1));
     test_cases.emplace_back(new test_moe_shexp(GGML_TYPE_Q8_0, 16, 8, 2048, 192, 1));
-    // 2-byte float experts at one token: the shared expert's down projection is one more channel of mul_mat_vec_f
+    // 2-byte float experts at one token: the shared expert's GLU and down projection are one more channel of the
+    //   experts' mul_mat_vec_f launches (the GLU only for rows of K > 512)
     for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_BF16 }) {
         for (int64_t n_ff : { 128, 512 }) {
             for (int64_t n_tokens : { 1, 2 }) {
@@ -14133,6 +14140,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    test_cases.emplace_back(new test_moe_shexp(GGML_TYPE_F16, 16, 8,  512, 128, 1));
+    test_cases.emplace_back(new test_moe_shexp(GGML_TYPE_F16, 32, 4, 1024, 256, 1));
     for (ggml_unary_op op : { GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SILU }) {
         for (int64_t n_tokens : { 1, 6, 32 }) {
             test_cases.emplace_back(new test_cont_unary_mul(256, 4,  n_tokens, op));

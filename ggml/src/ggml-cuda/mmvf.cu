@@ -6,6 +6,7 @@
 #include "mmf.cuh"
 #include "convert.cuh"
 #include "spin.cuh"
+#include "ssm-conv.cuh"
 #include "topk-moe.cuh"
 
 GGML_CUDA_SPIN_SETTER(mmvf)
@@ -61,16 +62,22 @@ static __device__ __forceinline__ void mul_mat_vec_f_topk_moe(const ggml_cuda_mm
 // ar: the two rows of a block go to an LL line of an all-reduce folded into this launch (topk_args holds its
 //   ggml_cuda_ar_fold_args), not to dst; see ggml_cuda_ar_fold_push
 // sib_ch: with ids and one token, the channel past the used experts (the last of the grid) is the sibling sib_x of one
-//   expert's layout with its own input sib_y, written to sib_dst; see ggml_cuda_mul_mat_vec_f_moe_sibling
+//   expert's layout with its own input sib_y, written to sib_dst; see ggml_cuda_mul_mat_vec_f_moe_sibling. With
+//   has_fusion (a gate) it is the pair sib_x/sib_gate of a GLU with the experts' input, see
+//   ggml_cuda_mul_mat_vec_f_moe_glu_sibling
+// gdn_qkv: one token, the projections of a gated delta net layer in one launch: the rows of x (qkv) with the convolution
+//   of build_conv_state in their epilogue (topk_args holds its ggml_cuda_mmvq_conv_args), then those of sib_x (z), then
+//   from gdn_block0 on those of gdn_x (alpha), the only ones with the gate (beta) and the gated delta net epilogue
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false, int rpb = 1, bool load16 = false,
-          int topk_n = 0, bool ar = false, bool sib_ch = false>
+          int topk_n = 0, bool ar = false, bool sib_ch = false, bool gdn_qkv = false>
 static __global__ void mul_mat_vec_f(
         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const int ncols2, const uint3 nchannels_y, const int stride_row, const int stride_col_y2, const int stride_col_dst,
         const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const int ids_stride,
-        const std::conditional_t<(topk_n > 0), ggml_cuda_mmvf_topk_args, std::conditional_t<ar, ggml_cuda_ar_fold_args, ggml_cuda_no_args>> topk_args) {
+        const std::conditional_t<(topk_n > 0), ggml_cuda_mmvf_topk_args, std::conditional_t<ar, ggml_cuda_ar_fold_args,
+            std::conditional_t<gdn_qkv, ggml_cuda_mmvq_conv_args, ggml_cuda_no_args>>> topk_args) {
     const T       * GGML_CUDA_RESTRICT x   = x_ptr;
     const float   * GGML_CUDA_RESTRICT y   = y_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
@@ -95,7 +102,8 @@ static __global__ void mul_mat_vec_f(
         channel_y  = fastmodulo(channel_dst, nchannels_y);
         sample_dst = 0;
     } else {
-        static_assert(!sib_ch || (ncols_dst == 1 && !has_fusion && topk_n == 0 && !ar), "the sibling channel is one token, nothing else fused");
+        static_assert(!sib_ch || (ncols_dst == 1 && (!has_fusion || rpb == 1) && topk_n == 0 && !ar && !gdn_qkv),
+            "the sibling channel is one token, nothing else fused but a gate");
         // the sibling channel has no id
         const bool sib_blk = sib_ch && blockIdx.y == gridDim.y - 1;
         token_idx  = ids ? blockIdx.z                                          : 0;
@@ -145,7 +153,7 @@ static __global__ void mul_mat_vec_f(
         }
     }
     // (the plain kernel of several tokens takes sibling rows too: the fused one holds the gate's sums in registers)
-    if constexpr (has_fusion || (load16 && ncols_dst > 1)) {
+    if constexpr ((has_fusion && !sib_ch) || (load16 && ncols_dst > 1)) {
         // sibling rows (one channel and sample): the rows from sib_block0 on are the rows of a sibling matrix of the same
         //   type, width and y, written to its own dst ([rows, tokens], contiguous), those from sib2_block0 on a second's
         //   and those from gdn_block0 on a third's (gdn_x, the gated delta net rows of mmvq). One token with one row per
@@ -198,6 +206,45 @@ static __global__ void mul_mat_vec_f(
 
     if (use_gate) {
         gate_x += int64_t(sample_x)  *stride_sample_x   + channel_x  *stride_channel_x   + row*stride_row;
+    }
+    if constexpr (sib_ch && has_fusion) {
+        // the sibling's gate
+        if (blockIdx.y == gridDim.y - 1) {
+            gate_x = (const T *) fusion.sib_gate + row*stride_row;
+        }
+    }
+
+    // gdn_qkv: the rows past gdn_block0 are gdn_x's, those of the gate the same rows of fusion.gate; only they have the
+    //   gate and the gated delta net epilogue, indexed by the row in gdn_x (gdn_row). The rows of x have the
+    //   convolution: the state columns and weights of the row's channel, loaded while the dot product runs.
+    [[maybe_unused]] int  gdn_row  = 0;
+    [[maybe_unused]] bool conv_row = false;
+    [[maybe_unused]] float conv_win[4];
+    [[maybe_unused]] float conv_wv[4];
+    if constexpr (gdn_qkv) {
+        static_assert(has_fusion && ncols_dst == 1 && rpb == 1 && load16 && !is_multi_token_id && topk_n == 0 && !ar,
+            "the projections of one token, one row per block");
+        const bool gdn_blk = uint32_t(row) >= fusion.gdn_block0;
+        gdn_row  = row - int(fusion.gdn_block0);
+        use_gate = gdn_blk;
+        use_gate_bias = false;
+        if (gdn_blk) {
+            gate_x = (const T *) fusion.gate + int64_t(gdn_row)*stride_row;
+        } else {
+            gdn_beta = nullptr;
+        }
+        conv_row = topk_args.w != nullptr && uint32_t(row) < fusion.sib_block0;
+        if (conv_row && tid == 0) {
+            const float * s = topk_args.states + int64_t(topk_args.ids[0])*topk_args.row_stride + int64_t(row)*3;
+#pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                conv_win[k] = s[k];
+            }
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                conv_wv[k] = topk_args.w[int64_t(row)*topk_args.w_stride + k];
+            }
+        }
     }
 
     if constexpr (has_fusion) {
@@ -698,8 +745,9 @@ static __global__ void mul_mat_vec_f(
             }
             if (gdn_beta) {
                 // the gate and beta of a gated delta net layer, x and gate being its alpha and beta projections
-                dst[dcol*stride_col_dst + drow]      = ggml_cuda_op_softplus_single(value + gdn_dt[drow]) * gdn_a[drow];
-                gdn_beta[dcol*stride_col_dst + drow] = ggml_cuda_op_sigmoid_single(gate_value);
+                const int grow = gdn_qkv ? gdn_row : drow;
+                dst[dcol*stride_col_dst + drow]      = ggml_cuda_op_softplus_single(value + gdn_dt[grow]) * gdn_a[grow];
+                gdn_beta[dcol*stride_col_dst + grow] = ggml_cuda_op_sigmoid_single(gate_value);
                 return;
             }
             switch (glu_op) {
@@ -723,6 +771,26 @@ static __global__ void mul_mat_vec_f(
     }
 
     dst[dcol*stride_col_dst_blk + drow] = value;
+
+    if constexpr (gdn_qkv) {
+        // as ssm_conv_state_f32 with one token; the convolution's dst may sit exactly on dst, so it is written last
+        if (conv_row) {
+            conv_win[3] = value;
+            if (topk_args.slot0 != nullptr) {
+#pragma unroll
+                for (int k = 0; k < 3; ++k) {
+                    topk_args.slot0[int64_t(row)*3 + k] = conv_win[k];
+                }
+            }
+            if (topk_args.slot1 != nullptr) {
+#pragma unroll
+                for (int k = 0; k < 3; ++k) {
+                    topk_args.slot1[int64_t(row)*3 + k] = conv_win[1 + k];
+                }
+            }
+            topk_args.dst[row] = ggml_cuda_ssm_conv_silu<4>(conv_win, conv_wv, 0.0f);
+        }
+    }
 
     if constexpr (!has_fusion) {
         GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, glu_limit, gate_x, x_bias, gate_bias, sumf_gate,
@@ -753,6 +821,9 @@ static void mul_mat_vec_f_switch_fusion(
     const bool sib_ch     = ids != nullptr && fusion.sib_y != nullptr;
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
         (fusion.sib_x != nullptr && !sib_ch);
+    // the projections of a gated delta net layer, see ggml_cuda_mul_mat_vec_f
+    const bool gdn_qkv    = fusion.gdn_x != nullptr && fusion.gdn_beta != nullptr;
+    GGML_ASSERT(!gdn_qkv || (ncols_dst == 1 && !is_multi_token_id && sizeof(T) == 2 && load16 && rpb == 1 && !sib_ch));
     if constexpr (ncols_dst > 1 && !is_multi_token_id && sizeof(T) == 2) {
         if (load16) {
             if (fusion.sib_block0 > 0) {
@@ -776,8 +847,13 @@ static void mul_mat_vec_f_switch_fusion(
     }
     if constexpr (ncols_dst == 1 && !is_multi_token_id && sizeof(T) == 2) {
         if (load16 && sib_ch) {
+            if (has_fusion) {
+                // the sibling pair of a GLU past the used experts, nothing else fused
+                GGML_ASSERT(rpb == 1 && fusion.sib_gate != nullptr && fusion.gate != nullptr && !fusion.x_bias && !fusion.gate_bias);
+                launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, false, 1, true, 0, false, true>);
+                return;
+            }
             // the sibling channel past the used experts, nothing else fused
-            GGML_ASSERT(!has_fusion);
             switch (rpb) {
                 case 1: launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, 1, true, 0, false, true>); break;
                 case 4: launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, 4, true, 0, false, true>); break;
@@ -808,7 +884,13 @@ static void mul_mat_vec_f_switch_fusion(
                 launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, 8, true>);
             } else {
                 GGML_ASSERT(rpb == 1);
-                if (has_fusion) {
+                if (gdn_qkv) {
+                    // the convolution's arguments in place of topk's
+                    ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, false, 1, true, 0, false, false, true>,
+                        launch_params, x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
+                        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, fusion.conv);
+                } else if (has_fusion) {
                     launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, false, 1, true>);
                 } else {
                     launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, 1, true>);
@@ -875,7 +957,7 @@ static bool mmvf_use_load16(
 // the sibling rows of a launch (see mul_mat_vec_f) read their own matrices
 static bool mmvf_siblings_aligned16(const ggml_cuda_mm_fusion_args_device & fusion) {
     return (uintptr_t) fusion.sib_x % 16 == 0 && (uintptr_t) fusion.sib2_x % 16 == 0 && (uintptr_t) fusion.gdn_x % 16 == 0 &&
-        (uintptr_t) fusion.sib_y % 16 == 0;
+        (uintptr_t) fusion.sib_y % 16 == 0 && (uintptr_t) fusion.sib_gate % 16 == 0;
 }
 
 template <typename T, typename type_acc, int ncols_dst, bool is_multi_token_id = false>
@@ -923,7 +1005,7 @@ void launch_mul_mat_vec_f_cuda(
     const bool sib_ch     = ids != nullptr && fusion.sib_y != nullptr;
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
         (fusion.sib_x != nullptr && !sib_ch);
-    GGML_ASSERT(!sib_ch || (load16 && ncols_dst == 1 && !is_multi_token_id && !has_fusion));
+    GGML_ASSERT(!sib_ch || (load16 && ncols_dst == 1 && !is_multi_token_id && (!has_fusion || fusion.sib_gate != nullptr)));
 
     // On Volta four rows per block share the y loads and keep more loads in flight. With the 16-byte loads
     // that pays for one token only for rows of <= 512 (bf16 4096x512 -10%, 8192x1024 +4%), and for 2-6 tokens for
@@ -932,8 +1014,9 @@ void launch_mul_mat_vec_f_cuda(
     // row still sums in its own order, short rows gain the most (bf16 8192x1024 -22%, 4096x512 -23%) and so do
     // very tall matrices (f16 62080x5120 -10%), rows of 2k-17k are within +-3%, and below ~8 blocks per SM it
     // loses.
+    // (the GLU of a sibling pair past the used experts keeps one row per block)
     int rpb = 1;
-    if (ncols_dst == 1 && !is_multi_token_id && is_volta && (fusion.sib_x == nullptr || sib_ch) && fusion.topk.ids == nullptr &&
+    if (ncols_dst == 1 && !is_multi_token_id && is_volta && (fusion.sib_x == nullptr || (sib_ch && !has_fusion)) && fusion.topk.ids == nullptr &&
             (load16 ? ncols <= 512 : (ncols <= 1024 || nrows >= 16384)) &&
             nrows % 4 == 0 && (nrows/4)*nchannels_dst*nsamples_or_ntokens >= 8*ggml_cuda_info().devices[device].nsm) {
         rpb = 4;
@@ -1323,7 +1406,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             fusion_local.x_bias = fusion->x_bias->data;
         }
         if (fusion->gate) {
-            GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
+            GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, fusion->gdn_x ? fusion->gdn_x : src0));
             fusion_local.gate = fusion->gate->data;
         }
         if (fusion->gate_bias) {
@@ -1334,7 +1417,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;
-        if (fusion->gdn_beta) {
+        if (fusion->gdn_beta && !fusion->gdn_x) {
             GGML_ASSERT(!ids && fusion->gate && !fusion->x_bias && !fusion->gate_bias);
             GGML_ASSERT(ggml_is_contiguous(dst) && dst->ne[2] == 1 && dst->ne[3] == 1);
             for (const ggml_tensor * t : { fusion->gdn_dt, fusion->gdn_a }) {
@@ -1346,6 +1429,56 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             fusion_local.gdn_a    = (const float *) fusion->gdn_a->data;
             fusion_local.gdn_beta = (float *) fusion->gdn_beta->data;
         }
+        if (fusion->gdn_x) {
+            // the projections of a gated delta net layer, one token (see mul_mat_vec_f, gdn_qkv): the rows of src0 (qkv)
+            //   with the convolution in their epilogue, sib's (z) into sib_dst, and gdn_x's (alpha) with the gate (beta)
+            //   and the gated delta net epilogue into gdn_dst
+            GGML_ASSERT(ggml_cuda_mul_mat_vec_f_gdn_qkv(src0, src1, fusion->sib, fusion->gdn_x, fusion->gate) && !ids && fusion->sib &&
+                fusion->sib_dst && fusion->gdn_dst && fusion->gdn_beta && !fusion->x_bias && !fusion->gate_bias && !fusion->sib_rows &&
+                !fusion->sib2 && !fusion->sib_y && !fusion->sib_gate);
+            GGML_ASSERT(ggml_nrows(dst) == 1 && ggml_is_contiguous(dst));
+            const int64_t nrows_gdn = fusion->gdn_x->ne[1];
+            for (const ggml_tensor * t : { fusion->gdn_dt, fusion->gdn_a, (const ggml_tensor *) fusion->gdn_beta, (const ggml_tensor *) fusion->gdn_dst }) {
+                GGML_ASSERT(t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nelements(t) == nrows_gdn);
+            }
+            GGML_ASSERT(fusion->sib_dst->type == GGML_TYPE_F32 && ggml_is_contiguous(fusion->sib_dst) &&
+                ggml_nelements(fusion->sib_dst) == fusion->sib->ne[1]);
+            fusion_local.sib_x      = fusion->sib->data;
+            fusion_local.sib_dst    = (float *) fusion->sib_dst->data;
+            fusion_local.sib_block0 = (uint32_t) ne01;
+            fusion_local.sib_nrows  = (uint32_t) fusion->sib->ne[1];
+            fusion_local.gdn_x      = fusion->gdn_x->data;
+            fusion_local.gdn_dst    = (float *) fusion->gdn_dst->data;
+            fusion_local.gdn_block0 = (uint32_t) (ne01 + fusion->sib->ne[1]);
+            fusion_local.gdn_nrows  = (uint32_t) nrows_gdn;
+            fusion_local.gdn_dt     = (const float *) fusion->gdn_dt->data;
+            fusion_local.gdn_a      = (const float *) fusion->gdn_a->data;
+            fusion_local.gdn_beta   = (float *) fusion->gdn_beta->data;
+            if (fusion->conv_w != nullptr) {
+                GGML_ASSERT(fusion->conv_states && fusion->conv_ids && fusion->conv_dst);
+                fusion_local.conv.states     = fusion->conv_states;
+                fusion_local.conv.ids        = fusion->conv_ids;
+                fusion_local.conv.row_stride = fusion->conv_row_stride;
+                fusion_local.conv.w          = fusion->conv_w;
+                fusion_local.conv.w_stride   = fusion->conv_w_stride;
+                fusion_local.conv.dst        = fusion->conv_dst;
+                fusion_local.conv.slot0      = fusion->conv_slot[0];
+                fusion_local.conv.slot1      = fusion->conv_slot[1];
+            }
+        }
+        GGML_ASSERT(fusion->conv_w == nullptr || fusion->gdn_x != nullptr);
+        if (fusion->sib && fusion->sib_gate) {
+            // with ids and a gate: the GLU of the sibling pair sib/sib_gate past the used experts, nothing else fused
+            //   (ggml_cuda_try_defer_glu)
+            GGML_ASSERT(ggml_cuda_mul_mat_vec_f_moe_glu_sibling(src0, fusion->gate, src1, ids, fusion->sib, fusion->sib_gate) &&
+                fusion->sib_dst && !fusion->x_bias && !fusion->gate_bias && !fusion->gdn_beta && !fusion->sib_rows && !fusion->sib_y);
+            GGML_ASSERT(fusion->sib_dst->type == GGML_TYPE_F32 && ggml_is_contiguous(fusion->sib_dst) &&
+                ggml_nelements(fusion->sib_dst) == ne01);
+            fusion_local.sib_x    = fusion->sib->data;
+            fusion_local.sib_gate = fusion->sib_gate->data;
+            fusion_local.sib_dst  = (float *) fusion->sib_dst->data;
+            fusion_local.sib_y    = src1_d; // the experts' input, which makes the sibling a channel of the grid
+        }
         if (fusion->sib && fusion->sib_y) {
             // with ids: the sibling channel past the used experts, nothing else fused
             GGML_ASSERT(ggml_cuda_mul_mat_vec_f_moe_sibling(src0, src1, ids, fusion->sib, fusion->sib_y) && fusion->sib_out &&
@@ -1354,7 +1487,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             fusion_local.sib_y   = (const float *) fusion->sib_y->data;
             fusion_local.sib_dst = fusion->sib_out;
         }
-        if (fusion->sib && !fusion->sib_rows && !fusion->sib_y) {
+        if (fusion->sib && !fusion->sib_rows && !fusion->sib_y && !fusion->sib_gate && !fusion->gdn_x) {
             GGML_ASSERT(!ids && !fusion->gate && !fusion->x_bias && !fusion->gate_bias && !fusion->gdn_beta);
             GGML_ASSERT(src0->type == GGML_TYPE_F32 && fusion->sib->type == GGML_TYPE_F32);
             GGML_ASSERT(fusion->sib->ne[0] == ne00 && ggml_nrows(fusion->sib) == 1 && ggml_is_contiguous(fusion->sib));
@@ -1568,6 +1701,51 @@ bool ggml_cuda_mul_mat_vec_f_moe_sibling(const ggml_tensor * src0, const ggml_te
     return src0->nb[0] == ts_src0 && src1->nb[0] == ts_src1 &&
         mmvf_use_load16(true, cc, 1, src0->ne[0], src0->nb[1]/ts_src0, src1->nb[2]/ts_src1, src0->nb[2]/ts_src0,
             src0->nb[3]/ts_src0, src1->nb[1]/ts_src1, src1->nb[3]/ts_src1, src0->data, src1->data, nullptr);
+}
+
+bool ggml_cuda_mul_mat_vec_f_moe_glu_sibling(const ggml_tensor * src0, const ggml_tensor * gate0, const ggml_tensor * src1,
+        const ggml_tensor * ids, const ggml_tensor * sib, const ggml_tensor * sib_gate) {
+    // one token of 2-byte experts with the 16-byte loads, one input for all of them; rows of > 512, which the experts'
+    //   launch keeps one per block without the pair too (see launch_mul_mat_vec_f_cuda)
+    if (!ids || (src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_BF16) || src1->type != GGML_TYPE_F32 ||
+            gate0 == nullptr || gate0->type != src0->type || !ggml_are_same_shape(gate0, src0) || !ggml_are_same_stride(gate0, src0) ||
+            src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || ids->ne[1] != 1 || src0->ne[3] != 1 || src0->ne[0] <= 512) {
+        return false;
+    }
+    // the pair has one expert's layout
+    for (const ggml_tensor * s : { sib, sib_gate }) {
+        if (s->type != src0->type || s->ne[0] != src0->ne[0] || s->ne[1] != src0->ne[1] || s->nb[1] != src0->nb[1] ||
+                ggml_nrows(s) != s->ne[1] || (uintptr_t) s->data % 16 != 0) {
+            return false;
+        }
+    }
+    const int    cc      = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const size_t ts_src0 = ggml_type_size(src0->type);
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    return src0->nb[0] == ts_src0 && src1->nb[0] == ts_src1 &&
+        mmvf_use_load16(true, cc, 1, src0->ne[0], src0->nb[1]/ts_src0, src1->nb[2]/ts_src1, src0->nb[2]/ts_src0,
+            src0->nb[3]/ts_src0, src1->nb[1]/ts_src1, src1->nb[3]/ts_src1, src0->data, src1->data, gate0->data);
+}
+
+bool ggml_cuda_mul_mat_vec_f_gdn_qkv(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * sib,
+        const ggml_tensor * gdn_x, const ggml_tensor * gate) {
+    // one token of 2-byte rows with the 16-byte loads, all matrices of the same type, K and row stride
+    if ((src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_BF16) || src1->type != GGML_TYPE_F32 || ggml_nrows(src1) != 1 ||
+            !ggml_is_contiguous(src1) || src1->ne[0] != src0->ne[0] || ggml_nrows(src0) != src0->ne[1] || gdn_x->ne[1] != gate->ne[1]) {
+        return false;
+    }
+    for (const ggml_tensor * t : { sib, gdn_x, gate }) {
+        if (t->type != src0->type || t->ne[0] != src0->ne[0] || t->nb[1] != src0->nb[1] || ggml_nrows(t) != t->ne[1] ||
+                (uintptr_t) t->data % 16 != 0) {
+            return false;
+        }
+    }
+    const int    cc      = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const size_t ts_src0 = ggml_type_size(src0->type);
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    return src0->nb[0] == ts_src0 && src1->nb[0] == ts_src1 &&
+        mmvf_use_load16(true, cc, 1, src0->ne[0], src0->nb[1]/ts_src0, src1->nb[1]/ts_src1, src0->nb[2]/ts_src0,
+            src0->nb[3]/ts_src0, src1->nb[2]/ts_src1, src1->nb[3]/ts_src1, src0->data, src1->data, gate->data);
 }
 
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {

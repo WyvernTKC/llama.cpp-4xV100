@@ -4354,7 +4354,11 @@ static int ggml_cuda_gdn_conv_fold(ggml_backend_cuda_context * cuda_ctx, const g
                                    const ggml_tensor * qkv, const ggml_tensor * const * launch_tensors, const int n_launch_tensors,
                                    ggml_cuda_ssm_conv_state_fusion & f) {
     static const bool disabled = getenv("GGML_CUDA_NO_CONV_FOLD") != nullptr;
-    if (disabled || !ggml_cuda_mmvq_conv_epilogue_pays(qkv->src[0]->type, ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+    // mul_mat_vec_f takes it for 2-byte float rows (ggml_cuda_mul_mat_vec_f_gdn_qkv), mul_mat_vec_q where it pays
+    const int  cc   = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    const bool pays = ggml_is_quantized(qkv->src[0]->type) ? ggml_cuda_mmvq_conv_epilogue_pays(qkv->src[0]->type, cc) :
+        qkv->src[0]->type == GGML_TYPE_F16 || qkv->src[0]->type == GGML_TYPE_BF16;
+    if (disabled || !pays) {
         return -1;
     }
     int concat_idx = -1;
@@ -6020,8 +6024,12 @@ static int ggml_cuda_try_defer_glu(ggml_backend_cuda_context * cuda_ctx, const g
         return 0;
     }
     const ggml_tensor * x = up->src[1];
+    // through mul_mat_vec_q, or for 2-byte float weights mul_mat_vec_f, which reads x itself in the launch that writes glu
+    static const bool no_mmvf = getenv("GGML_CUDA_NO_DEFER_GLU_MMVF") != nullptr;
+    const bool mmvf = !ggml_is_quantized(up->src[0]->type);
     if (x->type != GGML_TYPE_F32 || ggml_nrows(x) != 1 || glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) ||
-            !ggml_cuda_should_fuse_mul_mat_vec_q(up, true)) {
+            !(mmvf ? !no_mmvf && ggml_cuda_should_fuse_mul_mat_vec_f(up) && !ggml_cuda_tensors_overlap(glu, x) :
+                     ggml_cuda_should_fuse_mul_mat_vec_q(up, true))) {
         return 0;
     }
 
@@ -6040,7 +6048,9 @@ static int ggml_cuda_try_defer_glu(ggml_backend_cuda_context * cuda_ctx, const g
                 x2->ne[1] == 1 && glu2->ne[2] == 1 && glu2->ne[0] == glu->ne[0] &&
                 memcmp(glu2->op_params, glu->op_params, sizeof(glu->op_params)) == 0 &&
                 !ggml_cuda_tensors_overlap(glu, glu2) && !ggml_cuda_tensors_overlap(glu, ids) &&
-                (ggml_cuda_should_fuse_mul_mat_vec_q(up2, true) || ggml_cuda_expert_cache_glu_pair(up2, gate2));
+                (mmvf ? ggml_cuda_should_fuse_mul_mat_vec_f(up2) &&
+                        ggml_cuda_mul_mat_vec_f_moe_glu_sibling(up2->src[0], gate2->src[0], x2, ids, up->src[0], gate->src[0]) :
+                        ggml_cuda_should_fuse_mul_mat_vec_q(up2, true) || ggml_cuda_expert_cache_glu_pair(up2, gate2));
             for (int k = 0; ok && k < 2; k++) {
                 const ggml_tensor * w  = (k == 0 ? up : gate)->src[0];
                 const ggml_tensor * w2 = (k == 0 ? up2 : gate2)->src[0];
@@ -6342,7 +6352,11 @@ static void ggml_cuda_flush_deferred_glu(ggml_backend_cuda_context * cuda_ctx) {
     fusion_data.gate      = d.gate->src[0];
     fusion_data.glu_op    = ggml_get_glu_op(d.glu);
     fusion_data.glu_limit = ggml_get_op_params_f32(d.glu, 3);
-    ggml_cuda_mul_mat_vec_q(*cuda_ctx, d.up->src[0], d.up->src[1], nullptr, d.glu, &fusion_data);
+    if (ggml_is_quantized(d.up->src[0]->type)) {
+        ggml_cuda_mul_mat_vec_q(*cuda_ctx, d.up->src[0], d.up->src[1], nullptr, d.glu, &fusion_data);
+    } else {
+        ggml_cuda_mul_mat_vec_f(*cuda_ctx, d.up->src[0], d.up->src[1], nullptr, d.glu, &fusion_data);
+    }
     d = {};
 }
 
@@ -8072,6 +8086,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 
+                // the GLU deferred to this launch, see ggml_cuda_try_defer_glu
+                ggml_backend_cuda_context::deferred_glu & d = cuda_ctx->glu_deferred;
+                if (op == GGML_OP_MUL_MAT_ID && d.target == i) {
+                    fusion_data.sib      = d.up->src[0];
+                    fusion_data.sib_gate = d.gate->src[0];
+                    fusion_data.sib_dst  = d.glu;
+                    d = {};
+                }
+
                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
@@ -8649,9 +8672,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // ... and the qkv and z projections right after them, of the same input (qwen35 builds them in this order): one mmvq
     //   launch, the qkv rows, z's after them, then alpha's with beta and the gate epilogue. Each row sums as in its own
-    //   launch. GGML_CUDA_NO_SIBLING_ROWS=1 runs them apart.
+    //   launch. GGML_CUDA_NO_SIBLING_ROWS=1 runs them apart. The same on mmvf for 2-byte float rows
+    //   (ggml_cuda_mul_mat_vec_f_gdn_qkv, GGML_CUDA_NO_GDN_QKV_MMVF=1 runs them apart).
     static const bool no_sibling_rows = getenv("GGML_CUDA_NO_SIBLING_ROWS") != nullptr;
-    if (gdn_gate_mul_mat_vec == ggml_cuda_mul_mat_vec_q && !no_sibling_rows) {
+    static const bool no_gdn_qkv_mmvf = getenv("GGML_CUDA_NO_GDN_QKV_MMVF") != nullptr;
+    const bool gdn_qkv_mmvf = gdn_gate_mul_mat_vec == ggml_cuda_mul_mat_vec_f && !no_gdn_qkv_mmvf;
+    if ((gdn_gate_mul_mat_vec == ggml_cuda_mul_mat_vec_q || gdn_qkv_mmvf) && !no_sibling_rows) {
         int j = i + 9;
         while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
             j++;
@@ -8681,6 +8707,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return w->type == node->src[0]->type && w->ne[0] == node->src[0]->ne[0] && w->nb[1] == node->src[0]->nb[1] &&
                 ggml_nrows(w) == w->ne[1];
         };
+        // mmvf: where each would run on its own, and summed in the precision of alpha and beta
+        const auto mmvf_alone = [&](const ggml_tensor * t) {
+            return ggml_cuda_should_fuse_mul_mat_vec_f(t) && cuda_ctx->stream_context().concurrent_events.empty() &&
+                ggml_cuda_mul_mat_choose(*cuda_ctx, t->src[0], t->src[1], t) == GGML_CUDA_MUL_MAT_PATH_MMVF &&
+                ggml_prec(t->op_params[0]) == GGML_PREC_DEFAULT;
+        };
         bool ok = qkv != nullptr && z != nullptr && qkv->op == GGML_OP_MUL_MAT && z->op == GGML_OP_MUL_MAT &&
             (qkv->flags & GGML_TENSOR_FLAG_COMPUTE) && (z->flags & GGML_TENSOR_FLAG_COMPUTE) &&
             qkv->src[1]->data == x->data && z->src[1]->data == x->data &&
@@ -8688,7 +8720,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_are_same_shape(z->src[1], x) && ggml_are_same_stride(z->src[1], x) && ggml_nrows(x) == 1 &&
             same_rows(qkv->src[0]) && same_rows(z->src[0]) && same_rows(cgraph->nodes[i + 6]->src[0]) &&
             ggml_is_contiguous(qkv) && ggml_is_contiguous(z) &&
-            ggml_cuda_should_fuse_mul_mat_vec_q(qkv) && ggml_cuda_should_fuse_mul_mat_vec_q(z) &&
+            (gdn_qkv_mmvf ? mmvf_alone(qkv) && mmvf_alone(z) &&
+                ggml_cuda_mul_mat_vec_f_gdn_qkv(qkv->src[0], x, z->src[0], node->src[0], cgraph->nodes[i + 6]->src[0]) :
+                ggml_cuda_should_fuse_mul_mat_vec_q(qkv) && ggml_cuda_should_fuse_mul_mat_vec_q(z)) &&
             !ggml_cuda_op_mul_mat_use_fwht(qkv) && !ggml_cuda_op_mul_mat_use_fwht(z) &&
             (l >= cgraph->n_nodes || !reads(cgraph->nodes[l], z));
         const ggml_tensor * outs[4] = { qkv, z, mul_a, beta };
@@ -8727,7 +8761,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 cuda_ctx->conv_folded_concat = cgraph->nodes[concat_idx];
                 cuda_ctx->conv_folded_skip   = cf.last_cpy - concat_idx;
             }
-            ggml_cuda_mul_mat_vec_q(*cuda_ctx, qkv->src[0], qkv->src[1], nullptr, qkv, &fusion_data);
+            if (gdn_qkv_mmvf) {
+                ggml_cuda_mul_mat_vec_f(*cuda_ctx, qkv->src[0], qkv->src[1], nullptr, qkv, &fusion_data);
+            } else {
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, qkv->src[0], qkv->src[1], nullptr, qkv, &fusion_data);
+            }
             return k - i;
         }
     }

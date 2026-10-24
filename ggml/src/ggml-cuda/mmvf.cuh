@@ -21,3 +21,15 @@ bool ggml_cuda_mmvf_fuses_tokens(const ggml_tensor * src0, const ggml_tensor * s
 //   input sib_y as one more channel past the used experts of a one-token MUL_MAT_ID (fusion sib, sib_y and sib_out)
 bool ggml_cuda_mul_mat_vec_f_moe_sibling(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
     const ggml_tensor * sib, const ggml_tensor * sib_y);
+
+// whether ggml_cuda_mul_mat_vec_f can run the GLU of the pair sib (up) / sib_gate (gate), of one expert's layout, on
+//   the experts' input as one more channel past the used experts of a one-token MUL_MAT_ID with the gate gate0 (fusion
+//   gate, sib, sib_gate and sib_dst; see ggml_cuda_try_defer_glu)
+bool ggml_cuda_mul_mat_vec_f_moe_glu_sibling(const ggml_tensor * src0, const ggml_tensor * gate0, const ggml_tensor * src1,
+    const ggml_tensor * ids, const ggml_tensor * sib, const ggml_tensor * sib_gate);
+
+// whether ggml_cuda_mul_mat_vec_f can run the projections of a gated delta net layer at one token in one launch: the rows
+//   of src0 (qkv), then those of sib (z) and gdn_x (alpha) with the gate (beta), all of the same type, K and input
+//   (fusion sib, gdn_x, gate and the gated delta net epilogue)
+bool ggml_cuda_mul_mat_vec_f_gdn_qkv(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * sib,
+    const ggml_tensor * gdn_x, const ggml_tensor * gate);
