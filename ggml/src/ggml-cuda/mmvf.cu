@@ -779,6 +779,9 @@ static void mul_mat_vec_f_switch_fusion(
                 } else {
                     launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, 4, true>);
                 }
+            } else if (rpb == 8) {
+                GGML_ASSERT(!has_fusion);
+                launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, 8, true>);
             } else {
                 GGML_ASSERT(rpb == 1);
                 if (has_fusion) {
@@ -906,6 +909,12 @@ void launch_mul_mat_vec_f_cuda(
             (load16 ? ncols <= 512 : (ncols <= 1024 || nrows >= 16384)) &&
             nrows % 4 == 0 && (nrows/4)*nchannels_dst*nsamples_or_ntokens >= 8*ggml_cuda_info().devices[device].nsm) {
         rpb = 4;
+        // and 8 for the experts' rows of <= 256 (32 lanes of 16-byte loads), which give each lane only one load per row:
+        //   f16 down of 256 experts, 8 used, 2048 x 128, 9.9 -> 7.0 us (16 rows 7.4)
+        if (ids != nullptr && load16 && !has_fusion && ncols <= 256 && nrows % 8 == 0 &&
+                (nrows/8)*nchannels_dst*nsamples_or_ntokens >= 8*ggml_cuda_info().devices[device].nsm) {
+            rpb = 8;
+        }
     }
     // Only while that leaves a block per SM: with fewer, each block walks the whole K for every column on its own,
     //   and one row per block spreads that over more SMs (f16 12x5120 at 6 tokens 14.5 -> 9.5 us cold, 24x5120

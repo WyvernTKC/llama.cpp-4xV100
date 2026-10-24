@@ -2549,6 +2549,30 @@ static bool ggml_cuda_glu_with_f16_copy(ggml_backend_cuda_context & ctx, const g
     return true;
 }
 
+// A float MUL_MAT_ID of ne2 <= MMVF_MAX_BATCH_SIZE tokens on mul_mat_vec_f. On Volta mul_mat_f launches a block per row
+//   tile and expert, and at one token nearly all of them only scan the ids: F16 256 experts, 8 used, down 2048 x 128
+//   27.6 -> 7.0 us, gate 128 x 2048 15.4 -> 9.6. From 2 tokens the down loses (31.7 vs 55.1 us), so F16 stays on
+//   mul_mat_f where it takes the matrix. BF16 and F32 have no mul_mat_f there and would sort on the host instead (BF16
+//   down at 1/8 tokens 123/711 -> 7.7/203 us). GGML_CUDA_NO_MMID_MMVF=1 restores that on Volta.
+static bool ggml_cuda_mul_mat_id_use_mmvf(const ggml_tensor * src0, const int64_t ne2, const int cc) {
+    if (GGML_CUDA_CC_IS_AMD(cc)) {
+        return true;
+    }
+    static const bool disabled = getenv("GGML_CUDA_NO_MMID_MMVF") != nullptr;
+    const bool is_volta = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA && cc < GGML_CUDA_CC_TURING;
+    if (disabled || !is_volta || (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_BF16)) {
+        return false;
+    }
+    // the half2/float2 loads of mul_mat_vec_f
+    const size_t ts = ggml_type_size(src0->type);
+    if (src0->ne[0] % 2 != 0 || src0->nb[0] != ts || src0->nb[1] % (2*ts) != 0 || src0->nb[2] % (2*ts) != 0 ||
+            src0->nb[3] % (2*ts) != 0) {
+        return false;
+    }
+    return src0->type != GGML_TYPE_F16 || ne2 == 1 ||
+        !ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, ne2, /*mul_mat_id=*/true);
+}
+
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
@@ -2564,7 +2588,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
             if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
                 return false;
             }
-        } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+        } else if (ggml_cuda_mul_mat_id_use_mmvf(src0, dst->ne[2], cc)) {
             return false;
         }
     }
@@ -2626,11 +2650,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
                 }
-            } else {
-                if (GGML_CUDA_CC_IS_AMD(cc)) {
-                    ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
-                    return;
-                }
+            } else if (ggml_cuda_mul_mat_id_use_mmvf(src0, ne2, cc)) {
+                ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
+                return;
             }
         }
 
