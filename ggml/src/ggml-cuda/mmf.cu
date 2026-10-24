@@ -86,6 +86,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     ggml_cuda_pool_alloc<int32_t> ids_src_compact_dev;
     ggml_cuda_pool_alloc<int32_t> ids_dst_compact_dev;
     ggml_cuda_pool_alloc<int32_t> expert_bounds_dev;
+    ggml_cuda_pool_alloc<int2>    tile_map_dev;
 
     // For MUL_MAT_ID the memory layout is different than for MUL_MAT:
     const int64_t ncols_dst          = ids ? ne2  : ne1;
@@ -129,6 +130,28 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
         ids_info.n_experts         = static_cast<int>(n_experts);
         ids_info.sis1              = sis1;
         ids_info_ptr = &ids_info;
+
+        // Tiles of 32 columns where the experts average that many: each block reads its rows of the expert half as
+        //   often (f16, 256 experts, 8 used, 4096 tokens: 128 x 2048 1291 -> 1171 us, 2048 x 128 1477 -> 1387 us).
+        const int J = ne_get_rows/n_experts >= 32 ? 32 : 16;
+        ids_info.cols_per_block = J;
+
+        // The grid has a tile for every expert x n_tokens/J columns, though the columns of all experts add up to
+        //   n_tokens*n_expert_used: launch only the tiles that hold work (bounded on the host as in mul_mat_q), listed
+        //   expert by expert, so the tiles of an expert run together and read its rows from L2. f16 2048 x 128, 256
+        //   experts, 8 used: 4096 tokens 7954 -> 1491 us, 128 tokens 376 -> 220 us.
+        //   GGML_CUDA_MMF_DENSE_IDS=0 keeps the full grid, 2 takes the map also where it does not shrink the grid.
+        static const int dense_ids = getenv("GGML_CUDA_MMF_DENSE_IDS") ? atoi(getenv("GGML_CUDA_MMF_DENSE_IDS")) : 1;
+        const int n_tiles_dense = static_cast<int>(ne_get_rows/J + n_experts);
+        const int64_t n_tiles_full = n_experts*((ncols_dst + J - 1)/J);
+        if (n_tiles_dense <= 65535 && (dense_ids >= 2 || (dense_ids == 1 && n_tiles_dense < n_tiles_full))) {
+            tile_map_dev.alloc(ctx.pool(), n_tiles_dense);
+            ggml_cuda_launch_mmq_ids_tile_map(expert_bounds_dev.get(), tile_map_dev.get(), static_cast<int>(n_experts), J,
+                n_tiles_dense, static_cast<int>(ne_get_rows/J + 1), ctx.stream());
+            CUDA_CHECK(cudaGetLastError());
+            ids_info.tile_map = tile_map_dev.get();
+            ids_info.n_tiles  = n_tiles_dense;
+        }
     }
 
     const int device    = ggml_cuda_get_device();
@@ -182,7 +205,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 }
 
 bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne,
-        const size_t * src0_nb, const int src1_ncols, bool mul_mat_id) {
+        const size_t * src0_nb, const int src1_ncols, bool mul_mat_id, const int n_expert_used) {
     if (ggml_is_quantized(type)) {
         return false;
     }
@@ -211,7 +234,21 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const 
     }
 
     if (mul_mat_id) {
-        if (src0_ne[1] <= 1024 && src1_ncols > 512) {
+        // On Volta the expert lists also beat the generic path (a host sort and a cuBLAS GEMM per expert) at any batch
+        //   while an expert has little work, n_tokens*n_expert_used/n_experts columns of an m x k matrix. f16, 16-column
+        //   tiles, us: 256 experts, 8 used, 4096 tokens: 2048 x 128 1491 vs 7792, 128 x 2048 1344 vs 9011; 128 experts,
+        //   8 used, 2048 x 768: 1365 vs 2091 at 512 tokens but 9120 vs 7020 at 4096; 32 experts, 4 used, 2880 x 2880 at
+        //   512 tokens: 3461 vs 2654. GGML_CUDA_MMF_IDS_BIG_BATCH=0 keeps the plain limits below.
+        static const bool big_batch_off = getenv("GGML_CUDA_MMF_IDS_BIG_BATCH") &&
+            atoi(getenv("GGML_CUDA_MMF_IDS_BIG_BATCH")) == 0;
+        const bool small_experts = !big_batch_off && volta_mma_available(cc) && n_expert_used > 0 &&
+            int64_t(src1_ncols)*n_expert_used/src0_ne[2] * src0_ne[0]*src0_ne[1] <= (int64_t(1) << 27);
+        if (small_experts) {
+            // the tile map indexes a grid dimension of at most 65535 blocks
+            if (int64_t(src1_ncols)*n_expert_used/16 + src0_ne[2] > 65535) {
+                return false;
+            }
+        } else if (src0_ne[1] <= 1024 && src1_ncols > 512) {
             return false;
         } else if(src0_ne[1] > 1024 && src1_ncols > 128) {
             return false;

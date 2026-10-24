@@ -14809,6 +14809,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false,  128, n, 2048));
         }
     }
+    // and at prefill ubatches: the expert lists of mul_mat_f, and the generic path where mul_mat_f does not take them
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int n : {32, 129, 512, 1024}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 2048, n, 128));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false,  128, n, 2048));
+        }
+    }
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
     for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 }) {
         for (int64_t n : { 1, 2, 3, 4, 8, 9 }) {
@@ -16435,6 +16442,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false,  128, n, 2048)); // gate/up
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 2048, n,  128)); // down
         }
+    }
+    // and at prefill ubatches
+    for (int n : {128, 512, 1024, 4096}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 256, 8, false,  128, n, 2048)); // gate/up
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 256, 8, false, 2048, n,  128)); // down
+    }
+    // float MoE at prefill ubatches with fewer, wider experts: qwen3-30b-a3b, gpt-oss-20b and Mixtral shapes
+    for (int n : {512, 4096}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 128, 8, false,   768, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 128, 8, false,  2048, n,  768));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32,  32, 4, false,  2880, n, 2880));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32,   8, 2, false, 14336, n, 4096));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32,   8, 2, false,  4096, n, 14336));
     }
 
     // gpt-oss-20b

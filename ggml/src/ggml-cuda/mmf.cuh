@@ -38,13 +38,18 @@ struct mmf_ids_data {
     const int32_t * ids_src_compact = nullptr;
     const int32_t * ids_dst_compact = nullptr;
     const int32_t * expert_bounds_dev = nullptr;
+    const int2    * tile_map = nullptr; // the (expert, column tile) pairs that hold work, n_tiles of them at most
+    int n_tiles = 0;
+    int cols_per_block = 16; // of the compact-ids kernel, 16 or 32
     int n_experts = 0;
     int sis1 = 0;
 };
 
 void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 
-bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const int64_t * scr0_ne, const size_t * src0_nb, const int src1_ncols, bool mul_mat_id);
+// n_expert_used: of a MUL_MAT_ID, 0 if not known
+bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const int64_t * scr0_ne, const size_t * src0_nb, const int src1_ncols, bool mul_mat_id,
+        int n_expert_used = 0);
 
 // gate and up in one mmf launch, with the GLU applied to the result (Volta, f16, 2-8 tokens)
 bool ggml_cuda_should_fuse_mul_mat_f_glu(const ggml_tensor * ffn_up, const ggml_tensor * ffn_gate);
@@ -598,7 +603,7 @@ static __global__ void mul_mat_f_ids(
         const int ncols, const int ncols_dst_total, const int nchannels_dst, const int stride_row, const int stride_col_y, const int stride_col_dst,
         const int channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 sis1_fd, const uint3 nch_fd) {
+        const uint3 sis1_fd, const uint3 nch_fd, const int2 * __restrict__ tile_map) {
 // TODO: handle this in a consistent and simpler way after AMD MFMA support has been added
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 #if defined(AMD_WMMA_AVAILABLE)
@@ -637,13 +642,16 @@ static __global__ void mul_mat_f_ids(
 
     const int row0        = blockIdx.x * rows_per_block;
 
-    const int expert_idx = blockIdx.y;
+    // With a tile map the y dimension of the grid indexes the list of (expert, tile) pairs, so the tiles of an expert
+    //   run next to each other and share its rows in L2.
+    const int2 tile = tile_map ? tile_map[blockIdx.y] : make_int2(blockIdx.y, blockIdx.z);
+    const int expert_idx = tile.x;
     const int expert_start = expert_bounds[expert_idx];
     const int expert_end   = expert_bounds[expert_idx + 1];
     const int ncols_expert = expert_end - expert_start;
 
     const int tiles_for_expert = (ncols_expert + cols_per_block - 1) / cols_per_block;
-    const int tile_idx = blockIdx.z;
+    const int tile_idx = tile.y;
     if (tile_idx >= tiles_for_expert) {
         return;
     }
@@ -665,8 +673,8 @@ static __global__ void mul_mat_f_ids(
     const int32_t * ids_dst_expert = ids_dst_compact + expert_start;
 
     // An expert id repeated within a token's row can give an expert more columns than there are tokens, which sized the
-    // grid: the last tile of the grid also does the columns past it, with a plain dot product.
-    if (tile_idx == int(gridDim.z) - 1) {
+    // grid: the last tile of the grid also does the columns past it, with a plain dot product. A tile map lists every tile.
+    if (!tile_map && tile_idx == int(gridDim.z) - 1) {
         constexpr int y_stride_scale = std::is_same_v<T, float> ? 1 : 2;
 #pragma unroll 1
         for (int c = gridDim.z*cols_per_block; c < ncols_expert; ++c) {
@@ -883,7 +891,7 @@ static __global__ void mul_mat_f_ids(
     GGML_UNUSED_VARS(x, y, ids_src_compact, ids_dst_compact, expert_bounds, dst,
         ncols, ncols_dst_total, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, sis1_fd, nch_fd);
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, sis1_fd, nch_fd, tile_map);
     NO_DEVICE_CODE;
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
@@ -908,6 +916,9 @@ static inline void mul_mat_f_switch_ids(
             return;
         }
         dim3 block_nums_ids(block_nums.x, ids_data->n_experts, max_tiles);
+        if (ids_data->tile_map) {
+            block_nums_ids = dim3(block_nums.x, ids_data->n_tiles, 1);
+        }
 
         const uint3 sis1_fd = ids_data->sis1 > 0 ? init_fastdiv_values((uint32_t) ids_data->sis1) : make_uint3(0, 0, 1);
         const uint3 nch_fd  = init_fastdiv_values((uint32_t) nchannels_dst);
@@ -917,7 +928,7 @@ static inline void mul_mat_f_switch_ids(
             ncols_x, ncols_dst, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
             channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
             sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
-            sis1_fd, nch_fd);
+            sis1_fd, nch_fd, ids_data->tile_map);
     } else if (ids) {
         const int64_t col_tiles = (ncols_dst + cols_per_block - 1) / cols_per_block;
         dim3 block_nums_ids = block_nums;
@@ -1073,6 +1084,13 @@ static void mul_mat_f_switch_cols_per_block(
         const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst, const int64_t nsamples_x,
         const int64_t nsamples_dst, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
         cudaStream_t stream, const mmf_ids_data * ids_data) {
+
+    if (ids_data && ids_data->ids_src_compact && ids_data->cols_per_block == 32) {
+        mul_mat_f_cuda<T, rows_per_block, 32>(x, y, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
+            stride_col_id, stride_row_id, nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+            nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream, ids_data);
+        return;
+    }
 
     const int ncols_case = (ids && ncols_dst > 16) ? 16 : ncols_dst;
 
