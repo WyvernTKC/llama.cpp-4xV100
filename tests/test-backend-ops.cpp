@@ -5438,7 +5438,8 @@ struct test_rms_norm_gated : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
     const ggml_unary_op op;
-    const int64_t mm_rows; // > 0: a q8_0 matmul reads the output as one row, as ssm_out does
+    const int64_t mm_rows; // > 0: a matmul of mm_type reads the output as one row, as ssm_out does
+    const ggml_type mm_type;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5448,7 +5449,8 @@ struct test_rms_norm_gated : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR2(type, ne) + ",op=" + ggml_unary_op_name(op) + ",mm_rows=" + std::to_string(mm_rows);
+        return VARS_TO_STR2(type, ne) + ",op=" + ggml_unary_op_name(op) + ",mm_rows=" + std::to_string(mm_rows) +
+            (mm_type != GGML_TYPE_Q8_0 ? std::string(",mm_type=") + ggml_type_name(mm_type) : std::string());
     }
 
     double max_nmse_err() override {
@@ -5456,8 +5458,8 @@ struct test_rms_norm_gated : public test_case {
     }
 
     test_rms_norm_gated(ggml_type type = GGML_TYPE_F32, std::array<int64_t, 4> ne = {128, 12, 1, 1},
-            ggml_unary_op op = GGML_UNARY_OP_SILU, int64_t mm_rows = 0)
-        : type(type), ne(ne), op(op), mm_rows(mm_rows) {}
+            ggml_unary_op op = GGML_UNARY_OP_SILU, int64_t mm_rows = 0, ggml_type mm_type = GGML_TYPE_Q8_0)
+        : type(type), ne(ne), op(op), mm_rows(mm_rows), mm_type(mm_type) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor(ctx, type, 4, ne.data());
@@ -5473,7 +5475,7 @@ struct test_rms_norm_gated : public test_case {
         ggml_set_name(out, "out");
 
         if (mm_rows > 0) {
-            ggml_tensor * wo = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, ne[0]*ne[1], mm_rows);
+            ggml_tensor * wo = ggml_new_tensor_2d(ctx, mm_type, ne[0]*ne[1], mm_rows);
             ggml_set_name(wo, "wo");
             out = ggml_mul_mat(ctx, wo, ggml_reshape_2d(ctx, out, ne[0]*ne[1], ne[2]*ne[3]));
             ggml_set_name(out, "out_mm");
@@ -5484,7 +5486,7 @@ struct test_rms_norm_gated : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            init_tensor_uniform(t, t->type == GGML_TYPE_Q8_0 ? -1.f : -10.f, t->type == GGML_TYPE_Q8_0 ? 1.f : 10.f);
+            init_tensor_uniform(t, t->type != GGML_TYPE_F32 ? -1.f : -10.f, t->type != GGML_TYPE_F32 ? 1.f : 10.f);
         }
     }
 };
@@ -14199,6 +14201,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 128, 8, 2, 1 }, op, 256));
         test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 128, 12, 4, 1 }, op, 256));
         test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 1536, 2, 1, 1 }, op, 64));
+        // CUDA: an f16 matmul of one token normalizes the rows of 128 itself (silu only; rows of 128 per 16 lanes, every
+        //   lane of a block taking as many columns: 384 does not)
+        test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 128, 8, 1, 1 }, op, 2048, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 128, 12, 1, 1 }, op, 5120, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 128, 20, 1, 1 }, op, 256, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 128, 4, 1, 1 }, op, 64, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 128, 3, 1, 1 }, op, 64, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_rms_norm_gated(GGML_TYPE_F32, { 128, 8, 2, 1 }, op, 2048, GGML_TYPE_F16));
     }
 
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));

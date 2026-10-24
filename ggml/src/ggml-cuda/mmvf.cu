@@ -54,13 +54,71 @@ static __device__ __forceinline__ void mul_mat_vec_f_topk_moe(const ggml_cuda_mm
     }
 }
 
+// the arguments of the all-reduce folded into a launch, with the gated norm those in its norm arguments
+static __device__ __forceinline__ const ggml_cuda_ar_fold_args & mul_mat_vec_f_ar_args(const ggml_cuda_ar_fold_args & a) {
+    return a;
+}
+static __device__ __forceinline__ const ggml_cuda_ar_fold_args & mul_mat_vec_f_ar_args(const ggml_cuda_mmvf_norm_args & a) {
+    return a.ar;
+}
+
+// The 8 values y[8*col8 + l] of the gated output norm of a gated delta net layer, rms_norm(x)*w*silu(z) over rows of 128
+//   (16 lanes of a block, whole rows per warp), as rms_norm_gated_f32<256> computes them: its sum of squares is the
+//   butterfly of a warp over 32 columns, here xor 16 and 8 across lanes (lanes 2 and 1 apart) and 4, 2, 1 within a lane's
+//   8 columns, then (w0 + w2) + (w1 + w3) of the row's 4 warps (lanes 8 and 4 apart). All lanes of the warp take part.
+static __device__ __forceinline__ void mul_mat_vec_f_norm_gated(const ggml_cuda_mmvf_norm_args & a, const float4 * x4,
+        const int col8, float4 * y4) {
+    const float4 * z4 = (const float4 *) a.z;
+    const float4 * w4 = (const float4 *) a.w + 2*(col8 % 16);
+    const float4 x_lo = x4[2*col8 + 0];
+    const float4 x_hi = x4[2*col8 + 1];
+    const float4 z_lo = z4[2*col8 + 0];
+    const float4 z_hi = z4[2*col8 + 1];
+    const float4 w_lo = w4[0];
+    const float4 w_hi = w4[1];
+    const float xv[8] = {x_lo.x, x_lo.y, x_lo.z, x_lo.w, x_hi.x, x_hi.y, x_hi.z, x_hi.w};
+    const float zv[8] = {z_lo.x, z_lo.y, z_lo.z, z_lo.w, z_hi.x, z_hi.y, z_hi.z, z_hi.w};
+    const float wv[8] = {w_lo.x, w_lo.y, w_lo.z, w_lo.w, w_hi.x, w_hi.y, w_hi.z, w_hi.w};
+
+    // each square rounded on its own, as the norm's loop does: contracted into the sums it would not be
+    float s[8];
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        s[l] = __fmul_rn(xv[l], xv[l]);
+    }
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        s[l] += __shfl_xor_sync(0xFFFFFFFF, s[l], 2);
+    }
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        s[l] += __shfl_xor_sync(0xFFFFFFFF, s[l], 1);
+    }
+    float tmp = ((s[0] + s[4]) + (s[2] + s[6])) + ((s[1] + s[5]) + (s[3] + s[7]));
+    tmp += __shfl_xor_sync(0xFFFFFFFF, tmp, 8);
+    tmp += __shfl_xor_sync(0xFFFFFFFF, tmp, 4);
+
+    const float mean  = tmp / a.ncols;
+    const float scale = rsqrtf(mean + a.eps);
+
+    float yv[8];
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        const float normed = scale * xv[l] * wv[l];
+        yv[l] = ggml_cuda_op_silu_single(zv[l]) * normed;
+    }
+    y4[0] = make_float4(yv[0], yv[1], yv[2], yv[3]);
+    y4[1] = make_float4(yv[4], yv[5], yv[6], yv[7]);
+}
+
 // rpb > 1 puts that many consecutive rows in a block: they share the y loads, and each row still sums in
 // exactly the order it would with a block of its own. With several tokens it needs load16.
 // load16 (2-byte weights) reads 8 weights per 16-byte load instead of 2 per 4-byte load, which changes the
 // order in which a row sums, so its results can differ in the last bits.
 // topk_n: the expert count of a topk_moe run in the last block (topk_args), see mul_mat_vec_f_topk_moe
 // ar: the two rows of a block go to an LL line of an all-reduce folded into this launch (topk_args holds its
-//   ggml_cuda_ar_fold_args), not to dst; see ggml_cuda_ar_fold_push
+//   ggml_cuda_ar_fold_args), not to dst; see ggml_cuda_ar_fold_push. With norm 4 rows, the two lines of one float4
+//   (threads 0 and 1 push one each)
 // sib_ch: with ids and one token, the channel past the used experts (the last of the grid) is the sibling sib_x of one
 //   expert's layout with its own input sib_y, written to sib_dst; see ggml_cuda_mul_mat_vec_f_moe_sibling. With
 //   has_fusion (a gate) it is the pair sib_x/sib_gate of a GLU with the experts' input, see
@@ -68,16 +126,18 @@ static __device__ __forceinline__ void mul_mat_vec_f_topk_moe(const ggml_cuda_mm
 // gdn_qkv: one token, the projections of a gated delta net layer in one launch: the rows of x (qkv) with the convolution
 //   of build_conv_state in their epilogue (topk_args holds its ggml_cuda_mmvq_conv_args), then those of sib_x (z), then
 //   from gdn_block0 on those of gdn_x (alpha), the only ones with the gate (beta) and the gated delta net epilogue
+// norm: one token, y is the gated output norm of a gated delta net layer of the launch's y (topk_args holds its
+//   ggml_cuda_mmvf_norm_args, and those of the all-reduce with ar), see mul_mat_vec_f_norm_gated
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false, int rpb = 1, bool load16 = false,
-          int topk_n = 0, bool ar = false, bool sib_ch = false, bool gdn_qkv = false>
+          int topk_n = 0, bool ar = false, bool sib_ch = false, bool gdn_qkv = false, bool norm = false>
 static __global__ void mul_mat_vec_f(
         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const int ncols2, const uint3 nchannels_y, const int stride_row, const int stride_col_y2, const int stride_col_dst,
         const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const int ids_stride,
-        const std::conditional_t<(topk_n > 0), ggml_cuda_mmvf_topk_args, std::conditional_t<ar, ggml_cuda_ar_fold_args,
-            std::conditional_t<gdn_qkv, ggml_cuda_mmvq_conv_args, ggml_cuda_no_args>>> topk_args) {
+        const std::conditional_t<norm, ggml_cuda_mmvf_norm_args, std::conditional_t<(topk_n > 0), ggml_cuda_mmvf_topk_args,
+            std::conditional_t<ar, ggml_cuda_ar_fold_args, std::conditional_t<gdn_qkv, ggml_cuda_mmvq_conv_args, ggml_cuda_no_args>>>> topk_args) {
     const T       * GGML_CUDA_RESTRICT x   = x_ptr;
     const float   * GGML_CUDA_RESTRICT y   = y_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
@@ -116,14 +176,20 @@ static __global__ void mul_mat_vec_f(
     const int sample_y    = sample_dst;
 
     // ar: the sequence number of the call, loaded while the dot product runs
-    static_assert(!ar || (ncols_dst == 1 && rpb == 2 && !has_fusion && !is_multi_token_id && topk_n == 0),
-        "the fold pushes the two rows of one column of a block");
+    static_assert(!ar || (ncols_dst == 1 && (rpb == 2 || (norm && rpb == 4)) && !has_fusion && !is_multi_token_id && topk_n == 0),
+        "the fold pushes the rows of one column of a block, two to a line");
     [[maybe_unused]] uint32_t ar_seq = 0;
-    if constexpr (ar) {
+    if constexpr (ar && rpb == 2) {
         if (tid == 0) {
-            ar_seq = ggml_cuda_ar_seq(topk_args, row/4);
+            ar_seq = ggml_cuda_ar_seq(mul_mat_vec_f_ar_args(topk_args), row/4);
+        }
+    } else if constexpr (ar) {
+        if (tid < 2) {
+            ar_seq = ggml_cuda_ar_seq(mul_mat_vec_f_ar_args(topk_args), row/4);
         }
     }
+    static_assert(!norm || (load16 && ncols_dst == 1 && (rpb == 1 || ar) && !has_fusion && !is_multi_token_id && topk_n == 0 &&
+        !sib_ch && !gdn_qkv && std::is_same_v<T, half>), "the gated norm of one token's y, nothing else fused but an all-reduce");
 
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
 
@@ -325,8 +391,12 @@ static __global__ void mul_mat_vec_f(
 
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
-                    const float4 tmpy_lo = y4[j*stride_col_y4 + 2*col8 + 0];
-                    const float4 tmpy_hi = y4[j*stride_col_y4 + 2*col8 + 1];
+                    [[maybe_unused]] float4 tmpy_norm[2];
+                    if constexpr (norm) {
+                        mul_mat_vec_f_norm_gated(topk_args, y4, col8, tmpy_norm);
+                    }
+                    const float4 tmpy_lo = norm ? tmpy_norm[0] : y4[j*stride_col_y4 + 2*col8 + 0];
+                    const float4 tmpy_hi = norm ? tmpy_norm[1] : y4[j*stride_col_y4 + 2*col8 + 1];
                     const half2 tmpy[4] = {
                         make_half2(tmpy_lo.x, tmpy_lo.y), make_half2(tmpy_lo.z, tmpy_lo.w),
                         make_half2(tmpy_hi.x, tmpy_hi.y), make_half2(tmpy_hi.z, tmpy_hi.w)};
@@ -389,8 +459,12 @@ static __global__ void mul_mat_vec_f(
 
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
-                    const float4 tmpy_lo = y4[j*stride_col_y4 + 2*col8 + 0];
-                    const float4 tmpy_hi = y4[j*stride_col_y4 + 2*col8 + 1];
+                    [[maybe_unused]] float4 tmpy_norm[2];
+                    if constexpr (norm) {
+                        mul_mat_vec_f_norm_gated(topk_args, y4, col8, tmpy_norm);
+                    }
+                    const float4 tmpy_lo = norm ? tmpy_norm[0] : y4[j*stride_col_y4 + 2*col8 + 0];
+                    const float4 tmpy_hi = norm ? tmpy_norm[1] : y4[j*stride_col_y4 + 2*col8 + 1];
                     const float tmpy[8] = {tmpy_lo.x, tmpy_lo.y, tmpy_lo.z, tmpy_lo.w, tmpy_hi.x, tmpy_hi.y, tmpy_hi.z, tmpy_hi.w};
 #pragma unroll
                     for (int i = 0; i < rpb; ++i) {
@@ -702,9 +776,16 @@ static __global__ void mul_mat_vec_f(
         return;
     }
 
-    if constexpr (ar) {
+    if constexpr (ar && rpb == 2) {
         if (tid == 0) {
-            ggml_cuda_ar_fold_push(topk_args, ar_seq, row/4, (row/2) % 2, sumf[0], sumf[1]);
+            ggml_cuda_ar_fold_push(mul_mat_vec_f_ar_args(topk_args), ar_seq, row/4, (row/2) % 2, sumf[0], sumf[1]);
+        }
+        return;
+    } else if constexpr (ar) {
+        // the block's float4: thread 0 pushes its rows 0 and 1, thread 1 rows 2 and 3
+        if (tid < 2) {
+            ggml_cuda_ar_fold_push(mul_mat_vec_f_ar_args(topk_args), ar_seq, row/4, tid, tid == 0 ? sumf[0] : sumf[2],
+                tid == 0 ? sumf[1] : sumf[3]);
         }
         return;
     }
@@ -863,14 +944,41 @@ static void mul_mat_vec_f_switch_fusion(
             return;
         }
         if (load16) {
-            if (rpb == 2) {
-                // the all-reduce of dst folded in, see launch_mul_mat_vec_f_cuda
-                GGML_ASSERT(fusion.ar_pushed != nullptr && !has_fusion);
-                ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, 2, true, 0, true>, launch_params,
+            // the gated norm of y in the launch (see ggml_cuda_mul_mat_vec_f_norm_gated), with the fold's all-reduce
+            const auto launch_norm = [&](auto kernel) {
+                ggml_cuda_mmvf_norm_args norm_args = fusion.norm;
+                norm_args.ar = fusion.ar;
+                ggml_cuda_kernel_launch(kernel, launch_params,
                     x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
                     channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                    sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, fusion.ar);
+                    sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, norm_args);
+            };
+            if (rpb == 2 || (fusion.norm.z != nullptr && rpb == 4)) {
+                // the all-reduce of dst folded in, see launch_mul_mat_vec_f_cuda
+                GGML_ASSERT(fusion.ar_pushed != nullptr && !has_fusion);
+                if (fusion.norm.z != nullptr) {
+                    if constexpr (std::is_same_v<T, half>) {
+                        GGML_ASSERT(rpb == 4);
+                        launch_norm(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, 4, true, 0, true, false, false, true>);
+                    } else {
+                        GGML_ABORT("fatal error");
+                    }
+                } else {
+                    ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, 2, true, 0, true>, launch_params,
+                        x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
+                        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, fusion.ar);
+                }
                 *fusion.ar_pushed = true;
+                return;
+            }
+            if (fusion.norm.z != nullptr) {
+                GGML_ASSERT(rpb == 1 && !has_fusion && !gdn_qkv);
+                if constexpr (std::is_same_v<T, half>) {
+                    launch_norm(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, 1, true, 0, false, false, false, true>);
+                } else {
+                    GGML_ABORT("fatal error");
+                }
                 return;
             }
             if (rpb == 4) {
@@ -899,7 +1007,7 @@ static void mul_mat_vec_f_switch_fusion(
             return;
         }
     }
-    GGML_ASSERT(!load16 && !sib_ch);
+    GGML_ASSERT(!load16 && !sib_ch && fusion.norm.z == nullptr);
     if constexpr (ncols_dst == 1 && !is_multi_token_id) {
         if (rpb == 4) {
             if (has_fusion) {
@@ -954,6 +1062,26 @@ static bool mmvf_use_load16(
         (uintptr_t) x % 16 == 0 && (uintptr_t) y % 16 == 0 && (uintptr_t) gate % 16 == 0;
 }
 
+// the block size of a launch: the fewest iterations over a row, then the smallest block
+static int64_t mmvf_block_size(const int64_t ncols, const int64_t ncols_thread, const int device) {
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+
+    int64_t block_size_best = warp_size;
+    int64_t niter_best      = (ncols + ncols_thread*warp_size - 1) / (ncols_thread*warp_size);
+    int64_t max_block_size  = 256;
+    if(ggml_cuda_info().devices[device].cc > GGML_CUDA_CC_OFFSET_AMD && ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_RDNA1) {
+        max_block_size = 128;
+    }
+    for (int64_t block_size = 2*warp_size; block_size <= max_block_size; block_size += warp_size) {
+        const int64_t niter = (ncols + ncols_thread*block_size - 1) / (ncols_thread*block_size);
+        if (niter < niter_best) {
+            niter_best      = niter;
+            block_size_best = block_size;
+        }
+    }
+    return block_size_best;
+}
+
 // the sibling rows of a launch (see mul_mat_vec_f) read their own matrices
 static bool mmvf_siblings_aligned16(const ggml_cuda_mm_fusion_args_device & fusion) {
     return (uintptr_t) fusion.sib_x % 16 == 0 && (uintptr_t) fusion.sib2_x % 16 == 0 && (uintptr_t) fusion.gdn_x % 16 == 0 &&
@@ -987,19 +1115,7 @@ void launch_mul_mat_vec_f_cuda(
         stride_channel_x, stride_sample_x, stride_channel_y, stride_sample_y, x, y, fusion.gate) && mmvf_siblings_aligned16(fusion);
     const int64_t ncols_thread = load16 ? 8 : 2; // columns a thread takes per load
 
-    int64_t block_size_best = warp_size;
-    int64_t niter_best      = (ncols + ncols_thread*warp_size - 1) / (ncols_thread*warp_size);
-    int64_t max_block_size  = 256;
-    if(ggml_cuda_info().devices[device].cc > GGML_CUDA_CC_OFFSET_AMD && ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_RDNA1) {
-        max_block_size = 128;
-    }
-    for (int64_t block_size = 2*warp_size; block_size <= max_block_size; block_size += warp_size) {
-        const int64_t niter = (ncols + ncols_thread*block_size - 1) / (ncols_thread*block_size);
-        if (niter < niter_best) {
-            niter_best      = niter;
-            block_size_best = block_size;
-        }
-    }
+    const int64_t block_size_best = mmvf_block_size(ncols, ncols_thread, device);
 
     // the sibling channel past the used experts (see ggml_cuda_mul_mat_vec_f_moe_sibling) is one more channel of the grid
     const bool sib_ch     = ids != nullptr && fusion.sib_y != nullptr;
@@ -1017,6 +1133,7 @@ void launch_mul_mat_vec_f_cuda(
     // (the GLU of a sibling pair past the used experts keeps one row per block)
     int rpb = 1;
     if (ncols_dst == 1 && !is_multi_token_id && is_volta && (fusion.sib_x == nullptr || (sib_ch && !has_fusion)) && fusion.topk.ids == nullptr &&
+            fusion.norm.z == nullptr &&
             (load16 ? ncols <= 512 : (ncols <= 1024 || nrows >= 16384)) &&
             nrows % 4 == 0 && (nrows/4)*nchannels_dst*nsamples_or_ntokens >= 8*ggml_cuda_info().devices[device].nsm) {
         rpb = 4;
@@ -1051,7 +1168,17 @@ void launch_mul_mat_vec_f_cuda(
     if (fusion.ar_pushed != nullptr && ncols_dst == 1 && ids == nullptr && load16 && !has_fusion && nchannels_dst == 1 &&
             nsamples_or_ntokens == 1 && nrows % 4 == 0 && nrows == stride_col_dst) {
         rpb = 2;
+        // with the gated norm of y every block normalizes all of y, so 4 rows share it (the two lines of a float4). tg128
+        //   d0 / d8192 against 2 rows: Sage-A1.5 F16 (ssm_out 2048 x 1024 per GPU) -0.1% / +0.6%; Qwen3.8-27B F16 (5120 x
+        //   1536, where at 2 rows the prologue cost as much as the norm's launch, +3.4 vs 3.1 us) +0.8% / +0.6%. 8 rows
+        //   against 4: -0.1% / -0.1% and -0.0% / -0.2%
+        if (fusion.norm.z != nullptr) {
+            rpb = 4;
+        }
     }
+    // the gated norm of y (see ggml_cuda_mul_mat_vec_f_norm_gated): every lane of a block takes as many columns
+    GGML_ASSERT(fusion.norm.z == nullptr || (load16 && ncols_dst == 1 && !has_fusion && !sib_ch && (ncols/8) % block_size_best == 0 &&
+        (rpb == 1 || (rpb == 4 && fusion.ar_pushed != nullptr))));
 
     // the 16-byte path keeps one partial sum per warp, row and column
     const int nsums_red     = load16 ? int(ncols_dst*rpb*(block_size_best/warp_size)) : 0;
@@ -1552,6 +1679,18 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
         }
     }
 
+    if (fusion && fusion->norm_x) {
+        // y is the gated norm of norm_x, which the launch computes as it reads it, nothing else fused
+        GGML_ASSERT(ggml_cuda_mul_mat_vec_f_norm_gated(src0, src1, dst, fusion->norm_x, fusion->norm_z, fusion->norm_w) && !ids &&
+            !fusion->gate && !fusion->x_bias && !fusion->gate_bias && !fusion->gdn_beta && !fusion->gdn_x && !fusion->sib &&
+            !fusion->topk_ids);
+        src1_d                  = (const float *) fusion->norm_x->data;
+        fusion_local.norm.z     = (const float *) fusion->norm_z->data;
+        fusion_local.norm.w     = (const float *) fusion->norm_w->data;
+        fusion_local.norm.ncols = (int) fusion->norm_x->ne[0];
+        fusion_local.norm.eps   = fusion->norm_eps;
+    }
+
     // the all-reduce of the output folded into the launch, if it can take it (see ggml_backend_cuda_context::ar_fold)
     if (ctx.ar_fold.next == dst) {
         fusion_local.ar        = ctx.ar_fold.next_call.args;
@@ -1746,6 +1885,34 @@ bool ggml_cuda_mul_mat_vec_f_gdn_qkv(const ggml_tensor * src0, const ggml_tensor
     return src0->nb[0] == ts_src0 && src1->nb[0] == ts_src1 &&
         mmvf_use_load16(true, cc, 1, src0->ne[0], src0->nb[1]/ts_src0, src1->nb[1]/ts_src1, src0->nb[2]/ts_src0,
             src0->nb[3]/ts_src0, src1->nb[2]/ts_src1, src1->nb[3]/ts_src1, src0->data, src1->data, gate->data);
+}
+
+bool ggml_cuda_mul_mat_vec_f_norm_gated(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
+        const ggml_tensor * x, const ggml_tensor * z, const ggml_tensor * w) {
+    // one token of f16 rows with the 16-byte loads and one matrix, y being the norm's rows of 128 one after the other
+    const int64_t ncols = src0->ne[0];
+    if (src0->type != GGML_TYPE_F16 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ggml_nrows(src1) != 1 ||
+            !ggml_is_contiguous(src1) || src1->ne[0] != ncols || ggml_nrows(src0) != src0->ne[1] || ggml_nrows(dst) != 1 ||
+            !ggml_is_contiguous(dst) || dst->ne[0] != src0->ne[1] || ncols % 128 != 0) {
+        return false;
+    }
+    for (const ggml_tensor * t : { x, z }) {
+        if (t->type != GGML_TYPE_F32 || t->ne[0] != 128 || ggml_nelements(t) != ncols || !ggml_is_contiguous(t) ||
+                (uintptr_t) t->data % 16 != 0) {
+            return false;
+        }
+    }
+    if (w->type != GGML_TYPE_F32 || w->ne[0] != 128 || ggml_nelements(w) != 128 || !ggml_is_contiguous(w) || (uintptr_t) w->data % 16 != 0) {
+        return false;
+    }
+    const int    device  = ggml_cuda_get_device();
+    const int    cc      = ggml_cuda_info().devices[device].cc;
+    const size_t ts_src0 = ggml_type_size(src0->type);
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    // every lane of a block takes as many columns: the norm's shuffles need whole warps
+    return src0->nb[0] == ts_src0 && (ncols/8) % mmvf_block_size(ncols, 8, device) == 0 &&
+        mmvf_use_load16(true, cc, 1, ncols, src0->nb[1]/ts_src0, src1->nb[1]/ts_src1, src0->nb[2]/ts_src0,
+            src0->nb[3]/ts_src0, src1->nb[2]/ts_src1, src1->nb[3]/ts_src1, src0->data, x->data, nullptr);
 }
 
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {

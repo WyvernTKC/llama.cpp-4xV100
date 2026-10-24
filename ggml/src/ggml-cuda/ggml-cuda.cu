@@ -7273,6 +7273,59 @@ static int ggml_cuda_try_fuse_hc_post_fold(ggml_backend_cuda_context * cuda_ctx,
     return n > 0 ? k - i + n : 0;
 }
 
+// The gated output norm of a gated delta net layer at i (RMS_NORM, MUL, SILU, MUL, which ggml_cuda_op_rms_norm_gated runs
+//   as one launch) computed in the launch of the one-token f16 matmul that reads it (ssm_out): each block normalizes the
+//   norm's input as it reads it, which saves the norm's launch. Only for a matmul with nothing fused after it but an
+//   all-reduce (an add would fuse into it on its own). GGML_CUDA_NO_NORM_FOLD=1 runs the norm on its own. The nodes after
+//   i the launch covers, or 0.
+static int ggml_cuda_try_fuse_norm_gated_mm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    static const bool no_fold = getenv("GGML_CUDA_NO_NORM_FOLD") != nullptr;
+    if (no_fold || !cuda_ctx->stream_context().concurrent_events.empty() ||
+            ggml_get_unary_op(cgraph->nodes[i + 2]) != GGML_UNARY_OP_SILU) {
+        return 0;
+    }
+    const ggml_tensor * rms_norm = cgraph->nodes[i];
+    const ggml_tensor * mul      = cgraph->nodes[i + 1];
+    const ggml_tensor * unary    = cgraph->nodes[i + 2];
+
+    // the matmul reads the norm's output through reshapes, with nothing between them
+    enum ggml_op ops[8] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
+    const ggml_tensor * y = cgraph->nodes[i + 3];
+    int j = i + 4;
+    while (j < cgraph->n_nodes && j - i < 7 && cgraph->nodes[j]->op == GGML_OP_RESHAPE && cgraph->nodes[j]->src[0] == y) {
+        ops[j - i] = GGML_OP_RESHAPE;
+        y = cgraph->nodes[j++];
+    }
+    if (j >= cgraph->n_nodes || j - i >= 8) {
+        return 0;
+    }
+    ggml_tensor * mm = cgraph->nodes[j];
+    ops[j - i] = GGML_OP_MUL_MAT;
+    const int outputs[1] = { j };
+    if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != y || !ggml_can_fuse_subgraph(cgraph, i, j - i + 1, ops, outputs, 1) ||
+            (j + 1 < cgraph->n_nodes && ggml_can_fuse(cgraph, j, { GGML_OP_MUL_MAT, GGML_OP_ADD }))) {
+        return 0;
+    }
+
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * z = unary->src[0];
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    // the blocks read x and z all along, so the matmul's dst must not hold them
+    if (!ggml_cuda_should_fuse_mul_mat_vec_f(mm) || ggml_cuda_op_mul_mat_use_fwht(mm) ||
+            ggml_cuda_mul_mat_choose(*cuda_ctx, mm->src[0], mm->src[1], mm) != GGML_CUDA_MUL_MAT_PATH_MMVF ||
+            !ggml_cuda_mul_mat_vec_f_norm_gated(mm->src[0], mm->src[1], mm, x, z, w) ||
+            ggml_cuda_tensors_overlap(mm, x) || ggml_cuda_tensors_overlap(mm, z)) {
+        return 0;
+    }
+
+    ggml_cuda_mm_fusion_args_host fusion_data{};
+    fusion_data.norm_x = x;
+    fusion_data.norm_z = z;
+    fusion_data.norm_w = w;
+    memcpy(&fusion_data.norm_eps, rms_norm->op_params, sizeof(float));
+    ggml_cuda_mul_mat_vec_f(*cuda_ctx, mm->src[0], mm->src[1], nullptr, mm, &fusion_data);
+    return j - i;
+}
 
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     ggml_cuda_try_gather_expert_group(cuda_ctx, cgraph, i);
@@ -8826,6 +8879,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // the gated output norm of a gated delta net layer, rms_norm(x) * w * op(z): the unary reads z, not the norm
     if (node->op == GGML_OP_RMS_NORM && i + 3 < cgraph->n_nodes &&
             ggml_cuda_should_fuse_rms_norm_gated(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3])) {
+        // in the launch of the matmul that reads it
+        const int n_mm = ggml_cuda_try_fuse_norm_gated_mm(cuda_ctx, cgraph, i);
+        if (n_mm > 0) {
+            return n_mm;
+        }
         const int outputs[1] = { i + 3 };
         const enum ggml_op ops[4] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
         if (ggml_can_fuse_subgraph(cgraph, i, 4, ops, outputs, 1)) {

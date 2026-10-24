@@ -2060,6 +2060,13 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * shared_up = nullptr;
     const ggml_tensor * shared_gate = nullptr;
     ggml_tensor * shared_dst = nullptr;
+    // mmvf, one token: src1 is the gated output norm of a gated delta net layer, rms_norm(norm_x)*norm_w*silu(norm_z)
+    //   over rows of 128, which the launch computes from norm_x as it reads it instead of reading src1, see
+    //   ggml_cuda_mul_mat_vec_f_norm_gated
+    const ggml_tensor * norm_x = nullptr;
+    const ggml_tensor * norm_z = nullptr;
+    const ggml_tensor * norm_w = nullptr;
+    float norm_eps = 0.0f;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -2124,6 +2131,15 @@ struct ggml_cuda_mmvf_topk_args {
     bool           with_norm       = false;
     bool           delayed_softmax = false;
 };
+// mmvf with the gated output norm of a gated delta net layer applied to y as the launch reads it (see
+//   ggml_cuda_mm_fusion_args_host::norm_x), and the all-reduce of the launch if it has one
+struct ggml_cuda_mmvf_norm_args {
+    ggml_cuda_ar_fold_args ar;
+    const float *          z     = nullptr; // laid out as y
+    const float *          w     = nullptr; // one row of 128
+    int                    ncols = 0;       // the norm's row, 128
+    float                  eps   = 0.0f;
+};
 // in place of either in the other kernels
 struct ggml_cuda_no_args {
     ggml_cuda_no_args() = default;
@@ -2134,6 +2150,7 @@ struct ggml_cuda_no_args {
 struct ggml_cuda_mm_fusion_args_launch : ggml_cuda_mm_fusion_args_device {
     ggml_cuda_mmvq_conv_args conv;
     ggml_cuda_mmvf_topk_args topk;
+    ggml_cuda_mmvf_norm_args norm; // its ar is that of the launch's fold, see ar below
     // with ar_pushed: a launch that can push its rows as the LL lines of ar does so and sets *ar_pushed; with ar_moe the
     //   expert down projection of a MoE pushes the sum of its experts instead
     ggml_cuda_ar_fold_args   ar;

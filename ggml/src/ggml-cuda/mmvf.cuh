@@ -33,3 +33,9 @@ bool ggml_cuda_mul_mat_vec_f_moe_glu_sibling(const ggml_tensor * src0, const ggm
 //   (fusion sib, gdn_x, gate and the gated delta net epilogue)
 bool ggml_cuda_mul_mat_vec_f_gdn_qkv(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * sib,
     const ggml_tensor * gdn_x, const ggml_tensor * gate);
+
+// whether ggml_cuda_mul_mat_vec_f can compute its y, src1, as the gated output norm of a gated delta net layer,
+//   rms_norm(x)*w*silu(z) over rows of 128, from x as the launch reads it (fusion norm_x, norm_z, norm_w and norm_eps):
+//   one token of f16 rows, every block normalizing all of y, which saves the norm's launch
+bool ggml_cuda_mul_mat_vec_f_norm_gated(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
+    const ggml_tensor * x, const ggml_tensor * z, const ggml_tensor * w);
