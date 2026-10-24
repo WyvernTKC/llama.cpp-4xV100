@@ -1475,19 +1475,305 @@ static __global__ void mul_mat_vec_f_router(
     }
 }
 
+// The one-token f32 router with its selection by ranks (mul_mat_vec_f_router_cuda takes it for up to GGML_CUDA_ROUTER_RANK_MAX_USED of 128 or 256 experts):
+//   the same experts in the same order and the same weights, bit for bit, as the rounds of mul_mat_vec_f_router_wait.
+// The rounds are latency bound, ~420 cycles each, ~4400 cycles for 8 of 256 after the last logit lands. Here warp 0 polls and gates the logits as
+//   topk_moe_select does, then warp w ranks the experts 32w..32w+31 among themselves (31 shuffles); the n_used best of each group are its candidates, and
+//   every expert of the top n_used is one of them, so a candidate's rank among all experts is its rank in its group plus, for every other group, how many of
+//   that group's candidates beat it. Warp 0 then normalizes and scales the weights as topk_moe_select does: the k-th weight in lane k, each lane summing the
+//   weights of the experts it would have owned there in the order they were picked. ~2800 cycles with the barriers.
+// Ranks compare integer keys: key() orders as the float compares of topk_moe_select (FSETP.FTZ: -0 and +0 are one key; the values are never NaN, which is
+//   sanitized, nor denormal, as outputs of FTZ ops), and "o beats v" (larger, or equal and a lower expert) is one compare against a threshold that carries
+//   the tie-break: ko > kv - (o's expert < v's expert). An unused candidate slot holds INT_MIN, a candidate's own group compares against INT_MAX.
+// The code is cold in the instruction cache at every launch (~10 cycles per instruction met for the first time), so a first pass runs all of it on made-up
+//   logits while the rows are read: warp 0 the gating, warps 1.. the ranks, warp 1 the weights, at the same time and without barriers (that pass ends after
+//   ~2 us; one warp running it all ended after the logits had landed). The waiting block is block 0, so it starts first, and the kernel keeps to 64
+//   registers, so that 4 blocks of 256 fit an SM and the launch is one wave.
+// rpb router rows per block share the y loads; each row sums as with a block of its own, so the logits are those of mul_mat_vec_f.
+#define GGML_CUDA_ROUTER_RANK_MAX_USED 8
+
+static __device__ __forceinline__ int mul_mat_vec_f_router_key(const float f) {
+    const int b = __float_as_int(f);
+    const int c = b == INT_MIN ? 0 : b;
+    return c ^ ((c >> 31) & INT_MAX);
+}
+
+// the top bit of j: lane ^ j for j in [2^b, 2^(b+1)) is below lane iff bit b of lane is set
+static constexpr __device__ int mul_mat_vec_f_router_msb(const int j) {
+    return j >= 16 ? 4 : j >= 8 ? 3 : j >= 4 ? 2 : j >= 2 ? 1 : 0;
+}
+
+template <int n_experts>
+static __device__ __forceinline__ void mul_mat_vec_f_router_rank_wait(const ggml_cuda_mmvf_topk_args & topk, float * dst, const int tid) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int n_groups  = topk_moe_experts_per_thread(n_experts);
+    constexpr int max_used  = GGML_CUDA_ROUTER_RANK_MAX_USED;
+    constexpr int parts     = warp_size/max_used;
+    static_assert(warp_size == 32 && n_groups*warp_size == n_experts && n_groups <= 256/warp_size && n_groups % parts == 0,
+        "one warp of the block per 32 experts, whole parts of a warp per group");
+    static_assert(2*warp_size <= GGML_CUDA_BLOCK_FLAGS - GGML_CUDA_TOPK_WARM, "scratch of the first pass");
+    __shared__ float                 s_val[n_experts];
+    __shared__ __align__(16) int     s_ckey[n_groups][max_used];
+    __shared__ int                   s_clane[n_groups][max_used];
+    __shared__ float                 s_cval[n_groups][max_used];
+    __shared__ float                 s_sel[max_used];
+    __shared__ int                   s_own[max_used];
+    __shared__ int                   s_ready;
+
+    const int warp = tid / warp_size;
+    const int lane = tid % warp_size;
+    volatile unsigned long long * slots = topk.slots;
+    unsigned int * epoch        = (unsigned int *) (topk.slots + GGML_CUDA_TOPK_SLOT_COUNT);
+    float        * warm_weights = (float *) (epoch + (GGML_CUDA_TOPK_WARM - GGML_CUDA_TOPK_EPOCH));
+    int32_t      * warm_ids     = (int32_t *) (warm_weights + warp_size);
+    const topk_moe_config config = mul_mat_vec_f_topk_moe_config(topk);
+
+    unsigned int tag = 0;
+    if (warp == 0) {
+        tag = *(volatile unsigned int *) epoch + 1;
+    }
+    bool warm = true;
+#pragma unroll 1
+    while (true) {
+        if (warp == 0) {
+            float wt[n_groups];
+            bool  ready = false;
+            if (warm) {
+#pragma unroll
+                for (int i = 0; i < n_groups; i++) {
+                    wt[i] = (float) (i*warp_size + lane);
+                }
+            } else {
+                ready = ggml_cuda_spin_until([&]() {
+                    bool ready = true;
+#pragma unroll
+                    for (int i = 0; i < n_groups; i++) {
+                        const unsigned long long v = slots[i*warp_size + lane];
+                        wt[i] = __uint_as_float((unsigned int) v);
+                        ready = ready && (unsigned int) (v >> 32) == tag;
+                    }
+                    return __all_sync(0xFFFFFFFF, ready);
+                });
+                if (!ready) {
+                    ggml_cuda_spin_trap(GGML_CUDA_SPIN_SITE_ROUTER, -1, GGML_CUDA_SPIN_PEER_BLOCKS);
+                }
+#pragma unroll
+                for (int i = 0; i < n_groups; i++) {
+                    dst[i*warp_size + lane] = wt[i];
+                }
+                // every router block read the epoch before it stored its tag
+                if (lane == 0) {
+                    *(volatile unsigned int *) epoch = tag;
+                }
+            }
+            if (!config.delayed_softmax) {
+                if (config.use_sigmoid) {
+                    sigmoid_warp_inplace<n_groups, false>(wt, n_experts, lane);
+                } else if (config.use_sqrt_softplus) {
+                    sqrt_softplus_warp_inplace<n_groups, false>(wt, n_experts, lane);
+                } else {
+                    softmax_warp_inplace<n_groups, false>(wt, n_experts, lane);
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < n_groups; i++) {
+                s_val[i*warp_size + lane] = __isnanf(wt[i]) ? -FLT_MAX : wt[i];
+            }
+            if (lane == 0) {
+                s_ready = ready;
+            }
+        }
+        // the first pass has no barriers: its stages run at the same time on whatever the shared memory holds
+        if (!warm) {
+            __syncthreads();
+        }
+        const bool ready  = !warm && s_ready;
+        const int  n_used = ready ? topk.n_used : 1;
+
+        if (warp < n_groups && (!warm || warp != 0)) {
+            const float v  = s_val[warp*warp_size + lane];
+            const int   kv = mul_mat_vec_f_router_key(v);
+            int th[5];
+#pragma unroll
+            for (int b = 0; b < 5; b++) {
+                th[b] = kv - ((lane >> b) & 1);
+            }
+            // four counts: the shuffles do not wait for the adds
+            int r4[4] = { 0, 0, 0, 0 };
+#pragma unroll
+            for (int j = 1; j < warp_size; j++) {
+                r4[j % 4] += __shfl_xor_sync(0xFFFFFFFF, kv, j) > th[mul_mat_vec_f_router_msb(j)];
+            }
+            const int r = (r4[0] + r4[1]) + (r4[2] + r4[3]);
+            if (r < max_used) {
+                s_ckey[warp][r]  = r < n_used ? kv : INT_MIN;
+                s_clane[warp][r] = lane;
+                s_cval[warp][r]  = v;
+            }
+        }
+        if (!warm) {
+            __syncthreads();
+        }
+        // lane max_used*part + t: candidate t of this warp against the groups part, part + parts, ..., a lower group wins ties
+        if (warp < n_groups && (!warm || warp != 0)) {
+            const int   t    = lane % max_used;
+            const int   part = lane / max_used;
+            const int   kc   = s_ckey[warp][t];
+            const int   l    = s_clane[warp][t];
+            const float cv   = s_cval[warp][t];
+            int g = part == 0 ? t : 0;
+#pragma unroll
+            for (int w0 = 0; w0 < n_groups; w0 += parts) {
+                const int  w  = w0 + part;
+                const int4 a  = *(const int4 *) &s_ckey[w][0];
+                const int4 b  = *(const int4 *) &s_ckey[w][4];
+                const int  th = w == warp ? INT_MAX : (int) ((unsigned int) kc - (w < warp ? 1u : 0u));
+                g += (a.x > th) + (a.y > th) + (a.z > th) + (a.w > th) + (b.x > th) + (b.y > th) + (b.z > th) + (b.w > th);
+            }
+#pragma unroll
+            for (int offset = max_used; offset < warp_size; offset *= 2) {
+                g += __shfl_xor_sync(0xFFFFFFFF, g, offset);
+            }
+            if (part == 0 && t < n_used && g < n_used) {
+                (ready ? topk.ids : warm_ids)[g] = warp*warp_size + l;
+                s_sel[g] = cv;
+                s_own[g] = l;
+            }
+        }
+        if (!warm) {
+            __syncthreads();
+        }
+        if (warp == (warm ? 1 : 0)) {
+            float ow[n_groups];
+#pragma unroll
+            for (int i = 0; i < n_groups; i++) {
+                ow[i] = 0.0f;
+            }
+            ow[0] = lane < n_used ? s_sel[lane] : 0.0f;
+            if (config.with_norm) {
+                float wt_sum = 0.0f;
+#pragma unroll
+                for (int k = 0; k < max_used; k++) {
+                    if (k < n_used && s_own[k] == lane) {
+                        wt_sum += s_sel[k];
+                    }
+                }
+                wt_sum              = warp_reduce_sum(wt_sum);
+                wt_sum              = max(wt_sum, topk.clamp);
+                const float inv_sum = 1.0f / wt_sum;
+#pragma unroll
+                for (int i = 0; i < n_groups; i++) {
+                    ow[i] *= inv_sum;
+                }
+            }
+            if (config.delayed_softmax) {
+                softmax_warp_inplace<n_groups, true>(ow, n_used, lane);
+            }
+            if (lane < n_used) {
+                (ready ? topk.weights : warm_weights)[lane] = ow[0] * topk.scale;
+            }
+        }
+        if (ready) {
+            return;
+        }
+        warm = false;
+    }
+}
+
+// Block 0 waits for the logits and selects, blocks 1..n_experts/rpb are rpb router rows each, the last block is the sibling.
+template <int n_experts, int rpb>
+static __global__ void __launch_bounds__(256, 4) mul_mat_vec_f_router_rank(
+        const float * x_ptr, const float * y_ptr, const float * sib_x, float * dst, float * sib_dst, const int ncols2,
+        const int stride_row, const ggml_cuda_mmvf_topk_args topk) {
+    constexpr int block_size = 256;
+    constexpr int warp_size  = ggml_cuda_get_physical_warp_size();
+    constexpr int n_blocks   = n_experts/rpb;
+    static_assert(n_experts % rpb == 0 && rpb <= block_size/warp_size, "a warp per row for the last reduction");
+    const int tid = threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+    if (blockIdx.x == 0) {
+        mul_mat_vec_f_router_rank_wait<n_experts>(topk, dst, tid);
+        return;
+    }
+    const bool sib  = blockIdx.x == n_blocks + 1;
+    const int  nr   = sib ? 1 : rpb;
+    const int  row0 = (blockIdx.x - 1)*rpb;
+    const float2 * GGML_CUDA_RESTRICT x2 = (const float2 *) (sib ? sib_x : x_ptr + int64_t(row0)*stride_row);
+    const float2 * GGML_CUDA_RESTRICT y2 = (const float2 *) y_ptr;
+    const int stride_row2 = stride_row/2;
+
+    // read early, its latency hides behind the dot product; warp r stores the logit of row r
+    unsigned int tag = 0;
+    if (tid % warp_size == 0 && tid / warp_size < nr && !sib) {
+        tag = *(volatile unsigned int *) (topk.slots + GGML_CUDA_TOPK_SLOT_COUNT) + 1;
+    }
+
+    __shared__ float buf_iw[rpb][warp_size];
+    if (tid < warp_size) {
+#pragma unroll
+        for (int r = 0; r < rpb; r++) {
+            buf_iw[r][tid] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    float sumf[rpb];
+#pragma unroll
+    for (int r = 0; r < rpb; r++) {
+        sumf[r] = 0.0f;
+    }
+    for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+        const float2 tmpy = y2[col2];
+#pragma unroll
+        for (int r = 0; r < rpb; r++) {
+            if (r < nr) {
+                const float2 tmpx = x2[r*stride_row2 + col2];
+                ggml_cuda_mad(sumf[r], tmpx.x, tmpy.x);
+                ggml_cuda_mad(sumf[r], tmpx.y, tmpy.y);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < rpb; r++) {
+        sumf[r] = warp_reduce_sum<warp_size>(sumf[r]);
+        buf_iw[r][tid/warp_size] = sumf[r];
+    }
+    __syncthreads();
+    const int r = tid/warp_size;
+    if (r >= nr) {
+        return;
+    }
+    const int   lane = tid % warp_size;
+    const float sum  = warp_reduce_sum<warp_size>(buf_iw[r][lane]);
+    if (lane == 0) {
+        if (sib) {
+            sib_dst[0] = sum;
+        } else {
+            *(volatile unsigned long long *) (topk.slots + row0 + r) = ((unsigned long long) tag << 32) | __float_as_uint(sum);
+        }
+    }
+}
+
 static void mul_mat_vec_f_router_cuda(const float * x, const float * y, const ggml_cuda_mm_fusion_args_launch & fusion,
         float * dst, const int64_t ncols, const int64_t stride_row, cudaStream_t stream) {
     // rows of a multiple of 512 make mul_mat_vec_f take 256 threads
     GGML_ASSERT(ncols % 512 == 0 && fusion.sib_x != nullptr && fusion.sib_block0 == 0 && !fusion.gate && !fusion.x_bias &&
         !fusion.gate_bias && !fusion.gdn_beta);
-    const ggml_cuda_kernel_launch_params launch_params = {dim3(fusion.topk.n_expert + 2, 1, 1), dim3(256, 1, 1), 0, stream};
+    // GGML_CUDA_NO_ROUTER_RANK=1 keeps the rounds
+    static const bool no_rank = getenv("GGML_CUDA_NO_ROUTER_RANK") != nullptr;
+    const bool rank = !no_rank && fusion.topk.n_used <= GGML_CUDA_ROUTER_RANK_MAX_USED && fusion.topk.n_expert <= 256;
+    constexpr int rpb = 4;
+    const int n_blocks = rank ? fusion.topk.n_expert/rpb + 2 : fusion.topk.n_expert + 2;
+    const ggml_cuda_kernel_launch_params launch_params = {dim3(n_blocks, 1, 1), dim3(256, 1, 1), 0, stream};
     const auto launch = [&](auto kernel) {
         ggml_cuda_kernel_launch(kernel, launch_params, x, y, (const float *) fusion.sib_x, dst, fusion.sib_dst, int(ncols/2),
             int(stride_row), fusion.topk);
     };
     switch (fusion.topk.n_expert) {
-        case 128: launch(mul_mat_vec_f_router<128>); break;
-        case 256: launch(mul_mat_vec_f_router<256>); break;
+        case 128: rank ? launch(mul_mat_vec_f_router_rank<128, rpb>) : launch(mul_mat_vec_f_router<128>); break;
+        case 256: rank ? launch(mul_mat_vec_f_router_rank<256, rpb>) : launch(mul_mat_vec_f_router<256>); break;
         case 512: launch(mul_mat_vec_f_router<512>); break;
         default: GGML_ABORT("fatal error");
     }

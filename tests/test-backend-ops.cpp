@@ -16014,6 +16014,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_router_topk_moe(1024, 256, 10, with_norm, gate, 2.5f));
             test_cases.emplace_back(new test_router_topk_moe(2048, 256, 8, with_norm, gate, 0.0f, 3));
             test_cases.emplace_back(new test_router_topk_moe(1280, 256, 8, with_norm, gate));
+            // the selection by ranks takes up to 8 experts of 128 or 256
+            for (int n_expert_used : {1, 4, 6}) {
+                test_cases.emplace_back(new test_router_topk_moe(1024, 128, n_expert_used, with_norm, gate, 1.5f));
+                test_cases.emplace_back(new test_router_topk_moe(2048, 256, n_expert_used, with_norm, gate, 0.0f, 2));
+            }
         }
     }
 
