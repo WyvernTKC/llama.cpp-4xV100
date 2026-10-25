@@ -2631,6 +2631,53 @@ struct test_kq_mask : public test_case {
     }
 };
 
+// GGML_OP_KQ_MASK of ggml_kq_mask_prefix
+struct test_kq_mask_prefix : public test_case {
+    const ggml_type type;
+    const int64_t n_kv;
+    const int64_t n_q;
+    const int64_t n_stream;
+    const int64_t n_drop_max;
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, n_kv, n_q, n_stream, n_drop_max);
+    }
+
+    test_kq_mask_prefix(ggml_type type = GGML_TYPE_F16, int64_t n_kv = 512, int64_t n_q = 1, int64_t n_stream = 1, int64_t n_drop_max = 64)
+        : type(type), n_kv(n_kv), n_q(n_q), n_stream(n_stream), n_drop_max(n_drop_max) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * rows = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 2 + n_drop_max, n_q, 1, n_stream);
+        ggml_set_name(rows, "rows");
+
+        ggml_tensor * out = ggml_kq_mask_prefix(ctx, rows, n_kv, type);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(11);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "rows") != 0) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            // prefixes shorter and longer than n_kv, up to n_drop_max dropped cells in and past the prefix, the rest unused
+            std::vector<int32_t> data(ggml_nelements(t), -7);
+            for (int64_t r = 0; r < n_q*n_stream; ++r) {
+                int32_t * d = data.data() + r*(2 + n_drop_max);
+                d[0] = r % 4 == 3 ? (int32_t) (n_kv + 5) : (int32_t) (rng() % (n_kv + 1));
+                d[1] = (int32_t) (r % 3 == 0 ? n_drop_max : rng() % (n_drop_max + 1));
+                for (int32_t k = 0; k < d[1]; ++k) {
+                    d[2 + k] = (int32_t) (rng() % (n_kv + 8));
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+        }
+    }
+};
+
 // GGML_OP_KQ_MASK as the block bias of ggml_kq_block_bias: 0, 1e9 or -inf. -inf turns the value comparison into NaN,
 // which passes, so the cases without unseen blocks are the ones that check the 0 / 1e9 decisions
 struct test_kq_block_bias : public test_case {
@@ -13128,6 +13175,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_kq_mask(type, 1000, 37, 2, GGML_KQ_MASK_SWA_STANDARD,  128));
         test_cases.emplace_back(new test_kq_mask(type, 777,  65, 1, GGML_KQ_MASK_SWA_CHUNKED,   64));
         test_cases.emplace_back(new test_kq_mask(type, 600,  16, 3, GGML_KQ_MASK_SWA_SYMMETRIC, 32));
+        test_cases.emplace_back(new test_kq_mask_prefix(type, 512,   1, 1));
+        test_cases.emplace_back(new test_kq_mask_prefix(type, 1000,  6, 1));
+        test_cases.emplace_back(new test_kq_mask_prefix(type, 777,  16, 3, 8));
+        test_cases.emplace_back(new test_kq_mask_prefix(type, 70000, 3, 1));
     }
     test_cases.emplace_back(new test_kq_block_bias(300, 64, 1, 4, false));
     test_cases.emplace_back(new test_kq_block_bias(513, 37, 2, 4, false));

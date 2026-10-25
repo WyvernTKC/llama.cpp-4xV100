@@ -252,6 +252,10 @@ public:
     //   others), and the positions of the tokens
     void set_input_kq_pos(ggml_tensor * dst_kv, ggml_tensor * dst_q, const llama_ubatch * ubatch) const;
 
+    // the rows of a mask built by ggml_kq_mask_prefix, n_desc values each; false if a row does not fit in that.
+    //   dst nullptr only checks
+    bool get_kq_prefix(int32_t * dst, int64_t n_desc, const llama_ubatch * ubatch, bool causal_attn) const;
+
     llama_swa_type get_swa_type() const { return swa_type; }
     uint32_t       get_n_swa()    const { return n_swa; }
 
@@ -473,6 +477,10 @@ public:
     void set_input_kq_ranges (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, int64_t n_kv) const;
     void set_input_kq_pos    (ggml_tensor * dst_kv, ggml_tensor * dst_q, const llama_ubatch * ubatch) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    // the rows of a mask built by ggml_kq_mask_prefix, I32 [n_desc, n_tokens/n_stream, 1, n_stream]
+    bool can_kq_prefix      (const llama_ubatch & ubatch, int64_t n_desc, bool causal_attn) const;
+    void set_input_kq_prefix(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
 
     llama_swa_type get_swa_type() const;
     uint32_t       get_n_swa()    const;

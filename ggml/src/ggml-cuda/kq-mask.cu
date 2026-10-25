@@ -42,9 +42,45 @@ static __global__ void kq_mask(const int32_t * __restrict__ kv_pos, const int32_
     dst[(s*n_q + i)*n_kv + j] = ggml_cuda_cast<T>(masked ? -INFINITY : 0.0f);
 }
 
+// see ggml_kq_mask_prefix: a row sees the cells [0, d[0]) but the d[1] cells listed after them
+template <typename T>
+static __global__ void kq_mask_prefix(const int32_t * __restrict__ rows, T * __restrict__ dst, const int64_t n_kv, const int n_desc) {
+    const int64_t j = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (j >= n_kv) {
+        return;
+    }
+    const int64_t r = (int64_t) blockIdx.z*gridDim.y + blockIdx.y;
+
+    const int32_t * d = rows + r*n_desc;
+
+    bool seen = j < d[0];
+    const int n_drop = d[1];
+    for (int k = 0; k < n_drop; ++k) {
+        seen = seen && d[2 + k] != j;
+    }
+
+    dst[r*n_kv + j] = ggml_cuda_cast<T>(seen ? 0.0f : -INFINITY);
+}
+
 void ggml_cuda_op_kq_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+
+    if (ggml_get_op_params_i32(dst, 3) == 1) {
+        GGML_ASSERT(src0->type == GGML_TYPE_I32 && ggml_is_contiguous(src0) && ggml_is_contiguous(dst));
+        GGML_ASSERT(dst->ne[1] <= 65535 && dst->ne[3] <= 65535);
+        const int64_t n_kv = dst->ne[0];
+        const dim3 block_dims(CUDA_KQ_MASK_BLOCK_SIZE, 1, 1);
+        const dim3 block_nums((n_kv + CUDA_KQ_MASK_BLOCK_SIZE - 1)/CUDA_KQ_MASK_BLOCK_SIZE, dst->ne[1], dst->ne[3]);
+        const int32_t * rows = (const int32_t *) src0->data;
+        if (dst->type == GGML_TYPE_F16) {
+            kq_mask_prefix<<<block_nums, block_dims, 0, ctx.stream()>>>(rows, (half *) dst->data, n_kv, (int) src0->ne[0]);
+        } else {
+            GGML_ASSERT(dst->type == GGML_TYPE_F32);
+            kq_mask_prefix<<<block_nums, block_dims, 0, ctx.stream()>>>(rows, (float *) dst->data, n_kv, (int) src0->ne[0]);
+        }
+        return;
+    }
 
     GGML_ASSERT(src0->type == GGML_TYPE_I32 && src1->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst));
@@ -79,6 +115,10 @@ void ggml_cuda_op_kq_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 bool ggml_cuda_kq_mask_supported(const ggml_tensor * op) {
+    if (ggml_get_op_params_i32(op, 3) == 1) {
+        return (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) && op->src[0]->type == GGML_TYPE_I32 &&
+            ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) && op->ne[1] <= 65535 && op->ne[3] <= 65535;
+    }
     return (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) &&
         op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 &&
         ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op) &&

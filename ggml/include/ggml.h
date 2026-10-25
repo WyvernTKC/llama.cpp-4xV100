@@ -1771,6 +1771,15 @@ extern "C" {
             int                   n_swa,
             enum ggml_type        type);
 
+    // the same mask for rows that see a prefix of the cells but a few: rows I32 [2 + n_drop_max, n_q, 1, n_stream] holds
+    // per row the n cells [0, n) it sees, the count k of cells it does not see among them, then those k cells
+    // -> type (F16 or F32) [n_kv, n_q, 1, n_stream]
+    GGML_API struct ggml_tensor * ggml_kq_mask_prefix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * rows,
+            int64_t               n_kv,
+            enum ggml_type        type);
+
     // the bias of blocks of ratio positions from the same kind of inputs, as F32: blk_pos holds the first position of
     // each block (-1: the stream does not see it, -2: it is always picked), q_pos the position of each query. A block
     // from the query's incomplete tail block on gets 1e9, an earlier one 0, one not seen -INF (qwen4exp QSA)

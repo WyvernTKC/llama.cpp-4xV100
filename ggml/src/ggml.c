@@ -4065,6 +4065,29 @@ struct ggml_tensor * ggml_kq_mask(
     return result;
 }
 
+struct ggml_tensor * ggml_kq_mask_prefix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * rows,
+        int64_t               n_kv,
+        enum ggml_type        type) {
+    GGML_ASSERT(rows->type == GGML_TYPE_I32 && ggml_is_contiguous(rows));
+    GGML_ASSERT(rows->ne[0] >= 2 && rows->ne[2] == 1);
+    GGML_ASSERT(n_kv > 0);
+    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, n_kv, rows->ne[1], 1, rows->ne[3]);
+
+    ggml_set_op_params_i32(result, 0, GGML_KQ_MASK_SWA_NONE);
+    ggml_set_op_params_i32(result, 1, 0);
+    ggml_set_op_params_i32(result, 2, 0);
+    ggml_set_op_params_i32(result, 3, 1); // prefix rows
+
+    result->op     = GGML_OP_KQ_MASK;
+    result->src[0] = rows;
+
+    return result;
+}
+
 struct ggml_tensor * ggml_kq_block_bias(
         struct ggml_context * ctx,
         struct ggml_tensor  * blk_pos,

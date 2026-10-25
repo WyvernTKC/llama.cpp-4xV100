@@ -366,7 +366,8 @@ public:
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_ranges   = nullptr; // I32 [3, n_batch/n_stream, 1, n_stream], see ggml_flash_attn_ext_set_kv_ranges
 
-    // instead of self_kq_mask, the positions a device builds the mask from (ggml_kq_mask)
+    // instead of self_kq_mask, the positions a device builds the mask from (ggml_kq_mask), or in self_kq_pos alone the
+    //   rows of ggml_kq_mask_prefix (I32 [66, n_batch/n_stream, 1, n_stream])
     ggml_tensor * self_kq_pos  = nullptr; // I32 [n_kv, 1, 1, n_stream]
     ggml_tensor * self_kq_qpos = nullptr; // I32 [n_batch/n_stream, 1, 1, n_stream]
 
@@ -542,7 +543,8 @@ public:
     ggml_tensor * self_kq_ranges       = nullptr; // I32 [3, n_batch/n_stream, 1, n_stream], see ggml_flash_attn_ext_set_kv_ranges
     ggml_tensor * self_kq_ranges_swa   = nullptr; // I32 [3, n_batch/n_stream, 1, n_stream]
 
-    // instead of the masks, the positions a device builds them from (ggml_kq_mask)
+    // instead of the masks, the positions a device builds them from (ggml_kq_mask), or the rows of ggml_kq_mask_prefix
+    //   in self_kq_pos alone
     ggml_tensor * self_kq_pos      = nullptr; // I32 [n_kv, 1, 1, n_stream]
     ggml_tensor * self_kq_qpos     = nullptr; // I32 [n_batch/n_stream, 1, 1, n_stream]
     ggml_tensor * self_kq_pos_swa  = nullptr;

@@ -5578,17 +5578,40 @@ void ggml_compute_forward_kq_mask(
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
-    GGML_ASSERT(src0->type == GGML_TYPE_I32 && src1->type == GGML_TYPE_I32);
-    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst));
     GGML_ASSERT(dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F32);
-
-    const int swa_type = ggml_get_op_params_i32(dst, 0);
-    const int n_swa    = ggml_get_op_params_i32(dst, 1);
-    const int ratio    = ggml_get_op_params_i32(dst, 2);
 
     const int64_t n_kv = dst->ne[0];
     const int64_t n_q  = dst->ne[1];
     const int64_t nr   = n_q*dst->ne[3];
+
+    // see ggml_kq_mask_prefix
+    if (ggml_get_op_params_i32(dst, 3) == 1) {
+        GGML_ASSERT(src0->type == GGML_TYPE_I32 && ggml_is_contiguous(src0) && ggml_is_contiguous(dst));
+        const int64_t n_desc = src0->ne[0];
+        for (int64_t r = params->ith; r < nr; r += params->nth) {
+            const int32_t * d = (const int32_t *) src0->data + r*n_desc;
+            GGML_ASSERT(d[1] >= 0 && d[1] <= n_desc - 2);
+            for (int64_t j = 0; j < n_kv; ++j) {
+                bool seen = j < d[0];
+                for (int32_t k = 0; k < d[1]; ++k) {
+                    seen = seen && d[2 + k] != j;
+                }
+                if (dst->type == GGML_TYPE_F16) {
+                    ((ggml_fp16_t *) dst->data)[r*n_kv + j] = GGML_CPU_FP32_TO_FP16(seen ? 0.0f : -INFINITY);
+                } else {
+                    ((float *) dst->data)[r*n_kv + j] = seen ? 0.0f : -INFINITY;
+                }
+            }
+        }
+        return;
+    }
+
+    GGML_ASSERT(src0->type == GGML_TYPE_I32 && src1->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst));
+
+    const int swa_type = ggml_get_op_params_i32(dst, 0);
+    const int n_swa    = ggml_get_op_params_i32(dst, 1);
+    const int ratio    = ggml_get_op_params_i32(dst, 2);
 
     if (ratio > 0) {
         GGML_ASSERT(dst->type == GGML_TYPE_F32);

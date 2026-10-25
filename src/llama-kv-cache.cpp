@@ -2111,6 +2111,68 @@ void llama_kv_cache::set_input_kq_pos(ggml_tensor * dst_kv, ggml_tensor * dst_q,
     }
 }
 
+// A causal row over a prefix of the cells (kq_prefix_n, with the window of the row) sees [0, n) but the cells after its
+//   position and, for M-RoPE, the cells at its position that lie after it in 2D: as kq_prefix_row writes it.
+bool llama_kv_cache::get_kq_prefix(int32_t * dst, int64_t n_desc, const llama_ubatch * ubatch, bool causal_attn) const {
+    // as in set_input_kq_mask
+    if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
+        causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
+    }
+    if (!causal_attn || hparams.use_alibi || llama_kq_mask_fast() < 2 || n_desc < 2) {
+        return false;
+    }
+
+    const int     n_drop_max = (int) std::min<int64_t>(n_desc - 2, kq_tail_max);
+    const bool    is_2d      = ubatch->is_pos_2d();
+    uint32_t      tail[kq_tail_max];
+
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        const llama_seq_id seq_id = ubatch->seq_id[i][0];
+        const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+
+        const llama_pos p1 = ubatch->pos[i];
+        llama_pos lo = 0;
+        switch (swa_type) {
+            case LLAMA_SWA_TYPE_STANDARD:  lo = p1 - (llama_pos) n_swa + 1;                  break;
+            case LLAMA_SWA_TYPE_CHUNKED:   lo = (p1 / (llama_pos) n_swa) * (llama_pos) n_swa; break;
+            case LLAMA_SWA_TYPE_SYMMETRIC: lo = p1 - (llama_pos) n_swa/2;                   break;
+            case LLAMA_SWA_TYPE_NONE:                                                       break;
+        }
+
+        const int64_t n = kq_prefix_n(cells, seq_id, std::max<llama_pos>(lo, 0));
+        int n_drop = n < 0 ? -1 : kq_cells_after(cells, seq_id, p1, tail);
+        if (n_drop < 0 || n_drop > n_drop_max) {
+            return false;
+        }
+        int32_t * d = dst ? dst + i*n_desc : nullptr;
+        for (int k = 0; d && k < n_drop; ++k) {
+            d[2 + k] = (int32_t) tail[k];
+        }
+        if (is_2d) {
+            // M-RoPE: a cell at the same position is also masked if it lies after the token in 2D
+            const llama_pos p1_x = ubatch->pos[i + ubatch->n_tokens*2];
+            const llama_pos p1_y = ubatch->pos[i + ubatch->n_tokens];
+            cells.seq_cells_at(seq_id, p1, [&](uint32_t j) {
+                if (cells.ext_get(j).is_2d_gt(p1_x, p1_y)) {
+                    if (d && n_drop < n_drop_max) {
+                        d[2 + n_drop] = (int32_t) j;
+                    }
+                    n_drop++;
+                }
+            });
+            if (n_drop > n_drop_max) {
+                return false;
+            }
+        }
+        if (d) {
+            d[0] = (int32_t) n;
+            d[1] = n_drop;
+        }
+    }
+
+    return true;
+}
+
 // The KV ranges of the KQ mask rows, see ggml_flash_attn_ext_set_kv_ranges: per row {end, hole_begin, hole_end} in cells,
 //   at a granularity of GGML_KQ_RANGE_CHUNK cells. A chunk can be seen by a row if a cell of the row's sequence in it
 //   lies in the row's window of positions, from the smallest and largest position of those cells - an overestimate
@@ -3457,6 +3519,19 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
 
 void llama_kv_cache_context::set_input_kq_pos(ggml_tensor * dst_kv, ggml_tensor * dst_q, const llama_ubatch * ubatch) const {
     kv->set_input_kq_pos(dst_kv, dst_q, ubatch);
+}
+
+bool llama_kv_cache_context::can_kq_prefix(const llama_ubatch & ubatch, int64_t n_desc, bool causal_attn) const {
+    return kv->get_kq_prefix(nullptr, n_desc, &ubatch, causal_attn);
+}
+
+void llama_kv_cache_context::set_input_kq_prefix(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer) && dst->type == GGML_TYPE_I32 && ggml_is_contiguous(dst));
+    GGML_ASSERT(dst->ne[1]*dst->ne[3] == (int64_t) ubatch->n_tokens);
+
+    // the graph was built or reused for this ubatch only if it passed can_kq_prefix
+    const bool ok = kv->get_kq_prefix((int32_t *) dst->data, dst->ne[0], ubatch, causal_attn);
+    GGML_ASSERT(ok);
 }
 
 llama_swa_type llama_kv_cache_context::get_swa_type() const {

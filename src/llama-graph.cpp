@@ -137,7 +137,30 @@ static bool kq_mask_on_device(
     return true;
 }
 
-// the mask an attention input reads, filled on the host or built on the device (kq_mask_on_device)
+// the values per row of ggml_kq_mask_prefix: the prefix, the count of cells not seen and up to 64 of them
+static constexpr int64_t kq_prefix_n_desc = 2 + 64;
+
+// The mask of a short ubatch is built on each device from a few values per row when every row sees a prefix of the cells
+//   but a few (llama_kv_cache_context::can_kq_prefix): a decoded token or a verify batch over a cache of one sequence.
+//   Filled on the host it is n_kv values per row, copied to every device for each token. A graph is built so from
+//   LLAMA_KQ_MASK_PREFIX used cells on (default 32768, 0 never): below that the host mask is a few KB that costs less than
+//   the kernel. Once built so, a graph is reused for any ubatch it can take (build false), whatever its n_kv.
+static bool kq_mask_prefix_on_device(
+        const llama_kv_cache_context * mctx,
+        const llama_ubatch & ubatch,
+        const llama_cparams & cparams,
+        bool build) {
+    static const int64_t n_kv_min = [] {
+        const char * env = getenv("LLAMA_KQ_MASK_PREFIX");
+        return env == nullptr ? 32768 : atoll(env);
+    }();
+
+    return n_kv_min > 0 && (!build || mctx->get_n_kv_used() >= n_kv_min) && mctx->has_layers() &&
+        mctx->can_kq_prefix(ubatch, kq_prefix_n_desc, cparams.causal_attn);
+}
+
+// the mask an attention input reads, filled on the host or built on the device (kq_mask_on_device, kq_mask_prefix_on_device)
+//   from the positions in kq_pos and kq_qpos, or from the rows of ggml_kq_mask_prefix in kq_pos (kq_qpos stays nullptr)
 static void build_attn_inp_kq_mask_any(
         ggml_context * ctx,
         const llama_kv_cache_context * mctx,
@@ -149,6 +172,22 @@ static void build_attn_inp_kq_mask_any(
         ggml_tensor ** kq_qpos,
         ggml_tensor ** kq_mask_cnv) {
     if (!kq_mask_on_device(mctx, ubatch, hparams, cparams)) {
+        if (kq_mask_prefix_on_device(mctx, ubatch, cparams, /*build =*/ true)) {
+            const int64_t n_kv     = mctx->get_n_kv();
+            const int64_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+
+            *kq_pos = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, kq_prefix_n_desc, ubatch.n_tokens/n_stream, 1, n_stream);
+            ggml_set_input(*kq_pos);
+            ggml_set_name(*kq_pos, "attn_inp_kq_prefix");
+
+            *kq_mask_cnv = ggml_kq_mask_prefix(ctx, *kq_pos, n_kv, cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32);
+            ggml_set_name(*kq_mask_cnv, "attn_inp_kq_mask");
+
+            // the n_kv it is built for, and whether it is shrunk in place with the K/V it masks (see can_reuse_kq_mask)
+            (*kq_pos)->op_params[0] = (int32_t) n_kv;
+            (*kq_pos)->op_params[1] = mctx->add_graph_root(*kq_mask_cnv, 0);
+            return;
+        }
         *kq_mask     = build_attn_inp_kq_mask(ctx, mctx, ubatch, cparams);
         *kq_mask_cnv = *kq_mask;
         return;
@@ -184,6 +223,12 @@ static void build_attn_inp_kq_mask_first(
         return;
     }
 
+    // the small mask of ggml_kq_mask_prefix (no q positions) stays at its first use: at the graph start its input was
+    //   copied to each device apart from the batch of the other inputs (Qwen3.8 + MTP draft and verify graphs)
+    if (kq_mask_cnv->src[1] == nullptr) {
+        return;
+    }
+
     ggml_backend_t backend = ggml_backend_sched_get_backend(sched, 0);
     if (!ggml_backend_supports_op(backend, kq_mask_cnv)) {
         return;
@@ -204,6 +249,8 @@ static void set_input_kq_mask_any(
         bool causal_attn) {
     if (kq_mask && kq_mask->buffer) {
         mctx->set_input_kq_mask(kq_mask, ubatch, causal_attn);
+    } else if (kq_pos && kq_pos->buffer && kq_qpos == nullptr) {
+        mctx->set_input_kq_prefix(kq_pos, ubatch, causal_attn);
     } else if (kq_pos && kq_pos->buffer) {
         mctx->set_input_kq_pos(kq_pos, kq_qpos, ubatch);
     } else {
@@ -228,18 +275,32 @@ static bool can_reuse_kq_mask_any(
         return true;
     }
 
-    // a host mask holds for any ubatch, a device-built one only for those it is built for
-    if (dev && !kq_mask_on_device(mctx, params.ubatch, hparams, params.cparams)) {
-        return false;
-    }
-
     if (host) {
         return can_reuse_kq_mask(kq_mask, mctx, params.ubatch, params.cparams);
+    }
+
+    // a host mask holds for any ubatch, a device-built one only for those it is built for
+    const bool on_device = kq_mask_on_device(mctx, params.ubatch, hparams, params.cparams);
+    const bool prefix    = kq_qpos == nullptr;
+    if (prefix ? on_device || !kq_mask_prefix_on_device(mctx, params.ubatch, params.cparams, /*build =*/ false) : !on_device) {
+        return false;
     }
 
     const int64_t n_stream = params.cparams.kv_unified ? 1 : params.ubatch.n_seqs_unq;
 
     bool res = true;
+
+    if (prefix) {
+        // as can_reuse_kq_mask: a mask that follows the n_kv in place does so up to the one it was built for
+        const uint32_t n_kv       = mctx->get_n_kv_used();
+        const uint32_t n_kv_built = (uint32_t) kq_pos->op_params[0];
+
+        res &= kq_pos->op_params[1] ? n_kv <= n_kv_built : n_kv == n_kv_built;
+        res &= kq_pos->ne[1] == params.ubatch.n_tokens/n_stream;
+        res &= kq_pos->ne[3] == n_stream;
+
+        return res;
+    }
 
     res &= kq_pos->ne[0]  == mctx->get_n_kv_used();
     res &= kq_pos->ne[3]  == n_stream;
