@@ -1646,7 +1646,69 @@ struct args_set_input_kq_mask {
     int64_t n_kv;
     int64_t n_stream;
     int64_t n_tps;
+
+    int fast; // llama_kq_mask_fast
 };
+
+// LLAMA_KQ_MASK_FAST=0 scans every cell for every first row of a sequence, =1 not the prefix rows (kq_prefix_n), 2 default
+static int llama_kq_mask_fast() {
+    static const int mode = getenv("LLAMA_KQ_MASK_FAST") == nullptr ? 2 : atoi(getenv("LLAMA_KQ_MASK_FAST"));
+    return mode;
+}
+
+// The used cells are [0, n), all of them of seq_id and none before lo: a causal row at p1 then keeps the cells [0, n)
+//   but the ones after p1, which seq_pos holds at its end, without a scan of the cells. Returns n, or -1.
+static int64_t kq_prefix_n(const llama_kv_cells & cells, llama_seq_id seq_id, llama_pos lo) {
+    const uint32_t n = cells.get_used();
+    if (n == 0 || cells.used_min() != 0 || cells.used_max_p1() != n || !cells.seq_has_all(seq_id) || cells.seq_pos_min(seq_id) < lo) {
+        return -1;
+    }
+    return n;
+}
+
+// at most this many cells after the row, fewer than a chunk of the KV ranges
+static constexpr int kq_tail_max = 64;
+static_assert(kq_tail_max < GGML_KQ_RANGE_CHUNK, "kq_tail_max");
+
+// the cells of seq_id after p1 into tail, their count, or -1 if there are more than kq_tail_max
+static int kq_cells_after(const llama_kv_cells & cells, llama_seq_id seq_id, llama_pos p1, uint32_t * tail) {
+    if (cells.seq_pos_max(seq_id) <= p1) {
+        return 0;
+    }
+    const auto & sp = cells.seq_pos_get(seq_id);
+    int n = 0;
+    for (auto it = sp.upper_bound({ p1, std::numeric_limits<uint32_t>::max() }); it != sp.end(); ++it) {
+        if (n == kq_tail_max) {
+            return -1;
+        }
+        tail[n++] = it->second;
+    }
+    return n;
+}
+
+// the mask row of a prefix (kq_prefix_n) of n cells and the cells after the row
+template<typename T, bool is_2d>
+static void kq_prefix_row(T * row, int64_t n_kv, int64_t n, const uint32_t * tail, int n_tail, T keep, T drop,
+        const llama_kv_cells & cells, llama_seq_id seq_id, const llama_ubatch * ubatch, uint32_t i) {
+    const int64_t n_keep = std::min(n, n_kv);
+    std::fill(row, row + n_keep, keep);
+    std::fill(row + n_keep, row + n_kv, drop);
+    for (int k = 0; k < n_tail; ++k) {
+        if (tail[k] < n_kv) {
+            row[tail[k]] = drop;
+        }
+    }
+    if (is_2d) {
+        // M-RoPE: a cell at the same position is also masked if it lies after the token in 2D
+        const llama_pos p1_x = ubatch->pos[i + ubatch->n_tokens*2];
+        const llama_pos p1_y = ubatch->pos[i + ubatch->n_tokens];
+        cells.seq_cells_at(seq_id, ubatch->pos[i], [&](uint32_t j) {
+            if (j < n_kv && cells.ext_get(j).is_2d_gt(p1_x, p1_y)) {
+                row[j] = drop;
+            }
+        });
+    }
+}
 
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
 static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data) {
@@ -1666,17 +1728,16 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     const T mask_keep = llama_cast<T>(0.0f);
     const T mask_drop = llama_cast<T>(-INFINITY);
 
+    uint32_t tail[kq_tail_max];
+
     // A decoded token is one row of one sequence that holds every used cell: a causal row keeps the cells with a
     //   position in [lo, p1], where lo is where the sliding window starts. Empty cells have position -1, so one
-    //   compare per cell over the position array. LLAMA_KQ_MASK_FAST=0 takes the loop below.
-    static const bool fast_row = [] {
-        const char * env = getenv("LLAMA_KQ_MASK_FAST");
-        return env == nullptr || atoi(env) != 0;
-    }();
+    //   compare per cell over the position array, or two fills for a prefix of the cells. LLAMA_KQ_MASK_FAST=0 takes
+    //   the loop below.
     if constexpr (causal && !alibi) {
         const llama_seq_id seq_id = ubatch->seq_id[0][0];
         const auto & cells = v_cells.at(seq_to_stream[seq_id]);
-        if (fast_row && ubatch->n_tokens == 1 && n_stream == 1 && cells.seq_has_all(seq_id) && n_kv <= (int64_t) cells.size()) {
+        if (args.fast >= 1 && ubatch->n_tokens == 1 && n_stream == 1 && cells.seq_has_all(seq_id) && n_kv <= (int64_t) cells.size()) {
             const llama_pos p1 = ubatch->pos[0];
             llama_pos lo = 0;
             if (swa) {
@@ -1687,6 +1748,14 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     case LLAMA_SWA_TYPE_NONE:                                                           break;
                 }
                 lo = std::max<llama_pos>(lo, 0);
+            }
+            if (args.fast >= 2) {
+                const int64_t n = kq_prefix_n(cells, seq_id, lo);
+                const int n_tail = n < 0 ? -1 : kq_cells_after(cells, seq_id, p1, tail);
+                if (n_tail >= 0) {
+                    kq_prefix_row<T, is_2d>(data, n_kv, n, tail, n_tail, mask_keep, mask_drop, cells, seq_id, ubatch, 0);
+                    return;
+                }
             }
             const llama_pos * pos = cells.pos_data();
             // one unsigned compare per cell: lo <= pos <= p1, and an empty cell (-1) wraps around above the range
@@ -1777,6 +1846,23 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     idxs.reserve(ubatch->n_tokens + n_swa + 32);
 
                     seq_srct[seq_id] = i;
+                }
+            }
+
+            // the first row of a short batch (a verify step) over a prefix of the cells: the later rows redo the cells
+            //   from seq_pos_min - n_swa - 32 on, as the loop below records them
+            if constexpr (causal && !swa && !alibi) {
+                const int64_t n = args.fast >= 2 ? kq_prefix_n(cells, seq_id, 0) : -1;
+                const int n_tail = n < 0 ? -1 : kq_cells_after(cells, seq_id, p1, tail);
+                if (n_tail >= 0) {
+                    kq_prefix_row<T, is_2d>(data + idst, n_kv, n, tail, n_tail, mask_keep, mask_drop, cells, seq_id, ubatch, i);
+                    const auto & sp = cells.seq_pos_get(seq_id);
+                    for (auto it = sp.lower_bound({ seq_pos_min[seq_id] - (int32_t) (n_swa + 32), 0 }); it != sp.end(); ++it) {
+                        if (it->second < n_kv) {
+                            idxs.push_back(it->second);
+                        }
+                    }
+                    continue;
                 }
             }
 
@@ -1980,6 +2066,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
+        /*.fast             =*/ llama_kq_mask_fast(),
     };
 
     if (dst->type == GGML_TYPE_F16) {
@@ -2058,9 +2145,54 @@ void llama_kv_cache::set_input_kq_ranges(ggml_tensor * dst, const llama_ubatch *
 
     int32_t * data = (int32_t *) dst->data;
 
+    // the rows of a short batch over a prefix of the cells (kq_prefix_n) see every chunk with a used cell, as the cells
+    //   after a row are fewer than a chunk: all but the last chunk if it holds only such cells
+    const bool prefix = llama_kq_mask_fast() >= 2 && causal_attn && ubatch->n_tokens <= 16;
+    uint32_t tail[kq_tail_max];
+
     for (int64_t i = 0; i < (int64_t) ubatch->n_tokens; ++i) {
         const llama_seq_id seq_id = ubatch->seq_id[i][0];
         const uint32_t     strm   = seq_to_stream[seq_id];
+
+        // the positions the row can see
+        const llama_pos p1 = ubatch->pos[i];
+        llama_pos w_lo = std::numeric_limits<llama_pos>::min();
+        llama_pos w_hi = causal_attn ? p1 : std::numeric_limits<llama_pos>::max();
+        if (windowed) {
+            switch (swa_type) {
+                case LLAMA_SWA_TYPE_STANDARD:  w_lo = p1 - (llama_pos) n_swa + 1;          break;
+                case LLAMA_SWA_TYPE_CHUNKED:   w_lo = (p1 / (llama_pos) n_swa) * (llama_pos) n_swa; break;
+                case LLAMA_SWA_TYPE_SYMMETRIC: w_lo = p1 - (llama_pos) n_swa/2;
+                                               w_hi = std::min(w_hi, p1 + (llama_pos) n_swa/2); break;
+                case LLAMA_SWA_TYPE_NONE:                                                   break;
+            }
+        }
+
+        int32_t * r = data + 3*i; // row ii of stream s is i = s*n_tps + ii, as in the mask
+
+        if (prefix) {
+            const auto & cells = v_cells[strm];
+            const int64_t n = kq_prefix_n(cells, seq_id, w_lo);
+            const int n_tail = n < 0 ? -1 : kq_cells_after(cells, seq_id, w_hi, tail);
+            if (n_tail >= 0) {
+                const int64_t n_used = std::min(n, n_kv);
+                int64_t n_seen = (n_used + chunk - 1)/chunk;
+                if (n_seen > 0) {
+                    const int64_t j0 = (n_seen - 1)*chunk;
+                    int64_t n_after = 0;
+                    for (int k = 0; k < n_tail; ++k) {
+                        n_after += tail[k] >= j0 && tail[k] < n_used;
+                    }
+                    if (n_after == n_used - j0) {
+                        n_seen--;
+                    }
+                }
+                r[0] = (int32_t) (n_seen > 0 ? std::min<int64_t>(n_kv, n_seen*chunk) : n_kv);
+                r[1] = 0;
+                r[2] = 0;
+                continue;
+            }
+        }
 
         std::vector<chunk_pos> & chunks = seq_chunks[{strm, seq_id}];
         if (chunks.empty()) {
@@ -2070,11 +2202,7 @@ void llama_kv_cache::set_input_kq_ranges(ggml_tensor * dst, const llama_ubatch *
             const int64_t n_cells = std::min<int64_t>(n_kv, cells.size());
             // every used cell is of this sequence: min and max over the positions, without branches (an empty cell
             //   is -1, so it leaves the max alone and is lifted out of the min). LLAMA_KQ_MASK_FAST=0 off
-            static const bool fast_chunks = [] {
-                const char * env = getenv("LLAMA_KQ_MASK_FAST");
-                return env == nullptr || atoi(env) != 0;
-            }();
-            if (seq_all && fast_chunks) {
+            if (seq_all && llama_kq_mask_fast() >= 1) {
                 const llama_pos * pos = cells.pos_data();
                 for (int64_t c = 0; c < n_chunks; ++c) {
                     const int64_t j0 = c*chunk;
@@ -2113,20 +2241,6 @@ void llama_kv_cache::set_input_kq_ranges(ggml_tensor * dst, const llama_ubatch *
             }
         }
 
-        // the positions the row can see
-        const llama_pos p1 = ubatch->pos[i];
-        llama_pos w_lo = std::numeric_limits<llama_pos>::min();
-        llama_pos w_hi = causal_attn ? p1 : std::numeric_limits<llama_pos>::max();
-        if (windowed) {
-            switch (swa_type) {
-                case LLAMA_SWA_TYPE_STANDARD:  w_lo = p1 - (llama_pos) n_swa + 1;          break;
-                case LLAMA_SWA_TYPE_CHUNKED:   w_lo = (p1 / (llama_pos) n_swa) * (llama_pos) n_swa; break;
-                case LLAMA_SWA_TYPE_SYMMETRIC: w_lo = p1 - (llama_pos) n_swa/2;
-                                               w_hi = std::min(w_hi, p1 + (llama_pos) n_swa/2); break;
-                case LLAMA_SWA_TYPE_NONE:                                                   break;
-            }
-        }
-
         int64_t last     = -1;
         int64_t run_0    = 0; // the current run of chunks the row cannot see
         int64_t best_0   = 0;
@@ -2144,7 +2258,6 @@ void llama_kv_cache::set_input_kq_ranges(ggml_tensor * dst, const llama_ubatch *
             last  = c;
         }
 
-        int32_t * r = data + 3*i; // row ii of stream s is i = s*n_tps + ii, as in the mask
         if (last < 0) {
             // nothing visible: leave the row to the mask
             r[0] = (int32_t) n_kv;
