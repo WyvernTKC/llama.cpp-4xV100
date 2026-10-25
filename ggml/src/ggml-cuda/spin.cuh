@@ -47,6 +47,7 @@ enum ggml_cuda_spin_site : unsigned int {
     GGML_CUDA_SPIN_SITE_NORM_Q8,        // rms_norm_pre_add_f32, its q8_1 blocks
     GGML_CUDA_SPIN_SITE_NORM_PAIR_Q8,   // rms_norm_add_rms_norm_f32, its q8_1 blocks
     GGML_CUDA_SPIN_SITE_EXPERT_CPU,     // expert_cpu_wait_add (expert-cpu.cu)
+    GGML_CUDA_SPIN_SITE_FOLD_NORM_PAIR, // rms_norm_add_rms_norm_ar_split_f32, the lines
     GGML_CUDA_SPIN_SITE_COUNT,
 };
 

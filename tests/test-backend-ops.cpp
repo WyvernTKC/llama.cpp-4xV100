@@ -13992,6 +13992,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_rms_norm_add_rms_norm({n, 1, 1, 1}, scale, 1e-6f, 1e-6f, 256));
             test_cases.emplace_back(new test_rms_norm_add_rms_norm({n, 2, 1, 1}, scale, 1e-6f, 1e-6f, 256));
         }
+        // every columns-per-thread count of the kernel that polls the lines of an all-reduce fold (CUDA:
+        //   GGML_CUDA_AR_FOLD_TEST=1 runs it on one device), with and without the q8_1 copy
+        for (int64_t n : {1024, 1536, 2560, 3584, 4608, 5632, 6656, 8192}) {
+            test_cases.emplace_back(new test_rms_norm_add_rms_norm({n, 1, 1, 1}, scale, 1e-6f, 1e-5f));
+            test_cases.emplace_back(new test_rms_norm_add_rms_norm({n, 1, 1, 1}, scale, 1e-6f, 1e-5f, 256));
+        }
     }
     for (uint32_t n : {1, 511, 700, 1000, 1025, 3000, 5120, 7000, 8192, 33*512}) {
         for (bool multi_add : {false, true}) {

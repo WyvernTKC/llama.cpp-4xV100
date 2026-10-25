@@ -1117,6 +1117,190 @@ static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_f32(
     }
 }
 
+// row_split_reduce of a row whose warps are the first row_warps warps of each block of the launch (the block's other
+//   warps do not take part): the same sum
+template <int row_warps>
+static __device__ __forceinline__ float row_split_reduce_lead(float val, uint4 * slots, const unsigned int tag, const int nwarps_row) {
+    val = warp_reduce_sum(val);
+    const int lane = threadIdx.x % WARP_SIZE;
+    if (lane == 0) {
+        row_split_put(slots + blockIdx.x*row_warps + threadIdx.x/WARP_SIZE, make_float2(val, 0.0f), tag);
+    }
+    val = 0.0f;
+    if (lane < nwarps_row) {
+        val = row_split_get(slots + lane, tag).x;
+    }
+    return warp_reduce_sum(val);
+}
+
+// rms_norm_add_rms_norm_f32 of one row whose x is the sum of an all-reduce fold, polled from its LL lines, not read: the
+//   threads of the 1024-thread layout, split over nsplit blocks as in rms_norm_pre_add_ar_split_f32, are the first warps of
+//   each block of block_size threads, so the values are those of the LL kernel and rms_norm_add_rms_norm_f32. One function
+//   for both sandwich norms of a layer: without s, y is scaled by 1, which is exact. t, if not nullptr, gets the sum. Every
+//   block must be resident at once.
+// A launch this small runs at the speed its warps get their instructions (Volta, cold instruction cache), so each warp
+//   runs few: all warps of a block load its columns of w1, r, s and w2 and poll its lines (2 values each, summed in rank
+//   order as the LL kernels add them) into shared memory, and make its q8_1 blocks; only the norms are left to the first.
+template <int row_threads, int cols_per_thread, int nsplit, int block_size>
+static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_ar_split_f32(const ggml_cuda_ar_fold_args ar,
+        const float * w1, const float * r, const float * s, const float * w2, float * y_out, float * dst, float * t,
+        const int ncols, const float eps1, const float eps2, const bool s_per_col, block_q8_1 * q8_dst, const int nq8,
+        unsigned int * flags) {
+    constexpr int row_block  = row_threads/nsplit;       // the threads of the 1024-thread layout in a block
+    constexpr int row_warps  = row_block/WARP_SIZE;
+    constexpr int nwarps_row = row_threads/WARP_SIZE;
+    constexpr int ncb        = cols_per_thread*row_block; // the block's columns: row_block of them in each slot
+    static_assert(row_block % WARP_SIZE == 0 && ncb/2 <= block_size, "one line per thread");
+    __shared__ float4 vs[4][ncb/4]; // x, w1, r and w2 of the block's columns
+    __shared__ float  ss[ncb];      // s of the block's columns, if one per column
+    float * xs  = (float *) vs[0];
+    float * w1s = (float *) vs[1];
+    float * rs  = (float *) vs[2];
+    float * w2s = (float *) vs[3];
+    ggml_cuda_pdl_lc();
+    const int tx = threadIdx.x;
+
+    uint4 * slots = (uint4 *) (flags + ROW_SPLIT_SLOTS);
+    const unsigned int tag = *(volatile unsigned int *) (flags + ROW_SPLIT_EPOCH) + 1;
+
+    ggml_cuda_pdl_sync();
+    // float4 tx of the block: slot tx/(row_block/4), the row's float4 fi
+    if (tx < ncb/4) {
+        const int fi = (tx/(row_block/4))*(row_threads/4) + blockIdx.x*(row_block/4) + tx % (row_block/4);
+        const bool ok = 4*fi < ncols;
+        const float4 z = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        vs[1][tx] = ok ? ((const float4 *) w1)[fi] : z;
+        vs[2][tx] = ok ? ((const float4 *) r)[fi]  : z;
+        vs[3][tx] = ok ? ((const float4 *) w2)[fi] : z;
+        if (s_per_col) {
+            ((float4 *) ss)[tx] = ok ? ((const float4 *) s)[fi] : z;
+        }
+    }
+    const float s0 = s != nullptr && !s_per_col ? s[0] : 1.0f;
+
+    // line tx of the block: line k = (tx/(row_block/4)) % 2 of float4 tx % (row_block/4) of slot tx/(row_block/2)
+    if (tx < ncb/2) {
+        const int  slot = tx/(row_block/2);
+        const int  k    = (tx/(row_block/4)) % 2;
+        const int  f    = tx % (row_block/4);
+        const int  fi   = slot*(row_threads/4) + blockIdx.x*(row_block/4) + f;
+        const bool ok   = 4*fi < ncols;
+        const uint32_t seq  = ok ? ar.ll_seq[fi/GGML_CUDA_P2P_AR_LL_NTHREADS] + 1 : 0;
+        const uint32_t flag = seq | 1u;
+        const uint4 * p = ar.own + (int64_t) ((seq % GGML_CUDA_P2P_AR_NSLOTS)*ar.n_devs)*ar.ll_stride + ggml_cuda_ar_ll_line(fi, k);
+        uint4 rl[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            if (ok && j < ar.n_devs) {
+                rl[j] = ggml_cuda_ar_ld_ll(p + j*ar.ll_stride);
+            }
+        }
+        const bool arrived = ggml_cuda_spin_until([&]() {
+            bool done = true;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                if (ok && j < ar.n_devs && (rl[j].y != flag || rl[j].w != flag)) {
+                    rl[j] = ggml_cuda_ar_ld_ll(p + j*ar.ll_stride);
+                    done = false;
+                }
+            }
+            return done;
+        });
+        if (!arrived) {
+            ggml_cuda_spin_trap(GGML_CUDA_SPIN_SITE_FOLD_NORM_PAIR, ar.rank, GGML_CUDA_SPIN_PEER_DEVICE);
+        }
+        float a0 = 0.0f;
+        float a1 = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            if (j < ar.n_devs) {
+                a0 += __uint_as_float(rl[j].x);
+                a1 += __uint_as_float(rl[j].z);
+            }
+        }
+        xs[slot*row_block + 4*f + 2*k + 0] = ok ? a0 : 0.0f;
+        xs[slot*row_block + 4*f + 2*k + 1] = ok ? a1 : 0.0f;
+    }
+    __syncthreads();
+
+    if (tx < row_block) {
+        const int tid = blockIdx.x*row_block + tx;
+        float xv[cols_per_thread];
+        float tmp = 0.0f;
+#pragma unroll
+        for (int i = 0; i < cols_per_thread; ++i) {
+            xv[i] = xs[i*row_block + tx];
+            if (tid + i*row_threads < ncols) {
+                tmp += xv[i] * xv[i];
+            }
+        }
+        tmp = row_split_reduce_lead<row_warps>(tmp, slots, tag, nwarps_row);
+        // every block has polled its lines and read the epoch
+        if (blockIdx.x == 0) {
+            if (tx == 0) {
+                *(volatile unsigned int *) (flags + ROW_SPLIT_EPOCH) = tag;
+            }
+            ggml_cuda_ar_fold_done(ar, ncols, tx);
+        }
+        const float scale1 = rsqrtf(tmp / ncols + eps1);
+
+        float tmp2 = 0.0f;
+#pragma unroll
+        for (int i = 0; i < cols_per_thread; ++i) {
+            const int col = tid + i*row_threads;
+            if (col >= ncols) {
+                continue;
+            }
+            if (t != nullptr) {
+                t[col] = xv[i];
+            }
+            float y = scale1 * xv[i] * w1s[i*row_block + tx] + rs[i*row_block + tx];
+            y = __fmul_rn(y, s_per_col ? ss[i*row_block + tx] : s0);
+            y_out[col] = y;
+            xv[i] = y;
+            tmp2 += y * y;
+        }
+        tmp2 = row_split_reduce_lead<row_warps>(tmp2, slots + 32, tag, nwarps_row);
+        const float scale2 = rsqrtf(tmp2 / ncols + eps2);
+
+        // the outputs, in the places of x for the q8_1 blocks (zeros past the row: the padding)
+#pragma unroll
+        for (int i = 0; i < cols_per_thread; ++i) {
+            const int   col = tid + i*row_threads;
+            const float v   = (scale2 * xv[i]) * w2s[i*row_block + tx];
+            if (col < ncols) {
+                dst[col] = v;
+            }
+            xs[i*row_block + tx] = col < ncols ? v : 0.0f;
+        }
+    }
+
+    // q8_1 block i*nwarps_row + w holds the columns of warp w of the 1024-thread layout in slot i: the block's warps take
+    //   its row_warps*cols_per_thread blocks in turn
+    if (q8_dst != nullptr) {
+        __syncthreads();
+        for (int g = tx/WARP_SIZE; g < row_warps*cols_per_thread; g += block_size/WARP_SIZE) {
+            const int i  = g/row_warps;
+            const int w  = g % row_warps;
+            const int ib = i*nwarps_row + blockIdx.x*row_warps + w;
+            if (ib < nq8) {
+                quantize_q8_1_lane(xs[i*row_block + w*WARP_SIZE + tx % WARP_SIZE], q8_dst + ib, tx % WARP_SIZE);
+            }
+        }
+    }
+}
+
+// GGML_CUDA_AR_FOLD_TEST: x as the LL lines of a fold of one rank, for rms_norm_add_rms_norm_ar_split_f32 to poll
+static __global__ void ggml_cuda_ar_fold_test_push(const ggml_cuda_ar_fold_args ar, const float4 * x, const int64_t nvec) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < nvec) {
+        const float4   v   = x[i];
+        const uint32_t seq = ggml_cuda_ar_seq(ar, i);
+        ggml_cuda_ar_fold_push(ar, seq, i, 0, v.x, v.y);
+        ggml_cuda_ar_fold_push(ar, seq, i, 1, v.z, v.w);
+    }
+}
+
 // dst = op(gate) * (rms_norm(x) * mul): the gated output norm of a gated delta net layer (build_norm_gated) in one launch
 //   instead of two. The norm reduces exactly like rms_norm_f32 with the same block size and the gate is applied like in
 //   unary_gated_op_kernel, so the values are those of the separate kernels. x and gate have contiguous rows, dst is
@@ -2206,11 +2390,113 @@ bool ggml_cuda_should_fuse_rms_norm_pair_add(const ggml_tensor * norm_a, const g
         !ggml_cuda_tensors_overlap(mul2, wa) && !ggml_cuda_tensors_overlap(mul2, wb);
 }
 
+bool ggml_cuda_rms_norm_add_rms_norm_ar_supported(const ggml_tensor * norm1, const ggml_tensor * mul1, const ggml_tensor * add,
+                                                  const ggml_tensor * scale, const ggml_tensor * norm2, const ggml_tensor * mul2,
+                                                  const ggml_tensor * t) {
+    if (!ggml_cuda_should_fuse_rms_norm_add_rms_norm(norm1, mul1, add, scale, norm2, mul2)) {
+        return false;
+    }
+    const ggml_tensor * x  = norm1->src[0];
+    const ggml_tensor * w1 = ggml_cuda_other_src(mul1, norm1);
+    const ggml_tensor * r  = ggml_cuda_other_src(add, mul1);
+    const ggml_tensor * s  = scale != nullptr ? ggml_cuda_other_src(scale, add) : nullptr;
+    const ggml_tensor * w2 = ggml_cuda_other_src(mul2, norm2);
+    const int64_t ncols = x->ne[0];
+    const auto aligned = [](const ggml_tensor * a) { return (uintptr_t) a->data % 16 == 0; };
+    // one row of the 1024-thread layout in registers (up to 8 columns per thread) whose x is t, the inputs read as float4s;
+    //   the other inputs are read, and t is not written before the kernel
+    return ggml_nrows(x) == 1 && ncols >= 1024 && ncols <= 8*1024 && ncols % 4 == 0 && x->data == t->data &&
+        ggml_are_same_shape(x, t) && ggml_is_contiguous(t) && aligned(w1) && aligned(r) && aligned(w2) &&
+        (s == nullptr || ggml_nelements(s) == 1 || aligned(s)) && !ggml_cuda_tensors_overlap(t, w1) &&
+        !ggml_cuda_tensors_overlap(t, r) && !ggml_cuda_tensors_overlap(t, w2) && (s == nullptr || !ggml_cuda_tensors_overlap(t, s));
+}
+
+void ggml_cuda_op_rms_norm_add_rms_norm_ar(ggml_backend_cuda_context & ctx, ggml_tensor * norm1, ggml_tensor * mul1, ggml_tensor * add,
+                                           ggml_tensor * scale, ggml_tensor * norm2, ggml_tensor * mul2,
+                                           const ggml_cuda_ar_fold_args & ar, ggml_tensor * t) {
+    const ggml_tensor * w1 = ggml_cuda_other_src(mul1, norm1);
+    const ggml_tensor * r  = ggml_cuda_other_src(add, mul1);
+    const ggml_tensor * s  = scale != nullptr ? ggml_cuda_other_src(scale, add) : nullptr;
+    const ggml_tensor * w2 = ggml_cuda_other_src(mul2, norm2);
+    ggml_tensor       * y  = scale != nullptr ? scale : add;
+
+    float eps1 = 0.0f;
+    float eps2 = 0.0f;
+    memcpy(&eps1, norm1->op_params, sizeof(float));
+    memcpy(&eps2, norm2->op_params, sizeof(float));
+    GGML_ASSERT(eps1 >= 0.0f && eps2 >= 0.0f);
+
+    const int  ncols     = norm1->src[0]->ne[0];
+    const bool s_per_col = s != nullptr && ggml_nelements(s) > 1;
+
+    // the sum is written into t too unless an output sits on it (t is then dead after the norm)
+    float * t_d = t == nullptr || ggml_cuda_tensors_overlap(t, y) || ggml_cuda_tensors_overlap(t, mul2) ? nullptr : (float *) t->data;
+
+    // the q8_1 copy for the matmul that reads the output, see ggml_cuda_q8_1_request
+    block_q8_1 * q8_d = nullptr;
+    int          nq8  = 0;
+    if (ctx.q8_1_emit == mul2 && ggml_is_contiguous(mul2)) {
+        int64_t ne_padded = 0;
+        q8_d = (block_q8_1 *) ctx.q8_1_emit_alloc(mul2, ne_padded);
+        nq8  = (int) (ne_padded / QK8_1);
+    }
+
+    // the 1024-thread layout over 16 blocks, its 64 threads the first two warps of 256
+    constexpr int nsplit     = 16;
+    constexpr int block_size = 256;
+    GGML_ASSERT(ncols >= 1024 && ncols <= 8*1024);
+    const ggml_cuda_kernel_launch_params launch_params{dim3(nsplit, 1, 1), dim3(block_size, 1, 1), 0, ctx.stream()};
+    rms_norm_pre_add_ar_cols<1024, 8>(ncols, [&](auto cols) {
+        constexpr int n = decltype(cols)::value;
+        GGML_ASSERT(nq8 <= n*1024/QK8_1);
+        ggml_cuda_kernel_launch(rms_norm_add_rms_norm_ar_split_f32<1024, n, nsplit, block_size>, launch_params, ar,
+            (const float *) w1->data, (const float *) r->data, s != nullptr ? (const float *) s->data : nullptr,
+            (const float *) w2->data, (float *) y->data, (float *) mul2->data, t_d, ncols, eps1, eps2, s_per_col, q8_d, nq8,
+            ctx.block_flags_get());
+    });
+}
+
+// GGML_CUDA_AR_FOLD_TEST=1: a row the polling kernel of a fold can take runs it on lines this device pushes to itself (a
+//   fold of one rank), so that test-backend-ops reaches it on one device. The lines of each device are made at first use.
+static bool ggml_cuda_rms_norm_add_rms_norm_ar_test(ggml_backend_cuda_context & ctx, ggml_tensor * norm1, ggml_tensor * mul1,
+                                                    ggml_tensor * add, ggml_tensor * scale, ggml_tensor * norm2, ggml_tensor * mul2) {
+    static const bool enabled = getenv("GGML_CUDA_AR_FOLD_TEST") != nullptr;
+    ggml_tensor * x = norm1->src[0];
+    if (!enabled || !ggml_cuda_rms_norm_add_rms_norm_ar_supported(norm1, mul1, add, scale, norm2, mul2, x)) {
+        return false;
+    }
+    constexpr int64_t ne_max = 8*1024;
+    static uint4 *        ll[GGML_CUDA_MAX_DEVICES]     = {};
+    static unsigned int * ll_seq[GGML_CUDA_MAX_DEVICES] = {};
+    ggml_cuda_ar_fold_args ar;
+    ar.ll_stride = 2*ne_max/4;
+    if (ll[ctx.device] == nullptr) {
+        const size_t nb_seq = ne_max/4/GGML_CUDA_P2P_AR_LL_NTHREADS;
+        CUDA_CHECK(cudaMalloc(&ll[ctx.device], GGML_CUDA_P2P_AR_NSLOTS*ar.ll_stride*sizeof(uint4)));
+        CUDA_CHECK(cudaMalloc(&ll_seq[ctx.device], nb_seq*sizeof(unsigned int)));
+        CUDA_CHECK(cudaMemsetAsync(ll[ctx.device], 0, GGML_CUDA_P2P_AR_NSLOTS*ar.ll_stride*sizeof(uint4), ctx.stream()));
+        CUDA_CHECK(cudaMemsetAsync(ll_seq[ctx.device], 0, nb_seq*sizeof(unsigned int), ctx.stream()));
+    }
+    ar.ll[0]  = ll[ctx.device];
+    ar.own    = ll[ctx.device];
+    ar.ll_seq = ll_seq[ctx.device];
+    ar.rank   = 0;
+    ar.n_devs = 1;
+
+    const int64_t nvec = x->ne[0]/4;
+    ggml_cuda_ar_fold_test_push<<<(nvec + 127)/128, 128, 0, ctx.stream()>>>(ar, (const float4 *) x->data, nvec);
+    ggml_cuda_op_rms_norm_add_rms_norm_ar(ctx, norm1, mul1, add, scale, norm2, mul2, ar, nullptr);
+    return true;
+}
+
 void ggml_cuda_op_rms_norm_add_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * norm1, ggml_tensor * mul1, ggml_tensor * add,
                                         ggml_tensor * scale, ggml_tensor * norm2, ggml_tensor * mul2,
                                         const ggml_tensor * norm_a, const ggml_tensor * mul_a,
                                         const ggml_tensor * norm_b, const ggml_tensor * mul_b,
                                         const ggml_tensor * scale2) {
+    if (norm_a == nullptr && scale2 == nullptr && ggml_cuda_rms_norm_add_rms_norm_ar_test(ctx, norm1, mul1, add, scale, norm2, mul2)) {
+        return;
+    }
     const ggml_tensor * x  = norm1->src[0];
     const ggml_tensor * w1 = ggml_cuda_other_src(mul1, norm1);
     const ggml_tensor * r  = ggml_cuda_other_src(add, mul1);

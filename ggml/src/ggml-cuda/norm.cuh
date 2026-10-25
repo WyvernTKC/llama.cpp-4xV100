@@ -67,6 +67,15 @@ void ggml_cuda_op_rms_norm_add_rms_norm(ggml_backend_cuda_context & ctx, ggml_te
                                         const ggml_tensor * norm_b = nullptr, const ggml_tensor * mul_b = nullptr,
                                         const ggml_tensor * scale2 = nullptr);
 
+// the same with the all-reduce of t, the post-norm's input, folded in: t's sum is polled from the LL lines of ar and
+//   written into t if t is not nullptr
+bool ggml_cuda_rms_norm_add_rms_norm_ar_supported(const ggml_tensor * norm1, const ggml_tensor * mul1, const ggml_tensor * add,
+                                                  const ggml_tensor * scale, const ggml_tensor * norm2, const ggml_tensor * mul2,
+                                                  const ggml_tensor * t);
+void ggml_cuda_op_rms_norm_add_rms_norm_ar(ggml_backend_cuda_context & ctx, ggml_tensor * norm1, ggml_tensor * mul1, ggml_tensor * add,
+                                           ggml_tensor * scale, ggml_tensor * norm2, ggml_tensor * mul2,
+                                           const ggml_cuda_ar_fold_args & ar, ggml_tensor * t);
+
 // rms_norm(x) * w * op(z) with op silu or sigmoid, the gated output norm of a gated delta net layer
 bool ggml_cuda_should_fuse_rms_norm_gated(const ggml_tensor * rms_norm, const ggml_tensor * mul, const ggml_tensor * unary,
                                           const ggml_tensor * mul_gate);

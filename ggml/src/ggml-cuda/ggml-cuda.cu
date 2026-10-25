@@ -9165,6 +9165,26 @@ static int ggml_cuda_ar_fold_consume(ggml_backend_cuda_context * cuda_ctx, ggml_
             return 3;
         }
     }
+    // the sandwich norms of gemma after the reduced tensor (post-norm, residual add, layer scale, next pre-norm, see
+    //   ggml_cuda_op_rms_norm_add_rms_norm) in one launch that polls the lines (5 or 6 nodes done): decode gemma-4-31B
+    //   +2.7%, Muse-Glimmer +0.6%. GGML_CUDA_NO_AR_FOLD_SANDWICH=1 turns it off.
+    static const bool no_sandwich = getenv("GGML_CUDA_NO_AR_FOLD_SANDWICH") != nullptr;
+    if (cgraph != nullptr && !no_sandwich && i + 4 < cgraph->n_nodes && cgraph->nodes[i]->op == GGML_OP_RMS_NORM) {
+        ggml_tensor ** n = cgraph->nodes + i;
+        const bool has_scale = n[3]->op == GGML_OP_MUL;
+        const int  n_ops     = has_scale ? 6 : 5;
+        const int  outputs[2] = { i + n_ops - 3, i + n_ops - 1 };
+        const enum ggml_op ops_scale[6] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL, GGML_OP_RMS_NORM, GGML_OP_MUL };
+        const enum ggml_op ops[5]       = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
+        if (i + n_ops <= cgraph->n_nodes &&
+                ggml_cuda_rms_norm_add_rms_norm_ar_supported(n[0], n[1], n[2], has_scale ? n[3] : nullptr, n[n_ops - 2], n[n_ops - 1], t) &&
+                ggml_can_fuse_subgraph(cgraph, i, n_ops, has_scale ? ops_scale : ops, outputs, 2)) {
+            ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + n_ops - 1);
+            ggml_cuda_op_rms_norm_add_rms_norm_ar(*cuda_ctx, n[0], n[1], n[2], has_scale ? n[3] : nullptr, n[n_ops - 2],
+                n[n_ops - 1], c.args, t);
+            return n_ops;
+        }
+    }
     static const bool no_gathered = getenv("GGML_CUDA_NO_AR_FOLD_GATHER") != nullptr;
     if (cgraph != nullptr && !no_gathered && i + 4 < cgraph->n_nodes) {
         ggml_tensor * add  = cgraph->nodes[i + 2];
@@ -11373,7 +11393,7 @@ void ggml_cuda_spin_print() {
         "ggml_cuda_p2p_ar_ll_kernel_n (receive)", "ggml_cuda_p2p_ar_ll_moe_reduce_kernel", "rms_norm_pre_add_ar_f32",
         "rms_norm_pre_add_ar_f32 (q8_1 blocks)", "rms_norm_pre_add_ar_split_f32", "ggml_cuda_ar_kernel", "mul_mat_vec_f_router",
         "hc_post_blocks_sync", "row_split_reduce", "rms_norm_pre_add_f32 (q8_1 blocks)", "rms_norm_add_rms_norm_f32 (q8_1 blocks)",
-        "expert_cpu_wait_add",
+        "expert_cpu_wait_add", "rms_norm_add_rms_norm_ar_split_f32",
     };
     if (ggml_cuda_spin_records == nullptr) {
         return;
