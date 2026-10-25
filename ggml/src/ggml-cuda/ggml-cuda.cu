@@ -9140,14 +9140,17 @@ static bool ggml_cuda_ar_fold_l2_prefetch(const ggml_cgraph * cgraph, const int 
 //   The last layer of a model that keeps only the output rows (inp_out_ids) gathers both inputs of the add first: at one
 //   row with one output that is the identity, so the gathers do not run either (5 nodes done).
 //   cgraph nullptr: the receive half.
-static int ggml_cuda_ar_fold_consume(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+//   t_dry: nothing runs, the result is the number of nodes a launch that polls the lines of t_dry would take there.
+static int ggml_cuda_ar_fold_consume(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i, ggml_tensor * t_dry = nullptr) {
     ggml_backend_cuda_context::ar_fold_t & f = cuda_ctx->ar_fold;
-    if (!f.recv) {
-        return 0;
+    if (t_dry == nullptr) {
+        if (!f.recv) {
+            return 0;
+        }
+        f.recv = false;
     }
-    f.recv = false;
     ggml_backend_cuda_context::ar_fold_call_t & c = f.recv_call;
-    ggml_tensor * t = c.tensors[c.rank];
+    ggml_tensor * t = t_dry != nullptr ? t_dry : c.tensors[c.rank];
     if (cgraph != nullptr && i + 2 < cgraph->n_nodes) {
         ggml_tensor * add  = cgraph->nodes[i];
         ggml_tensor * norm = cgraph->nodes[i + 1];
@@ -9156,6 +9159,9 @@ static int ggml_cuda_ar_fold_consume(ggml_backend_cuda_context * cuda_ctx, ggml_
         const enum ggml_op ops[3] = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
         if (add->op == GGML_OP_ADD && norm->op == GGML_OP_RMS_NORM && mul->op == GGML_OP_MUL &&
                 ggml_cuda_rms_norm_pre_add_ar_supported(add, norm, mul, t) && ggml_can_fuse_subgraph(cgraph, i, 3, ops, outputs, 2)) {
+            if (t_dry != nullptr) {
+                return 3;
+            }
             ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + 2);
             ggml_cuda_l2_prefetch_args pf;
             if (f.l2pf) {
@@ -9179,6 +9185,9 @@ static int ggml_cuda_ar_fold_consume(ggml_backend_cuda_context * cuda_ctx, ggml_
         if (i + n_ops <= cgraph->n_nodes &&
                 ggml_cuda_rms_norm_add_rms_norm_ar_supported(n[0], n[1], n[2], has_scale ? n[3] : nullptr, n[n_ops - 2], n[n_ops - 1], t) &&
                 ggml_can_fuse_subgraph(cgraph, i, n_ops, has_scale ? ops_scale : ops, outputs, 2)) {
+            if (t_dry != nullptr) {
+                return n_ops;
+            }
             ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + n_ops - 1);
             ggml_cuda_op_rms_norm_add_rms_norm_ar(*cuda_ctx, n[0], n[1], n[2], has_scale ? n[3] : nullptr, n[n_ops - 2],
                 n[n_ops - 1], c.args, t);
@@ -9207,6 +9216,9 @@ static int ggml_cuda_ar_fold_consume(ggml_backend_cuda_context * cuda_ctx, ggml_
             norm_s.src[0] = &add_s;
             mul_s.src[mul->src[0] == norm ? 0 : 1] = &norm_s;
             if (ggml_cuda_rms_norm_pre_add_ar_supported(&add_s, &norm_s, &mul_s, t)) {
+                if (t_dry != nullptr) {
+                    return 5;
+                }
                 ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + 4);
                 if (cuda_ctx->q8_1_emit == mul) {
                     cuda_ctx->q8_1_emit = &mul_s;
@@ -9220,9 +9232,23 @@ static int ggml_cuda_ar_fold_consume(ggml_backend_cuda_context * cuda_ctx, ggml_
             }
         }
     }
+    if (t_dry != nullptr) {
+        return 0;
+    }
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(c.comm_ctx);
     ggml_cuda_p2p_ar_launch_ll_recv(comm_ctx->p2p_ar, comm_ctx->backends.data(), c.tensors, c.rank);
     return 0;
+}
+
+// the first node of cgraph that ggml_cuda_graph_evaluate_and_capture launches something for, -1 if none
+static int ggml_cuda_first_compute_node(const ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (!ggml_cuda_is_view_or_noop(node) && (node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
@@ -9557,7 +9583,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         ggml_cuda_ar_fold_consume(cuda_ctx, nullptr, 0);
         return GGML_STATUS_SUCCESS;
     }
-    GGML_ASSERT(!cuda_ctx->ar_fold.recv && cuda_ctx->ar_fold.next == nullptr);
+    GGML_ASSERT(!cuda_ctx->ar_fold.recv && cuda_ctx->ar_fold.next == nullptr && !cuda_ctx->ar_fold.carry);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -9682,7 +9708,10 @@ static int ggml_backend_cuda_session_plan(ggml_backend_t backend, ggml_cgraph **
     return mode;
 }
 
-static void ggml_backend_cuda_session_begin(ggml_backend_t backend, ggml_cgraph ** cgraphs, int n_cgraphs, int mode) {
+// cgraph_next: the first subgraph of the session that follows this one with the all-reduce after the last subgraph
+//   between them, nullptr if none
+static void ggml_backend_cuda_session_begin(ggml_backend_t backend, ggml_cgraph ** cgraphs, int n_cgraphs, int mode,
+        ggml_cgraph * cgraph_next) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     GGML_ASSERT(cuda_ctx->session_mode == ggml_backend_cuda_context::SESSION_OFF && n_cgraphs > 0);
     GGML_ASSERT(mode == ggml_backend_cuda_context::SESSION_EAGER || mode == ggml_backend_cuda_context::SESSION_CAPTURE);
@@ -9736,6 +9765,38 @@ static void ggml_backend_cuda_session_begin(ggml_backend_t backend, ggml_cgraph 
         }
     }
     cuda_ctx->ar_fold.l2pf = l2pf;
+
+    // lines the session before left (see ggml_backend_cuda_session_end): the first subgraph receives them
+    ggml_backend_cuda_context::ar_fold_t & f = cuda_ctx->ar_fold;
+    GGML_ASSERT(!f.recv && f.captured == nullptr);
+    f.carry_in = f.carry;
+    if (f.carry) {
+        f.recv      = true;
+        f.recv_call = f.carry_call;
+        f.carry     = false;
+    }
+
+    static const bool no_carry = getenv("GGML_CUDA_NO_AR_CARRY") != nullptr;
+    f.bound       = nullptr;
+    f.bound_poll  = false;
+    f.bound_match = -1;
+    f.bound_carry = false;
+    if (cgraph_next != nullptr) {
+        const ggml_cgraph * last = cgraphs[n_cgraphs - 1];
+        f.bound = last->nodes[last->n_nodes - 1];
+        const int i_next = ggml_cuda_first_compute_node(cgraph_next);
+        f.bound_poll = !no_carry && i_next >= 0 &&
+            ggml_cuda_ar_fold_consume(cuda_ctx, cgraph_next, i_next, f.bound) > 0;
+#ifdef USE_CUDA_GRAPH
+        // a next session that may be replayed keeps what it was captured with: it is replayed only if the plans of all
+        //   devices, ours too, asked for that
+        const auto it = cuda_ctx->cuda_graphs.find(ggml_cuda_session_key(cgraph_next));
+        if (it != cuda_ctx->cuda_graphs.end() && it->second->instance != nullptr &&
+                it->second->session_want == ggml_backend_cuda_context::SESSION_REPLAY) {
+            f.bound_match = it->second->session_carry_in ? 1 : 0;
+        }
+#endif // USE_CUDA_GRAPH
+    }
 }
 
 // whether the all-reduce of these tensors (one per device) can be part of a session graph
@@ -9760,6 +9821,12 @@ static void ggml_backend_cuda_session_allreduce_next(void * comm_ctx_v, struct g
     // the norm that polls the lines keeps the row in registers, up to 8 columns per thread of its 1024-thread layout (see
     //   rms_norm_pre_add_ar_split_f32)
     const int64_t ncols = ggml_nelements(tensors[rank]);
+    // GGML_CUDA_AR_CARRY_TEST=1: the all-reduce after the last subgraph is not folded but its lines still go to the next
+    //   session, by the push on its own (see ggml_backend_cuda_session_allreduce)
+    static const bool carry_test = getenv("GGML_CUDA_AR_CARRY_TEST") != nullptr;
+    if (carry_test && tensors[rank] == f.bound) {
+        return;
+    }
     if (no_fold || f.hc || ncols > 8*1024 || comm_ctx->p2p_ar == nullptr ||
             !ggml_cuda_p2p_ar_fold_args(comm_ctx->p2p_ar, comm_ctx->backends.data(), tensors, rank, f.next_call.args)) {
         return;
@@ -9779,12 +9846,33 @@ static void ggml_backend_cuda_session_allreduce(void * comm_ctx_v, struct ggml_t
     const bool pushed = f.pushed && f.next == tensors[rank];
     f.next   = nullptr;
     f.pushed = false;
+    // after the last subgraph, see ggml_backend_cuda_session_end
+    const bool bound = tensors[rank] == f.bound;
+    static const bool carry_test = getenv("GGML_CUDA_AR_CARRY_TEST") != nullptr;
+    if (bound) {
+        f.bound_carry = f.bound_match >= 0 ? f.bound_match == 1 : (pushed || carry_test) && f.bound_poll;
+    }
     if (pushed) {
         GGML_ASSERT(!f.recv);
         ggml_cuda_session_reduction_flush(cuda_ctx);
         f.recv_call = f.next_call;
         f.recv      = true;
         return;
+    }
+    // the replayed graph of the next session polls lines that a push made when it was captured: push them on their own
+    if (bound && f.bound_carry) {
+        GGML_ASSERT(!f.recv);
+        ggml_cuda_ar_fold_call & c = f.recv_call;
+        if (comm_ctx->p2p_ar != nullptr && ggml_cuda_p2p_ar_fold_args(comm_ctx->p2p_ar, comm_ctx->backends.data(), tensors, rank, c.args)) {
+            ggml_cuda_session_reduction_flush(cuda_ctx);
+            ggml_cuda_ar_fold_launch_push(c.args, (const float *) tensors[rank]->data, ggml_nelements(tensors[rank]), cuda_ctx->stream());
+            c.comm_ctx = comm_ctx_v;
+            std::copy_n(tensors, comm_ctx->backends.size(), c.tensors);
+            c.rank = rank;
+            f.recv = true;
+            return;
+        }
+        f.bound_carry = false;
     }
     // the MoE sum that ended the subgraph, if it is this all-reduce's input, see ggml_cuda_try_fuse_moe_down_shexp
     ggml_backend_cuda_context::session_reduction_t & red = cuda_ctx->session_red;
@@ -9808,10 +9896,22 @@ static void ggml_backend_cuda_session_end(ggml_backend_t backend) {
     // a sum that ended the last subgraph has no all-reduce after it
     ggml_cuda_set_device(cuda_ctx->device);
     ggml_cuda_session_reduction_flush(cuda_ctx);
-    // the subgraph that reads an all-reduce after the last one is in the next session
+    // The subgraph that reads an all-reduce after the last one is in the next session. If the next session starts with a
+    //   launch that polls the lines of a fold, they are left to it (carry) instead of a receive kernel here: gemma-4-31B
+    //   has 15 of its 120 all-reduces a token there. A session graph keeps what it was captured with, so the next one
+    //   that is replayed decides it (bound_match), and the launch of a replayed graph moves carry on (session_launch).
+    //   GGML_CUDA_NO_AR_CARRY=1 turns it off.
+    ggml_backend_cuda_context::ar_fold_t & f = cuda_ctx->ar_fold;
+    GGML_ASSERT(!f.carry);
+    if (f.recv && f.bound_carry) {
+        f.carry_call = f.recv_call;
+        f.carry      = true;
+        f.recv       = false;
+    }
     ggml_cuda_ar_fold_consume(cuda_ctx, nullptr, 0);
-    cuda_ctx->ar_fold.next   = nullptr;
-    cuda_ctx->ar_fold.pushed = false;
+    f.next   = nullptr;
+    f.pushed = false;
+    f.bound  = nullptr;
     cuda_ctx->session_mode = ggml_backend_cuda_context::SESSION_OFF;
 
 #ifdef USE_CUDA_GRAPH
@@ -9833,6 +9933,10 @@ static void ggml_backend_cuda_session_end(ggml_backend_t backend) {
         for (size_t i = 0; i < graph->session_keys.size(); i++) {
             graph->session_gens[i] = cuda_ctx->cuda_graph(graph->session_keys[i])->props_gen;
         }
+        graph->session_carry_in   = f.carry_in;
+        graph->session_carry_out  = f.carry;
+        graph->session_carry_call = f.carry_call;
+        f.captured = cuda_ctx->session_key;
         if (graph->instance == nullptr) {
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
         } else {
@@ -9850,10 +9954,25 @@ static void ggml_backend_cuda_session_launch(ggml_backend_t backend, ggml_cgraph
     GGML_ASSERT(cuda_ctx->session_mode == ggml_backend_cuda_context::SESSION_OFF && n_cgraphs > 0);
 #ifdef USE_CUDA_GRAPH
     ggml_cuda_set_device(cuda_ctx->device);
-    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(ggml_cuda_session_key(cgraphs[0]));
+    const void * key = ggml_cuda_session_key(cgraphs[0]);
+    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(key);
     GGML_ASSERT(graph->instance != nullptr);
     if (cuda_ctx->device == ggml_cuda_expert_cpu_device()) {
         ggml_cuda_expert_cpu_kick();
+    }
+    // the lines of a fold left between sessions (see ggml_backend_cuda_session_end); those of a graph launched right after
+    //   its capture moved on then
+    ggml_backend_cuda_context::ar_fold_t & f = cuda_ctx->ar_fold;
+    if (f.captured == key) {
+        f.captured = nullptr;
+    } else {
+        GGML_ASSERT(f.captured == nullptr && (f.carry || !graph->session_carry_in));
+        if (f.carry && !graph->session_carry_in) {
+            auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(f.carry_call.comm_ctx);
+            ggml_cuda_p2p_ar_launch_ll_recv(comm_ctx->p2p_ar, comm_ctx->backends.data(), f.carry_call.tensors, f.carry_call.rank);
+        }
+        f.carry      = graph->session_carry_out;
+        f.carry_call = graph->session_carry_call;
     }
     CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
 #else

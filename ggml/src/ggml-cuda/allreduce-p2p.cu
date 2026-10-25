@@ -799,6 +799,23 @@ bool ggml_cuda_p2p_ar_fold_args(const ggml_cuda_p2p_ar * ar, ggml_backend_t * ba
     return true;
 }
 
+static __global__ void ggml_cuda_ar_fold_push_kernel(const ggml_cuda_ar_fold_args a, const float4 * x, const int64_t nvec) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < nvec) {
+        const float4   v   = x[i];
+        const uint32_t seq = ggml_cuda_ar_seq(a, i);
+        ggml_cuda_ar_fold_push(a, seq, i, 0, v.x, v.y);
+        ggml_cuda_ar_fold_push(a, seq, i, 1, v.z, v.w);
+    }
+}
+
+void ggml_cuda_ar_fold_launch_push(const ggml_cuda_ar_fold_args & args, const float * x, const int64_t n, cudaStream_t stream) {
+    const int64_t nvec = n/4;
+    ggml_cuda_ar_fold_push_kernel<<<(nvec + GGML_CUDA_P2P_AR_LL_NTHREADS - 1)/GGML_CUDA_P2P_AR_LL_NTHREADS,
+        GGML_CUDA_P2P_AR_LL_NTHREADS, 0, stream>>>(args, (const float4 *) x, nvec);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void ggml_cuda_p2p_ar_launch_ll_moe_reduce(const ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors,
         size_t rank, const float * experts, const float * weights, int n_used, const float * add_x, const float * add_g) {
     unsigned int contrib_mask = 0;

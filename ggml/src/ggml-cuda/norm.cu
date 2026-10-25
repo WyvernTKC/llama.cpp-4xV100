@@ -1290,17 +1290,6 @@ static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_ar_sp
     }
 }
 
-// GGML_CUDA_AR_FOLD_TEST: x as the LL lines of a fold of one rank, for rms_norm_add_rms_norm_ar_split_f32 to poll
-static __global__ void ggml_cuda_ar_fold_test_push(const ggml_cuda_ar_fold_args ar, const float4 * x, const int64_t nvec) {
-    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
-    if (i < nvec) {
-        const float4   v   = x[i];
-        const uint32_t seq = ggml_cuda_ar_seq(ar, i);
-        ggml_cuda_ar_fold_push(ar, seq, i, 0, v.x, v.y);
-        ggml_cuda_ar_fold_push(ar, seq, i, 1, v.z, v.w);
-    }
-}
-
 // dst = op(gate) * (rms_norm(x) * mul): the gated output norm of a gated delta net layer (build_norm_gated) in one launch
 //   instead of two. The norm reduces exactly like rms_norm_f32 with the same block size and the gate is applied like in
 //   unary_gated_op_kernel, so the values are those of the separate kernels. x and gate have contiguous rows, dst is
@@ -2483,8 +2472,7 @@ static bool ggml_cuda_rms_norm_add_rms_norm_ar_test(ggml_backend_cuda_context & 
     ar.rank   = 0;
     ar.n_devs = 1;
 
-    const int64_t nvec = x->ne[0]/4;
-    ggml_cuda_ar_fold_test_push<<<(nvec + 127)/128, 128, 0, ctx.stream()>>>(ar, (const float4 *) x->data, nvec);
+    ggml_cuda_ar_fold_launch_push(ar, (const float *) x->data, x->ne[0], ctx.stream());
     ggml_cuda_op_rms_norm_add_rms_norm_ar(ctx, norm1, mul1, add, scale, norm2, mul2, ar, nullptr);
     return true;
 }

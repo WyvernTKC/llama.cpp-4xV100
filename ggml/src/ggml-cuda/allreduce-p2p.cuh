@@ -68,6 +68,9 @@ void ggml_cuda_p2p_ar_launch_ll_recv(const ggml_cuda_p2p_ar * ar, ggml_backend_t
 bool ggml_cuda_p2p_ar_fold_args(const ggml_cuda_p2p_ar * ar, ggml_backend_t * backends, ggml_tensor ** tensors, size_t rank,
                                 ggml_cuda_ar_fold_args & args);
 
+// The push of a fold on its own: this rank's n values x as the LL lines of every rank, for a kernel that polls them
+void ggml_cuda_ar_fold_launch_push(const ggml_cuda_ar_fold_args & args, const float * x, int64_t n, cudaStream_t stream);
+
 // The LL scheme of the kernels in allreduce-p2p.cu, for the kernels a fold puts it in. The values of a call are float4s;
 //   LL block b (GGML_CUDA_P2P_AR_LL_NTHREADS float4s) has its own sequence number ll_seq[b]: call seq = ll_seq[b] + 1
 //   uses slot seq % GGML_CUDA_P2P_AR_NSLOTS and flag seq | 1, and its last reader stores seq into ll_seq[b]. Float4 i

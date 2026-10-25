@@ -3925,7 +3925,8 @@ struct ggml_backend_meta_context {
     //   GGML_META_NO_SESSION=1 keeps a launch per subgraph. A plan returns one of these, slowest first.
     enum { SESSION_EAGER = 0, SESSION_CAPTURE = 1, SESSION_REPLAY = 2 };
     typedef int  (*session_plan_t)(ggml_backend_t backend, ggml_cgraph ** cgraphs, int n_cgraphs);
-    typedef void (*session_begin_t)(ggml_backend_t backend, ggml_cgraph ** cgraphs, int n_cgraphs, int mode);
+    // next: the first subgraph of the next chunk, which reads the all-reduce after the last one, nullptr for the last chunk
+    typedef void (*session_begin_t)(ggml_backend_t backend, ggml_cgraph ** cgraphs, int n_cgraphs, int mode, ggml_cgraph * next);
     typedef bool (*session_allreduce_supported_t)(void * comm_ctx, ggml_tensor ** tensors);
     typedef void (*session_allreduce_t)(void * comm_ctx, ggml_tensor ** tensors, size_t rank);
     typedef void (*session_end_t)(ggml_backend_t backend);
@@ -6082,7 +6083,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     if (next < 0) {
                         return;
                     }
-                    backend_ctx->session_begin(backend_j, cgraphs_j + i0, (int) (i1 - i0), next);
+                    backend_ctx->session_begin(backend_j, cgraphs_j + i0, (int) (i1 - i0), next, i1 < n_sess ? cgraphs_j[i1] : nullptr);
                     const size_t i_end = next == ggml_backend_meta_context::SESSION_CAPTURE ? i1 : i0 + 1;
                     for (size_t i = i0; i < i_end; i++) {
                         run_subgraph(j, i);

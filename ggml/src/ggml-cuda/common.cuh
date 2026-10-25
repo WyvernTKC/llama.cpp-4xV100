@@ -1324,6 +1324,25 @@ struct ggml_tensor_extra_gpu {
     cudaEvent_t events[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS]; // events for synchronizing multiple GPUs
 };
 
+// An LL all-reduce folded into the kernels around it (see ggml_cuda_ar_fold_push in allreduce-p2p.cuh): the matmul
+//   that makes this rank's partial sum writes it as the LL lines of every rank, the kernel that reads the sum polls them
+struct ggml_cuda_ar_fold_args {
+    uint4 *        ll[4]     = {};      // the LL staging of every rank
+    uint4 *        own       = nullptr; // that of this rank, ll[rank]
+    unsigned int * ll_seq    = nullptr; // this rank's sequence number per LL block
+    int64_t        ll_stride = 0;       // lines per (slot, rank) region
+    int            rank      = 0;
+    int            n_devs    = 0;
+};
+
+// such an all-reduce of a session, see ggml_backend_cuda_context::ar_fold
+struct ggml_cuda_ar_fold_call {
+    void *                 comm_ctx = nullptr;
+    ggml_tensor *          tensors[GGML_CUDA_MAX_DEVICES] = {};
+    size_t                 rank = 0;
+    ggml_cuda_ar_fold_args args;
+};
+
 
 #if (defined(GGML_CUDA_USE_GRAPHS) || defined(GGML_HIP_GRAPHS)) || defined(GGML_MUSA_GRAPHS)
 #define USE_CUDA_GRAPH
@@ -1365,6 +1384,11 @@ struct ggml_cuda_graph {
     uint64_t captured_gen = 0;
     std::vector<uint64_t> session_gens;
     int warmup_stable = 0;                  // and how many plans in a row found its properties unchanged
+    // a session graph captured with the lines of an all-reduce fold left by the session before it to receive, or leaving
+    //   those of the one after its last subgraph to the next session (see ggml_backend_cuda_session_end)
+    bool                   session_carry_in  = false;
+    bool                   session_carry_out = false;
+    ggml_cuda_ar_fold_call session_carry_call;
 
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
@@ -1545,17 +1569,6 @@ struct ggml_cuda_dsv4_compress_fold {
     float   sm_scale = 1.0f;
 };
 
-// An LL all-reduce folded into the kernels around it (see ggml_cuda_ar_fold_push in allreduce-p2p.cuh): the matmul
-//   that makes this rank's partial sum writes it as the LL lines of every rank, the kernel that reads the sum polls them
-struct ggml_cuda_ar_fold_args {
-    uint4 *        ll[4]     = {};      // the LL staging of every rank
-    uint4 *        own       = nullptr; // that of this rank, ll[rank]
-    unsigned int * ll_seq    = nullptr; // this rank's sequence number per LL block
-    int64_t        ll_stride = 0;       // lines per (slot, rank) region
-    int            rank      = 0;
-    int            n_devs    = 0;
-};
-
 // the MoE all-reduce folded into the expert down projection of one token (see mul_mat_vec_q_short): the last block of a
 //   group of rows to finish sums the experts' rows (dst) and the gated shared expert as moe_weighted_reduction does and
 //   pushes the sums as the LL lines of ar
@@ -1658,13 +1671,10 @@ struct ggml_backend_cuda_context {
     // an all-reduce of a session folded into the kernels around it: next is the node it reduces, announced before its
     //   subgraph runs (ggml_backend_cuda_session_allreduce_next); a matmul writing it pushes its rows as the LL lines of
     //   every rank (pushed), the all-reduce then launches nothing and recv is left for the next subgraph, whose residual
-    //   add and norm poll the lines, else a kernel that only receives (ggml_cuda_ar_fold_consume)
-    struct ar_fold_call_t {
-        void *                 comm_ctx = nullptr;
-        ggml_tensor *          tensors[GGML_CUDA_MAX_DEVICES] = {};
-        size_t                 rank = 0;
-        ggml_cuda_ar_fold_args args;
-    };
+    //   add and norm poll the lines, else a kernel that only receives (ggml_cuda_ar_fold_consume). The lines of the
+    //   all-reduce after the last subgraph of a session can be left to the next session (carry, see
+    //   ggml_backend_cuda_session_end).
+    using ar_fold_call_t = ggml_cuda_ar_fold_call;
     struct ar_fold_t {
         ar_fold_call_t      next_call;
         const ggml_tensor * next   = nullptr;
@@ -1673,6 +1683,14 @@ struct ggml_backend_cuda_context {
         bool                recv   = false;
         bool                hc     = false; // the session has hyper-connection posts, see ggml_backend_cuda_session_begin
         bool                l2pf   = false; // the folded norms prefetch the router after them, see ggml_backend_cuda_session_begin
+        ar_fold_call_t      carry_call;
+        bool                carry       = false;   // lines a session left to the next one
+        bool                carry_in    = false;   // the session started with such lines
+        ggml_tensor *       bound       = nullptr; // the tensor of the all-reduce after the last subgraph, if a session follows
+        bool                bound_poll  = false;   // the first launch of the next session can poll its lines
+        int                 bound_match = -1;      // the carry_in of the next session's graph if that is replayed, else -1
+        bool                bound_carry = false;   // its lines are left to the next session
+        const void *        captured    = nullptr; // the session graph captured last: its launch moves nothing on
     } ar_fold;
 
     // the CONCAT of a build_conv_state whose chain the qkv projection already ran (ggml_cuda_gdn_conv_fold), and the
