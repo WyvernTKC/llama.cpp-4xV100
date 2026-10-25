@@ -1699,8 +1699,9 @@ struct ggml_backend_cuda_context {
     int                 conv_folded_skip   = 0;
 
     // the first node of a topk_moe that a router's launch already ran (ggml_cuda_topk_moe_fold), and its other nodes
-    const ggml_tensor * topk_folded_node = nullptr;
-    int                 topk_folded_skip = 0;
+    const ggml_tensor * topk_folded_node  = nullptr;
+    int                 topk_folded_skip  = 0;
+    const ggml_tensor * topk_folded_defer = nullptr; // the GLU whose gate/up the fold relied on being deferred
 
     ~ggml_backend_cuda_context();
 

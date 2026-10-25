@@ -5872,6 +5872,7 @@ static bool ggml_cuda_topk_moe_launch(ggml_backend_cuda_context * cuda_ctx, cons
 //   the logits, which that block's warp reads first, but not over the launch's inputs or its sibling's output, and no
 //   node in between may touch them. Returns whether it folded; ggml_cuda_try_fuse then skips the topk_moe.
 // With a sibling on Volta, a block of the launch that waits for the logits runs it instead, see mul_mat_vec_f_router.
+static int ggml_cuda_try_defer_glu(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i, const bool dry_run);
 static bool ggml_cuda_topk_moe_fold(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i,
                                    const ggml_tensor * sib_dst, const int last, ggml_cuda_mm_fusion_args_host & fusion) {
     static const bool disabled = getenv("GGML_CUDA_NO_TOPK_FOLD") != nullptr;
@@ -5901,18 +5902,27 @@ static bool ggml_cuda_topk_moe_fold(ggml_backend_cuda_context * cuda_ctx, const 
             return false;
         }
     }
-    // the outputs are written before the nodes in between run: none of them may read or write them, or the logits
+    // the outputs are written before the nodes in between run: none of them may read or write them, or the logits. A GLU
+    //   deferred to the experts' launch (a shared expert, ggml_cuda_try_defer_glu) neither writes its gate and up nor reads
+    //   them, and ggml-alloc may well have put the outputs where they would go; its own output is written after them
     const ggml_tensor * held[3] = { node, p.weights, p.ids };
+    int deferred = -1;
     for (int j = last + 1; j < k; j++) {
         const ggml_tensor * n = cgraph->nodes[j];
         if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        if (deferred < 0 && n->op == GGML_OP_MUL_MAT && ggml_cuda_try_defer_glu(cuda_ctx, cgraph, j, /*dry_run =*/ true) != 0) {
+            deferred = j;
+        }
+        if (deferred >= 0 && j <= deferred + 1) {
             continue;
         }
         for (const ggml_tensor * t : held) {
             if (ggml_cuda_tensors_overlap(n, t)) {
                 return false;
             }
-            for (int s = 0; s < GGML_MAX_SRC; s++) {
+            for (int s = 0; s < GGML_MAX_SRC && (deferred < 0 || j != deferred + 2); s++) {
                 if (n->src[s] != nullptr && ggml_cuda_tensors_overlap(n->src[s], t)) {
                     return false;
                 }
@@ -5940,8 +5950,9 @@ static bool ggml_cuda_topk_moe_fold(ggml_backend_cuda_context * cuda_ctx, const 
     if (!no_wait && volta && node->src[0]->ne[0] % 512 == 0 && sib_dst != nullptr) {
         fusion.topk_slots = (unsigned long long *) (cuda_ctx->block_flags_get() + GGML_CUDA_TOPK_SLOTS);
     }
-    cuda_ctx->topk_folded_node = cgraph->nodes[k];
-    cuda_ctx->topk_folded_skip = p.n_ops - 1;
+    cuda_ctx->topk_folded_node  = cgraph->nodes[k];
+    cuda_ctx->topk_folded_skip  = p.n_ops - 1;
+    cuda_ctx->topk_folded_defer = deferred >= 0 ? cgraph->nodes[deferred + 2] : nullptr;
     return true;
 }
 
@@ -6003,8 +6014,8 @@ static bool ggml_cuda_expert_cache_glu_pair(const ggml_tensor * up, const ggml_t
 // A one-token gate/up GLU (MUL_MAT, MUL_MAT, GLU) with a MUL_MAT_ID gate/up GLU of the same input and matrices of the
 //   same shape after it, e.g. the shared expert of Qwen3.5-MoE built before its routed experts: deferred to that launch,
 //   which runs it as one more channel past the used experts (one launch less per layer). Nothing in between may read its
-//   output or write its input or output. Returns the nodes to skip.
-static int ggml_cuda_try_defer_glu(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i) {
+//   output or write its input or output. Returns the nodes to skip; dry_run only tells.
+static int ggml_cuda_try_defer_glu(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i, const bool dry_run) {
     static const bool disabled = getenv("GGML_CUDA_NO_DEFER_GLU") != nullptr;
     if (disabled || cuda_ctx->glu_deferred.glu != nullptr ||
             !ggml_cuda_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, {})) {
@@ -6059,7 +6070,9 @@ static int ggml_cuda_try_defer_glu(ggml_backend_cuda_context * cuda_ctx, const g
             if (!ok) {
                 return 0;
             }
-            cuda_ctx->glu_deferred = { up, gate, glu, j };
+            if (!dry_run) {
+                cuda_ctx->glu_deferred = { up, gate, glu, j };
+            }
             return 2;
         }
         if (ggml_cuda_is_view_or_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
@@ -7343,7 +7356,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return cuda_ctx->conv_folded_skip;
     }
     if (node == cuda_ctx->topk_folded_node) {
-        cuda_ctx->topk_folded_node = nullptr;
+        // the fold let the gate/up of this GLU lie over its outputs: they must not have run
+        GGML_ASSERT(cuda_ctx->topk_folded_defer == nullptr || cuda_ctx->glu_deferred.glu == cuda_ctx->topk_folded_defer);
+        cuda_ctx->topk_folded_node  = nullptr;
+        cuda_ctx->topk_folded_defer = nullptr;
         return cuda_ctx->topk_folded_skip;
     }
 
@@ -7415,7 +7431,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (node->op == GGML_OP_MUL_MAT) {
-        const int n_skip = ggml_cuda_try_defer_glu(cuda_ctx, cgraph, i);
+        const int n_skip = ggml_cuda_try_defer_glu(cuda_ctx, cgraph, i, /*dry_run =*/ false);
         if (n_skip != 0) {
             return n_skip;
         }
