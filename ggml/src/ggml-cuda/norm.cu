@@ -1290,6 +1290,177 @@ static __global__ void __launch_bounds__(block_size) rms_norm_add_rms_norm_ar_sp
     }
 }
 
+// rms_norm_pre_add_ar_split_f32 with the work of a block spread over block_size threads (the 1024-thread layout over
+//   nsplit blocks is the first warps of each block), as in rms_norm_add_rms_norm_ar_split_f32: a launch this small runs at
+//   the speed its warps get their instructions, so the warps that poll the lines and reduce the row run little else.
+//   Threads that poll no line load b and mul (and prefetch with l2pf); the polling threads sum the 2 values of a line in
+//   rank order; after the reduction all warps make the q8_1 blocks and write the outputs from shared memory. The values
+//   are those of rms_norm_pre_add_ar_split_f32.
+template <int row_threads, int cols_per_thread, int nsplit, int block_size, bool l2pf>
+static __global__ void __launch_bounds__(block_size) rms_norm_pre_add_ar_lean_f32(const ggml_cuda_ar_fold_args ar,
+        const float * b, float * sum, float * dst, float * t, const int ncols, const float eps, const float * mul,
+        block_q8_1 * q8_dst, const int nq8, unsigned int * flags,
+        const std::conditional_t<l2pf, ggml_cuda_l2_prefetch_args, ggml_cuda_no_args> pf) {
+    constexpr int row_block  = row_threads/nsplit;       // the threads of the 1024-thread layout in a block
+    constexpr int row_warps  = row_block/WARP_SIZE;
+    constexpr int nwarps_row = row_threads/WARP_SIZE;
+    constexpr int ncb        = cols_per_thread*row_block; // the block's columns: row_block of them in each slot
+    constexpr int nlines     = ncb/2;                     // its lines, one per thread from 0
+    constexpr int nload      = (ncb + block_size - 1)/block_size;
+    constexpr int pf_first   = block_size - nlines >= block_size/4 ? nlines : 0; // the threads that prefetch
+    static_assert(row_block % WARP_SIZE == 0 && nlines <= block_size, "one line per thread");
+    __shared__ float xs[ncb]; // the sums of the lines
+    __shared__ float bs[ncb];
+    __shared__ float ms[ncb];
+    __shared__ float scale_s;
+    ggml_cuda_pdl_lc();
+    const int tx   = threadIdx.x;
+    const int lane = tx % WARP_SIZE;
+
+    uint4 * slots = (uint4 *) (flags + ROW_SPLIT_SLOTS);
+    const unsigned int tag = *(volatile unsigned int *) (flags + ROW_SPLIT_EPOCH) + 1;
+
+    // column c of the block is this column of the row
+    const auto row_col = [](const int c) {
+        return (c/row_block)*row_threads + blockIdx.x*row_block + c % row_block;
+    };
+
+    ggml_cuda_pdl_sync();
+    // b and mul, from the threads past the lines first, into shared memory after the lines
+    float bv[nload];
+    float mv[nload];
+#pragma unroll
+    for (int i = 0; i < nload; ++i) {
+        const int  c  = (tx + block_size - nlines) % block_size + i*block_size;
+        const bool ok = c < ncb && row_col(c) < ncols;
+        bv[i] = ok ? b[row_col(c)]   : 0.0f;
+        mv[i] = ok ? mul[row_col(c)] : 0.0f;
+    }
+    if constexpr (l2pf) {
+        // prefetch.global.L2 fetches 64 bytes on Volta
+        if (tx >= pf_first) {
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                for (int off = (blockIdx.x*(block_size - pf_first) + tx - pf_first)*64; off < pf.bytes[k]; off += nsplit*(block_size - pf_first)*64) {
+                    asm volatile("prefetch.global.L2 [%0];" :: "l"(pf.ptr[k] + off));
+                }
+            }
+        }
+    }
+
+    // line tx of the block: line k = (tx/(row_block/4)) % 2 of float4 tx % (row_block/4) of slot tx/(row_block/2)
+    if (tx < nlines) {
+        const int  slot = tx/(row_block/2);
+        const int  k    = (tx/(row_block/4)) % 2;
+        const int  f    = tx % (row_block/4);
+        const int  fi   = slot*(row_threads/4) + blockIdx.x*(row_block/4) + f;
+        const bool ok   = 4*fi < ncols;
+        // the line in the region of rank 0 of the first LL slot, made while the sequence number comes
+        const uint4 *  p0   = ar.own + ggml_cuda_ar_ll_line(fi, k);
+        const int64_t  d1   = (int64_t) ar.n_devs*ar.ll_stride;
+        const uint32_t seq  = ok ? ar.ll_seq[fi/GGML_CUDA_P2P_AR_LL_NTHREADS] + 1 : 0;
+        const uint32_t flag = seq | 1u;
+        const uint4 *  p    = seq % GGML_CUDA_P2P_AR_NSLOTS != 0 ? p0 + d1 : p0;
+        uint4 rl[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            if (ok && j < ar.n_devs) {
+                rl[j] = ggml_cuda_ar_ld_ll(p + j*ar.ll_stride);
+            }
+        }
+        const bool arrived = ggml_cuda_spin_until([&]() {
+            bool done = true;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                if (ok && j < ar.n_devs && (rl[j].y != flag || rl[j].w != flag)) {
+                    rl[j] = ggml_cuda_ar_ld_ll(p + j*ar.ll_stride);
+                    done = false;
+                }
+            }
+            return done;
+        });
+        if (!arrived) {
+            ggml_cuda_spin_trap(GGML_CUDA_SPIN_SITE_FOLD_NORM_SPLIT, ar.rank, GGML_CUDA_SPIN_PEER_DEVICE);
+        }
+        float a0 = 0.0f;
+        float a1 = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            if (j < ar.n_devs) {
+                a0 += __uint_as_float(rl[j].x);
+                a1 += __uint_as_float(rl[j].z);
+            }
+        }
+        xs[slot*row_block + 4*f + 2*k + 0] = ok ? a0 : 0.0f;
+        xs[slot*row_block + 4*f + 2*k + 1] = ok ? a1 : 0.0f;
+    }
+#pragma unroll
+    for (int i = 0; i < nload; ++i) {
+        const int c = (tx + block_size - nlines) % block_size + i*block_size;
+        if (c < ncb) {
+            bs[c] = bv[i];
+            ms[c] = mv[i];
+        }
+    }
+    __syncthreads();
+
+    if (tx < row_block) {
+        const int tid = blockIdx.x*row_block + tx;
+        float tmp = 0.0f;
+#pragma unroll
+        for (int i = 0; i < cols_per_thread; ++i) {
+            if (tid + i*row_threads < ncols) {
+                const float x = xs[i*row_block + tx] + bs[i*row_block + tx];
+                tmp += x * x;
+            }
+        }
+        tmp = row_split_reduce_lead<row_warps>(tmp, slots, tag, nwarps_row);
+        if (tx == 0) {
+            const float mean = tmp / ncols;
+            scale_s = rsqrtf(mean + eps);
+        }
+    }
+    __syncthreads();
+    const float scale = scale_s;
+
+    // every block has polled its lines and read the epoch: the last warp of block 0 moves them on
+    if (blockIdx.x == 0 && tx >= block_size - WARP_SIZE) {
+        if (lane == 0) {
+            *(volatile unsigned int *) (flags + ROW_SPLIT_EPOCH) = tag;
+        }
+        ggml_cuda_ar_fold_done(ar, ncols, lane);
+    }
+
+    // q8_1 block i*nwarps_row + w holds the columns of warp w of the 1024-thread layout in slot i (zeros past the row: the
+    //   padding): the block's warps take its row_warps*cols_per_thread blocks in turn
+    if (q8_dst != nullptr) {
+        for (int g = tx/WARP_SIZE; g < row_warps*cols_per_thread; g += block_size/WARP_SIZE) {
+            const int i  = g/row_warps;
+            const int w  = g % row_warps;
+            const int ib = i*nwarps_row + blockIdx.x*row_warps + w;
+            const int c  = i*row_block + w*WARP_SIZE + lane;
+            if (ib < nq8) {
+                const float v = row_col(c) < ncols ? scale * (xs[c] + bs[c]) * ms[c] : 0.0f;
+                quantize_q8_1_lane(v, q8_dst + ib, lane);
+            }
+        }
+    }
+
+    // the outputs, from the threads past the first q8_1 blocks first
+    for (int c = (tx + block_size/2) % block_size; c < ncb; c += block_size) {
+        const int col = row_col(c);
+        if (col < ncols) {
+            const float s = xs[c];
+            const float x = s + bs[c];
+            if (t != nullptr) {
+                t[col] = s;
+            }
+            sum[col] = x;
+            dst[col] = scale * x * ms[c];
+        }
+    }
+}
+
 // dst = op(gate) * (rms_norm(x) * mul): the gated output norm of a gated delta net layer (build_norm_gated) in one launch
 //   instead of two. The norm reduces exactly like rms_norm_f32 with the same block size and the gate is applied like in
 //   unary_gated_op_kernel, so the values are those of the separate kernels. x and gate have contiguous rows, dst is
@@ -2142,7 +2313,52 @@ static void rms_norm_pre_add_cuda(ggml_backend_cuda_context & ctx, const float *
     }
 }
 
+// GGML_CUDA_AR_FOLD_TEST=1: a row the polling kernel of a fold can take runs it on lines this device pushes to itself (a
+//   fold of one rank), so that test-backend-ops reaches it on one device; =2 takes the instances that prefetch. The lines
+//   of each device are made at first use.
+static int ggml_cuda_ar_fold_test_mode() {
+    static const char * env  = getenv("GGML_CUDA_AR_FOLD_TEST");
+    static const int    mode = env == nullptr ? 0 : (atoi(env) == 2 ? 2 : 1);
+    return mode;
+}
+
+// the lines of such a fold of one rank, with the row x pushed into them
+static ggml_cuda_ar_fold_args ggml_cuda_ar_fold_test_push(ggml_backend_cuda_context & ctx, const ggml_tensor * x) {
+    constexpr int64_t ne_max = 8*1024;
+    static uint4 *        ll[GGML_CUDA_MAX_DEVICES]     = {};
+    static unsigned int * ll_seq[GGML_CUDA_MAX_DEVICES] = {};
+    GGML_ASSERT(x->ne[0] <= ne_max);
+    ggml_cuda_ar_fold_args ar;
+    ar.ll_stride = 2*ne_max/4;
+    if (ll[ctx.device] == nullptr) {
+        const size_t nb_seq = ne_max/4/GGML_CUDA_P2P_AR_LL_NTHREADS;
+        CUDA_CHECK(cudaMalloc(&ll[ctx.device], GGML_CUDA_P2P_AR_NSLOTS*ar.ll_stride*sizeof(uint4)));
+        CUDA_CHECK(cudaMalloc(&ll_seq[ctx.device], nb_seq*sizeof(unsigned int)));
+        CUDA_CHECK(cudaMemsetAsync(ll[ctx.device], 0, GGML_CUDA_P2P_AR_NSLOTS*ar.ll_stride*sizeof(uint4), ctx.stream()));
+        CUDA_CHECK(cudaMemsetAsync(ll_seq[ctx.device], 0, nb_seq*sizeof(unsigned int), ctx.stream()));
+    }
+    ar.ll[0]  = ll[ctx.device];
+    ar.own    = ll[ctx.device];
+    ar.ll_seq = ll_seq[ctx.device];
+    ar.rank   = 0;
+    ar.n_devs = 1;
+
+    ggml_cuda_ar_fold_launch_push(ar, (const float *) x->data, x->ne[0], ctx.stream());
+    return ar;
+}
+
 void ggml_cuda_op_rms_norm_pre_add(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * rms_norm, ggml_tensor * mul) {
+    // the test of the fold: the first input of the add is the reduced tensor
+    ggml_tensor * t = add->src[0];
+    if (ggml_cuda_ar_fold_test_mode() != 0 && ggml_cuda_rms_norm_pre_add_ar_supported(add, rms_norm, mul, t)) {
+        const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+        ggml_cuda_l2_prefetch_args pf;
+        pf.ptr[0]   = (const char *) w->data;
+        pf.bytes[0] = (int) ggml_nbytes(w);
+        ggml_cuda_op_rms_norm_pre_add_ar(ctx, add, rms_norm, mul, ggml_cuda_ar_fold_test_push(ctx, t), t,
+            ggml_cuda_ar_fold_test_mode() == 2 ? &pf : nullptr);
+        return;
+    }
     rms_norm_pre_add_cuda<false>(ctx, (const float *) add->src[0]->data, (const float *) add->src[1]->data, nullptr, nullptr,
                                  add, rms_norm, mul);
 }
@@ -2203,6 +2419,30 @@ void ggml_cuda_op_rms_norm_pre_add_ar(ggml_backend_cuda_context & ctx, ggml_tens
     // the 1024-thread layout over 16 blocks of 64 threads: one block (and each q8_1 block) polling the whole row was bound
     //   by its SM's loads, 4 ranks x 8 bytes per value (Ornith, 2048 values: tg +1.6%; Qwen3.8-27B, 5120: the fold went
     //   from 4% slower than none to 0.9% faster)
+    // each block of 64 threads of that layout the first warps of 256 that share its loads, lines and q8_1 blocks (see
+    //   rms_norm_pre_add_ar_lean_f32): Ornith tg +0.5%, Sage-A1.5 +1.0% (d0), Qwen3.8-27B +0.45% (d8192).
+    //   GGML_CUDA_NO_AR_FOLD_LEAN=1 turns it off.
+    static const bool no_lean = getenv("GGML_CUDA_NO_AR_FOLD_LEAN") != nullptr;
+    if (block_size == 1024 && !no_lean) {
+        constexpr int nsplit     = 16;
+        constexpr int lean_block = 256;
+        GGML_ASSERT(ncols <= 8*block_size);
+        const ggml_cuda_kernel_launch_params launch_params{dim3(nsplit, 1, 1), dim3(lean_block, 1, 1), 0, ctx.stream()};
+        rms_norm_pre_add_ar_cols<1024, 8>(ncols, [&](auto cols) {
+            constexpr int n = decltype(cols)::value;
+            GGML_ASSERT(nq8 <= n*1024/QK8_1);
+            if (pf != nullptr) {
+                ggml_cuda_kernel_launch(rms_norm_pre_add_ar_lean_f32<1024, n, nsplit, lean_block, true>, launch_params, ar,
+                    (const float *) b->data, (float *) add->data, (float *) mul->data, t_d, ncols, eps, (const float *) w->data,
+                    q8_d, nq8, ctx.block_flags_get(), *pf);
+            } else {
+                ggml_cuda_kernel_launch(rms_norm_pre_add_ar_lean_f32<1024, n, nsplit, lean_block, false>, launch_params, ar,
+                    (const float *) b->data, (float *) add->data, (float *) mul->data, t_d, ncols, eps, (const float *) w->data,
+                    q8_d, nq8, ctx.block_flags_get(), ggml_cuda_no_args{});
+            }
+        });
+        return;
+    }
     if (block_size == 1024) {
         constexpr int nsplit = 16;
         GGML_ASSERT(ncols <= 8*block_size);
@@ -2445,35 +2685,14 @@ void ggml_cuda_op_rms_norm_add_rms_norm_ar(ggml_backend_cuda_context & ctx, ggml
     });
 }
 
-// GGML_CUDA_AR_FOLD_TEST=1: a row the polling kernel of a fold can take runs it on lines this device pushes to itself (a
-//   fold of one rank), so that test-backend-ops reaches it on one device. The lines of each device are made at first use.
+// the test of the fold, see ggml_cuda_ar_fold_test_mode
 static bool ggml_cuda_rms_norm_add_rms_norm_ar_test(ggml_backend_cuda_context & ctx, ggml_tensor * norm1, ggml_tensor * mul1,
                                                     ggml_tensor * add, ggml_tensor * scale, ggml_tensor * norm2, ggml_tensor * mul2) {
-    static const bool enabled = getenv("GGML_CUDA_AR_FOLD_TEST") != nullptr;
     ggml_tensor * x = norm1->src[0];
-    if (!enabled || !ggml_cuda_rms_norm_add_rms_norm_ar_supported(norm1, mul1, add, scale, norm2, mul2, x)) {
+    if (ggml_cuda_ar_fold_test_mode() == 0 || !ggml_cuda_rms_norm_add_rms_norm_ar_supported(norm1, mul1, add, scale, norm2, mul2, x)) {
         return false;
     }
-    constexpr int64_t ne_max = 8*1024;
-    static uint4 *        ll[GGML_CUDA_MAX_DEVICES]     = {};
-    static unsigned int * ll_seq[GGML_CUDA_MAX_DEVICES] = {};
-    ggml_cuda_ar_fold_args ar;
-    ar.ll_stride = 2*ne_max/4;
-    if (ll[ctx.device] == nullptr) {
-        const size_t nb_seq = ne_max/4/GGML_CUDA_P2P_AR_LL_NTHREADS;
-        CUDA_CHECK(cudaMalloc(&ll[ctx.device], GGML_CUDA_P2P_AR_NSLOTS*ar.ll_stride*sizeof(uint4)));
-        CUDA_CHECK(cudaMalloc(&ll_seq[ctx.device], nb_seq*sizeof(unsigned int)));
-        CUDA_CHECK(cudaMemsetAsync(ll[ctx.device], 0, GGML_CUDA_P2P_AR_NSLOTS*ar.ll_stride*sizeof(uint4), ctx.stream()));
-        CUDA_CHECK(cudaMemsetAsync(ll_seq[ctx.device], 0, nb_seq*sizeof(unsigned int), ctx.stream()));
-    }
-    ar.ll[0]  = ll[ctx.device];
-    ar.own    = ll[ctx.device];
-    ar.ll_seq = ll_seq[ctx.device];
-    ar.rank   = 0;
-    ar.n_devs = 1;
-
-    ggml_cuda_ar_fold_launch_push(ar, (const float *) x->data, x->ne[0], ctx.stream());
-    ggml_cuda_op_rms_norm_add_rms_norm_ar(ctx, norm1, mul1, add, scale, norm2, mul2, ar, nullptr);
+    ggml_cuda_op_rms_norm_add_rms_norm_ar(ctx, norm1, mul1, add, scale, norm2, mul2, ggml_cuda_ar_fold_test_push(ctx, x), nullptr);
     return true;
 }
 
