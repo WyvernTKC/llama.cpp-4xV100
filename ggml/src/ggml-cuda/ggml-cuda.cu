@@ -7568,8 +7568,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
-            // The kernel reads only the experts, the expert scales and the router weights. Under -sm tensor only the
-            //   one-token deps of ggml_backend_cuda_graph_alloc_deps are made, so ggml-alloc can put dst over the weights,
+            // The kernel reads only the experts, the expert scales and the router weights. Under -sm tensor the alloc deps
+            //   that keep the weights are made only with GGML_CUDA_ALLOC_DEPS=all, so ggml-alloc can put dst over the weights,
             //   which the elided MUL read last: a block reads its token's
             //   weights before it writes, and with several tokens the kernel reads a copy. Over the experts, dst can
             //   only sit on the rows of a lone token, which the threads read before they write the same columns.
@@ -10026,12 +10026,20 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
 //   without them ggml-alloc may put an output of the group over that input, and the address checks of the fusion then
 //   refuse it by layout luck. No node moves here, so the meta backend (-sm tensor) makes them for its graphs too: the
 //   tensors of a device sit at the offsets of the meta tensors. Only at the sizes the fusions run at, so the layout of a
-//   prefill graph does not change, and each keeps only what the checks of its fusion read: a longer lifetime moves the
-//   layout, and another fusion may then refuse by luck (compare the kernel counts of a decode with GGML_META_NO_ALLOC_DEPS=1).
+//   prefill graph does not change, and each keeps only what the checks of its fusion read.
+// GGML_CUDA_ALLOC_DEPS: unset - the deps of the fusions seen to drop by layout (dsv4_hc_up_pre, after the device KQ mask
+//   moved the layout), 0 - none, all - every dep below. All of them keep the fusions of a decode independent of the
+//   layout, but the layout they give cost 0.2-0.6% decode on Ornith, Sage, gemma and Qwen3.8-27B with the same kernels
+//   (less reuse of memory); use it to tell a fusion dropped by layout luck from a real change in an A/B (kernel counts).
 static void ggml_backend_cuda_graph_alloc_deps(ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
-    if (ggml_cuda_fusion_disabled()) {
+    static const int mode = [] {
+        const char * env = getenv("GGML_CUDA_ALLOC_DEPS");
+        return env == nullptr ? 1 : strcmp(env, "all") == 0 ? 2 : atoi(env) != 0 ? 1 : 0;
+    }();
+    if (ggml_cuda_fusion_disabled() || mode == 0) {
         return;
     }
+    const bool all = mode == 2;
     ggml_tensor ** nodes   = cgraph->nodes;
     const int      n_nodes = cgraph->n_nodes;
 
@@ -10056,13 +10064,41 @@ static void ggml_backend_cuda_graph_alloc_deps(ggml_cgraph * cgraph, ggml_backen
             }
         }
     };
+    // the last node that reads each tensor, directly or through a view
+    std::unordered_map<const ggml_tensor *, int> last_read;
+    for (int i = 0; all && i < n_nodes; ++i) {
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * src = nodes[i]->src[j];
+            if (src != nullptr) {
+                last_read[src->view_src != nullptr ? src->view_src : src] = i;
+            }
+        }
+    }
+    // the src whose memory ggml-alloc gives node i in place (the first one it is the last reader of, of the same layout)
+    const auto inplace_src = [&](int i) -> const ggml_tensor * {
+        const ggml_tensor * node = nodes[i];
+        for (int j = 0; ggml_op_can_inplace(node->op) && j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * src = node->src[j];
+            if (src != nullptr && src->data == nullptr && src->view_src == nullptr && !(src->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                    ggml_are_same_layout(node, src)) {
+                const auto it = last_read.find(src);
+                if (it != last_read.end() && it->second == i) {
+                    return src;
+                }
+            }
+        }
+        return nullptr;
+    };
     // the srcs of the nodes [start, last] that come from outside them until the node last: a launch that elides the
-    //   nodes in between reads them while it writes its outputs
+    //   nodes in between reads them while it writes its outputs. Not the one the first node takes in place: the launch
+    //   may write exactly over it, and keeping it would only cost that reuse (the all-reduce fold then also stores the
+    //   reduced tensor)
     const auto keep_inputs = [&](int start, int last) {
+        const ggml_tensor * inplace = inplace_src(start);
         for (int i = start; i <= last; ++i) {
             for (int j = 0; j < GGML_MAX_SRC; ++j) {
                 const ggml_tensor * src = nodes[i]->src[j];
-                bool inner = src == nullptr;
+                bool inner = src == nullptr || src == inplace;
                 for (int k = start; k < i && !inner; ++k) {
                     inner = src == nodes[k] || src->view_src == nodes[k];
                 }
@@ -10096,7 +10132,7 @@ static void ggml_backend_cuda_graph_alloc_deps(ggml_cgraph * cgraph, ggml_backen
         //   cache row, the ids and the new tokens while it writes the SILU after the SSM_CONV, and at one token it runs in
         //   the epilogue of the projection the new tokens view (ggml_cuda_gdn_conv_fold); from that projection or the
         //   GET_ROWS of the cache row, whichever comes first
-        if (node->op == GGML_OP_CONCAT && node->src[0] != nullptr && node->src[1] != nullptr) {
+        if (all && node->op == GGML_OP_CONCAT && node->src[0] != nullptr && node->src[1] != nullptr) {
             int conv = -1;
             for (int k = i + 1; k < n_nodes && k <= i + 64; k++) {
                 if (nodes[k]->op == GGML_OP_SSM_CONV && nodes[k]->src[0] == node) {
@@ -10126,8 +10162,8 @@ static void ggml_backend_cuda_graph_alloc_deps(ggml_cgraph * cgraph, ggml_backen
 
         // the top-k fold of a router (ggml_cuda_topk_moe_fold): its launch writes the expert selection before the nodes up
         //   to the topk_moe run, so what they touch must not lie under it
-        if (node->op == GGML_OP_MUL_MAT && ggml_nrows(node) == 1 && i + 2 < n_nodes && nodes[i + 1]->op == GGML_OP_MUL_MAT &&
-                nodes[i + 1]->src[1] == node->src[1]) {
+        if (all && node->op == GGML_OP_MUL_MAT && ggml_nrows(node) == 1 && i + 2 < n_nodes &&
+                nodes[i + 1]->op == GGML_OP_MUL_MAT && nodes[i + 1]->src[1] == node->src[1]) {
             for (int k = i + 2; k < n_nodes && k <= i + 17; k++) {
                 const ggml_tensor * g = nodes[k];
                 if ((g->op == GGML_OP_SOFT_MAX || g->op == GGML_OP_UNARY || g->op == GGML_OP_ARGSORT) && g->src[0] == node) {
@@ -10151,7 +10187,7 @@ static void ggml_backend_cuda_graph_alloc_deps(ggml_cgraph * cgraph, ggml_backen
         //   expert added (ggml_cuda_try_fuse_moe_down_shexp) or alone: it reads the router weights, the expert scales and the
         //   gate (the sum may sit on the rows of the experts)
         ggml_cuda_moe_weighted_reduction_match match;
-        if (node->op == GGML_OP_MUL && ggml_cuda_match_moe_weighted_reduction(cgraph, i, match) &&
+        if (all && node->op == GGML_OP_MUL && ggml_cuda_match_moe_weighted_reduction(cgraph, i, match) &&
                 match.dst->ne[1] == 1) {
             const ggml_tensor * dst = match.dst;
             const ggml_tensor * g   = nullptr;
@@ -10176,7 +10212,7 @@ static void ggml_backend_cuda_graph_alloc_deps(ggml_cgraph * cgraph, ggml_backen
 
         // the gate and up projections of a few tokens and their GLU in one launch (ggml_cuda_can_fuse): the GLU is written
         //   while the input is read
-        if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[1] != nullptr &&
+        if (all && (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[1] != nullptr &&
                 ggml_nrows(node->src[1]) <= MMVQ_MAX_BATCH_SIZE) {
             const ggml_op mm      = node->op;
             const ggml_op bias    = mm == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
@@ -10193,7 +10229,7 @@ static void ggml_backend_cuda_graph_alloc_deps(ggml_cgraph * cgraph, ggml_backen
 
         // a gated norm in the prologue of the matmul that reads it (ggml_cuda_try_fuse_norm_gated_mm): the launch reads x
         //   and the gate while it writes the matmul
-        if (node->op == GGML_OP_RMS_NORM && i + 4 < n_nodes && nodes[i + 1]->op == GGML_OP_MUL &&
+        if (all && node->op == GGML_OP_RMS_NORM && i + 4 < n_nodes && nodes[i + 1]->op == GGML_OP_MUL &&
                 nodes[i + 2]->op == GGML_OP_UNARY && nodes[i + 3]->op == GGML_OP_MUL) {
             int j = i + 4;
             while (j < n_nodes && j - i < 7 && nodes[j]->op == GGML_OP_RESHAPE) {
@@ -10206,13 +10242,13 @@ static void ggml_backend_cuda_graph_alloc_deps(ggml_cgraph * cgraph, ggml_backen
 
         // a GET_ROWS and the ADD that reads it in one launch (ggml_cuda_should_fuse_get_rows_add), a few rows: the launch
         //   reads the source rows while it writes the sum
-        if (node->op == GGML_OP_GET_ROWS && i + 1 < n_nodes && nodes[i + 1]->op == GGML_OP_ADD &&
+        if (all && node->op == GGML_OP_GET_ROWS && i + 1 < n_nodes && nodes[i + 1]->op == GGML_OP_ADD &&
                 (nodes[i + 1]->src[0] == node || nodes[i + 1]->src[1] == node) && ggml_nrows(node) <= MMVQ_MAX_BATCH_SIZE) {
             keep_inputs(i, i + 1);
         }
 
         // the add and norms after an all-reduce that poll its lines (ggml_cuda_ar_fold_consume), one row
-        if (ggml_nrows(node) == 1) {
+        if (all && ggml_nrows(node) == 1) {
             static const ggml_op add_norm[3]  = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
             static const ggml_op gathered[5]  = { GGML_OP_GET_ROWS, GGML_OP_GET_ROWS, GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
             static const ggml_op sandwich[5]  = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };

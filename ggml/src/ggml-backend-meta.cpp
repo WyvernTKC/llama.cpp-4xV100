@@ -6314,12 +6314,11 @@ static void ggml_backend_meta_event_wait(ggml_backend_t backend, ggml_backend_ev
 }
 
 // The scheduler allocates the meta graph, and the tensors of a device sit at the offsets of the meta tensors: the alloc deps
-//   that keep the fusions of the devices off ggml-alloc layout luck are made here. The nodes keep their order.
-//   GGML_META_NO_ALLOC_DEPS=1 makes none.
+//   that keep the fusions of the devices off ggml-alloc layout luck are made here (see GGML_CUDA_ALLOC_DEPS). The nodes
+//   keep their order.
 static void ggml_backend_meta_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
-    static const bool no_alloc_deps = getenv("GGML_META_NO_ALLOC_DEPS") != nullptr;
     const ggml_backend_meta_context * ctx = (const ggml_backend_meta_context *) backend->context;
-    if (ctx->graph_alloc_deps != nullptr && !no_alloc_deps) {
+    if (ctx->graph_alloc_deps != nullptr) {
         ctx->graph_alloc_deps(cgraph, params);
     }
 }
