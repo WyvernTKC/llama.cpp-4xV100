@@ -2198,6 +2198,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             return ret;
         }
 
+        // a full view of a tensor (ggml_view_tensor) splits as the tensor, whatever other srcs it has: the scheduler gives
+        //   one the tensors an alloc dep keeps allocated, which need not split alike
+        if (tensor->op == GGML_OP_NONE && tensor->view_src != nullptr && tensor->view_offs == 0 &&
+                ggml_are_same_shape(tensor, tensor->view_src)) {
+            return ggml_backend_meta_get_split_state(stc, tensor->view_src, assume_sync);
+        }
+
         // A split state is ~2 kiB: a vector of them allocated and filled for every node of a new graph was most of
         //   the cost of deriving its split. One per depth of the recursion, every entry is written below.
         thread_local std::vector<std::unique_ptr<std::vector<ggml_backend_meta_split_state>>> src_ss_pool;
@@ -3945,6 +3952,10 @@ struct ggml_backend_meta_context {
         const size_t * sizes);
     set_tensors_batch_t set_tensors_batch = nullptr;
 
+    // optional: the alloc deps the fusions of the devices need, declared for a meta graph without moving its nodes
+    typedef void (*graph_alloc_deps_t)(ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params);
+    graph_alloc_deps_t graph_alloc_deps = nullptr;
+
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
         n_reduce_steps = std::ceil(std::log2(n_devs));
@@ -3965,6 +3976,8 @@ struct ggml_backend_meta_context {
 
         set_tensors_batch = (set_tensors_batch_t) ggml_backend_reg_get_proc_address(
             ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0])), "ggml_backend_set_tensors_batch");
+        graph_alloc_deps = (graph_alloc_deps_t) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0])), "ggml_backend_graph_alloc_deps");
 
         if (n_devs > 1) {
             ggml_backend_comm_init_t comm_init = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(
@@ -6300,6 +6313,17 @@ static void ggml_backend_meta_event_wait(ggml_backend_t backend, ggml_backend_ev
     }
 }
 
+// The scheduler allocates the meta graph, and the tensors of a device sit at the offsets of the meta tensors: the alloc deps
+//   that keep the fusions of the devices off ggml-alloc layout luck are made here. The nodes keep their order.
+//   GGML_META_NO_ALLOC_DEPS=1 makes none.
+static void ggml_backend_meta_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+    static const bool no_alloc_deps = getenv("GGML_META_NO_ALLOC_DEPS") != nullptr;
+    const ggml_backend_meta_context * ctx = (const ggml_backend_meta_context *) backend->context;
+    if (ctx->graph_alloc_deps != nullptr && !no_alloc_deps) {
+        ctx->graph_alloc_deps(cgraph, params);
+    }
+}
+
 static const ggml_backend_i ggml_backend_meta_i = {
     /* .get_name                = */ ggml_backend_meta_get_name,
     /* .free                    = */ ggml_backend_meta_free,
@@ -6316,7 +6340,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .graph_compute           = */ ggml_backend_meta_graph_compute,
     /* .event_record            = */ ggml_backend_meta_event_record,
     /* .event_wait              = */ ggml_backend_meta_event_wait,
-    /* .graph_optimize          = */ nullptr,
+    /* .graph_optimize          = */ ggml_backend_meta_graph_optimize,
 };
 
 bool ggml_backend_is_meta(ggml_backend_t backend) {

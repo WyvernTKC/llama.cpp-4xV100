@@ -448,7 +448,7 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
 }
 
 // The Volta kernels compile the shared expert channel out: its selects took 6-17 more registers in every fused launch
-//   (q4_K gate 96 -> 113), and under -sm tensor the fusion never runs (no graph_optimize).
+//   (q4_K gate 96 -> 113), and under -sm tensor the fusion never runs (no node moves there).
 bool ggml_cuda_mmvq_shared_expert_supported(const int cc) {
     return get_device_table_id(cc) != MMVQ_PARAMETERS_VOLTA;
 }

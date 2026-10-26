@@ -5845,7 +5845,7 @@ static bool ggml_cuda_topk_moe_plan_at(const ggml_cgraph * cgraph, const int i, 
 }
 
 // The outputs of the fused topk_moe may lie over the logits: ggml-alloc puts them there once nothing else reads the
-// logits, as the alloc deps of graph_optimize are not made under the meta backend. Up to TOPK_MOE_ROWS_PER_BLOCK rows
+// logits when no alloc dep keeps them (none does under the meta backend). Up to TOPK_MOE_ROWS_PER_BLOCK rows
 // one block reads all logits before it writes; with more, the other blocks would read logits already overwritten, so
 // they read a copy (a prefill batch otherwise took the unfused argsort path, ~0.1 ms per layer at 2048 tokens).
 static bool ggml_cuda_topk_moe_launch(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i,
@@ -7568,9 +7568,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
-            // The kernel reads only the experts, the expert scales and the router weights. Under -sm tensor the meta
-            //   backend has no graph_optimize, so the alloc deps of ggml_backend_cuda_graph_optimize are not made and
-            //   ggml-alloc can put dst over the weights, which the elided MUL read last: a block reads its token's
+            // The kernel reads only the experts, the expert scales and the router weights. Under -sm tensor only the
+            //   one-token deps of ggml_backend_cuda_graph_alloc_deps are made, so ggml-alloc can put dst over the weights,
+            //   which the elided MUL read last: a block reads its token's
             //   weights before it writes, and with several tokens the kernel reads a copy. Over the experts, dst can
             //   only sit on the rows of a lone token, which the threads read before they write the same columns.
             const int64_t n_tokens  = match.experts->ne[2] * match.experts->ne[3];
@@ -10022,6 +10022,219 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
     }
 }
 
+// The alloc deps of the fusions of a few rows whose launch reads an input after the last node that reads it in graph order:
+//   without them ggml-alloc may put an output of the group over that input, and the address checks of the fusion then
+//   refuse it by layout luck. No node moves here, so the meta backend (-sm tensor) makes them for its graphs too: the
+//   tensors of a device sit at the offsets of the meta tensors. Only at the sizes the fusions run at, so the layout of a
+//   prefill graph does not change, and each keeps only what the checks of its fusion read: a longer lifetime moves the
+//   layout, and another fusion may then refuse by luck (compare the kernel counts of a decode with GGML_META_NO_ALLOC_DEPS=1).
+static void ggml_backend_cuda_graph_alloc_deps(ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+    if (ggml_cuda_fusion_disabled()) {
+        return;
+    }
+    ggml_tensor ** nodes   = cgraph->nodes;
+    const int      n_nodes = cgraph->n_nodes;
+
+    // a view by its source (the meta backend splits a full view of a tensor as the tensor); an empty tensor, or one with
+    //   memory already (a weight, the KV cache), is not placed by ggml-alloc
+    const auto keep = [&](const ggml_tensor * t, const ggml_tensor * until) {
+        if (t->view_src != nullptr) {
+            t = t->view_src;
+        }
+        if (ggml_nelements(t) > 0 && t->data == nullptr) {
+            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(t), const_cast<ggml_tensor *>(until));
+        }
+    };
+    // the nodes [start, last) and their srcs until the node last
+    const auto keep_group = [&](int start, int last) {
+        for (int i = start; i < last; ++i) {
+            keep(nodes[i], nodes[last]);
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                if (nodes[i]->src[j]) {
+                    keep(nodes[i]->src[j], nodes[last]);
+                }
+            }
+        }
+    };
+    // the srcs of the nodes [start, last] that come from outside them until the node last: a launch that elides the
+    //   nodes in between reads them while it writes its outputs
+    const auto keep_inputs = [&](int start, int last) {
+        for (int i = start; i <= last; ++i) {
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                const ggml_tensor * src = nodes[i]->src[j];
+                bool inner = src == nullptr;
+                for (int k = start; k < i && !inner; ++k) {
+                    inner = src == nodes[k] || src->view_src == nodes[k];
+                }
+                if (!inner) {
+                    keep(src, nodes[last]);
+                }
+            }
+        }
+    };
+
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor * node = nodes[i];
+
+        // dsv4_hc_up_pre (qwen4exp): the launch reads the mix of the SCALE while it writes the DSV4_HC_PRE
+        if (node->op == GGML_OP_SCALE && i + 3 < n_nodes) {
+            int j = i + 3;
+            while (j < n_nodes && ggml_cuda_is_view_or_noop(nodes[j])) {
+                j++;
+            }
+            const ggml_tensor * silu = nodes[i + 1];
+            const ggml_tensor * mm   = nodes[i + 2];
+            if (j < n_nodes && nodes[j]->op == GGML_OP_DSV4_HC_PRE && silu->op == GGML_OP_UNARY &&
+                    ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU && silu->src[0] == node && mm->op == GGML_OP_MUL_MAT &&
+                    mm->src[1] == silu && mm->ne[1] <= 4 && nodes[j]->src[1] != nullptr &&
+                    (nodes[j]->src[1] == mm || nodes[j]->src[1]->view_src == mm)) {
+                keep(node->src[0], nodes[j]);
+            }
+        }
+
+        // the convolution state of a few tokens (ggml_cuda_ssm_conv_state_fusion_match): the launch at the CONCAT reads the
+        //   cache row, the ids and the new tokens while it writes the SILU after the SSM_CONV, and at one token it runs in
+        //   the epilogue of the projection the new tokens view (ggml_cuda_gdn_conv_fold); from that projection or the
+        //   GET_ROWS of the cache row, whichever comes first
+        if (node->op == GGML_OP_CONCAT && node->src[0] != nullptr && node->src[1] != nullptr) {
+            int conv = -1;
+            for (int k = i + 1; k < n_nodes && k <= i + 64; k++) {
+                if (nodes[k]->op == GGML_OP_SSM_CONV && nodes[k]->src[0] == node) {
+                    conv = k;
+                    break;
+                }
+            }
+            if (conv >= 0 && conv + 1 < n_nodes && nodes[conv]->ne[1] <= GGML_CUDA_SSM_CONV_STATE_MAX_TOKENS) {
+                int silu = conv + 1;
+                if (nodes[silu]->op == GGML_OP_RESHAPE && nodes[silu]->src[0] == nodes[conv] && silu + 1 < n_nodes) {
+                    silu++;
+                }
+                const ggml_tensor * gr = node->src[0];
+                while ((gr->op == GGML_OP_RESHAPE || gr->op == GGML_OP_VIEW) && gr->src[0] != nullptr) {
+                    gr = gr->src[0];
+                }
+                const ggml_tensor * x = node->src[1]->view_src != nullptr ? node->src[1]->view_src : node->src[1];
+                int first = i;
+                for (int k = i - 1; k >= 0 && k >= i - 64; k--) {
+                    if (nodes[k] == gr || nodes[k] == x) {
+                        first = k;
+                    }
+                }
+                keep_group(first, silu);
+            }
+        }
+
+        // the top-k fold of a router (ggml_cuda_topk_moe_fold): its launch writes the expert selection before the nodes up
+        //   to the topk_moe run, so what they touch must not lie under it
+        if (node->op == GGML_OP_MUL_MAT && ggml_nrows(node) == 1 && i + 2 < n_nodes && nodes[i + 1]->op == GGML_OP_MUL_MAT &&
+                nodes[i + 1]->src[1] == node->src[1]) {
+            for (int k = i + 2; k < n_nodes && k <= i + 17; k++) {
+                const ggml_tensor * g = nodes[k];
+                if ((g->op == GGML_OP_SOFT_MAX || g->op == GGML_OP_UNARY || g->op == GGML_OP_ARGSORT) && g->src[0] == node) {
+                    ggml_cuda_topk_moe_plan p;
+                    if (ggml_cuda_topk_moe_plan_at(cgraph, k, p)) {
+                        for (int j = i + 2; j < k; j++) {
+                            keep(nodes[j], nodes[k + p.n_ops - 1]);
+                            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                                if (nodes[j]->src[s] != nullptr) {
+                                    keep(nodes[j]->src[s], nodes[k + p.n_ops - 1]);
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        // the weighted sum of the routed experts at one token, in the experts' launch with the down projection of a shared
+        //   expert added (ggml_cuda_try_fuse_moe_down_shexp) or alone: it reads the router weights, the expert scales and the
+        //   gate (the sum may sit on the rows of the experts)
+        ggml_cuda_moe_weighted_reduction_match match;
+        if (node->op == GGML_OP_MUL && ggml_cuda_match_moe_weighted_reduction(cgraph, i, match) &&
+                match.dst->ne[1] == 1) {
+            const ggml_tensor * dst = match.dst;
+            const ggml_tensor * g   = nullptr;
+            const int t = i + match.node_count;
+            if (t < n_nodes && nodes[t]->op == GGML_OP_MUL_MAT) {
+                const bool gated   = t + 3 < n_nodes && nodes[t + 1]->op == GGML_OP_UNARY;
+                const int  add_idx = t + (gated ? 3 : 1);
+                if (add_idx < n_nodes && nodes[add_idx]->op == GGML_OP_ADD &&
+                        (nodes[add_idx]->src[0] == match.dst || nodes[add_idx]->src[1] == match.dst)) {
+                    dst = nodes[add_idx];
+                    g   = gated ? nodes[t + 1]->src[0] : nullptr;
+                }
+            }
+            keep(match.weights, dst);
+            if (match.expert_scale != nullptr) {
+                keep(match.expert_scale, dst);
+            }
+            if (g != nullptr) {
+                keep(g, dst);
+            }
+        }
+
+        // the gate and up projections of a few tokens and their GLU in one launch (ggml_cuda_can_fuse): the GLU is written
+        //   while the input is read
+        if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[1] != nullptr &&
+                ggml_nrows(node->src[1]) <= MMVQ_MAX_BATCH_SIZE) {
+            const ggml_op mm      = node->op;
+            const ggml_op bias    = mm == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
+            const ggml_op glu[3]  = { mm, mm, GGML_OP_GLU };
+            const ggml_op glub[5] = { mm, bias, mm, bias, GGML_OP_GLU };
+            const int out_glu[1]  = { i + 2 };
+            const int out_glub[1] = { i + 4 };
+            if (ggml_can_fuse_subgraph(cgraph, i, 3, glu, out_glu, 1)) {
+                keep_inputs(i, i + 2);
+            } else if (ggml_can_fuse_subgraph(cgraph, i, 5, glub, out_glub, 1)) {
+                keep_inputs(i, i + 4);
+            }
+        }
+
+        // a gated norm in the prologue of the matmul that reads it (ggml_cuda_try_fuse_norm_gated_mm): the launch reads x
+        //   and the gate while it writes the matmul
+        if (node->op == GGML_OP_RMS_NORM && i + 4 < n_nodes && nodes[i + 1]->op == GGML_OP_MUL &&
+                nodes[i + 2]->op == GGML_OP_UNARY && nodes[i + 3]->op == GGML_OP_MUL) {
+            int j = i + 4;
+            while (j < n_nodes && j - i < 7 && nodes[j]->op == GGML_OP_RESHAPE) {
+                j++;
+            }
+            if (j < n_nodes && nodes[j]->op == GGML_OP_MUL_MAT && ggml_nrows(nodes[j]->src[1]) <= MMVQ_MAX_BATCH_SIZE) {
+                keep_inputs(i, j);
+            }
+        }
+
+        // a GET_ROWS and the ADD that reads it in one launch (ggml_cuda_should_fuse_get_rows_add), a few rows: the launch
+        //   reads the source rows while it writes the sum
+        if (node->op == GGML_OP_GET_ROWS && i + 1 < n_nodes && nodes[i + 1]->op == GGML_OP_ADD &&
+                (nodes[i + 1]->src[0] == node || nodes[i + 1]->src[1] == node) && ggml_nrows(node) <= MMVQ_MAX_BATCH_SIZE) {
+            keep_inputs(i, i + 1);
+        }
+
+        // the add and norms after an all-reduce that poll its lines (ggml_cuda_ar_fold_consume), one row
+        if (ggml_nrows(node) == 1) {
+            static const ggml_op add_norm[3]  = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
+            static const ggml_op gathered[5]  = { GGML_OP_GET_ROWS, GGML_OP_GET_ROWS, GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
+            static const ggml_op sandwich[5]  = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
+            static const ggml_op sandwich6[6] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL, GGML_OP_RMS_NORM, GGML_OP_MUL };
+            const int out_add_norm[2]  = { i, i + 2 };
+            const int out_gathered[2]  = { i + 2, i + 4 };
+            const int out_sandwich[2]  = { i + 2, i + 4 };
+            const int out_sandwich6[2] = { i + 3, i + 5 };
+            if (ggml_can_fuse_subgraph(cgraph, i, 3, add_norm, out_add_norm, 2)) {
+                keep_inputs(i, i + 2);
+            } else if (ggml_can_fuse_subgraph(cgraph, i, 5, gathered, out_gathered, 2) && ggml_nrows(node->src[0]) == 1 &&
+                    ggml_nrows(nodes[i + 1]->src[0]) == 1) {
+                keep_inputs(i, i + 4);
+            } else if (ggml_can_fuse_subgraph(cgraph, i, 6, sandwich6, out_sandwich6, 2)) {
+                keep_inputs(i, i + 5);
+            } else if (ggml_can_fuse_subgraph(cgraph, i, 5, sandwich, out_sandwich, 2)) {
+                keep_inputs(i, i + 4);
+            }
+        }
+    }
+}
+
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -10139,6 +10352,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 }
             }
         }
+        ggml_backend_cuda_graph_alloc_deps(cgraph, params);
     }
 
 #ifdef USE_CUDA_GRAPH
@@ -11404,6 +11618,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_graph_alloc_deps") == 0) {
+        return (void *)ggml_backend_cuda_graph_alloc_deps;
     }
     return nullptr;
 }
