@@ -62,6 +62,8 @@ private:
         std::vector<ggml_tensor *> score_stream;
     };
 
+    const llama_hparams & hparams;
+
     const uint32_t ratio;
     // whether a pooled group overlaps the previous one; V4's CSA does, V4.1's compressor does not
     const bool     overlap;

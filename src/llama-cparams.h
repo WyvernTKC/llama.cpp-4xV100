@@ -50,6 +50,8 @@ struct llama_cparams {
     bool auto_fhc;
     bool fused_qsa_pool;     // pool the qwen4exp QSA indexer keys with one ggml_get_rows_mean
     bool auto_fqsa;
+    bool fused_top_k_mask;   // use fused top-k sparse attention mask
+    bool auto_ftkm;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;

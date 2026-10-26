@@ -912,14 +912,13 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
             uint32_t        n_rs_seq,
         const char    * name,
         const llama_memory_i::layer_filter_cb & filter) :
+    hparams(model.hparams),
     ratio(ratio),
     overlap(overlap),
     state_size(state_size),
     n_embd_state(n_embd_state),
     n_stream(unified ? 1 : n_seq_max),
     n_rs_seq(n_rs_seq) {
-    const llama_hparams & hparams = model.hparams;
-
     struct ggml_backend_buft_comparator {
         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
             return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
@@ -994,7 +993,15 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
     }
 
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        ggml_backend_buffer_t buf;
+        if (hparams.no_alloc) {
+            buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                t->buffer = buf; // set dummy buffer for DSV4 state so that the backend scheduler won't try to allocate it
+            }
+        } else {
+            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+        }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for DSV4 compressor state");
         }
@@ -1086,9 +1093,15 @@ uint32_t llama_dsv4_comp_state::get_n_rows() const {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_dsv4_comp_state::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
-    for (const auto & [_, buf] : ctxs_bufs) {
+    for (const auto & [ctx, buf] : ctxs_bufs) {
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
-        ret[buft] += ggml_backend_buffer_get_size(buf.get());
+
+        if (hparams.no_alloc) {
+            GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
+            ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+        } else {
+            ret[buft] += ggml_backend_buffer_get_size(buf.get());
+        }
     }
     return ret;
 }
@@ -1723,12 +1736,15 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
         const llama_pos pos_max = seq_id >= 0 ? kv_raw->seq_pos_max(seq_id) : -1;
 
         //FIXME : note that we conflate token positions with rows, which is not true for multi-modal case.
+        // V4.1 keeps the rows of both its ratios in the CSA and indexer caches, sized for the finer one (V4: the CSA ratio)
+        const uint32_t ratio_kv = std::min(csa_state->get_ratio(), hca_state->get_ratio());
+
         const uint32_t n_rows_csa = seq_id >= 0 ?
-            dsv4_state_n_used_k_rows(pos_max, DSV4_CSA_RATIO, kv_csa->get_size()) : kv_csa->get_size();
+            dsv4_state_n_used_k_rows(pos_max, ratio_kv, kv_csa->get_size()) : kv_csa->get_size();
         const uint32_t n_rows_hca = seq_id >= 0 ?
-            dsv4_state_n_used_k_rows(pos_max, DSV4_HCA_RATIO, kv_hca->get_size()) : kv_hca->get_size();
+            dsv4_state_n_used_k_rows(pos_max, hca_state->get_ratio(), kv_hca->get_size()) : kv_hca->get_size();
         const uint32_t n_rows_lid = seq_id >= 0 ?
-            dsv4_state_n_used_k_rows(pos_max, DSV4_CSA_RATIO, kv_lid->get_size()) : kv_lid->get_size();
+            dsv4_state_n_used_k_rows(pos_max, ratio_kv, kv_lid->get_size()) : kv_lid->get_size();
 
         dsv4_state_write_k_cache(io, kv_csa.get(), seq_id, flags, n_rows_csa);
         dsv4_state_write_k_cache(io, kv_hca.get(), seq_id, flags, n_rows_hca);

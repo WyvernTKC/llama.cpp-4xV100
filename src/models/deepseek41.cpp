@@ -61,6 +61,9 @@ int llama_model_deepseek41::engram_index(int il) const {
 void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
     llama_model_deepseek4::load_arch_hparams(ml);
 
+    // no hc_head: the output (and embeddings) is the collapsed [n_embd] stream, not the V4 hc copies
+    hparams.n_embd_out_impl = hparams.n_embd;
+
     ml.get_arr_n(LLM_KV_ENGRAM_LAYER_IDS, engram_n_layer);
     if (engram_n_layer == 0 || engram_n_layer > LLAMA_MAX_LAYERS) {
         throw std::runtime_error(format("DeepSeek-V4.1 engram layer count %u is out of range", engram_n_layer));

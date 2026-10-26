@@ -619,6 +619,10 @@ struct llama_layer {
     struct ggml_tensor * hc_ffn_down    = nullptr;
     struct ggml_tensor * hc_ffn_up      = nullptr;
     struct ggml_tensor * hc_ffn_inject  = nullptr;
+    struct ggml_tensor * hc_attn_down_inject = nullptr; // [hc_attn_down | hc_attn_inject] in one weight
+    struct ggml_tensor * hc_ffn_down_inject  = nullptr; // [hc_ffn_down | hc_ffn_inject] in one weight
+    struct ggml_tensor * wqkv_z              = nullptr; // [wqkv | wqkv_gate] in one weight
+    struct ggml_tensor * ssm_beta_alpha_cat  = nullptr; // [ssm_beta | ssm_alpha] in one weight, unlike the grouped ssm_beta_alpha
 
     // Engram (n-gram keyed lookup table) for DeepSeek-V4.1
     struct ggml_tensor * engram_embd    = nullptr;
@@ -730,6 +734,7 @@ struct llama_model {
 
     // for classifier models
     std::vector<std::string> classifier_labels;
+    std::vector<std::string> decision_labels;
 
     struct ggml_tensor * tok_embd   = nullptr;
     struct ggml_tensor * type_embd  = nullptr;
@@ -784,8 +789,9 @@ struct llama_model {
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
 
     // eagle3 / dflash feature fusion layer
-    struct ggml_tensor * fc   = nullptr;
-    struct ggml_tensor * fc_s = nullptr;
+    struct ggml_tensor * fc      = nullptr;
+    struct ggml_tensor * fc_s    = nullptr;
+    struct ggml_tensor * fc_in_s = nullptr;
     struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
 
     // dspark

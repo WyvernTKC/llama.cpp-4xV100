@@ -175,6 +175,12 @@ static const llm_fused_op_probe llm_fused_op_qsa_pool_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
+    /*.op               =*/ LLM_FUSED_OP_TOP_K_MASK,
+    /*.name             =*/ "fused top-k mask",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -340,6 +346,11 @@ llama_context::llama_context(
 
     cparams.fused_qsa_pool = true;
     cparams.auto_fqsa      = model.arch == LLM_ARCH_QWEN4EXP;
+
+    // only the indexer models build this mask, skip the probe for the others
+    // not under -sm tensor: the indexer may score a slice of the tokens per device, ggml_top_k_mask needs them all
+    cparams.fused_top_k_mask = model.split_mode() != LLAMA_SPLIT_MODE_TENSOR;
+    cparams.auto_ftkm        = cparams.fused_top_k_mask && hparams.indexer_top_k > 0;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -714,6 +725,12 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         LLAMA_LOG_INFO("%s: resolving fused QSA key pooling support:\n", func);
         resolve(llm_fused_op_qsa_pool_probe, cparams.fused_qsa_pool);
         cparams.auto_fqsa = false;
+    }
+
+    if (cparams.auto_ftkm) {
+        LLAMA_LOG_INFO("%s: resolving fused top-k mask support:\n", func);
+        resolve(llm_fused_op_top_k_mask_probe, cparams.fused_top_k_mask);
+        cparams.auto_ftkm = false;
     }
 }
 
@@ -1425,8 +1442,9 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
 void llama_context::set_embeddings(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
-    // a pooled context computes the logits only without embeddings, so the toggle changes the graph shape
-    if (cparams.embeddings != value && cparams.pooling_type != LLAMA_POOLING_TYPE_NONE) {
+    // the toggle changes the graph shape (pooled: logits only; pooling NONE: the reserve graph outputs all tokens,
+    // which crashed ggml_gallocr on the first /completion), so re-reserve on every toggle
+    if (cparams.embeddings != value) {
         sched_need_reserve = true;
     }
 
