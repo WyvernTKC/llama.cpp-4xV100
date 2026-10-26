@@ -145,12 +145,9 @@ static constexpr int64_t kq_prefix_n_desc = 2 + 64;
 //   Filled on the host it is n_kv values per row, copied to every device for each token. A graph is built so from
 //   LLAMA_KQ_MASK_PREFIX used cells on (default 32768, 0 never): below that the host mask is a few KB that costs less than
 //   the kernel. Once built so, a graph is reused for any ubatch it can take (build false), whatever its n_kv.
-//   Not with DSV4 hyper-connections (qwen4exp): the node moves the ggml-alloc layout, and CUDA then fuses their mix
-//   (dsv4_hc_up_pre, which checks the addresses) in few layers: slower, and not the same bits.
 static bool kq_mask_prefix_on_device(
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
-        const llama_hparams & hparams,
         const llama_cparams & cparams,
         bool build) {
     static const int64_t n_kv_min = [] {
@@ -158,7 +155,7 @@ static bool kq_mask_prefix_on_device(
         return env == nullptr ? 32768 : atoll(env);
     }();
 
-    return n_kv_min > 0 && hparams.dsv4_hc_mult == 0 && (!build || mctx->get_n_kv_used() >= n_kv_min) && mctx->has_layers() &&
+    return n_kv_min > 0 && (!build || mctx->get_n_kv_used() >= n_kv_min) && mctx->has_layers() &&
         mctx->can_kq_prefix(ubatch, kq_prefix_n_desc, cparams.causal_attn);
 }
 
@@ -175,7 +172,7 @@ static void build_attn_inp_kq_mask_any(
         ggml_tensor ** kq_qpos,
         ggml_tensor ** kq_mask_cnv) {
     if (!kq_mask_on_device(mctx, ubatch, hparams, cparams)) {
-        if (kq_mask_prefix_on_device(mctx, ubatch, hparams, cparams, /*build =*/ true)) {
+        if (kq_mask_prefix_on_device(mctx, ubatch, cparams, /*build =*/ true)) {
             const int64_t n_kv     = mctx->get_n_kv();
             const int64_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
@@ -285,7 +282,7 @@ static bool can_reuse_kq_mask_any(
     // a host mask holds for any ubatch, a device-built one only for those it is built for
     const bool on_device = kq_mask_on_device(mctx, params.ubatch, hparams, params.cparams);
     const bool prefix    = kq_qpos == nullptr;
-    if (prefix ? on_device || !kq_mask_prefix_on_device(mctx, params.ubatch, hparams, params.cparams, /*build =*/ false) : !on_device) {
+    if (prefix ? on_device || !kq_mask_prefix_on_device(mctx, params.ubatch, params.cparams, /*build =*/ false) : !on_device) {
         return false;
     }
 
