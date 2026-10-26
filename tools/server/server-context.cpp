@@ -4697,9 +4697,14 @@ private:
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
+        // the speculative hooks run before it: with the target states on the devices their graphs queue behind the target's
         int ret = 0;
+        bool spec_ok = true;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+            if (ret == 0 && spec) {
+                spec_ok = common_speculative_process(spec.get(), batch.view);
+            }
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
@@ -4761,18 +4766,11 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (spec) {
-            bool ok = true;
-            queue_tasks.yield_to_queue([&]() {
-                ok = common_speculative_process(spec.get(), batch.view);
-            });
+        if (!spec_ok) {
+            SRV_ERR("%s", "failed to process speculative batch\n");
 
-            if (!ok) {
-                SRV_ERR("%s", "failed to process speculative batch\n");
-
-                // TODO: handle error
-                throw std::runtime_error("failed to process speculative batch");
-            }
+            // TODO: handle error
+            throw std::runtime_error("failed to process speculative batch");
         }
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too

@@ -98,7 +98,7 @@ llama_model_mimo2::graph::graph(const llama_model & model, const llm_graph_param
     const bool extract_final_inp = (size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer];
 
     for (int il = 0; il < n_layer; ++il) {
-        res->t_layer_inp[il] = inpL;
+        build_layer_inp(il, inpL);
 
         ggml_tensor * inpSA = inpL;
 
@@ -288,9 +288,7 @@ llama_model_mimo2::graph_mtp::graph_mtp(const llama_model & model, const llm_gra
     inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
     ggml_set_input(inp->embd);
 
-    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
-    ggml_set_input(inp->h);
-    ggml_set_name(inp->h, "mtp_h_input");
+    build_inp_embd_h_state(inp.get(), hparams.n_embd);
 
     ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
     ggml_tensor * h_input    = inp->h;

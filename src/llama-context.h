@@ -43,6 +43,22 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+// The target states a speculative draft context reads on the devices, shared by the two contexts (see
+//   llama_set_spec_states_device): the graphs of the target write them, the graphs of the draft read them.
+struct llama_spec_states {
+    llama_spec_states_tensors t;
+
+    ggml_context_ptr        ctx;
+    ggml_backend_buffer_ptr buf;
+
+    // recorded after the target graphs that write the states, and after the draft graphs that read them
+    ggml_backend_event_ptr written;
+    ggml_backend_event_ptr read;
+
+    // a draft graph read the states since the target last waited for it: the next write waits for read
+    bool read_pending = false;
+};
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -127,6 +143,9 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+
+    // see llama_set_spec_states_device
+    bool set_spec_states_device(llama_context & dft);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -267,6 +286,12 @@ private:
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
     bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+
+    // the input of layer il goes to the target states on the devices instead of the host
+    bool spec_layer_on_device(uint32_t il) const;
+
+    // the backend of the one device of this context, nullptr if it has several (see llama_set_spec_states_device)
+    ggml_backend_t spec_device_backend() const;
 
     //
     // graph
@@ -490,6 +515,11 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+
+    // the target states on the devices (llama_set_spec_states_device): written by this context if spec_owner, else read
+    std::shared_ptr<llama_spec_states> spec_states;
+    bool           spec_owner   = false;
+    ggml_backend_t spec_backend = nullptr; // where the events of this context are recorded and waited for
 
     // keep copies of the per-sequence memory on the device
     // keyed by (seq_id, dev_slot) so several states of one sequence can be resident at once

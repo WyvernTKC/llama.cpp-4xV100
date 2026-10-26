@@ -1464,6 +1464,118 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+ggml_backend_t llama_context::spec_device_backend() const {
+    if (model.devices.size() != 1) {
+        return nullptr;
+    }
+    for (const auto & backend : backends) {
+        if (ggml_backend_get_device(backend.get()) == model.devices[0].dev) {
+            return backend.get();
+        }
+    }
+    return nullptr;
+}
+
+bool llama_context::spec_layer_on_device(uint32_t il) const {
+    return spec_states && spec_owner && il < spec_states->t.col.size() && spec_states->t.col[il] >= 0;
+}
+
+bool llama_context::set_spec_states_device(llama_context & dft) {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_SPEC_STATES_DEVICE");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!enabled || spec_states || dft.spec_states) {
+        return false;
+    }
+
+    ggml_backend_t backend_tgt = spec_device_backend();
+    ggml_backend_t backend_dft = dft.spec_device_backend();
+    if (backend_tgt == nullptr || backend_dft == nullptr) {
+        LLAMA_LOG_INFO("%s: the target or the draft context has more than one device: the states go through the host\n", __func__);
+        return false;
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend_tgt);
+    if (!ggml_backend_supports_buft(backend_dft, buft)) {
+        LLAMA_LOG_INFO("%s: the draft device cannot read %s: the states go through the host\n", __func__, ggml_backend_buft_name(buft));
+        return false;
+    }
+
+    auto states = std::make_shared<llama_spec_states>();
+
+    states->written.reset(ggml_backend_event_new(ggml_backend_get_device(backend_tgt)));
+    states->read   .reset(ggml_backend_event_new(ggml_backend_get_device(backend_dft)));
+    if (!states->written || !states->read) {
+        LLAMA_LOG_INFO("%s: no device events: the states go through the host\n", __func__);
+        return false;
+    }
+
+    int32_t n_col = 0;
+    states->t.col.assign(cparams.embeddings_layer_inp.size(), -1);
+    for (size_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
+        if (cparams.embeddings_layer_inp[il]) {
+            states->t.col[il] = n_col++;
+        }
+    }
+    const bool has_h = cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
+    if (n_col == 0 && !has_h) {
+        return false;
+    }
+
+    // a row per batch entry, kept until the next batch
+    const int64_t n_rows = cparams.n_batch;
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    states->ctx.reset(ggml_init(params));
+    if (n_col > 0) {
+        states->t.feat = ggml_new_tensor_2d(states->ctx.get(), GGML_TYPE_F32, (int64_t) n_col*model.hparams.n_embd, n_rows);
+        ggml_set_name(states->t.feat, "spec_states_feat");
+    }
+    if (has_h) {
+        states->t.h = ggml_new_tensor_2d(states->ctx.get(), GGML_TYPE_F32, model.hparams.n_embd_out(), n_rows);
+        ggml_set_name(states->t.h, "spec_states_h");
+    }
+    states->buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(states->ctx.get(), buft));
+    if (!states->buf) {
+        LLAMA_LOG_WARN("%s: failed to allocate the states: they go through the host\n", __func__);
+        return false;
+    }
+
+    LLAMA_LOG_INFO("%s: %10s target states = %8.2f MiB (%d layer inputs%s, %" PRId64 " rows)\n", __func__,
+            ggml_backend_buffer_name(states->buf.get()), ggml_backend_buffer_get_size(states->buf.get())/1024.0/1024.0,
+            n_col, has_h ? ", nextn" : "", n_rows);
+
+    synchronize();
+    dft.synchronize();
+
+    spec_states  = states;
+    spec_owner   = true;
+    spec_backend = backend_tgt;
+
+    dft.spec_states  = states;
+    dft.spec_owner   = false;
+    dft.spec_backend = backend_dft;
+
+    // the layer inputs leave the host output buffer
+    if (n_col > 0 && buf_output) {
+        buf_output.reset();
+        output_reserve(n_seq_max());
+    }
+
+    // the target graphs write the states and no longer output the layer inputs, the draft graphs read them
+    sched_need_reserve = true;
+    sched_reserve();
+    dft.sched_need_reserve = true;
+    dft.sched_reserve();
+
+    return true;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1737,7 +1849,27 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // the target states on the devices: a write waits for the draft graphs that read the last ones, a read for the write
+    if (spec_states) {
+        if (res->spec_written && spec_states->read_pending) {
+            ggml_backend_event_wait(spec_backend, spec_states->read.get());
+            spec_states->read_pending = false;
+        }
+        if (res->spec_read) {
+            ggml_backend_event_wait(spec_backend, spec_states->written.get());
+        }
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (status == GGML_STATUS_SUCCESS && spec_states) {
+        if (res->spec_written) {
+            ggml_backend_event_record(spec_states->written.get(), spec_backend);
+        }
+        if (res->spec_read) {
+            ggml_backend_event_record(spec_states->read.get(), spec_backend);
+            spec_states->read_pending = true;
+        }
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2468,8 +2600,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         embd_nextn.size = (size_t) n_embd_out * n_batch;
     }
 
-    for (bool enabled : cparams.embeddings_layer_inp) {
-        if (enabled) {
+    for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
+        if (cparams.embeddings_layer_inp[il] && !spec_layer_on_device(il)) {
             embd_layer_inp_float_count += (size_t) n_embd * n_batch;
         }
     }
@@ -2541,7 +2673,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     offset += embd_nextn.size * sizeof(float);
 
     for (uint32_t il = 0; il < embd_layer_inp.size(); ++il) {
-        if (cparams.embeddings_layer_inp[il]) {
+        if (cparams.embeddings_layer_inp[il] && !spec_layer_on_device(il)) {
             embd_layer_inp[il] = buffer_view<float>{(float *) (base + offset), (size_t) n_embd * n_batch};
             offset += embd_layer_inp[il].size * sizeof(float);
         } else {
@@ -2598,7 +2730,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
     bool extracted = false;
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
-        if (!cparams.embeddings_layer_inp[il]) {
+        if (!cparams.embeddings_layer_inp[il] || spec_layer_on_device(il)) {
             continue;
         }
         if (!embd_layer_inp[il].has_data()) {
@@ -3038,6 +3170,8 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
         /*.res_sampling =*/ sampling.res,
+        /*.spec_write  =*/ spec_states &&  spec_owner ? &spec_states->t : nullptr,
+        /*.spec_read   =*/ spec_states && !spec_owner ? &spec_states->t : nullptr,
     };
 }
 
@@ -4871,6 +5005,10 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
+}
+
+bool llama_set_spec_states_device(llama_context * ctx_tgt, llama_context * ctx_dft) {
+    return ctx_tgt->set_spec_states_device(*ctx_dft);
 }
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {

@@ -410,6 +410,11 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
         ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(embd));
     }
 
+    // set by its llm_graph_input_state_rows
+    if (h_rows) {
+        return;
+    }
+
     GGML_ASSERT(ubatch->embd_state && "this graph requires a state embedding, see llama_batch_ext_set_embd_state()");
     GGML_ASSERT(n_embd_state == h->ne[0]);
 
@@ -422,8 +427,59 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     res &= (!params.ubatch.token)      || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)       || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd_state) || (h      && h->ne[1]      == params.ubatch.n_tokens);
+    res &= h_rows == (params.ubatch.state_row != nullptr);
 
     return res;
+}
+
+void llm_graph_input_state_rows::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(ubatch->state_row);
+
+    const int64_t n_tokens = ubatch->n_tokens;
+
+    std::vector<int32_t> data(n_tokens);
+    std::vector<int64_t> pos;
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        data[i] = std::max(ubatch->state_row[i], 0);
+        if (ubatch->state_row[i] < 0) {
+            pos.push_back(i);
+        }
+    }
+    ggml_backend_tensor_set(rows, data.data(), 0, n_tokens*sizeof(int32_t));
+
+    if (host) {
+        GGML_ASSERT(ubatch->embd_state && host->ne[1] == (int64_t) pos.size());
+        ggml_backend_tensor_set(host,     ubatch->embd_state, 0, ggml_nbytes(host));
+        ggml_backend_tensor_set(host_pos, pos.data(),         0, ggml_nbytes(host_pos));
+    }
+}
+
+bool llm_graph_input_state_rows::can_reuse(const llm_graph_params & params) {
+    if (!params.ubatch.state_row || rows->ne[0] != params.ubatch.n_tokens) {
+        return false;
+    }
+
+    int64_t n_host = 0;
+    for (uint32_t i = 0; i < params.ubatch.n_tokens; ++i) {
+        n_host += params.ubatch.state_row[i] < 0;
+    }
+
+    return n_host == (host ? host->ne[1] : 0);
+}
+
+void llm_graph_input_spec_rows::set_input(const llama_ubatch * ubatch) {
+    const int64_t n_tokens = ubatch->n_tokens;
+
+    std::vector<int64_t> data(n_tokens);
+    const bool has_idxs = ubatch->data && ubatch->data->batch_idxs.size() == (size_t) n_tokens;
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        data[i] = has_idxs ? ubatch->data->batch_idxs[i] : i;
+    }
+    ggml_backend_tensor_set(rows, data.data(), 0, n_tokens*sizeof(int64_t));
+}
+
+bool llm_graph_input_spec_rows::can_reuse(const llm_graph_params & params) {
+    return rows->ne[0] == params.ubatch.n_tokens;
 }
 
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
@@ -1664,6 +1720,11 @@ void llm_graph_result::reset() {
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
+    spec_written = false;
+    spec_read    = false;
+    spec_layer_written.assign(LLAMA_MAX_LAYERS + 1, false);
+    spec_rows = nullptr;
+
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -1717,6 +1778,10 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
         for (size_t il = 0; il < embeddings_layer_inp.size(); ++il) {
             if (embeddings_layer_inp[il]) {
                 GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
+                // written to the target states on the devices instead
+                if (il < spec_layer_written.size() && spec_layer_written[il]) {
+                    continue;
+                }
                 ggml_set_output(t_layer_inp[il]);
             }
         }
@@ -1844,6 +1909,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
+    spec_write       (params.spec_write),
+    spec_read        (params.spec_read),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
@@ -4340,6 +4407,128 @@ ggml_tensor * llm_graph_context::build_d2t_logits(ggml_tensor * cur, ggml_tensor
     cb(cur, "result_output_d2t", -1);
 
     return cur;
+}
+
+ggml_tensor * llm_graph_context::build_inp_state_rows(ggml_tensor * src) const {
+    GGML_ASSERT(ubatch.state_row && src != nullptr);
+
+    auto inp = std::make_unique<llm_graph_input_state_rows>();
+
+    inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp->rows);
+
+    ggml_tensor * cur = ggml_get_rows(ctx0, src, inp->rows);
+
+    int64_t n_host = 0;
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        n_host += ubatch.state_row[i] < 0;
+    }
+    if (n_host > 0) {
+        inp->host = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, src->ne[0], n_host);
+        ggml_set_input(inp->host);
+
+        inp->host_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_host);
+        ggml_set_input(inp->host_pos);
+
+        cur = ggml_set_rows(ctx0, cur, inp->host, inp->host_pos);
+    }
+
+    res->add_input(std::move(inp));
+    res->spec_read = true;
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_inp_embd_h_state(llm_graph_input_embd_h * inp, int64_t n_embd_h) const {
+    if (ubatch.state_row) {
+        GGML_ASSERT(spec_read && spec_read->h && spec_read->h->ne[0] == n_embd_h && "no target nextn states on the devices");
+        inp->h = build_inp_state_rows(spec_read->h);
+        inp->h_rows = true;
+    } else {
+        inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_h, n_tokens);
+        ggml_set_input(inp->h);
+    }
+    ggml_set_name(inp->h, "mtp_h_input");
+
+    return inp->h;
+}
+
+ggml_tensor * llm_graph_context::build_inp_target_features(int64_t n_embd_inp) const {
+    ggml_tensor * cur;
+    if (ubatch.state_row) {
+        GGML_ASSERT(spec_read && spec_read->feat && spec_read->feat->ne[0] == n_embd_inp && "no target features on the devices");
+        cur = build_inp_state_rows(spec_read->feat);
+    } else {
+        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
+        ggml_set_input(inp->embd);
+
+        cur = inp->embd;
+        res->add_input(std::move(inp));
+    }
+    cb(cur, "inp_target_features", -1);
+
+    return cur;
+}
+
+// writes cur [ne0, n_tokens] to the rows of dst at the batch indexes of the ubatch entries
+static void llm_graph_spec_write(const llm_graph_context & g, ggml_tensor * dst, ggml_tensor * cur) {
+    if (g.res->spec_rows == nullptr) {
+        auto inp = std::make_unique<llm_graph_input_spec_rows>();
+
+        inp->rows = ggml_new_tensor_1d(g.ctx0, GGML_TYPE_I64, g.n_tokens);
+        ggml_set_input(inp->rows);
+
+        g.res->spec_rows = inp->rows;
+        g.res->add_input(std::move(inp));
+    }
+
+    ggml_build_forward_expand(g.gf, ggml_set_rows(g.ctx0, dst, cur, g.res->spec_rows));
+    g.res->spec_written = true;
+}
+
+static void llm_graph_spec_write_layer(const llm_graph_context & g, int il, ggml_tensor * cur) {
+    ggml_tensor * feat = g.spec_write->feat;
+    GGML_ASSERT(cur->ne[0] == g.n_embd && cur->ne[1] == g.n_tokens && cur->type == GGML_TYPE_F32);
+
+    // the column block of the layer in every row
+    ggml_tensor * dst = ggml_view_2d(g.ctx0, feat, g.n_embd, feat->ne[1], feat->nb[1],
+            (size_t) g.spec_write->col[il]*g.n_embd*ggml_element_size(feat));
+
+    llm_graph_spec_write(g, dst, cur);
+    g.res->spec_layer_written[il] = true;
+}
+
+void llm_graph_context::build_layer_inp(int il, ggml_tensor * cur) const {
+    res->t_layer_inp[il] = cur;
+
+    if (spec_write && spec_write->feat && il < (int) spec_write->col.size() && spec_write->col[il] >= 0) {
+        llm_graph_spec_write_layer(*this, il, cur);
+    }
+}
+
+void llm_graph_context::build_spec_states() const {
+    if (!spec_write) {
+        return;
+    }
+
+    if (spec_write->feat) {
+        for (size_t il = 0; il < spec_write->col.size(); ++il) {
+            if (spec_write->col[il] < 0 || res->spec_layer_written[il]) {
+                continue;
+            }
+            GGML_ASSERT(res->t_layer_inp[il] != nullptr && "layer input tensor is null");
+            llm_graph_spec_write_layer(*this, (int) il, res->t_layer_inp[il]);
+        }
+    }
+
+    if (spec_write->h) {
+        // only the unmasked graph has the rows of every entry
+        ggml_tensor * h = res->t_h_nextn;
+        GGML_ASSERT(h && h->ne[0] == spec_write->h->ne[0] && h->ne[1] == n_tokens && "no unmasked nextn states");
+        llm_graph_spec_write(*this, spec_write->h, h);
+    }
 }
 
 void llm_graph_context::build_pooling(

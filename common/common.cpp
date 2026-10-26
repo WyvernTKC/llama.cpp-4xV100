@@ -2217,10 +2217,18 @@ bool common_batch::set_embd(int32_t idx, llama_embd embd) {
 }
 
 bool common_batch::set_embd_state(int32_t idx, llama_embd state) {
-    if (idx < 0 || idx >= size() || tokens[idx].state.data != nullptr) {
+    if (idx < 0 || idx >= size() || tokens[idx].state.data != nullptr || tokens[idx].state_row >= 0) {
         return false;
     }
     tokens[idx].state = state;
+    return true;
+}
+
+bool common_batch::set_state_row(int32_t idx, int32_t row) {
+    if (idx < 0 || idx >= size() || row < 0 || tokens[idx].state.data != nullptr || tokens[idx].state_row >= 0) {
+        return false;
+    }
+    tokens[idx].state_row = row;
     return true;
 }
 
@@ -2272,6 +2280,9 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
         }
         if (t.state.data) {
             llama_batch_ext_set_embd_state(res, idx, t.state); // contexts without a state input ignore it
+        }
+        if (t.state_row >= 0 && !llama_batch_ext_set_state_row(res, idx, t.state_row)) {
+            GGML_ABORT("%s: failed to set the state row of the entry at index %d\n", __func__, i);
         }
         if (t.decision_order != 0) {
             llama_batch_ext_set_decision_order(res, idx, (llama_decision_order) t.decision_order);

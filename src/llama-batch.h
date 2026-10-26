@@ -74,12 +74,17 @@ struct llama_ubatch {
         std::vector<int8_t>         type;
         std::vector<int32_t>        batch_idxs;  // original batch index for each token
         std::vector<int32_t>        decision_order;
+        std::vector<int32_t>        state_row;
 
         std::vector<llama_seq_id> seq_id_data;
     };
 
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
     std::shared_ptr<data_t> data;
+
+    // [n_tokens], NULL if no entry has one: the row of the target's states on the devices (see llama_spec_states), -1 = the
+    //   next row of embd_state, which then holds only the rows of these entries
+    int32_t * state_row = nullptr;
 };
 
 // crash if a mixed ubatch reaches code that expects only tokens or only embd
@@ -114,6 +119,7 @@ struct llama_batch_ext {
         size_t       embd_off = 0; // index offset in the embd array
         bool         has_state = false; // whether state_off is set
         size_t       state_off = 0; // index offset in the state array
+        int32_t      state_row = -1; // row of the target's states on the devices, instead of a state or an embedding
         bool         output = false; // TODO: have dedicated output flags
         int32_t      decision_order = 0; // see llama_batch_ext_set_decision_order()
         std::unordered_set<llama_seq_id> seq_ids;
@@ -146,6 +152,7 @@ struct llama_batch_ext {
     bool set_token_embd(int32_t idx, llama_embd embd_in);
     bool set_token_embd_parts(int32_t idx, const float * const * parts, size_t n_parts, size_t n_part);
     bool set_token_state(int32_t idx, llama_embd state_in);
+    bool set_token_state_row(int32_t idx, int32_t row);
     bool set_token_pos(int32_t idx, const llama_pos * pos_in);
     bool set_output(int32_t idx, bool output_last);
     bool set_decision_order(int32_t idx, int32_t order);
@@ -223,7 +230,10 @@ private:
     std::vector<llama_token>    token_vec;    // owned token IDs built from llama_batch_ext
     std::vector<float>          embd_vec;     // owned embeddings built from llama_batch_ext
     std::vector<int8_t>         is_embd_vec;  // mixed batch only (= 1 if embd, 0 if text token)
-    std::vector<float>          state_vec;    // owned state embeddings built from llama_batch_ext, llama_batch has no slot for them
+    // state embeddings, read in place from the llama_batch_ext like embd: llama_batch has no slot for them
+    const float *               state_src = nullptr;
+    std::vector<size_t>         state_off;    // per entry, into state_src
+    std::vector<int32_t>        state_row;    // per entry, empty if no entry has one: see llama_ubatch::state_row
     std::vector<llama_seq_id>   seq_id_data;  // flat storage for seq_id pointers below
 
     std::vector<llama_pos>      pos;

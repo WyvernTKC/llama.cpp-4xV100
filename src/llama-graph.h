@@ -167,8 +167,40 @@ public:
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * h      = nullptr; // F32 [n_embd_state, n_batch]
 
+    // h comes from the target states on the devices instead (llm_graph_context::build_inp_embd_h_state)
+    bool h_rows = false;
+
     const int64_t n_embd       = 0;
     const int64_t n_embd_state = 0;
+};
+
+// The state of each ubatch entry from rows of the target states on the devices (ubatch.state_row), and for the entries
+//   without one from ubatch.embd_state
+class llm_graph_input_state_rows : public llm_graph_input_i {
+public:
+    llm_graph_input_state_rows() = default;
+    virtual ~llm_graph_input_state_rows() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * rows     = nullptr; // I32 [n_batch], 0 for the entries of host
+    ggml_tensor * host     = nullptr; // F32 [n_embd_state, n_host], nullptr if every entry has a row
+    ggml_tensor * host_pos = nullptr; // I64 [n_host], the ubatch entries of host
+};
+
+// The batch index of each ubatch entry: the row a target graph writes its states to (llama_set_spec_states_device)
+class llm_graph_input_spec_rows : public llm_graph_input_i {
+public:
+    llm_graph_input_spec_rows() = default;
+    virtual ~llm_graph_input_spec_rows() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * rows = nullptr; // I64 [n_batch]
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {
@@ -813,6 +845,14 @@ struct llama_graph_reshape_group {
     std::vector<std::pair<ggml_tensor *, int>> tensors; // tensor, dim
 };
 
+// The target states a speculative draft context reads on the devices (llama_set_spec_states_device). A row is a batch index.
+struct llama_spec_states_tensors {
+    ggml_tensor * feat = nullptr; // F32 [n_col*n_embd, n_rows]: the inputs of the extracted layers, a column block each
+    ggml_tensor * h    = nullptr; // F32 [n_embd_out, n_rows]: the unmasked nextn embeddings
+
+    std::vector<int32_t> col; // [n_layer + 1]: the column block of a layer in feat, -1 = not extracted
+};
+
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
@@ -862,6 +902,10 @@ struct llm_graph_params {
     // the graph the samplers were applied to last: it holds their input tensors
     const llm_graph_result * res_sampling = nullptr;
 
+    // the target states the graph writes (target context) or reads (draft context), see llama_set_spec_states_device
+    const llama_spec_states_tensors * spec_write = nullptr;
+    const llama_spec_states_tensors * spec_read  = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -878,7 +922,8 @@ struct llm_graph_params {
                 (!ubatch.embd  && !other.ubatch.embd)  ||
                 (ubatch.token && other.ubatch.token && ubatch.embd && other.ubatch.embd)
             ) &&
-            (!ubatch.embd_state == !other.ubatch.embd_state);
+            (!ubatch.embd_state == !other.ubatch.embd_state) &&
+            (!ubatch.state_row  == !other.ubatch.state_row);
 
         // when we split the batch using "equal_seqs" we have to verify that the participating sequences are the same
         //   the reason is because the set of attention streams would be different for different sequences
@@ -934,7 +979,9 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            spec_write == other.spec_write &&
+            spec_read  == other.spec_read;
     }
 };
 
@@ -996,6 +1043,16 @@ public:
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
     std::vector<ggml_tensor *> t_layer_inp;
+
+    // the graph writes the target states on the devices (target context) or reads them (draft context)
+    bool spec_written = false;
+    bool spec_read    = false;
+
+    // the layers whose input the graph wrote to the states already (llm_graph_context::build_layer_inp)
+    std::vector<bool> spec_layer_written;
+
+    // the batch indexes of the ubatch entries, made by the first write
+    ggml_tensor * spec_rows = nullptr;
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
@@ -1108,6 +1165,9 @@ struct llm_graph_context {
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
+
+    const llama_spec_states_tensors * spec_write;
+    const llama_spec_states_tensors * spec_read;
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
@@ -1465,6 +1525,25 @@ struct llm_graph_context {
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
+
+    //
+    // target states on the devices for a speculative draft context (llama_set_spec_states_device)
+    //
+
+    // the state of each ubatch entry: the rows of src (the target states) of ubatch.state_row, the other entries from embd_state
+    ggml_tensor * build_inp_state_rows(ggml_tensor * src) const;
+
+    // the hidden state input of an MTP head, F32 [n_embd_h, n_tokens]: sets inp->h (and inp->h_rows)
+    ggml_tensor * build_inp_embd_h_state(llm_graph_input_embd_h * inp, int64_t n_embd_h) const;
+
+    // the target features of a DFlash inject batch, F32 [n_embd_inp, n_tokens]: the embd input, or the target states
+    ggml_tensor * build_inp_target_features(int64_t n_embd_inp) const;
+
+    // res->t_layer_inp[il] = cur, written to the target states here when they take it: its memory can be reused after the layer
+    void build_layer_inp(int il, ggml_tensor * cur) const;
+
+    // the writes of the target states that build_layer_inp did not do (end of the graph)
+    void build_spec_states() const;
 
     //
     // pooling

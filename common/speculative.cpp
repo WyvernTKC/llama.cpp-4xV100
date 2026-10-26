@@ -1238,6 +1238,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
+    // the target features stay on the devices: the inject batches name their rows (llama_set_spec_states_device)
+    bool states_dev = false;
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq, params.draft.n_max)
@@ -1351,6 +1354,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2 && !is_lilicorr);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
+
+        states_dev = llama_set_spec_states_device(ctx_tgt, ctx_dft);
+        LOG_INF("%s: - target features on the devices: %s\n", __func__, states_dev ? "yes" : "no");
     }
 
     ~common_speculative_impl_draft_dflash() override {
@@ -1444,8 +1450,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 continue;
             }
 
+            // on the devices the rows are only named, see llama_set_spec_states_device
             std::vector<const float *> layers(target_layer_ids_n);
-            for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+            for (uint32_t k = 0; k < target_layer_ids_n && !states_dev; ++k) {
                 layers[k] = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
                 if (!layers[k]) {
                     GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
@@ -1464,14 +1471,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 llama_batch_ext_clear(bx);
                 for (int32_t i = 0; i < n_chunk; ++i) {
                     const int32_t row = i_batch_beg[seq_id] + offset + i;
-                    for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                    for (uint32_t k = 0; k < target_layer_ids_n && !states_dev; ++k) {
                         parts[k] = layers[k] + (size_t) row * n_embd_tgt;
                     }
 
                     const llama_pos p = batch_in.tokens[row].pos[0];
                     const llama_pos pos[4] = { p, p, p, 0 }; // an M-RoPE draft reads all 4, others the first
 
-                    const int32_t idx = llama_batch_ext_add_embd_parts(bx, seq_id, parts.data(), target_layer_ids_n, (size_t) n_embd_tgt);
+                    const int32_t idx = states_dev
+                        ? llama_batch_ext_add_state_row(bx, seq_id, row)
+                        : llama_batch_ext_add_embd_parts(bx, seq_id, parts.data(), target_layer_ids_n, (size_t) n_embd_tgt);
                     if (idx < 0 || !llama_batch_ext_set_pos(bx, idx, pos)) {
                         LOG_ERR("%s: failed to add row %d to the inject batch (idx=%d)\n", __func__, (int) row, (int) idx);
                         return false;
@@ -1703,8 +1712,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     // Hidden rows from the most recent target verification batch, grouped by seq.
     // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
+    // Only the last rows of a long batch are kept, from row verify_h_base.
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
+    std::vector<int32_t> verify_h_base;
+
+    // the target hidden states stay on the devices: the catch-up batches name their rows (llama_set_spec_states_device)
+    bool states_dev = false;
 
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
@@ -1787,6 +1801,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+        verify_h_base.assign(n_seq, 0);
+
+        // with a shared KV there is no catch-up batch to read the states
+        if (!is_mem_shared) {
+            states_dev = llama_set_spec_states_device(ctx_tgt, ctx_dft);
+        }
+        SPC_TRC("- target hidden states on the devices: %s\n", states_dev ? "yes" : "no");
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1867,7 +1888,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
-            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+            // on the devices the rows of the target batch are only named, and the target need not be done yet
+            const float * h_tgt = states_dev ? nullptr : llama_get_embeddings_nextn(ctx_tgt);
 
             for (int k = 0; k < n_tokens; ++k) {
                 const auto & t = batch_in.tokens[k];
@@ -1879,11 +1901,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     ? batch.add(t.id, t.pos[0], seq_id, false)
                     : batch.add_embd(t.embd, t.pos.data(), seq_id, false);
 
-                const float * h_row = k == i_batch_beg[seq_id]
-                    ? pending_h[seq_id].data()
-                    : h_tgt + (size_t) (k - 1) * n_embd;
-
-                batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
+                if (k == i_batch_beg[seq_id]) {
+                    batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
+                } else if (states_dev) {
+                    batch.set_state_row(idx, k - 1);
+                } else {
+                    batch.set_embd_state(idx, { h_tgt + (size_t) (k - 1) * n_embd, 1, (size_t) n_embd });
+                }
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
@@ -1924,16 +1948,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            // accept() reads a row of a verify batch (short, its drafts may come from another implementation), a prompt
+            //   batch needs its last row only
+            const int32_t n_keep = std::min(n_rows, std::max(params.n_max + 1, 256));
             verify_h_rows[seq_id] = n_rows;
-            verify_h[seq_id].resize((size_t) n_rows * n_embd);
+            verify_h_base[seq_id] = n_rows - n_keep;
+            verify_h[seq_id].resize((size_t) n_keep * n_embd);
 
-            for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+            for (int32_t i = 0; i < n_keep; ++i) {
+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + verify_h_base[seq_id] + i);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
             std::memcpy(pending_h[seq_id].data(),
-                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+                    verify_h[seq_id].data() + (size_t) (n_keep - 1) * n_embd, row_bytes);
         }
 
         return true;
@@ -2119,7 +2147,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
-        const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+        const int32_t i_h = std::max(std::min<int32_t>(n_accepted, n_rows - 1), verify_h_base[seq_id]) - verify_h_base[seq_id];
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
     }

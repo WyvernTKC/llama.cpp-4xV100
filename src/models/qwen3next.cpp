@@ -150,7 +150,7 @@ llama_model_qwen3next::graph::graph(const llama_model & model, const llm_graph_p
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
-        res->t_layer_inp[il] = inpL;
+        build_layer_inp(il, inpL);
 
         ggml_tensor * inpSA = inpL;
 
@@ -667,9 +667,7 @@ llama_model_qwen3next::graph_mtp::graph_mtp(const llama_model & model, const llm
     }
     cb(tok_embd, "mtp_tok_embd", il);
 
-    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
-    ggml_set_input(inp->h);
-    ggml_set_name(inp->h, "mtp_h_input");
+    build_inp_embd_h_state(inp.get(), hparams.n_embd);
 
     ggml_tensor * h_embd = inp->h;
 

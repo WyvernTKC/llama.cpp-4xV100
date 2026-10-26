@@ -244,7 +244,7 @@ llama_model_bailingmoe3::graph::graph(const llama_model & model, const llm_graph
     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
 
     for (int il = 0; il < n_layer; ++il) {
-        res->t_layer_inp[il] = inpL;
+        build_layer_inp(il, inpL);
 
         const auto & layer = model.layers[il];
         ggml_tensor * inpSA = inpL;
@@ -442,9 +442,7 @@ llama_model_bailingmoe3::graph_mtp::graph_mtp(const llama_model & model, const l
     ggml_set_input(inp->tokens);
     inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
     ggml_set_input(inp->embd);
-    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
-    ggml_set_input(inp->h);
-    ggml_set_name(inp->h, "mtp_h_input");
+    build_inp_embd_h_state(inp.get(), hparams.n_embd);
 
     ggml_tensor * tok_embd = ubatch.token ? ggml_get_rows(ctx0, model.tok_embd, inp->tokens) : inp->embd;
     ggml_tensor * h_norm = build_norm(inp->h, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);

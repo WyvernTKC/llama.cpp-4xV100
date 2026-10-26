@@ -127,6 +127,20 @@ LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch
 LLAMA_API int32_t llama_batch_ext_add_embd_parts(struct llama_batch_ext * batch, llama_seq_id seq_id,
         const float * const * parts, size_t n_parts, size_t n_part);
 
+// The state of the entry at idx is row `row` of the target states this context reads on the devices (see
+//   llama_set_spec_states_device): the MTP hidden state, or the DFlash target features of an entry without token or embd
+LLAMA_API bool llama_batch_ext_set_state_row(struct llama_batch_ext * batch, int32_t idx, int32_t row);
+
+// Add an entry with only a state row (no token, no embedding). Returns the batch index or a negative error.
+LLAMA_API int32_t llama_batch_ext_add_state_row(struct llama_batch_ext * batch, llama_seq_id seq_id, int32_t row);
+
+// Keep the target states that ctx_dft reads (the extracted layer inputs and the unmasked nextn embeddings) on the devices:
+//   the graphs of ctx_tgt write the row of every batch entry, at its batch index, to a buffer on its devices, the graphs
+//   of ctx_dft read the rows of llama_batch_ext_set_state_row, and device events order the two. Call after the extraction
+//   flags are set. False (the host copies stay) when the devices cannot: not one device per context, no events.
+//   LLAMA_SPEC_STATES_DEVICE=0 keeps the host copies.
+LLAMA_API bool llama_set_spec_states_device(struct llama_context * ctx_tgt, struct llama_context * ctx_dft);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
