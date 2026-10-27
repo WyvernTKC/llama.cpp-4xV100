@@ -115,6 +115,14 @@ struct llama_model_loader {
         std::set<std::string>                  tensors;
     } lazy;
 
+    // K/V weights of repeated kv heads (llama_hparams::n_head_kv_rep): the file holds n_head heads, the tensor
+    //   holds each of them rep times in a row
+    struct kv_rep_info {
+        uint32_t n_head;
+        uint32_t rep;
+    };
+    std::unordered_map<const ggml_tensor *, kv_rep_info> kv_rep;
+
     llama_files files;
     llama_ftype ftype;
     llama_fver  fver;

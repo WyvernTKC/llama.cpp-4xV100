@@ -109,6 +109,10 @@ struct llama_hparams {
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_ff_arr;
 
+    // > 1: n_head_kv_arr counts every kv head of the file this many times, and the K/V weights repeat each head
+    //   on load (the loader expands them), see llama_model_base::load_tensors
+    uint32_t n_head_kv_rep = 1;
+
     // per-layer expert feed-forward size
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_ff_exp_arr;
     // per-layer top-k expert routing count

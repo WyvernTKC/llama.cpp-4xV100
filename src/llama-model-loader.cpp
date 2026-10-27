@@ -1605,6 +1605,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return buft;
     };
 
+    // repeated kv heads: the file holds the K/V weights with every head once, the head dim is their last one
+    const bool is_kv_rep = hparams.n_head_kv_rep > 1 && tn.bid >= 0 && tn.suffix != nullptr &&
+        (tn.tensor == LLM_TENSOR_ATTN_K || tn.tensor == LLM_TENSOR_ATTN_V) &&
+        (strcmp(tn.suffix, "weight") == 0 || strcmp(tn.suffix, "bias") == 0);
+    const kv_rep_info kv_rep_cur = {
+        is_kv_rep ? hparams.n_head_kv(tn.bid) / hparams.n_head_kv_rep : 0, hparams.n_head_kv_rep };
+
     if (files.empty()) {
         if (flags & TENSOR_SKIP_IF_VIRTUAL) {
             return nullptr;
@@ -1646,11 +1653,20 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
+        if (is_kv_rep) {
+            kv_rep[ret] = kv_rep_cur;
+        }
         return ret;
     }
 
+    std::vector<int64_t> ne_file(ne);
+    if (is_kv_rep) {
+        GGML_ASSERT(ne_file.back() % kv_rep_cur.rep == 0);
+        ne_file.back() /= kv_rep_cur.rep;
+    }
+
     LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
-    const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne, !(flags & TENSOR_NOT_REQUIRED), flags & TENSOR_ALLOW_RESHAPE);
+    const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne_file, !(flags & TENSOR_NOT_REQUIRED), flags & TENSOR_ALLOW_RESHAPE);
     if (cur == NULL) {
         return NULL;
     }
@@ -1663,7 +1679,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     ggml_tensor t_meta = *cur;
     if (flags & TENSOR_ALLOW_RESHAPE) {
         for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
-            t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
+            t_meta.ne[dim] = dim < ne_file.size() ? ne_file[dim] : 1;
             if (dim == 0) {
                 t_meta.nb[dim] = ggml_type_size(t_meta.type);
             } else if (dim == 1) {
@@ -1693,8 +1709,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     const bool duplicated = flags & TENSOR_DUPLICATED;
 
+    if (is_kv_rep) {
+        t_meta.ne[ne_file.size() - 1] *= kv_rep_cur.rep; // ggml_dup_tensor derives nb from ne
+    }
+
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
     ggml_set_name(tensor, ggml_get_name(&t_meta));
+    if (is_kv_rep) {
+        kv_rep[tensor] = kv_rep_cur;
+    }
 
     if (duplicated) {
         size_data += ggml_nbytes(&t_meta);
@@ -1870,6 +1893,19 @@ const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, 
     return data;
 }
 
+// upload a K/V weight of repeated kv heads from its file data, in which every head is once
+static void llama_kv_rep_upload(ggml_tensor * t, const uint8_t * data, size_t size, const llama_model_loader::kv_rep_info & info) {
+    GGML_ASSERT(size*info.rep == ggml_nbytes(t) && size % info.n_head == 0);
+    const size_t size_head = size/info.n_head;
+    std::vector<uint8_t> buf(ggml_nbytes(t));
+    for (uint32_t h = 0; h < info.n_head; h++) {
+        for (uint32_t r = 0; r < info.rep; r++) {
+            memcpy(buf.data() + (h*info.rep + r)*size_head, data + h*size_head, size_head);
+        }
+    }
+    ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
+}
+
 bool llama_model_loader::load_all_data(
         struct ggml_context * ctx,
         std::vector<ggml_backend_buffer_t> & bufs,
@@ -1879,6 +1915,13 @@ bool llama_model_loader::load_all_data(
     if (files.empty()) {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             set_tensor_data(t, set_tensor_data_ud);
+            const auto it_rep = kv_rep.find(t);
+            if (it_rep != kv_rep.end()) {
+                // keep the heads the filler wrote first, as a file of this model would hold them
+                std::vector<uint8_t> data(ggml_nbytes(t));
+                ggml_backend_tensor_get(t, data.data(), 0, data.size());
+                llama_kv_rep_upload(t, data.data(), data.size()/it_rep->second.rep, it_rep->second);
+            }
         }
         return true;
     }
@@ -2005,6 +2048,9 @@ bool llama_model_loader::load_all_data(
     const auto t_load_start = ggml_time_us();
     llama_load_pipeline pipeline(files, check_tensors);
 
+    // the file data of the K/V weights of repeated kv heads, read by the pipeline and uploaded after it drained
+    std::vector<std::pair<ggml_tensor *, std::vector<uint8_t>>> kv_rep_data;
+
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -2019,6 +2065,24 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        const auto it_rep = kv_rep.find(cur);
+        if (it_rep != kv_rep.end()) {
+            n_size /= it_rep->second.rep;
+            GGML_ASSERT(n_size == ggml_nbytes(weight->tensor));
+            if (use_mmap) {
+                const uint8_t * data = (const uint8_t *) mappings.at(weight->idx)->addr() + weight->offs;
+                if (check_tensors && !ggml_validate_row_data(cur->type, data, n_size)) {
+                    throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                }
+                llama_kv_rep_upload(cur, data, n_size, it_rep->second);
+            } else {
+                kv_rep_data.emplace_back(cur, std::vector<uint8_t>(n_size));
+                pipeline.submit(cur, weight->idx, weight->offs, n_size, kv_rep_data.back().second.data());
+            }
+            size_done += n_size;
+            continue;
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 
@@ -2130,6 +2194,10 @@ bool llama_model_loader::load_all_data(
 
     // everything still in flight must land before the caller frees the file or checks size_done
     pipeline.drain();
+
+    for (const auto & [t, data] : kv_rep_data) {
+        llama_kv_rep_upload(t, data.data(), data.size(), kv_rep.at(t));
+    }
 
     if (pipeline.n_read > 0) {
         const double t_total = (ggml_time_us() - t_load_start)/1e6;

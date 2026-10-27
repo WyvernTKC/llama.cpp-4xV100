@@ -592,8 +592,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             //   so every layer has to split its heads in the same way for them to line up
             rotation = 0;
         }
-        // the per-device q heads have to stay inside one kv head, which only the even split guarantees
-        const bool even_split = q_subgroup_split(il) && is_attn;
+        // the per-device q heads have to stay inside one kv head, which only the even split guarantees;
+        //   with repeated kv heads the even split gives every device one of them
+        const bool even_split = (q_subgroup_split(il) || hparams.n_head_kv_rep > 1) && is_attn;
         return {axis, tensor_axis_0, il, il_split, rotation, even_split};
     };
 
@@ -2411,6 +2412,67 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
+
+    // -sm tensor with fewer kv heads than devices: count every kv head n_devices/n_head_kv times and repeat it in the
+    //   K/V weights (the loader expands them), so that each device holds the one kv head its q heads use, its K/V
+    //   projection rows and its cache - instead of all of them mirrored. LLAMA_KV_HEAD_REP=0 keeps them mirrored.
+    if (split_mode == LLAMA_SPLIT_MODE_TENSOR && hparams.n_head_kv_rep == 1) {
+        const uint32_t rep = [&]() -> uint32_t {
+            const char * env = getenv("LLAMA_KV_HEAD_REP");
+            const uint32_t n_dev = (uint32_t) get_split_state_ud.n_devices;
+            // TODO: qwen4exp's sparse attention gathers whole kv rows, not tried with a split kv
+            if ((env != nullptr && atoi(env) == 0) || n_dev <= 1 || hparams.is_mla() || hparams.n_layer_kv_from_start >= 0 ||
+                    arch == LLM_ARCH_QWEN4EXP) {
+                return 1;
+            }
+            // the graph takes one n_head_kv for all layers
+            uint32_t n_kv = 0;
+            for (int il = 0; il < n_layer_all; il++) {
+                const uint32_t n = hparams.n_head_kv_arr[il];
+                if (n != 0 && n_kv != 0 && n != n_kv) {
+                    return 1;
+                }
+                n_kv = n != 0 ? n : n_kv;
+            }
+            if (n_kv == 0 || n_kv >= n_dev || n_dev % n_kv != 0) {
+                return 1;
+            }
+            const auto tn = LLM_TN(arch);
+            for (int il = 0; il < n_layer_all; il++) {
+                if (hparams.n_head_kv_arr[il] == 0 || hparams.is_recr(il)) {
+                    continue;
+                }
+                // the loader expands the weights of separate Q/K/V projections in device buffers
+                const ggml_tensor * wq = ml.get_tensor_meta(tn(LLM_TENSOR_ATTN_Q,   "weight", il).str().c_str());
+                const ggml_tensor * wo = ml.get_tensor_meta(tn(LLM_TENSOR_ATTN_OUT, "weight", il).str().c_str());
+                if (pimpl->dev_layer[il].dev == cpu_dev || wq == nullptr || wo == nullptr ||
+                        ml.get_tensor_meta(tn(LLM_TENSOR_ATTN_K, "weight", il).str().c_str()) == nullptr ||
+                        ml.get_tensor_meta(tn(LLM_TENSOR_ATTN_V, "weight", il).str().c_str()) == nullptr ||
+                        hparams.n_head(il) % n_dev != 0) {
+                    return 1;
+                }
+                // the q heads of one kv head have to be whole granules of the q split, as in q_subgroup_split
+                const int64_t n_head_dev = hparams.n_head(il) / n_dev;
+                const int64_t n_embd_q   = n_head_dev * hparams.n_embd_head_k(il);
+                const int64_t n_embd_o   = n_head_dev * hparams.n_embd_head_v(il);
+                int64_t blck_size_perf = std::lcm(ggml_blck_size(wq->type), ggml_blck_size(wo->type));
+                while (blck_size_perf < 128 && blck_size_perf*n_dev < n_embd_q) {
+                    blck_size_perf *= 2;
+                }
+                if (n_embd_q % blck_size_perf != 0 || n_embd_o % blck_size_perf != 0) {
+                    return 1;
+                }
+            }
+            return n_dev / n_kv;
+        }();
+        if (rep > 1) {
+            for (int il = 0; il < n_layer_all; il++) {
+                hparams.n_head_kv_arr[il] *= rep;
+            }
+            hparams.n_head_kv_rep = rep;
+            LLAMA_LOG_INFO("%s: SPLIT_MODE_TENSOR: repeating each kv head %u times, n_head_kv = %u\n", __func__, rep, hparams.n_head_kv());
+        }
+    }
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
