@@ -1977,8 +1977,9 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
         fusion_local.norm.eps   = fusion->norm_eps;
     }
 
-    // the all-reduce of the output folded into the launch, if it can take it (see ggml_backend_cuda_context::ar_fold)
-    if (ctx.ar_fold.next == dst) {
+    // the all-reduce of the output folded into the launch, if it can take it (see ggml_backend_cuda_context::ar_fold),
+    //   not with hyper-connections (see ggml_backend_cuda_session_allreduce_next)
+    if (ctx.ar_fold.next == dst && !ctx.ar_fold.hc) {
         fusion_local.ar        = ctx.ar_fold.next_call.args;
         fusion_local.ar_pushed = &ctx.ar_fold.pushed;
     }

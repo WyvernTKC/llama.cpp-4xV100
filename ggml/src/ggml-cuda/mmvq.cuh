@@ -19,6 +19,10 @@ bool ggml_cuda_should_fuse_mmvq_gate(enum ggml_type type, int cc, int64_t nrows_
 // whether a convolution in the epilogue of a one-token mmvq of this type (fusion conv_*) costs the kernel no occupancy
 bool ggml_cuda_mmvq_conv_epilogue_pays(enum ggml_type type, int cc);
 
+// the experts of a one-token MoE down projection whose sum the launch can push as the all-reduce (see
+//   mul_mat_vec_q_short_ar_moe)
+#define MMVQ_SHORT_AR_MAX_EXPERTS 10
+
 // whether the one-token short q8_0 kernel takes this MUL_MAT_ID with a sibling of one more channel, sib*sib_y
 bool ggml_cuda_mul_mat_vec_q_short_sibling(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
         const ggml_tensor * sib, const ggml_tensor * sib_y);

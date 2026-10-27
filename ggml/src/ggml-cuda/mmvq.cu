@@ -1417,10 +1417,9 @@ static __global__ void mul_mat_vec_q_short(
 //   rows as mul_mat_vec_q_short does, then the block adds them as moe_weighted_reduction_f32 does and pushes the sums:
 //   no ticket per group of rows and no read back of dst (Ornith-122B: 20.9 -> 18.2 us a launch).
 #define MMVQ_SHORT_AR_ROWS 4
-#define MMVQ_SHORT_AR_MAX_EXPERTS 8
-// 7 blocks of 9 warps per SM
-template <int lanes>
-__launch_bounds__((MMVQ_SHORT_AR_MAX_EXPERTS + 1)*WARP_SIZE, 7)
+// nwarps: the experts and the sibling at most, 9 (7 blocks per SM) or 11 (5)
+template <int lanes, int nwarps>
+__launch_bounds__(nwarps*WARP_SIZE, 64/nwarps)
 static __global__ void mul_mat_vec_q_short_ar_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion,
         float * dst_ptr, const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x,
@@ -1492,7 +1491,7 @@ static __global__ void mul_mat_vec_q_short_ar_moe(
         }
     }
 
-    __shared__ float sums[MMVQ_SHORT_AR_MAX_EXPERTS + 1][MMVQ_SHORT_AR_ROWS];
+    __shared__ float sums[nwarps][MMVQ_SHORT_AR_ROWS];
 #pragma unroll
     for (int i = 0; i < rows_per_thread; ++i) {
         tmp[i] = warp_reduce_sum<lanes>(tmp[i]);
@@ -1924,9 +1923,14 @@ static void mul_mat_vec_q_short_launch_lanes(
             m.n_used  = fold->ar_n_used;
             const dim3 block_nums(nrows_x / MMVQ_SHORT_AR_ROWS, 1, 1);
             const dim3 block_dims(WARP_SIZE, nchannels_dst + 1, 1);
-            ggml_cuda_kernel_launch(mul_mat_vec_q_short_ar_moe<lanes>, ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream),
-                vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_channel_x, stride_channel_y,
-                stride_channel_dst, m);
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+            if (nchannels_dst + 1 <= 9) {
+                ggml_cuda_kernel_launch(mul_mat_vec_q_short_ar_moe<lanes, 9>, launch_params, vx, vy, ids, fusion, dst, ncols_x,
+                    nchannels_y, stride_row_x, stride_channel_x, stride_channel_y, stride_channel_dst, m);
+            } else {
+                ggml_cuda_kernel_launch(mul_mat_vec_q_short_ar_moe<lanes, MMVQ_SHORT_AR_MAX_EXPERTS + 1>, launch_params, vx, vy, ids,
+                    fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_channel_x, stride_channel_y, stride_channel_dst, m);
+            }
             *fold->ar_pushed = true;
             return;
         }
@@ -2673,9 +2677,10 @@ static void ggml_cuda_mul_mat_vec_q_impl(
         }
     }
 
-    // the all-reduce of the output folded into the launch, if it can take it (see ggml_backend_cuda_context::ar_fold);
-    //   with ar_weights that of the MoE sum of the experts this launch computes, which the caller checked is next
-    if (ctx.ar_fold.next == dst && src1_rot == 0) {
+    // the all-reduce of the output folded into the launch, if it can take it (see ggml_backend_cuda_context::ar_fold),
+    //   not with hyper-connections (see ggml_backend_cuda_session_allreduce_next); with ar_weights that of the MoE sum
+    //   of the experts this launch computes, which the caller checked is next
+    if (ctx.ar_fold.next == dst && src1_rot == 0 && !ctx.ar_fold.hc) {
         fusion_local.ar        = ctx.ar_fold.next_call.args;
         fusion_local.ar_pushed = &ctx.ar_fold.pushed;
     }

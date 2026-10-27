@@ -6267,7 +6267,7 @@ static int ggml_cuda_try_fuse_moe_down_shexp(ggml_backend_cuda_context * cuda_ct
     //   written anywhere
     static const bool no_moe_fold = getenv("GGML_CUDA_NO_AR_FOLD_MOE") != nullptr;
     const bool fold = !use_mmvf && last && gated && !no_moe_fold && cuda_ctx->ar_fold.next == add && ggml_are_same_shape(match.experts, down) &&
-        match.experts->data == down->data && match.experts->ne[1] <= 8;
+        match.experts->data == down->data && match.experts->ne[1] <= MMVQ_SHORT_AR_MAX_EXPERTS;
     if (fold) {
         fusion_data.ar_weights = match.weights;
         fusion_data.ar_gate    = g;
@@ -9911,9 +9911,9 @@ static bool ggml_backend_cuda_session_allreduce_supported(void * comm_ctx_v, str
 
 // The all-reduce of tensors (one per device) after the subgraph about to run: the matmul that writes tensors[rank] may
 //   push its rows as the LL lines of every rank, see ggml_backend_cuda_context::ar_fold. GGML_CUDA_NO_AR_FOLD=1 turns
-//   it off. Not in a model with hyper-connections (ar_fold.hc): DSV4_HC_POST cannot poll the lines, so the receive kernel
-//   would run, and with the pushing matmul that is two kernels of their own per layer, which costs DeepSeek-V4-Flash
-//   more than the LL kernel they replace.
+//   it off. With hyper-connections (ar_fold.hc) DSV4_HC_POST cannot poll the lines, so the receive kernel runs: only the
+//   MoE fold pushes there (its receive kernel replaces ll_moe_reduce, Qwen3.8-Flash-Next +2.0%); a matvec that pushes
+//   plus the receive kernel is one launch more than the LL kernel, which costs DeepSeek-V4-Flash more than it saves.
 static void ggml_backend_cuda_session_allreduce_next(void * comm_ctx_v, struct ggml_tensor ** tensors, size_t rank) {
     static const bool no_fold = getenv("GGML_CUDA_NO_AR_FOLD") != nullptr;
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
@@ -9931,7 +9931,7 @@ static void ggml_backend_cuda_session_allreduce_next(void * comm_ctx_v, struct g
     if (carry_test && tensors[rank] == f.bound) {
         return;
     }
-    if (no_fold || f.hc || ncols > 8*1024 || comm_ctx->p2p_ar == nullptr ||
+    if (no_fold || ncols > 8*1024 || comm_ctx->p2p_ar == nullptr ||
             !ggml_cuda_p2p_ar_fold_args(comm_ctx->p2p_ar, comm_ctx->backends.data(), tensors, rank, f.next_call.args)) {
         return;
     }
