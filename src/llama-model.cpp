@@ -3957,9 +3957,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         };
 
                         if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
-                            // QSA runs on the dense-attention layers only
+                            // QSA runs on the dense-attention layers that have a compress ratio
                             filter_idx = [&](uint32_t il) {
-                                return il < hparams.n_layer() && !hparams.is_recr(il);
+                                return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.dsv4_compress_ratios[il] > 0;
                             };
                         }
 

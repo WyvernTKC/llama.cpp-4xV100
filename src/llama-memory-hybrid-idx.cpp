@@ -50,7 +50,16 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         n_seq_max, n_rs_seq, offload, unified,
         filter_attn, filter_recr),
     hparams_idx(model.hparams),
-    mem_idx(filter_idx == nullptr ? nullptr : [&] {
+    mem_idx(filter_idx == nullptr ? nullptr : [&]() -> llama_kv_cache * {
+        // a model whose layers all run dense attention leaves its indexer unused, and keeps no cache for it
+        bool any = false;
+        for (uint32_t il = 0; il < model.hparams.n_layer_all && !any; ++il) {
+            any = filter_idx(il);
+        }
+        if (!any) {
+            return nullptr;
+        }
+
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
         // a k-pool indexer caches its per-token rows and the pooled key side by side
@@ -71,7 +80,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
-    }()) {
+    }()),
+    has_indexer(filter_idx != nullptr) {
     // LLAMA_QSA_POOL_CACHE=0 pools every block of every ubatch
     const char * env = getenv("LLAMA_QSA_POOL_CACHE");
     if (!mem_idx || model.arch != LLM_ARCH_QWEN4EXP || model.hparams.indexer_kpool > 0 || mem_idx->get_n_stream() != 1 ||
@@ -411,7 +421,8 @@ llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
 //   indexer, no graph is built for more cells than its ubatch needs (the attention cache alone did, and qwen4exp
 //   asserted at the first graph of a few tokens)
 void llama_memory_hybrid_idx::set_graph_reshape(bool enable) {
-    llama_memory_hybrid::set_graph_reshape(enable && mem_idx == nullptr);
+    // a model whose indexer is unused keeps the graphs it had with the cache
+    llama_memory_hybrid::set_graph_reshape(enable && mem_idx == nullptr && !has_indexer);
 }
 
 void llama_memory_hybrid_idx::set_input_qsa(

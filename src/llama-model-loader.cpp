@@ -764,7 +764,8 @@ namespace GGUFMeta {
             throw std::runtime_error(format("n > N_MAX: %u > %u for key %s", n, (uint32_t) N_MAX, key.c_str()));
         }
 
-        if (gguf_get_kv_type(metadata, kid) == GGUF_TYPE_ARRAY) {
+        // a scalar override (--override-kv) replaces the whole array with one value
+        if (gguf_get_kv_type(metadata, kid) == GGUF_TYPE_ARRAY && kv_overrides.find(key) == kv_overrides.end()) {
             struct GGUFMeta::ArrayInfo arr_info =
                 GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(metadata, kid);
 

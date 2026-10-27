@@ -168,6 +168,22 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         }
     }
 
+    // a compress ratio means something on attention layers only, so one value (a scalar --override-kv) can set them all
+    bool any_qsa = false;
+    for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
+        if (hparams.is_recr(i)) {
+            hparams.dsv4_compress_ratios[i] = 0;
+        }
+        any_qsa = any_qsa || (i < hparams.n_layer() && hparams.dsv4_compress_ratios[i] > 0);
+    }
+
+    // every attention layer loads its indexer weights, but without a ratio it runs dense attention and never uses them
+    if (!any_qsa) {
+        LLAMA_LOG_WARN("%s: no attention layer has a QSA compress ratio: attention is dense and the indexer weights go unused; "
+                       "if the GGUF lost them, --override-kv %s=int:<ratio> restores them (Qwen3.8-Flash-Next: 4)\n",
+                       __func__, ml.llm_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS).c_str());
+    }
+
     switch (hparams.n_layer()) {
         case 48: type = LLM_TYPE_A3B; break;
         default: type = LLM_TYPE_UNKNOWN;

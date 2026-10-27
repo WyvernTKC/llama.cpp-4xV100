@@ -153,6 +153,9 @@ private:
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
 
+    // the model has indexer weights, though mem_idx is null when no layer uses them
+    const bool has_indexer;
+
     // unique_ptr because kpool_layout is incomplete here
     std::unique_ptr<kpool_layout> kpool_lay;
 
