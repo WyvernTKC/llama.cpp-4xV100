@@ -209,6 +209,9 @@ struct llama_context {
     // wait for the queued reads and copy them to their destinations
     void state_read_async_wait();
 
+    // pinned host memory for the 2-D state copies to and from buft (llama_io_tensor_2d), nullptr if there is none
+    uint8_t * state_stage(ggml_backend_buffer_type_t buft);
+
     bool state_load_file(
             const char * filepath,
            llama_token * tokens_out,
@@ -537,6 +540,9 @@ private:
     std::vector<std::pair<ggml_backend_t, ggml_backend_event_ptr>> state_read_events;
     std::vector<ggml_backend_event_t> state_read_events_used;
     std::vector<state_read_pending>   state_read_copies;
+
+    // pinned staging of the 2-D state copies, one per buffer type, see state_stage()
+    std::vector<std::pair<ggml_backend_buffer_type_t, ggml_backend_buffer_ptr>> state_stage_bufs;
 
 
     bool has_evaluated_once = false;

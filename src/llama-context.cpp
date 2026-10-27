@@ -3372,9 +3372,119 @@ llm_graph_cb llama_context::graph_get_cb() const {
 // state save/load
 //
 
+// a block of state data and its 2-D copies
+template <typename T>
+struct llama_io_block {
+    T * data;
+    std::vector<llama_io_tensor_2d> parts;
+};
+
+// size of the pinned staging per buffer type, see llama_context::state_stage
+static constexpr size_t llama_state_stage_size = 16*1024*1024;
+
+uint8_t * llama_context::state_stage(ggml_backend_buffer_type_t buft) {
+    if (ggml_backend_buft_is_host(buft)) {
+        return nullptr;
+    }
+    auto it = std::find_if(state_stage_bufs.begin(), state_stage_bufs.end(), [&](const auto & s) { return s.first == buft; });
+    if (it == state_stage_bufs.end()) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        ggml_backend_buffer_type_t buft_host = dev != nullptr ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+        state_stage_bufs.emplace_back(buft, buft_host != nullptr ? ggml_backend_buft_alloc_buffer(buft_host, llama_state_stage_size) : nullptr);
+        it = std::prev(state_stage_bufs.end());
+    }
+    return it->second ? (uint8_t *) ggml_backend_buffer_get_base(it->second.get()) : nullptr;
+}
+
+// Run the 2-D copies of the blocks, one thread per buffer type: each copy waits for its own transfer, so the parts on
+//   different devices run at the same time and the parts on one device run in order. Pageable 2-D copies of a few
+//   hundred bytes per row are slow, so with ctx_stage a device moves whole runs of rows through pinned memory and its
+//   thread spreads or gathers the rows on the host.
+template <typename T, typename F>
+static void llama_io_blocks_run(const std::vector<llama_io_block<T>> & blocks, llama_context * ctx_stage, F && copy) {
+    std::vector<std::pair<ggml_backend_buffer_type_t, std::vector<std::pair<T *, const llama_io_tensor_2d *>>>> groups;
+    size_t n_bytes = 0;
+    for (const auto & block : blocks) {
+        for (const auto & part : block.parts) {
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(part.tensor->buffer);
+            auto it = std::find_if(groups.begin(), groups.end(), [&](const auto & g) { return g.first == buft; });
+            if (it == groups.end()) {
+                groups.push_back({ buft, {} });
+                it = std::prev(groups.end());
+            }
+            it->second.push_back({ block.data, &part });
+            n_bytes += part.size*part.n_rows;
+        }
+    }
+
+    std::vector<uint8_t *> stages(groups.size(), nullptr);
+    if (ctx_stage != nullptr) {
+        for (size_t i = 0; i < groups.size(); ++i) {
+            stages[i] = ctx_stage->state_stage(groups[i].first);
+        }
+    }
+
+    auto run = [&](size_t i) {
+        for (const auto & [data, part] : groups[i].second) {
+            copy(data + part->data_offset, *part, part->size <= llama_state_stage_size ? stages[i] : nullptr);
+        }
+    };
+
+    if (groups.size() < 2 || n_bytes < 1024*1024) {
+        for (size_t i = 0; i < groups.size(); ++i) {
+            run(i);
+        }
+        return;
+    }
+
+    std::vector<std::thread> workers;
+    for (size_t i = 1; i < groups.size(); ++i) {
+        workers.emplace_back(run, i);
+    }
+    run(0);
+    for (auto & w : workers) {
+        w.join();
+    }
+}
+
+static void llama_io_blocks_get(const std::vector<llama_io_block<uint8_t>> & blocks, llama_context * ctx_stage) {
+    llama_io_blocks_run(blocks, ctx_stage, [](uint8_t * dst, const llama_io_tensor_2d & p, uint8_t * stage) {
+        if (stage == nullptr) {
+            ggml_backend_tensor_get_2d(p.tensor, dst, p.offset, p.size, p.n_rows, p.stride, p.data_stride);
+            return;
+        }
+        const size_t n_stage = llama_state_stage_size/p.size;
+        for (size_t r0 = 0; r0 < p.n_rows; r0 += n_stage) {
+            const size_t n = std::min(n_stage, p.n_rows - r0);
+            ggml_backend_tensor_get_2d(p.tensor, stage, p.offset + r0*p.stride, p.size, n, p.stride, p.size);
+            for (size_t i = 0; i < n; ++i) {
+                memcpy(dst + (r0 + i)*p.data_stride, stage + i*p.size, p.size);
+            }
+        }
+    });
+}
+
+static void llama_io_blocks_set(const std::vector<llama_io_block<const uint8_t>> & blocks, llama_context * ctx_stage) {
+    llama_io_blocks_run(blocks, ctx_stage, [](const uint8_t * src, const llama_io_tensor_2d & p, uint8_t * stage) {
+        if (stage == nullptr) {
+            ggml_backend_tensor_set_2d(p.tensor, src, p.offset, p.size, p.n_rows, p.stride, p.data_stride);
+            return;
+        }
+        const size_t n_stage = llama_state_stage_size/p.size;
+        for (size_t r0 = 0; r0 < p.n_rows; r0 += n_stage) {
+            const size_t n = std::min(n_stage, p.n_rows - r0);
+            for (size_t i = 0; i < n; ++i) {
+                memcpy(stage + i*p.size, src + (r0 + i)*p.data_stride, p.size);
+            }
+            ggml_backend_tensor_set_2d(p.tensor, stage, p.offset + r0*p.stride, p.size, n, p.stride, p.size);
+        }
+    });
+}
+
 class llama_io_write_dummy : public llama_io_write_i {
 public:
-    llama_io_write_dummy(bool skip_tensors) : skip_tensors(skip_tensors) {}
+    // tensor_2d: the writer it sizes for takes 2-D copies
+    llama_io_write_dummy(bool skip_tensors, bool tensor_2d) : skip_tensors(skip_tensors), tensor_2d(tensor_2d) {}
 
     void write(const void * /* src */, size_t size) override {
         size_written += size;
@@ -3388,12 +3498,21 @@ public:
         size_written += size;
     }
 
+    bool has_tensor_2d() const override {
+        return tensor_2d;
+    }
+
+    void write_tensor_2d(size_t size, const std::vector<llama_io_tensor_2d> & /* parts */) override {
+        size_written += size;
+    }
+
     size_t n_bytes() override {
         return size_written;
     }
 
 private:
     const bool skip_tensors;
+    const bool tensor_2d;
 
     size_t size_written = 0;
 };
@@ -3401,8 +3520,9 @@ private:
 class llama_io_write_host : public llama_io_write_i {
 public:
     // with lctx (LLAMA_STATE_SEQ_FLAGS_ASYNC) the caller did not wait for the submitted work
+    // ctx_stage: the context whose pinned staging the 2-D copies use
     llama_io_write_host(
-            uint8_t * p, size_t len, llama_context * lctx = nullptr) : ptr(p), buf_size(len), lctx(lctx) {}
+            uint8_t * p, size_t len, llama_context * lctx = nullptr, llama_context * ctx_stage = nullptr) : ptr(p), buf_size(len), lctx(lctx), ctx_stage(ctx_stage) {}
 
     ~llama_io_write_host() {
         if (lctx != nullptr) {
@@ -3421,6 +3541,8 @@ public:
         for (const auto & winfo : winfos) {
             ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
         }
+
+        llama_io_blocks_get(blocks, ctx_stage);
     }
 
     void write(const void * src, size_t size) override {
@@ -3446,6 +3568,23 @@ public:
         buf_size -= size;
     }
 
+    // the queued reads (lctx) take whole tensor ranges only
+    bool has_tensor_2d() const override {
+        return lctx == nullptr;
+    }
+
+    void write_tensor_2d(size_t size, const std::vector<llama_io_tensor_2d> & parts) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+
+        blocks.push_back({ ptr, parts });
+
+        ptr += size;
+        size_written += size;
+        buf_size -= size;
+    }
+
     size_t n_bytes() override {
         return size_written;
     }
@@ -3456,6 +3595,9 @@ private:
     size_t size_written = 0;
 
     llama_context * lctx;
+    llama_context * ctx_stage;
+
+    std::vector<llama_io_block<uint8_t>> blocks;
 
     struct write_info {
         ggml_tensor * tensor;
@@ -3468,13 +3610,15 @@ private:
 
 class llama_io_read_host : public llama_io_read_i {
 public:
-    llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
+    llama_io_read_host(const uint8_t * p, size_t len, llama_context * ctx_stage = nullptr) : ptr(p), buf_size(len), ctx_stage(ctx_stage) {}
 
     ~llama_io_read_host() {
         // flush the reads
         for (const auto & rinfo : rinfos) {
             ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
         }
+
+        llama_io_blocks_set(blocks, ctx_stage);
     }
 
     void read(void * dst, size_t size) override {
@@ -3500,8 +3644,25 @@ public:
         buf_size -= size;
     }
 
+    bool has_tensor_2d() const override {
+        return true;
+    }
+
+    void read_tensor_2d(size_t size, const std::vector<llama_io_tensor_2d> & parts) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+
+        blocks.push_back({ ptr, parts });
+
+        ptr += size;
+        size_read += size;
+        buf_size -= size;
+    }
+
     void discard() override {
         rinfos.clear();
+        blocks.clear();
     }
 
     size_t n_bytes() override {
@@ -3520,11 +3681,15 @@ private:
         size_t offset;
     };
     std::vector<read_info> rinfos;
+
+    llama_context * ctx_stage;
+
+    std::vector<llama_io_block<const uint8_t>> blocks;
 };
 
 class llama_io_write_file : public llama_io_write_i {
 public:
-    llama_io_write_file(llama_file * f) : file(f) {}
+    llama_io_write_file(llama_file * f, llama_context * ctx_stage = nullptr) : file(f), ctx_stage(ctx_stage) {}
 
     void write(const void * src, size_t size) override {
         file->write_raw(src, size);
@@ -3537,19 +3702,30 @@ public:
         write(temp_buffer.data(), temp_buffer.size());
     }
 
+    bool has_tensor_2d() const override {
+        return true;
+    }
+
+    void write_tensor_2d(size_t size, const std::vector<llama_io_tensor_2d> & parts) override {
+        temp_buffer.resize(size);
+        llama_io_blocks_get({ { temp_buffer.data(), parts } }, ctx_stage);
+        write(temp_buffer.data(), temp_buffer.size());
+    }
+
     size_t n_bytes() override {
         return size_written;
     }
 
 private:
     llama_file * file;
+    llama_context * ctx_stage;
     size_t size_written = 0;
     std::vector<uint8_t> temp_buffer;
 };
 
 class llama_io_read_file : public llama_io_read_i {
 public:
-    llama_io_read_file(llama_file * f) : file(f) {}
+    llama_io_read_file(llama_file * f, llama_context * ctx_stage = nullptr) : file(f), ctx_stage(ctx_stage) {}
 
     void read(void * dst, size_t size) override {
         file->read_raw(dst, size);
@@ -3562,12 +3738,23 @@ public:
         ggml_backend_tensor_set(tensor, temp_buffer.data(), offset, size);
     }
 
+    bool has_tensor_2d() const override {
+        return true;
+    }
+
+    void read_tensor_2d(size_t size, const std::vector<llama_io_tensor_2d> & parts) override {
+        temp_buffer.resize(size);
+        read(temp_buffer.data(), size);
+        llama_io_blocks_set({ { temp_buffer.data(), parts } }, ctx_stage);
+    }
+
     size_t n_bytes() override {
         return size_read;
     }
 
 private:
     llama_file * file;
+    llama_context * ctx_stage;
     size_t size_read = 0;
     std::vector<uint8_t> temp_buffer;
 };
@@ -3961,7 +4148,7 @@ private:
 };
 
 size_t llama_context::state_get_size() {
-    llama_io_write_dummy io(false);
+    llama_io_write_dummy io(false, true);
     try {
         return state_write_data(io);
     } catch (const std::exception & err) {
@@ -3971,7 +4158,7 @@ size_t llama_context::state_get_size() {
 }
 
 size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
-    llama_io_write_host io(dst, size);
+    llama_io_write_host io(dst, size, nullptr, this);
     try {
         return state_write_data(io);
     } catch (const std::exception & err) {
@@ -3981,7 +4168,7 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
 }
 
 size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
-    llama_io_read_host io(src, size);
+    llama_io_read_host io(src, size, this);
     try {
         return state_read_data(io);
     } catch (const std::exception & err) {
@@ -4143,7 +4330,7 @@ void llama_context::state_read_async_wait() {
 }
 
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
-    llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+    llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE, !(flags & (LLAMA_STATE_SEQ_FLAGS_ON_DEVICE | LLAMA_STATE_SEQ_FLAGS_ASYNC)));
     try {
         io.write(&io_magic, sizeof(io_magic));
         io.write(&seq_id, sizeof(seq_id));
@@ -4164,7 +4351,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[{ seq_id, dev_slot }], lctx_async);
     } else {
-        io = std::make_unique<llama_io_write_host>(dst, size, lctx_async);
+        io = std::make_unique<llama_io_write_host>(dst, size, lctx_async, this);
     }
 
     try {
@@ -4199,7 +4386,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
 
         io = std::make_unique<llama_io_read_device>(src, size, mem_storage[{ seq_id_read, dev_slot }]);
     } else {
-        io = std::make_unique<llama_io_read_host>(src, size);
+        io = std::make_unique<llama_io_read_host>(src, size, this);
     }
 
     try {
@@ -4251,7 +4438,7 @@ bool llama_context::state_load_file(const char * filepath, llama_token * tokens_
     {
         const size_t n_state_size_cur = file.size() - file.tell();
 
-        llama_io_read_file io( &file);
+        llama_io_read_file io(&file, this);
         const size_t n_read = state_read_data(io);
 
         if (n_read != n_state_size_cur) {
@@ -4274,7 +4461,7 @@ bool llama_context::state_save_file(const char * filepath, const llama_token * t
     file.write_raw(tokens, sizeof(llama_token) * n_token_count);
 
     // save the context state using stream saving
-    llama_io_write_file io(&file);
+    llama_io_write_file io(&file, this);
     state_write_data(io);
 
     return true;
@@ -4321,7 +4508,7 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
     // restore the context state
     {
         const size_t state_size = file.size() - file.tell();
-        llama_io_read_file io(&file);
+        llama_io_read_file io(&file, this);
         const size_t nread = state_seq_read_data(io, seq_id, 0);
         if (!nread) {
             LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
@@ -4345,7 +4532,7 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
     file.write_raw(tokens, sizeof(llama_token) * n_token_count);
 
     // save the context state using stream saving
-    llama_io_write_file io(&file);
+    llama_io_write_file io(&file, this);
     state_seq_write_data(io, seq_id, 0);
 
     const size_t res = file.tell();
@@ -5327,8 +5514,17 @@ size_t llama_state_seq_set_data(llama_context * ctx, const uint8_t * src, size_t
     return llama_state_seq_set_data_ext(ctx, src, size, seq_id, 0);
 }
 
+// LLAMA_STATE_ASYNC=0 waits for the submitted work as before; the size has to follow, an async save stores other rows
+static llama_state_seq_flags llama_state_seq_flags_eff(llama_state_seq_flags flags) {
+    static const bool async_ok = [] {
+        const char * env = getenv("LLAMA_STATE_ASYNC");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return async_ok ? flags : flags & ~LLAMA_STATE_SEQ_FLAGS_ASYNC;
+}
+
 size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    return ctx->state_seq_get_size(seq_id, flags);
+    return ctx->state_seq_get_size(seq_id, llama_state_seq_flags_eff(flags));
 }
 
 void llama_state_seq_free_dev(llama_context * ctx, llama_seq_id seq_id, uint32_t dev_slot) {
@@ -5336,14 +5532,7 @@ void llama_state_seq_free_dev(llama_context * ctx, llama_seq_id seq_id, uint32_t
 }
 
 size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    // LLAMA_STATE_ASYNC=0 waits for the submitted work as before
-    static const bool async_ok = [] {
-        const char * env = getenv("LLAMA_STATE_ASYNC");
-        return env == nullptr || atoi(env) != 0;
-    }();
-    if (!async_ok) {
-        flags &= ~LLAMA_STATE_SEQ_FLAGS_ASYNC;
-    }
+    flags = llama_state_seq_flags_eff(flags);
 
     // an async save waits only when it cannot queue its copies
     if (!(flags & LLAMA_STATE_SEQ_FLAGS_ASYNC)) {

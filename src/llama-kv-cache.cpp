@@ -2608,6 +2608,84 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
     return gf;
 }
 
+// With repeated kv heads (llama_hparams::n_head_kv_rep) a cache row holds every kv head rep times, one copy per device.
+//   A host or file state keeps one copy of each head, the row of a cache without the repeat, and a restore writes it to
+//   every copy. Each head is copied from or to the device that holds it, so only its bytes cross PCIe.
+struct llama_kv_rep_rows {
+    uint32_t rep       = 1;
+    size_t   size_head = 0; // bytes of one head in a row
+    size_t   size_row  = 0; // bytes of a state row
+
+    // where each head of the cache row is: its tensor (the device's part of a split tensor) and its place in the rows
+    struct head {
+        ggml_tensor * t;
+        size_t offset;
+        size_t stride;
+    };
+    std::vector<head> heads;
+
+    // false if the rows of t cannot be stored this way
+    bool init(ggml_tensor * t, uint32_t n_embd, uint32_t n_head, uint32_t n_rep) {
+        if (n_rep <= 1 || n_head % n_rep != 0 || n_embd % n_head != 0 || (n_embd/n_head) % ggml_blck_size(t->type) != 0) {
+            return false;
+        }
+
+        const size_t row = ggml_row_size(t->type, n_embd);
+
+        rep       = n_rep;
+        size_head = ggml_row_size(t->type, n_embd/n_head);
+        size_row  = ggml_row_size(t->type, n_embd/n_rep);
+        heads.clear();
+
+        const size_t n_simple = ggml_backend_meta_tensor_n_simple(t);
+        for (uint32_t h = 0; h < n_head; ++h) {
+            const size_t b_head = h*size_head;
+            if (n_simple == 0) {
+                heads.push_back({ t, b_head, row });
+                continue;
+            }
+            // the devices hold consecutive slices of every row
+            size_t b = 0;
+            for (size_t j = 0; j < n_simple; ++j) {
+                ggml_tensor * st = nullptr;
+                size_t offset_j = 0;
+                size_t size_j   = 0;
+                if (!ggml_backend_meta_tensor_simple_range(t, 0, row, j, &st, &offset_j, &size_j)) {
+                    return false;
+                }
+                if (b_head >= b && b_head + size_head <= b + size_j) {
+                    heads.push_back({ st, b_head - b, size_j });
+                    break;
+                }
+                b += size_j;
+            }
+            if (heads.size() != h + 1) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // the copies between the cache rows [r0, r0 + n) and n state rows; a save takes a share of the rows from each copy
+    std::vector<llama_io_tensor_2d> parts(uint32_t r0, uint32_t n, bool save) const {
+        std::vector<llama_io_tensor_2d> res;
+        for (size_t h = 0; h < heads.size(); ++h) {
+            const size_t g = h / rep;
+            const size_t c = h % rep;
+
+            const size_t i0 = save ? (size_t) n*c/rep       : 0;
+            const size_t i1 = save ? (size_t) n*(c + 1)/rep : n;
+            if (i1 == i0) {
+                continue;
+            }
+
+            const head & hd = heads[h];
+            res.push_back({ hd.t, (r0 + i0)*hd.stride + hd.offset, size_head, i1 - i0, hd.stride, i0*size_row + g*size_head, size_row });
+        }
+        return res;
+    }
+};
+
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
@@ -2805,6 +2883,10 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     io.write(&n_rot_k, sizeof(n_rot_k));
     io.write(&n_rot_v, sizeof(n_rot_v));
 
+    const uint32_t n_rep = io.has_tensor_2d() ? hparams.n_head_kv_rep : 1;
+
+    llama_kv_rep_rows rep_rows;
+
     // Iterate and write all the keys first, each row is a cell
     // Get whole range at a time
     for (const auto & layer : layers) {
@@ -2818,13 +2900,20 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
         const int32_t k_type_i = (int32_t) k->type;
         io.write(&k_type_i, sizeof(k_type_i));
 
+        const bool k_rep = rep_rows.init(k, n_embd_k_gqa, hparams.n_head_kv(il), n_rep);
+
         // Write row size of key
         const uint64_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
-        io.write(&k_size_row, sizeof(k_size_row));
+        const uint64_t k_size_row_w = k_rep ? rep_rows.size_row : k_size_row;
+        io.write(&k_size_row_w, sizeof(k_size_row_w));
 
         // Read each range of cells of k_size length and write out
         for (const auto & range : cr.data) {
             const size_t range_size = range.second - range.first;
+            if (k_rep) {
+                io.write_tensor_2d(range_size * k_size_row_w, rep_rows.parts(range.first, range_size, true));
+                continue;
+            }
             const size_t buf_size = range_size * k_size_row;
             io.write_tensor(k, range.first * k_size_row, buf_size);
         }
@@ -2845,13 +2934,20 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
             const int32_t v_type_i = (int32_t) v->type;
             io.write(&v_type_i, sizeof(v_type_i));
 
+            const bool v_rep = rep_rows.init(v, n_embd_v_gqa, hparams.n_head_kv(il), n_rep);
+
             // Write row size of value
             const uint64_t v_size_row = ggml_row_size(v->type, n_embd_v_gqa);
-            io.write(&v_size_row, sizeof(v_size_row));
+            const uint64_t v_size_row_w = v_rep ? rep_rows.size_row : v_size_row;
+            io.write(&v_size_row_w, sizeof(v_size_row_w));
 
             // Read each range of cells of v_size length and write out
             for (const auto & range : cr.data) {
                 const size_t range_size = range.second - range.first;
+                if (v_rep) {
+                    io.write_tensor_2d(range_size * v_size_row_w, rep_rows.parts(range.first, range_size, true));
+                    continue;
+                }
                 const size_t buf_size = range_size * v_size_row;
                 io.write_tensor(v, range.first * v_size_row, buf_size);
             }
@@ -3129,6 +3225,11 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         return false;
     }
 
+    // a row with one copy of each repeated kv head is written to every copy, see llama_kv_rep_rows
+    const uint32_t n_rep = io.has_tensor_2d() ? hparams.n_head_kv_rep : 1;
+
+    llama_kv_rep_rows rep_rows;
+
     // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
     for (const auto & layer : layers) {
         const uint32_t il = layer.il;
@@ -3150,12 +3251,18 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         uint64_t k_size_row_ref;
         io.read(&k_size_row_ref, sizeof(k_size_row_ref));
         const size_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
-        if (k_size_row != k_size_row_ref) {
+        const bool k_rep = k_size_row != k_size_row_ref &&
+            rep_rows.init(k, n_embd_k_gqa, hparams.n_head_kv(il), n_rep) && rep_rows.size_row == k_size_row_ref;
+        if (k_size_row != k_size_row_ref && !k_rep) {
             LLAMA_LOG_ERROR("%s: mismatched key row size (%zu != %zu, layer %d)\n", __func__, k_size_row, (size_t) k_size_row_ref, il);
             return false;
         }
 
         for (const auto & r : runs) {
+            if (k_rep) {
+                io.read_tensor_2d((size_t) (r.to - r.from) * k_size_row_ref, rep_rows.parts(r.from, r.to - r.from, false));
+                continue;
+            }
             io.read_tensor(k, (size_t) r.from * k_size_row, (size_t) (r.to - r.from) * k_size_row);
         }
     }
@@ -3184,12 +3291,18 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             uint64_t v_size_row_ref;
             io.read(&v_size_row_ref, sizeof(v_size_row_ref));
             const size_t v_size_row = ggml_row_size(v->type, n_embd_v_gqa);
-            if (v_size_row != v_size_row_ref) {
+            const bool v_rep = v_size_row != v_size_row_ref &&
+                rep_rows.init(v, n_embd_v_gqa, hparams.n_head_kv(il), n_rep) && rep_rows.size_row == v_size_row_ref;
+            if (v_size_row != v_size_row_ref && !v_rep) {
                 LLAMA_LOG_ERROR("%s: mismatched value row size (%zu != %zu, layer %d)\n", __func__, v_size_row, (size_t) v_size_row_ref, il);
                 return false;
             }
 
             for (const auto & r : runs) {
+                if (v_rep) {
+                    io.read_tensor_2d((size_t) (r.to - r.from) * v_size_row_ref, rep_rows.parts(r.from, r.to - r.from, false));
+                    continue;
+                }
                 io.read_tensor(v, (size_t) r.from * v_size_row, (size_t) (r.to - r.from) * v_size_row);
             }
         }
