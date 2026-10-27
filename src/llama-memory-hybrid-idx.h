@@ -90,9 +90,28 @@ public:
     // the caller then adds the attention mask, the only part of the bias that varies within a block
     // with bias_blk and bias_q instead of bias, the inputs of ggml_kq_block_bias: I32 [n_blocks, ns] and [n_tokens/ns, ns]
     // causal_attn selects the rule: causal forces the query's own block on, non-causal lets every visible block compete on score
+    // pool_write: the graph stores the pooled key of every block in the kept pool, see get_qsa_pool
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, ggml_tensor * bias_blk, ggml_tensor * bias_q, const llama_ubatch * ubatch,
-                       uint32_t ratio, bool blk_bias, bool causal_attn) const;
+                       uint32_t ratio, bool blk_bias, bool causal_attn, bool pool_write);
+
+    // qwen4exp QSA keeps the scored key of each full block (pooled, normed, rotated, F32) across ubatches. A short ubatch
+    //   of the one sequence of a single stream whose cell j holds position j (the identity layout) then pools only the
+    //   blocks it completes, and needs no per-cell inputs: block b is cells [b*ratio, (b + 1)*ratio) and the block bias is
+    //   ggml_kq_block_bias over get_qsa_pool_ramp, so the host work does not grow with the context.
+    bool qsa_pool_on() const;
+    ggml_tensor * get_qsa_pool(int32_t il) const;
+    ggml_tensor * get_qsa_pool_ramp(int32_t il) const; // I32 b*ratio for each block b
+
+    // pool rows a short ubatch rewrites (its blocks, the spare block, padding), fixed by the ubatch size; 0 when it must use the full lists
+    uint32_t qsa_pool_n_new(const llama_ubatch & ubatch, uint32_t ratio) const;
+
+    // the inputs of such a ubatch: pool_cells I32 [ratio*n_new], pool_pos I32 [4*n_new], pool_rows I64 [n_new], bias_q I32 [n_tokens]
+    void set_input_qsa_pool(ggml_tensor * pool_cells, ggml_tensor * pool_pos, ggml_tensor * pool_rows, ggml_tensor * bias_q,
+                            const llama_ubatch * ubatch, uint32_t ratio, int64_t n_kv);
+
+    // a ubatch longer than this pools every block
+    static constexpr uint32_t QSA_POOL_MAX_TOKENS = 64;
 
     // The model's indexer pool size.
     uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
@@ -144,6 +163,20 @@ private:
     llama_pos mem_idx_stale_pos(llama_seq_id seq_id, llama_pos p0) const;
 
     stale_pos_t mem_idx_stale = stale_pos_clean();
+
+    // see get_qsa_pool. Each tensor has a row per block of the cache plus spare rows for the padding of the rewrite list.
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> qsa_pool_ctxs_bufs;
+    std::map<int32_t, ggml_tensor *> qsa_pool;
+    std::map<int32_t, ggml_tensor *> qsa_pool_ramp; // one per buffer, shared by its layers
+    uint32_t qsa_pool_ratio = 0;
+    uint32_t qsa_pool_rows  = 0; // rows of blocks, the spare rows follow
+
+    // the pool rows hold the blocks of this sequence, current below this position. -1: none
+    llama_seq_id qsa_pool_seq   = -1;
+    llama_pos    qsa_pool_valid = 0;
+
+    // the sequence's cells form the identity layout: positions 0..n-1 in cells 0..n-1
+    bool qsa_pool_ident = false;
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -206,7 +239,14 @@ public:
 
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, ggml_tensor * bias_blk, ggml_tensor * bias_q, const llama_ubatch * ubatch,
-                       uint32_t ratio, bool blk_bias, bool causal_attn) const;
+                       uint32_t ratio, bool blk_bias, bool causal_attn, bool pool_write) const;
+
+    bool qsa_pool_on() const;
+    ggml_tensor * get_qsa_pool(int32_t il) const;
+    ggml_tensor * get_qsa_pool_ramp(int32_t il) const;
+    uint32_t qsa_pool_n_new(const llama_ubatch & ubatch, uint32_t ratio) const;
+    void set_input_qsa_pool(ggml_tensor * pool_cells, ggml_tensor * pool_pos, ggml_tensor * pool_rows, ggml_tensor * bias_q,
+                            const llama_ubatch * ubatch, uint32_t ratio) const;
 
     // glm5-next and qwen4exp, complete pools of kpool cells per sequence, scored as whole pools.
     uint32_t get_n_kpool    () const; // Padded pool count, where the last pool is always unused.
