@@ -1566,14 +1566,12 @@ struct ggml_cuda_dsv4_compress_fold {
     float   sm_scale = 1.0f;
 };
 
-// the MoE all-reduce folded into the expert down projection of one token (see mul_mat_vec_q_short): the last block of a
-//   group of rows to finish sums the experts' rows (dst) and the gated shared expert as moe_weighted_reduction does and
-//   pushes the sums as the LL lines of ar
+// the MoE all-reduce folded into the expert down projection of one token (see mul_mat_vec_q_short_ar_moe): a block sums
+//   the experts' rows and the gated shared expert as moe_weighted_reduction does and pushes the sums as the LL lines of ar
 struct ggml_cuda_ar_fold_moe_args {
     ggml_cuda_ar_fold_args ar;
     const float *  weights = nullptr; // [n_used]
     const float *  gate    = nullptr; // the shared expert's gate (one value), its output being the sibling's dst
-    unsigned int * tickets = nullptr; // a zeroed counter per group of rows, reset by its last block
     int            n_used  = 0;
 };
 
@@ -1738,29 +1736,15 @@ struct ggml_backend_cuda_context {
     //   slots, their epoch and the scratch of a router launch with a waiting block (mul_mat_vec_f_router)
     unsigned int * block_flags[GGML_CUDA_MAX_DEVICES] = { nullptr };
 
-    // the tickets of ggml_cuda_ar_fold_moe_args, zero between launches
-    unsigned int * ar_tickets[GGML_CUDA_MAX_DEVICES] = { nullptr };
-
     // Called before a capture begins (graph_compute, session_begin): a memset in a capture would run again at every replay.
     // The zeroing goes on the compute stream, a cudaMemset on the legacy stream is not ordered with it.
     void flags_alloc() {
-        if (block_flags[device] != nullptr && ar_tickets[device] != nullptr) {
+        if (block_flags[device] != nullptr) {
             return;
         }
         ggml_cuda_set_device(device);
-        if (block_flags[device] == nullptr) {
-            CUDA_CHECK(cudaMalloc(&block_flags[device], GGML_CUDA_BLOCK_FLAGS*sizeof(unsigned int)));
-            CUDA_CHECK(cudaMemsetAsync(block_flags[device], 0, GGML_CUDA_BLOCK_FLAGS*sizeof(unsigned int), stream()));
-        }
-        if (ar_tickets[device] == nullptr) {
-            CUDA_CHECK(cudaMalloc(&ar_tickets[device], 4096*sizeof(unsigned int)));
-            CUDA_CHECK(cudaMemsetAsync(ar_tickets[device], 0, 4096*sizeof(unsigned int), stream()));
-        }
-    }
-
-    unsigned int * ar_tickets_get() {
-        flags_alloc();
-        return ar_tickets[device];
+        CUDA_CHECK(cudaMalloc(&block_flags[device], GGML_CUDA_BLOCK_FLAGS*sizeof(unsigned int)));
+        CUDA_CHECK(cudaMemsetAsync(block_flags[device], 0, GGML_CUDA_BLOCK_FLAGS*sizeof(unsigned int), stream()));
     }
 
     unsigned int * block_flags_get() {
@@ -2175,7 +2159,6 @@ struct ggml_cuda_mm_fusion_args_launch : ggml_cuda_mm_fusion_args_device {
     bool                     ar_moe    = false;
     const float *            ar_weights = nullptr;
     const float *            ar_gate    = nullptr;
-    unsigned int *           ar_tickets = nullptr;
     int                      ar_n_used  = 0;
 };
 
