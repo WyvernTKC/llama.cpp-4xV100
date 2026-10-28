@@ -457,6 +457,14 @@ struct case_state_restore_failure : ctx_test {
         return "restoring a corrupted state fails and leaves the other sequences untouched";
     }
 
+    std::string skip_reason(model_run & mr) const override {
+        if (mr.params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+            return "the case disables flash attention, which SPLIT_MODE_TENSOR requires";
+        }
+
+        return ctx_test::skip_reason(mr);
+    }
+
     case_result run(model_run & mr) const override {
         ctx_opts opts;
         opts.n_ctx      = 256;
