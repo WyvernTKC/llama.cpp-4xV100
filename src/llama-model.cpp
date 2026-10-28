@@ -2440,8 +2440,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 return 1;
             }
             const auto tn = LLM_TN(arch);
+            int n_attn = 0;
             for (int il = 0; il < n_layer_all; il++) {
-                if (hparams.n_head_kv_arr[il] == 0 || hparams.is_recr(il)) {
+                // a recurrent layer has no attention, except in falcon-h1, where every layer has both (as in its
+                //   llama_memory_hybrid filters)
+                if (hparams.n_head_kv_arr[il] == 0 || (hparams.is_recr(il) && arch != LLM_ARCH_FALCON_H1)) {
                     continue;
                 }
                 // the loader expands the weights of separate Q/K/V projections in device buffers
@@ -2464,8 +2467,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 if (n_embd_q % blck_size_perf != 0 || n_embd_o % blck_size_perf != 0) {
                     return 1;
                 }
+                n_attn++;
             }
-            return n_dev / n_kv;
+            // n_head_kv*rep must not exceed n_head, which only the checks above ensure
+            return n_attn > 0 ? n_dev / n_kv : 1;
         }();
         if (rep > 1) {
             for (int il = 0; il < n_layer_all; il++) {
