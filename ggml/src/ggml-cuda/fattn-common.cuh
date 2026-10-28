@@ -1203,9 +1203,28 @@ static __global__ void flash_attn_combine_results(
 
     __syncthreads();
 
+    // A column is one thread and a launch is a few blocks per head (1-2 warps an SM), so the partials (in DRAM, not L2,
+    //     by the time this runs) are latency-bound: the loads of 64 partials go out before their sums, which keep their
+    //     order. The compiler's own unroll of 16 waited on 20 rounds of loads at 320 partials (100k cells).
+    constexpr int nchunk = 64;
     float VKQ_numerator   = 0.0f;
     float VKQ_denominator = 0.0f;
-    for (int l = 0; l < parallel_blocks; ++l) {
+    int l = 0;
+    for (; l + nchunk <= parallel_blocks; l += nchunk) {
+        float part[nchunk];
+#pragma unroll
+        for (int i = 0; i < nchunk; ++i) {
+            part[i] = VKQ_parts[(l + i)*D + d];
+        }
+#pragma unroll
+        for (int i = 0; i < nchunk; ++i) {
+            const float KQ_max_scale = meta[l + i].x;
+
+            VKQ_numerator   += KQ_max_scale * part[i];
+            VKQ_denominator += KQ_max_scale * meta[l + i].y;
+        }
+    }
+    for (; l < parallel_blocks; ++l) {
         const float KQ_max_scale = meta[l].x;
 
         VKQ_numerator   += KQ_max_scale * VKQ_parts[l*D + d];
