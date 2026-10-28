@@ -16419,6 +16419,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q6_K,   GGML_GLU_OP_SWIGLU_OAI,   150, 40960, 256, false, 1, 1, false, false, true, false, { 1, 1 }));
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0,   GGML_GLU_OP_SWIGLU_CLAMP, 150,  6912, 256, false, 1, 1, false, false, true, false, { 2, 3 }));
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ4_XS, GGML_GLU_OP_SWIGLU,       150, 40960, 512, false, 1, 1, false, false, true, false, { 1, 1 }));
+    // The same with experts (~1280 tiles each): 17 tokens with broadcast input (one MMA tile per warp), 2048 tokens without (two, several column tiles per expert).
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K,   GGML_GLU_OP_SWIGLU,        17,  5120, 256, true, 16, 8, true));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0,   GGML_GLU_OP_SWIGLU,      2048,   128, 256, true, 40, 8, false));
 
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {
@@ -16436,6 +16439,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     test_cases.emplace_back(new test_topk_moe({288, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w)); // Used by StepFun 3.7
                     test_cases.emplace_back(new test_topk_moe({384, 22, 1, 1}, 6, with_norm, bias_probs, gate, scale_w)); // Used by DeepSeek-V4.1
                     test_cases.emplace_back(new test_topk_moe({384, 1, 1, 1}, 6, with_norm, bias_probs, gate, scale_w));
+                    test_cases.emplace_back(new test_topk_moe({384, 8, 1, 1}, 6, with_norm, bias_probs, gate, scale_w));
                     // Nemotron 3.5 Bolt: 240..496 experts depending on the layer, none a multiple of the warp size
                     for (int64_t n_expert : {240, 304, 368, 432, 496}) {
                         test_cases.emplace_back(new test_topk_moe({n_expert, 22, 1, 1}, 9, with_norm, bias_probs, gate, scale_w));
