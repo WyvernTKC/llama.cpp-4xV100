@@ -119,6 +119,14 @@ public:
     // Whether pools are kpool consecutive cells in sequence order (qwen4exp) instead of kpool consecutive positions.
     bool get_kpool_by_order() const { return hparams_idx.indexer_kpool_by_order; }
 
+    // glm5-next decode in the identity layout (the one sequence of a single stream, position j in cell j): pool b is the
+    //   cells [b*kpool, (b + 1)*kpool), so the graph reads its members and the cell of its pooled key from these ramps
+    //   instead of per-pool host inputs, and the host work does not grow with the context.
+    //   cells I32 [kpool*n] holds i, reps I32 [n] the last cell of each pool clamped to the cache, n covers every padded
+    //   pool count. Null when not kept (LLAMA_KPOOL_IDENT=0).
+    ggml_tensor * get_kpool_ramp_cells() const { return kpool_ramp_cells; }
+    ggml_tensor * get_kpool_ramp_reps () const { return kpool_ramp_reps; }
+
     // Which cells of a sequence make up which pool of kpool consecutive positions (or cells, in order mode).
     // It is kept here because it outlives the batch: pools are fixed by the positions relative to the
     // sequence's first one, so a ubatch only ever appends to it. Sequence edits drop it, see mem_idx_stale.
@@ -180,6 +188,11 @@ private:
 
     // the sequence's cells form the identity layout: positions 0..n-1 in cells 0..n-1
     bool qsa_pool_ident = false;
+
+    // see get_kpool_ramp_cells
+    llama_memory_bufs kpool_ramp_ctxs_bufs;
+    ggml_tensor * kpool_ramp_cells = nullptr;
+    ggml_tensor * kpool_ramp_reps  = nullptr;
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -247,6 +260,8 @@ public:
     bool qsa_pool_on() const;
     ggml_tensor * get_qsa_pool(int32_t il) const;
     ggml_tensor * get_qsa_pool_ramp(int32_t il) const;
+    ggml_tensor * get_kpool_ramp_cells() const { return mem != nullptr ? mem->get_kpool_ramp_cells() : nullptr; }
+    ggml_tensor * get_kpool_ramp_reps () const { return mem != nullptr ? mem->get_kpool_ramp_reps()  : nullptr; }
     uint32_t qsa_pool_n_new(const llama_ubatch & ubatch, uint32_t ratio) const;
     void set_input_qsa_pool(ggml_tensor * pool_cells, ggml_tensor * pool_pos, ggml_tensor * pool_rows, ggml_tensor * bias_q,
                             const llama_ubatch * ubatch, uint32_t ratio) const;
@@ -263,6 +278,13 @@ public:
     void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
                          ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
                          const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr) const;
+
+    // a one-token ubatch of the identity layout, whose pools the graph takes from the ramps (see get_kpool_ramp_cells)
+    bool kpool_ident(const llama_ubatch & ubatch) const;
+    // its inputs, filled as set_input_kpool would: vis (I32 [2, 1]) the ggml_kq_mask_prefix row of the visible pools,
+    //   tail_idxs, new_pool_idxs and new_pool_rep, with no work that grows with the pool count
+    void set_input_kpool_ident(ggml_tensor * vis, ggml_tensor * tail_idxs, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
+                               const llama_ubatch * ubatch) const;
 
 private:
     llama_memory_hybrid_idx * mem = nullptr;

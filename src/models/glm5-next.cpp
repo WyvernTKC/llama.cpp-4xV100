@@ -266,7 +266,11 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
-        mctx->set_input_kpool(pool_cells, pool_idxs, pool_mask, tail_idxs, sel_mask, new_pool_idxs, new_pool_rep, ubatch);
+        if (ident) {
+            mctx->set_input_kpool_ident(vis, tail_idxs, new_pool_idxs, new_pool_rep, ubatch);
+        } else {
+            mctx->set_input_kpool(pool_cells, pool_idxs, pool_mask, tail_idxs, sel_mask, new_pool_idxs, new_pool_rep, ubatch);
+        }
 
         if (gather) {
             GGML_ASSERT(ubatch->n_tokens == 1 && mctx->get_n_kpool_visible(*ubatch, 0) >= n_top);
@@ -311,7 +315,9 @@ public:
         // The scatter mask shape follows n_kv.
         res &= n_kv              == idx->get_n_kv();
         res &= n_new             == std::max(mctx->get_n_kpool_new(), 1u);
-        res &= gather            == glm5_gather_k(mctx, params.ubatch, flash_attn, n_top);
+        const bool gather_cur = glm5_gather_k(mctx, params.ubatch, flash_attn, n_top);
+        res &= gather            == gather_cur;
+        res &= ident             == (gather_cur && mctx->kpool_ident(params.ubatch));
 
         return res;
     }
@@ -335,6 +341,10 @@ public:
 
     // decode with a gathered K, see glm5_gather_k
     bool     gather      = false;
+    // and in the identity layout: pool_cells and pool_idxs are views of the ramps, pool_mask is built from vis
+    //   (see llama_memory_hybrid_idx::get_kpool_ramp_cells)
+    bool     ident       = false;
+    ggml_tensor * vis    = nullptr; // I32 [2, 1]
     bool     flash_attn  = false;
     bool     select_tail = false;
     uint32_t n_top       = 0; // pools per token in the selection
@@ -357,13 +367,34 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
 
     auto inp = std::make_unique<llm_graph_input_kpool>(mctx_hyb, kpool);
 
-    inp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-    inp->pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
-    inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
-    inp->pool_mask  = ggml_new_tensor_2d(ctx0, type_mask, n_pool, n_tokens);
-    ggml_set_input(inp->pool_cells);
-    ggml_set_input(inp->pool_idxs);
-    ggml_set_input(inp->pool_mask);
+    inp->k_idxs = mctx_idx->build_input_k_idxs(ctx0, ubatch);
+
+    {
+        const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
+        inp->gather = glm5_gather_k(mctx_hyb, ubatch, cparams.flash_attn, (uint32_t) n_top_pool);
+        inp->ident  = inp->gather && mctx_hyb->kpool_ident(ubatch);
+    }
+
+    if (inp->ident) {
+        // pool b is cells [b*kpool, (b + 1)*kpool) with its pooled key in the last, and the token sees a prefix of the pools
+        ggml_tensor * cells = mctx_hyb->get_kpool_ramp_cells();
+        ggml_tensor * reps  = mctx_hyb->get_kpool_ramp_reps();
+        GGML_ASSERT(reps->ne[0] >= (int64_t) n_pool && cells->ne[0] >= (int64_t) kpool*n_pool);
+
+        inp->pool_cells = ggml_view_1d(ctx0, reps, n_pool, 0);
+        inp->pool_idxs  = ggml_view_2d(ctx0, cells, kpool, n_pool, ggml_row_size(cells->type, kpool), 0);
+
+        inp->vis = ggml_new_tensor_4d(ctx0, GGML_TYPE_I32, 2, 1, 1, 1);
+        ggml_set_input(inp->vis);
+        inp->pool_mask = ggml_reshape_2d(ctx0, ggml_kq_mask_prefix(ctx0, inp->vis, n_pool, type_mask), n_pool, n_tokens);
+    } else {
+        inp->pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
+        inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
+        inp->pool_mask  = ggml_new_tensor_2d(ctx0, type_mask, n_pool, n_tokens);
+        ggml_set_input(inp->pool_cells);
+        ggml_set_input(inp->pool_idxs);
+        ggml_set_input(inp->pool_mask);
+    }
 
     ggml_build_forward_expand(gf, inp->pool_cells);
     ggml_build_forward_expand(gf, inp->pool_idxs);
@@ -380,7 +411,6 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
         inp->n_top       = (uint32_t) n_top_pool;
         inp->flash_attn  = cparams.flash_attn;
         inp->select_tail = hparams.indexer_kpool_select_tail;
-        inp->gather      = glm5_gather_k(mctx_hyb, ubatch, cparams.flash_attn, inp->n_top);
 
         // only inputs that a node reads are allocated, so the gathering graph has neither the selection mask nor
         //   a tail row of its own: the tail row carries the padding up to the FA KV stride of 256
