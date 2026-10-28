@@ -18,12 +18,12 @@ class llama_memory_hybrid_idx : public llama_memory_hybrid {
 public:
     llama_memory_hybrid_idx(
         const llama_model & model,
+                     bool   no_alloc,
                             /* attn */
                 ggml_type   type_k,
                 ggml_type   type_v,
                      bool   v_trans,
                  uint32_t   kv_size,
-                 uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
                             /* recurrent */
@@ -168,7 +168,7 @@ private:
     stale_pos_t mem_idx_stale = stale_pos_clean();
 
     // see get_qsa_pool. Each tensor has a row per block of the cache plus spare rows for the padding of the rewrite list.
-    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> qsa_pool_ctxs_bufs;
+    llama_memory_bufs qsa_pool_ctxs_bufs;
     std::map<int32_t, ggml_tensor *> qsa_pool;
     std::map<int32_t, ggml_tensor *> qsa_pool_ramp; // one per buffer, shared by its layers
     uint32_t qsa_pool_ratio = 0;

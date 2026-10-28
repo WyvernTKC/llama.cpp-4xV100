@@ -1207,21 +1207,21 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         const auto & layer = model.layers[il];
 
         ggml_tensor * residual = inpL;
-        ggml_tensor * post = nullptr;
-        ggml_tensor * comb = nullptr;
+        // hc_lag: the collapse uses the incoming mix, and this sublayer's pre weights are for the next one
+        hc_pre attn_hc = {};
         ggml_tensor * attn_pre = nullptr;
-
-        ggml_tensor * cur = nullptr;
         if (hc_lag) {
-            build_hc_mixes(inpL, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, &attn_pre, &post, &comb, il);
-            cur = build_hc_pre(inpL, pre_mix, il);
+            const hc_mixes attn_mix = build_hc_mixes(inpL, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, il);
+            attn_hc  = { build_hc_pre(inpL, pre_mix, il), attn_mix.post, attn_mix.comb };
+            attn_pre = attn_mix.pre;
         } else {
-            cur = build_hc_pre(inpL,
+            attn_hc = build_hc_pre(inpL,
                 layer.hc_attn_fn,
                 layer.hc_attn_scale,
                 layer.hc_attn_base,
-                &post, &comb, il);
+                il);
         }
+        ggml_tensor * cur = attn_hc.cur;
         cb(cur, "hc_attn_pre", il);
 
         cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
@@ -1229,20 +1229,23 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 
         cur = build_attention(model, inp_attn, cur, inp_pos, il);
 
-        inpL = build_hc_post(cur, residual, post, comb, il);
+        inpL = build_hc_post(cur, residual, attn_hc.post, attn_hc.comb, il);
         cb(inpL, "hc_attn_post", il);
 
         residual = inpL;
+        hc_pre ffn_hc = {};
         if (hc_lag) {
-            build_hc_mixes(inpL, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, &pre_mix, &post, &comb, il);
-            cur = build_hc_pre(inpL, attn_pre, il);
+            const hc_mixes ffn_mix = build_hc_mixes(inpL, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, il);
+            ffn_hc  = { build_hc_pre(inpL, attn_pre, il), ffn_mix.post, ffn_mix.comb };
+            pre_mix = ffn_mix.pre;
         } else {
-            cur = build_hc_pre(inpL,
+            ffn_hc = build_hc_pre(inpL,
                 layer.hc_ffn_fn,
                 layer.hc_ffn_scale,
                 layer.hc_ffn_base,
-                &post, &comb, il);
+                il);
         }
+        cur = ffn_hc.cur;
         cb(cur, "hc_ffn_pre", il);
 
         cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
@@ -1271,7 +1274,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);
 
-        inpL = build_hc_post(cur, residual, post, comb, il);
+        inpL = build_hc_post(cur, residual, ffn_hc.post, ffn_hc.comb, il);
         cb(inpL, "l_out", il);
     }
 

@@ -1100,16 +1100,13 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         }
 
         ggml_tensor * residual = inpL;
-        ggml_tensor * attn_pre = nullptr;
-        ggml_tensor * post     = nullptr;
-        ggml_tensor * comb     = nullptr;
 
         // this sublayer's mixes are for the next one, so the collapse uses the incoming mix
-        build_hc_mixes(inpL,
+        const hc_mixes attn_mix = build_hc_mixes(inpL,
                 model.layers[il].hc_attn_fn,
                 model.layers[il].hc_attn_scale,
                 model.layers[il].hc_attn_base,
-                &attn_pre, &post, &comb, il);
+                il);
 
         cur = build_hc_pre(inpL, pre_mix, il);
         cb(cur, "hc_attn_pre", il);
@@ -1119,24 +1116,25 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
 
         cur = build_attention_v41(model, inp_dsv4, cur, inp_pos, il);
 
-        inpL = build_hc_post(cur, residual, post, comb, il);
+        inpL = build_hc_post(cur, residual, attn_mix.post, attn_mix.comb, il);
         cb(inpL, "hc_attn_post", il);
 
         residual = inpL;
 
         // the FFN mix is what the next layer's attention collapses with
-        build_hc_mixes(inpL,
+        const hc_mixes ffn_mix = build_hc_mixes(inpL,
                 model.layers[il].hc_ffn_fn,
                 model.layers[il].hc_ffn_scale,
                 model.layers[il].hc_ffn_base,
-                &pre_mix, &post, &comb, il);
+                il);
+        pre_mix = ffn_mix.pre;
 
-        cur = build_hc_pre(inpL, attn_pre, il);
+        cur = build_hc_pre(inpL, attn_mix.pre, il);
         cb(cur, "hc_ffn_pre", il);
 
         ggml_build_forward_expand(gf, residual);
-        ggml_build_forward_expand(gf, post);
-        ggml_build_forward_expand(gf, comb);
+        ggml_build_forward_expand(gf, ffn_mix.post);
+        ggml_build_forward_expand(gf, ffn_mix.comb);
 
         cur = build_norm(cur, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
@@ -1172,7 +1170,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);
 
-        inpL = build_hc_post(cur, residual, post, comb, il);
+        inpL = build_hc_post(cur, residual, ffn_mix.post, ffn_mix.comb, il);
         inpL = build_cvec(inpL, il);
         cb(inpL, "l_last", il);
     }

@@ -1,20 +1,16 @@
 #include "llama-memory-hybrid-idx.h"
 
-#include <algorithm>
-#include <cmath>
-#include <type_traits>
-
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-model.h"
-
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <iterator>
 #include <stdexcept>
+#include <type_traits>
 
 //
 // llama_memory_hybrid_idx
@@ -22,12 +18,12 @@
 
 llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const llama_model & model,
+                     bool   no_alloc,
                             /* attn */
                 ggml_type   type_k,
                 ggml_type   type_v,
                      bool   v_trans,
                  uint32_t   kv_size,
-                 uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
                             /* recurrent */
@@ -45,7 +41,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     const layer_filter_cb & filter_idx) :
     llama_memory_hybrid(
         model,
-        type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
+        no_alloc,
+        type_k, type_v, v_trans, kv_size, n_swa, swa_type,
         type_r, type_s, rs_size,
         n_seq_max, n_rs_seq, offload, unified,
         filter_attn, filter_recr),
@@ -77,11 +74,12 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
         return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
-            kv_size, n_seq_max, n_pad, n_swa, swa_type,
+            model, no_alloc, hparams_idx, type_k, type_v, v_trans, offload, unified,
+            kv_size, n_seq_max, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()),
-    has_indexer(filter_idx != nullptr) {
+    has_indexer(filter_idx != nullptr),
+    qsa_pool_ctxs_bufs(no_alloc) {
     // LLAMA_QSA_POOL_CACHE=0 pools every block of every ubatch
     const char * env = getenv("LLAMA_QSA_POOL_CACHE");
     if (!mem_idx || model.arch != LLM_ARCH_QWEN4EXP || model.hparams.indexer_kpool > 0 || mem_idx->get_n_stream() != 1 ||
@@ -132,22 +130,11 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             qsa_pool_ramp[il] = ramp;
         }
 
-        ggml_backend_buffer_t buf;
-        if (model.hparams.no_alloc) {
-            buf = ggml_backend_buft_alloc_buffer(buft, 0);
-            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
-                t->buffer = buf;
-            }
-        } else {
-            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
-        }
-        if (!buf) {
-            throw std::runtime_error("failed to allocate buffer for the qsa pool");
-        }
-        // stale rows are scored and dropped by the bias, so they must not hold a nan
-        ggml_backend_buffer_clear(buf, 0);
+        // with no_alloc a dummy buffer is attached; emplace clears the buffer: stale rows are scored and dropped by
+        //   the bias, so they must not hold a nan
+        ggml_backend_buffer_t buf = qsa_pool_ctxs_bufs.emplace(std::move(ctx), buft, "the qsa pool");
 
-        if (!model.hparams.no_alloc) {
+        if (!no_alloc) {
             std::vector<int32_t> v(qsa_pool_rows);
             for (uint32_t b = 0; b < qsa_pool_rows; ++b) {
                 v[b] = (int32_t) (b*r);
@@ -157,8 +144,6 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
 
         LLAMA_LOG_INFO("%s: %10s QSA pool buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf),
                 ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
-
-        qsa_pool_ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 }
 
@@ -347,8 +332,9 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
         }
     }
 
-    for (const auto & [_, buf] : qsa_pool_ctxs_bufs) {
-        mb[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+    // with no_alloc, the simulated sizes
+    for (const auto & [buft, size] : qsa_pool_ctxs_bufs.memory_breakdown()) {
+        mb[buft] += size;
     }
 
     return mb;
