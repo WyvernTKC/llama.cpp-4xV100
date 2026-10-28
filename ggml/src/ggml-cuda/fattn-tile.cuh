@@ -7,6 +7,10 @@
 // TODO optimize kernel parameters for FP16 NVIDIA (P100)
 // TODO optimize kernel parameters for head sizes 40, 72, 80, 96, 112
 
+// A second config row for the same column count is keyed ncols + GGML_CUDA_FATTN_TILE_CFG_DEEP (the cfg template
+//     parameter of flash_attn_tile), picked by the launcher for one token deep in the cache.
+#define GGML_CUDA_FATTN_TILE_CFG_DEEP 1000
+
 // The ROCm compiler cannot handle templating in __launch_bounds__.
 // As a workaround, define a macro to package the kernel parameters as uint32_t:
 #define GGML_CUDA_FATTN_TILE_CONFIG_CASE(DKQ_, DV_, ncols_, nthreads, occupancy, nbatch_fa, nbatch_K) \
@@ -79,6 +83,8 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nv
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  4, 128, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  8, 256, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512, 16, 256, 2,  64,  64)
+    // deep decode, see launch_fattn_tile_switch_ncols1
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  8 + GGML_CUDA_FATTN_TILE_CFG_DEEP, 128, 4,  64,  64)
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  4, 128, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  8, 256, 2,  64,  64)
@@ -907,8 +913,15 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     }
 }
 
-template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, ggml_type type_KV> // D == head size
-__launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_tile_get_occupancy(DKQ, DV, ncols1*ncols2))
+// the config key of a kernel instance: ncols, or ncols + cfg where the device's table has that row
+static constexpr __device__ int ggml_cuda_fattn_tile_cfg_key(const int DKQ, const int DV, const int ncols, const int cfg) {
+    return cfg != 0 && ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols + cfg) != 0 ? ncols + cfg : ncols;
+}
+
+// cfg: 0, or GGML_CUDA_FATTN_TILE_CFG_DEEP for the second config row of the same column count
+template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, ggml_type type_KV, int cfg = 0> // D == head size
+__launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ggml_cuda_fattn_tile_cfg_key(DKQ, DV, ncols1*ncols2, cfg)),
+                  ggml_cuda_fattn_tile_get_occupancy(DKQ, DV, ggml_cuda_fattn_tile_cfg_key(DKQ, DV, ncols1*ncols2, cfg)))
 static __global__ void flash_attn_tile(
         const char * Q_ptr,
         const char * K_ptr,
@@ -960,13 +973,14 @@ static __global__ void flash_attn_tile(
         return;
     }
 
-    static_assert(ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols1*ncols2) != 0, "kernel config not defined");
+    constexpr int cfg_key = ggml_cuda_fattn_tile_cfg_key(DKQ, DV, ncols1*ncols2, cfg);
+    static_assert(ggml_cuda_fattn_tile_get_config(DKQ, DV, cfg_key) != 0, "kernel config not defined");
 
     constexpr int ncols     = ncols1*ncols2;
     constexpr int warp_size = 32;
-    constexpr int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, ncols1*ncols2) / warp_size;
-    constexpr int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, ncols1*ncols2);
-    constexpr int nbatch_K  = ggml_cuda_fattn_tile_get_nbatch_K (DKQ, DV, ncols1*ncols2);
+    constexpr int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cfg_key) / warp_size;
+    constexpr int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cfg_key);
+    constexpr int nbatch_K  = ggml_cuda_fattn_tile_get_nbatch_K (DKQ, DV, cfg_key);
 
     // In this kernel Q, K, V are matrices while i, j, k are matrix indices.
 
@@ -1359,6 +1373,26 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     if constexpr (ncols2 <= 8) {
         if (Q->ne[1] > 4/ncols2) {
             constexpr int cols_per_block = 8;
+            // Volta, head 512 (Gemma 4 global layers: V is a view of K, 8 Q heads on 1 K/V head per device): one token deep
+            //     in the cache takes 4 warps of 2 Q heads each, which read the K/V tiles from shared memory half as often,
+            //     at 4 blocks/SM. At 100k cells 312 -> 270 us; at 8k the half-size grid of one tile per block is slower, and
+            //     at 34k the combine of its 400 partials (16 vs 10 us) eats the gain: GGML_CUDA_FATTN_TILE_DEEP_KV, 0 = off.
+            if constexpr (DKQ == 512 && DV == 512 && ncols2 == 8 && type_KV == GGML_TYPE_F16) {
+                static const int64_t min_kv = [] {
+                    const char * env = getenv("GGML_CUDA_FATTN_TILE_DEEP_KV");
+                    return env != nullptr ? (int64_t) atoll(env) : (int64_t) 49152;
+                }();
+                if (cc == GGML_CUDA_CC_VOLTA && min_kv > 0 && dst->src[1]->ne[1] >= min_kv) {
+                    constexpr int key   = cols_per_block + GGML_CUDA_FATTN_TILE_CFG_DEEP;
+                    const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, key, cc) / warp_size;
+                    const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, key, cc);
+                    fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV,
+                        GGML_CUDA_FATTN_TILE_CFG_DEEP>;
+                    launch_fattn<DV, cols_per_block/ncols2, ncols2>
+                        (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, need_f16, need_f16, false, false, warp_size);
+                    return;
+                }
+            }
             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
             fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;

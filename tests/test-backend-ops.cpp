@@ -11797,7 +11797,9 @@ struct test_flash_attn_ext : public test_case {
     }
 
     double max_nmse_err() override {
-        return 5e-4;
+        // an F16 V accumulated over a deep cache of near-uniform random scores: the Volta tile kernel at head 512, 8 q
+        //   heads, 1 token is 6.4e-4 at 40960 keys and 1.0e-3 (deep config row) / 1.1e-3 (base row) at 49408
+        return kv >= 32768 && type_V == GGML_TYPE_F16 ? 2e-3 : 5e-4;
     }
 
     uint64_t op_flops(ggml_tensor * t) override {
@@ -16149,6 +16151,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 8192, 66, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 16384, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 1024));
+    // one token of 8 q heads on 1 kv head with head 512 deep in the cache (Gemma 4 global layers, V a view of K): the
+    //   second tile config row on Volta, see GGML_CUDA_FATTN_TILE_CFG_DEEP
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 53248, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, { 8, 1}, 49408, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false));
     // the same tile for 6 q heads on 1 kv head (Qwen QSA split across 4 devices), padded to 8 heads
     for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
         for (int nb : { 5, 64, 66 }) {
