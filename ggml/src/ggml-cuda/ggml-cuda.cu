@@ -6269,9 +6269,9 @@ static int ggml_cuda_try_fuse_moe_down_shexp(ggml_backend_cuda_context * cuda_ct
     fusion_data.sib_y   = mm->src[1];
     fusion_data.sib_out = shexp->get();
     // the all-reduce of the sum folded into the launch (ggml_cuda_ar_fold_moe_args, gated only): the sum is not
-    //   written anywhere
+    //   written anywhere; q8_0 experts in mul_mat_vec_q_short_ar_moe, 2-byte float ones in mul_mat_vec_f (ar_moe)
     static const bool no_moe_fold = getenv("GGML_CUDA_NO_AR_FOLD_MOE") != nullptr;
-    const bool fold = !use_mmvf && last && gated && !no_moe_fold && cuda_ctx->ar_fold.next == add && ggml_are_same_shape(match.experts, down) &&
+    const bool fold = last && gated && !no_moe_fold && cuda_ctx->ar_fold.next == add && ggml_are_same_shape(match.experts, down) &&
         match.experts->data == down->data && match.experts->ne[1] <= MMVQ_SHORT_AR_MAX_EXPERTS;
     if (fold) {
         fusion_data.ar_weights = match.weights;

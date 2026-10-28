@@ -11,6 +11,10 @@
 
 GGML_CUDA_SPIN_SETTER(mmvf)
 
+// the channels of the MoE all-reduce fold (ar_moe of mul_mat_vec_f): the used experts and the sibling, as many as the q8_0
+//   fold takes (MMVQ_SHORT_AR_MAX_EXPERTS + 1, mmvq.cuh)
+#define MMVF_AR_MOE_MAX_CHANNELS 11
+
 static __device__ __forceinline__ topk_moe_config mul_mat_vec_f_topk_moe_config(const ggml_cuda_mmvf_topk_args & topk) {
     topk_moe_config config;
     config.use_sigmoid       = topk.sigmoid;
@@ -128,16 +132,20 @@ static __device__ __forceinline__ void mul_mat_vec_f_norm_gated(const ggml_cuda_
 //   from gdn_block0 on those of gdn_x (alpha), the only ones with the gate (beta) and the gated delta net epilogue
 // norm: one token, y is the gated output norm of a gated delta net layer of the launch's y (topk_args holds its
 //   ggml_cuda_mmvf_norm_args, and those of the all-reduce with ar), see mul_mat_vec_f_norm_gated
+// ar_moe (with sib_ch, one warp a channel, 4 rows): the MoE all-reduce folded into the expert down projection (topk_args
+//   holds its ggml_cuda_ar_fold_moe_args) as mul_mat_vec_q_short_ar_moe does it: a block takes the 4 rows of one float4
+//   line of every expert and of the sibling, the warp threadIdx.y being the channel, and pushes their weighted sum
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false, int rpb = 1, bool load16 = false,
-          int topk_n = 0, bool ar = false, bool sib_ch = false, bool gdn_qkv = false, bool norm = false>
+          int topk_n = 0, bool ar = false, bool sib_ch = false, bool gdn_qkv = false, bool norm = false, bool ar_moe = false>
 static __global__ void mul_mat_vec_f(
         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const int ncols2, const uint3 nchannels_y, const int stride_row, const int stride_col_y2, const int stride_col_dst,
         const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const int ids_stride,
-        const std::conditional_t<norm, ggml_cuda_mmvf_norm_args, std::conditional_t<(topk_n > 0), ggml_cuda_mmvf_topk_args,
-            std::conditional_t<ar, ggml_cuda_ar_fold_args, std::conditional_t<gdn_qkv, ggml_cuda_mmvq_conv_args, ggml_cuda_no_args>>>> topk_args) {
+        const std::conditional_t<ar_moe, ggml_cuda_ar_fold_moe_args, std::conditional_t<norm, ggml_cuda_mmvf_norm_args,
+            std::conditional_t<(topk_n > 0), ggml_cuda_mmvf_topk_args, std::conditional_t<ar, ggml_cuda_ar_fold_args,
+            std::conditional_t<gdn_qkv, ggml_cuda_mmvq_conv_args, ggml_cuda_no_args>>>>> topk_args) {
     const T       * GGML_CUDA_RESTRICT x   = x_ptr;
     const float   * GGML_CUDA_RESTRICT y   = y_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
@@ -145,8 +153,9 @@ static __global__ void mul_mat_vec_f(
     static_assert(rpb == 1 || ((ncols_dst == 1 || load16) && !is_multi_token_id), "rows per block need a single token or the 16-byte loads");
     const int row         = rpb*blockIdx.x; // the first of the block's rows
     [[maybe_unused]] const int stride_row2 = stride_row/2;
-    // for MUL_MAT_ID - blockIdx.y = n_expert_used, blockIdx.z = ncols_dst (tokens)
-    const int channel_dst = blockIdx.y;
+    // for MUL_MAT_ID - blockIdx.y = n_expert_used, blockIdx.z = ncols_dst (tokens); with ar_moe the channels are the warps
+    const int channel_dst = ar_moe ? int(threadIdx.y) : int(blockIdx.y);
+    [[maybe_unused]] const int nchannels_grid = ar_moe ? int(blockDim.y) : int(gridDim.y);
     const int tid         = threadIdx.x;
 
     int token_idx;
@@ -165,10 +174,10 @@ static __global__ void mul_mat_vec_f(
         static_assert(!sib_ch || (ncols_dst == 1 && (!has_fusion || rpb == 1) && topk_n == 0 && !ar && !gdn_qkv),
             "the sibling channel is one token, nothing else fused but a gate");
         // the sibling channel has no id
-        const bool sib_blk = sib_ch && blockIdx.y == gridDim.y - 1;
+        const bool sib_blk = sib_ch && channel_dst == nchannels_grid - 1;
         token_idx  = ids ? blockIdx.z                                          : 0;
-        channel_x  = ids ? (sib_blk ? 0 : ids[blockIdx.y + token_idx * ids_stride]) : fastdiv((uint32_t) channel_dst, channel_ratio);
-        channel_y  = ids ? fastmodulo(blockIdx.y, nchannels_y)                 : channel_dst;
+        channel_x  = ids ? (sib_blk ? 0 : ids[channel_dst + token_idx * ids_stride]) : fastdiv((uint32_t) channel_dst, channel_ratio);
+        channel_y  = ids ? fastmodulo(channel_dst, nchannels_y)                : channel_dst;
         sample_dst = ids ? 0                                                   : blockIdx.z;
     }
 
@@ -201,7 +210,7 @@ static __global__ void mul_mat_vec_f(
         dst += token_idx*stride_col_dst;
     }
     if constexpr (sib_ch) {
-        if (blockIdx.y == gridDim.y - 1) {
+        if (channel_dst == nchannels_grid - 1) {
             x   = (const T *) fusion.sib_x + row*stride_row;
             y   = fusion.sib_y;
             dst = fusion.sib_dst;
@@ -275,7 +284,7 @@ static __global__ void mul_mat_vec_f(
     }
     if constexpr (sib_ch && has_fusion) {
         // the sibling's gate
-        if (blockIdx.y == gridDim.y - 1) {
+        if (channel_dst == nchannels_grid - 1) {
             gate_x = (const T *) fusion.sib_gate + row*stride_row;
         }
     }
@@ -764,6 +773,39 @@ static __global__ void mul_mat_vec_f(
         }
     }
 
+    if constexpr (ar_moe) {
+        // the products in expert order, then the gated sibling, as ggml_cuda_p2p_ar_ll_moe_reduce_kernel adds them; the even
+        //   row's lane pushes the pair
+        static_assert(sib_ch && load16 && !has_fusion && block_size == warp_size && rpb == 4 && ncols_dst == 1 && !ar,
+            "the fold takes one warp per channel and the 4 rows of a line");
+        const ggml_cuda_ar_fold_moe_args & m = topk_args;
+        __shared__ float sums[MMVF_AR_MOE_MAX_CHANNELS][4];
+        if (tid == 0) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                sums[channel_dst][i] = sumf[i];
+            }
+        }
+        __syncthreads();
+        if (channel_dst != 0) {
+            return;
+        }
+        float v = 0.0f;
+        if (tid < 4) {
+            v = __fmul_rn(sums[0][tid], m.weights[0]);
+            for (int e = 1; e < m.n_used; ++e) {
+                v = __fadd_rn(v, __fmul_rn(sums[e][tid], m.weights[e]));
+            }
+            v = __fadd_rn(v, __fmul_rn(sums[m.n_used][tid], ggml_cuda_op_sigmoid_single(*m.gate)));
+        }
+        const float v1 = __shfl_down_sync(0xFFFFFFFF, v, 1);
+        if (tid < 4 && tid % 2 == 0) {
+            const int r = row + tid;
+            ggml_cuda_ar_fold_push(m.ar, ggml_cuda_ar_seq(m.ar, r/4), r/4, (r/2) % 2, v, v1);
+        }
+        return;
+    }
+
     if constexpr (topk_n > 0) {
         static_assert(ncols_dst == 1 && rpb == 1 && !is_multi_token_id && !load16, "topk_moe needs one token and one row per block");
         if (tid >= warp_size) {
@@ -933,6 +975,27 @@ static void mul_mat_vec_f_switch_fusion(
                 GGML_ASSERT(rpb == 1 && fusion.sib_gate != nullptr && fusion.gate != nullptr && !fusion.x_bias && !fusion.gate_bias);
                 launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, false, 1, true, 0, false, true>);
                 return;
+            }
+            // the MoE all-reduce folded in (see ggml_cuda_ar_fold_moe_args): one warp per channel, a block per 4 rows; every
+            //   row sums as it does with rpb rows per block
+            if constexpr (block_size == WARP_SIZE) {
+                const int nchannels = int(block_nums.y);
+                const int nrows     = int(block_nums.x)*rpb;
+                if (fusion.ar_moe && fusion.ar_pushed != nullptr && nchannels == fusion.ar_n_used + 1 &&
+                        nchannels <= MMVF_AR_MOE_MAX_CHANNELS && nrows % 4 == 0 && block_nums.z == 1) {
+                    ggml_cuda_ar_fold_moe_args m;
+                    m.ar      = fusion.ar;
+                    m.weights = fusion.ar_weights;
+                    m.gate    = fusion.ar_gate;
+                    m.n_used  = fusion.ar_n_used;
+                    const ggml_cuda_kernel_launch_params fold_params = {dim3(nrows/4, 1, 1), dim3(WARP_SIZE, nchannels, 1), nbytes_shared, stream};
+                    ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, 4, true, 0, false, true, false, false, true>,
+                        fold_params, x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
+                        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, m);
+                    *fusion.ar_pushed = true;
+                    return;
+                }
             }
             // the sibling channel past the used experts, nothing else fused
             switch (rpb) {
@@ -1982,6 +2045,18 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     if (ctx.ar_fold.next == dst && !ctx.ar_fold.hc) {
         fusion_local.ar        = ctx.ar_fold.next_call.args;
         fusion_local.ar_pushed = &ctx.ar_fold.pushed;
+    }
+    // with ar_weights that of the MoE sum of the experts and the sibling this launch computes, which the caller checked
+    //   is next (see ggml_cuda_try_fuse_moe_down_shexp)
+    if (fusion && fusion->ar_weights && ctx.ar_fold.next != nullptr) {
+        GGML_ASSERT(ids && fusion->sib_y && fusion->ar_gate && ggml_is_contiguous(fusion->ar_weights) &&
+            ggml_nelements(fusion->ar_weights) == ne1);
+        fusion_local.ar         = ctx.ar_fold.next_call.args;
+        fusion_local.ar_pushed  = &ctx.ar_fold.pushed;
+        fusion_local.ar_moe     = true;
+        fusion_local.ar_weights = (const float *) fusion->ar_weights->data;
+        fusion_local.ar_gate    = (const float *) fusion->ar_gate->data;
+        fusion_local.ar_n_used  = (int) ne1;
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
