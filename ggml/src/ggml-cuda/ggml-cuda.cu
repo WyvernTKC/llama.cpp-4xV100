@@ -10238,6 +10238,81 @@ static void ggml_backend_cuda_graph_alloc_deps(ggml_cgraph * cgraph, ggml_backen
         keep(nodes[hc_up_pre[k].first]->src[0], nodes[hc_up_pre[k].second]);
     }
 
+    // the top-k fold of a router (ggml_cuda_topk_moe_fold): its launch writes the expert selection before the nodes up to
+    //   the topk_moe run, so what they touch must not lie under it. Also by default where a shared expert's projections run
+    //   in between with weights unlike the routed experts' (Ornith-122B: q8_0 vs q6_K): its GLU then cannot ride in the
+    //   experts' launch (ggml_cuda_try_defer_glu) and ggml-alloc put the selection over its gate (the fold refused in every
+    //   layer). GGML_CUDA_NO_ROUTER_DEP=1 turns that one off. Only in a graph where every router has one row, for the
+    //   reason given at hc_up_pre: in a prompt chunk with one output the router of the last layer has one row too. That
+    //   layer can be all a split of the graph holds, so the rows of what was cut to the outputs (a GET_ROWS of an input,
+    //   or the scheduler's copy of it, from an activation as wide as the router's input) count as well
+    static const bool router_dep = getenv("GGML_CUDA_NO_ROUTER_DEP") == nullptr;
+    std::vector<std::array<int, 3>> routers; // router, gating op, last node of the topk_moe
+    std::vector<const ggml_tensor *> cuts;
+    for (int i = 0; (all || router_dep) && i < n_nodes; ++i) {
+        const ggml_tensor * node = nodes[i];
+        if (node->op == GGML_OP_GET_ROWS) {
+            const ggml_tensor * base = node->src[0]->view_src != nullptr ? node->src[0]->view_src : node->src[0];
+            const ggml_tensor * ids  = node->src[1];
+            if (ids->op == GGML_OP_NONE && ids->type == GGML_TYPE_I32 && ids->data == nullptr && base->data == nullptr) {
+                cuts.push_back(node->src[0]);
+            }
+            continue;
+        }
+        if (i + 2 >= n_nodes || node->op != GGML_OP_MUL_MAT || nodes[i + 1]->op != GGML_OP_MUL_MAT ||
+                nodes[i + 1]->src[1] != node->src[1]) {
+            continue;
+        }
+        for (int k = i + 2; k < n_nodes && k <= i + 17; k++) {
+            const ggml_tensor * g = nodes[k];
+            if ((g->op == GGML_OP_SOFT_MAX || g->op == GGML_OP_UNARY || g->op == GGML_OP_ARGSORT) && g->src[0] == node) {
+                ggml_cuda_topk_moe_plan p;
+                if (ggml_cuda_topk_moe_plan_at(cgraph, k, p)) {
+                    routers.push_back({ i, k, k + p.n_ops - 1 });
+                }
+                break;
+            }
+        }
+    }
+    bool routers_decode = true;
+    for (const auto & r : routers) {
+        const ggml_tensor * router = nodes[r[0]];
+        routers_decode = routers_decode && ggml_nrows(router) <= 1;
+        for (const ggml_tensor * cut : cuts) {
+            routers_decode = routers_decode && (cut->ne[0] != router->src[1]->ne[0] || ggml_nrows(cut) <= 1);
+        }
+    }
+    for (int r = 0; routers_decode && r < (int) routers.size(); ++r) {
+        const int i = routers[r][0];
+        const int k = routers[r][1];
+        if (ggml_nrows(nodes[i]) != 1) {
+            continue;
+        }
+        bool unlike = all;
+        for (int e = k + 1; !unlike && e < n_nodes && e <= k + 32; e++) {
+            if (nodes[e]->op != GGML_OP_MUL_MAT_ID) {
+                continue;
+            }
+            const ggml_tensor * we = nodes[e]->src[0];
+            for (int j = i + 2; j < k; j++) {
+                const ggml_tensor * w = nodes[j]->op == GGML_OP_MUL_MAT ? nodes[j]->src[0] : nullptr;
+                unlike = unlike || (w != nullptr && (w->type != we->type || w->ne[0] != we->ne[0] || w->ne[1] != we->ne[1]));
+            }
+            break;
+        }
+        if (!unlike) {
+            continue;
+        }
+        for (int j = i + 2; j < k; j++) {
+            keep(nodes[j], nodes[routers[r][2]]);
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                if (nodes[j]->src[s] != nullptr) {
+                    keep(nodes[j]->src[s], nodes[routers[r][2]]);
+                }
+            }
+        }
+    }
+
     for (int i = 0; i < n_nodes; ++i) {
         const ggml_tensor * node = nodes[i];
 
@@ -10270,45 +10345,6 @@ static void ggml_backend_cuda_graph_alloc_deps(ggml_cgraph * cgraph, ggml_backen
                     }
                 }
                 keep_group(first, silu);
-            }
-        }
-
-        // the top-k fold of a router (ggml_cuda_topk_moe_fold): its launch writes the expert selection before the nodes up
-        //   to the topk_moe run, so what they touch must not lie under it. Also by default where a shared expert's
-        //   projections run in between with weights unlike the routed experts' (Ornith-122B: q8_0 vs q6_K): its GLU then
-        //   cannot ride in the experts' launch (ggml_cuda_try_defer_glu) and ggml-alloc put the selection over its gate
-        //   (the fold refused in every layer). GGML_CUDA_NO_ROUTER_DEP=1 turns that one off.
-        static const bool router_dep = getenv("GGML_CUDA_NO_ROUTER_DEP") == nullptr;
-        if ((all || router_dep) && node->op == GGML_OP_MUL_MAT && ggml_nrows(node) == 1 && i + 2 < n_nodes &&
-                nodes[i + 1]->op == GGML_OP_MUL_MAT && nodes[i + 1]->src[1] == node->src[1]) {
-            for (int k = i + 2; k < n_nodes && k <= i + 17; k++) {
-                const ggml_tensor * g = nodes[k];
-                if ((g->op == GGML_OP_SOFT_MAX || g->op == GGML_OP_UNARY || g->op == GGML_OP_ARGSORT) && g->src[0] == node) {
-                    ggml_cuda_topk_moe_plan p;
-                    bool unlike = all;
-                    for (int e = k + 1; !unlike && e < n_nodes && e <= k + 32; e++) {
-                        if (nodes[e]->op != GGML_OP_MUL_MAT_ID) {
-                            continue;
-                        }
-                        const ggml_tensor * we = nodes[e]->src[0];
-                        for (int j = i + 2; j < k; j++) {
-                            const ggml_tensor * w = nodes[j]->op == GGML_OP_MUL_MAT ? nodes[j]->src[0] : nullptr;
-                            unlike = unlike || (w != nullptr && (w->type != we->type || w->ne[0] != we->ne[0] || w->ne[1] != we->ne[1]));
-                        }
-                        break;
-                    }
-                    if (unlike && ggml_cuda_topk_moe_plan_at(cgraph, k, p)) {
-                        for (int j = i + 2; j < k; j++) {
-                            keep(nodes[j], nodes[k + p.n_ops - 1]);
-                            for (int s = 0; s < GGML_MAX_SRC; s++) {
-                                if (nodes[j]->src[s] != nullptr) {
-                                    keep(nodes[j]->src[s], nodes[k + p.n_ops - 1]);
-                                }
-                            }
-                        }
-                    }
-                    break;
-                }
             }
         }
 
