@@ -10198,24 +10198,37 @@ static void ggml_backend_cuda_graph_alloc_deps(ggml_cgraph * cgraph, ggml_backen
         }
     };
 
+    // dsv4_hc_up_pre (qwen4exp): the launch reads the mix of the SCALE while it writes the DSV4_HC_PRE. Only in a graph
+    //   where every site is decode-sized (<= 4 rows): in a prefill graph only the last layer, cut to the outputs, can be,
+    //   and a dep there would make the node count of a ubatch follow its number of outputs, so that one scheduler sees
+    //   graphs of the same size but other shapes and lays them out again (GGML_SCHED_DEBUG_REALLOC aborts on it)
+    std::vector<std::pair<int, int>> hc_up_pre;
+    bool hc_up_pre_decode = true;
+    for (int i = 0; i + 3 < n_nodes; ++i) {
+        const ggml_tensor * node = nodes[i];
+        if (node->op != GGML_OP_SCALE) {
+            continue;
+        }
+        int j = i + 3;
+        while (j < n_nodes && ggml_cuda_is_view_or_noop(nodes[j])) {
+            j++;
+        }
+        const ggml_tensor * silu = nodes[i + 1];
+        const ggml_tensor * mm   = nodes[i + 2];
+        if (j < n_nodes && nodes[j]->op == GGML_OP_DSV4_HC_PRE && silu->op == GGML_OP_UNARY &&
+                ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU && silu->src[0] == node && mm->op == GGML_OP_MUL_MAT &&
+                mm->src[1] == silu && nodes[j]->src[1] != nullptr &&
+                (nodes[j]->src[1] == mm || nodes[j]->src[1]->view_src == mm)) {
+            hc_up_pre.emplace_back(i, j);
+            hc_up_pre_decode = hc_up_pre_decode && mm->ne[1] <= 4;
+        }
+    }
+    for (int k = 0; hc_up_pre_decode && k < (int) hc_up_pre.size(); ++k) {
+        keep(nodes[hc_up_pre[k].first]->src[0], nodes[hc_up_pre[k].second]);
+    }
+
     for (int i = 0; i < n_nodes; ++i) {
         const ggml_tensor * node = nodes[i];
-
-        // dsv4_hc_up_pre (qwen4exp): the launch reads the mix of the SCALE while it writes the DSV4_HC_PRE
-        if (node->op == GGML_OP_SCALE && i + 3 < n_nodes) {
-            int j = i + 3;
-            while (j < n_nodes && ggml_cuda_is_view_or_noop(nodes[j])) {
-                j++;
-            }
-            const ggml_tensor * silu = nodes[i + 1];
-            const ggml_tensor * mm   = nodes[i + 2];
-            if (j < n_nodes && nodes[j]->op == GGML_OP_DSV4_HC_PRE && silu->op == GGML_OP_UNARY &&
-                    ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU && silu->src[0] == node && mm->op == GGML_OP_MUL_MAT &&
-                    mm->src[1] == silu && mm->ne[1] <= 4 && nodes[j]->src[1] != nullptr &&
-                    (nodes[j]->src[1] == mm || nodes[j]->src[1]->view_src == mm)) {
-                keep(node->src[0], nodes[j]);
-            }
-        }
 
         // the convolution state of a few tokens (ggml_cuda_ssm_conv_state_fusion_match): the launch at the CONCAT reads the
         //   cache row, the ids and the new tokens while it writes the SILU after the SSM_CONV, and at one token it runs in
