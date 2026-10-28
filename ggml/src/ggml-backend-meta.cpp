@@ -1939,6 +1939,23 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             }
             GGML_ABORT("fatal error");
         }
+        // The split dim is the outermost dim of both the source and the view, and the view keeps it whole: each device's
+        //   slice is one outer block, so a view that only regroups the dims inside it stays inside every block.
+        //   Example: glm5-next's permuted q_absorbed, split by heads, cut into per-stream token groups by build_attn_mha.
+        if (axis >= 0 && axis < GGML_MAX_DIMS && tensor->view_offs == 0 &&
+                tensor->ne[axis] == tensor->src[0]->ne[axis] && tensor->nb[axis] == tensor->src[0]->nb[axis]) {
+            auto split_dim_outermost = [axis](const ggml_tensor * t) {
+                for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
+                    if (dim != axis && t->ne[dim] > 1 && t->nb[dim] >= t->nb[axis]) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            if (split_dim_outermost(tensor) && split_dim_outermost(tensor->src[0])) {
+                return src_ss[0];
+            }
+        }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
             return src_ss[0];
         }
