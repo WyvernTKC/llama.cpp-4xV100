@@ -113,6 +113,9 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_sc(
 //   iq_sign_masks) where __vcmpne4 / __vsub4 cost about ten emulated integer instructions per int; the sums are the same.
 //   The mmvq kernels take it unless GGML_CUDA_NO_IQ_SIGN_DP4A is set, mul_mat_vec_q up to mmvq_sign_dp4a_max_cols. CUDA
 //   only, measured on V100 (4096 x 14336, one token: 4-6% faster).
+// With it the MoE kernel, mul_mat_vec_q at one column and the short kernel (IQ2_XXS, IQ3_XXS) copy the codebook (1-8 KiB)
+//   to shared memory first (mmvq_iq_grid_shared): the gathers of a warp then skip the L1. V100, one token: 4096 x 14336 6-13% faster, the
+//   DS4.1 experts 1-8%; the DS4.1 experts at 4 and 8 tokens: IQ3_XXS 9%, IQ2_XS 20%.
 static constexpr __host__ __device__ bool mmvq_sign_dp4a_type(ggml_type type) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     GGML_UNUSED(type);
@@ -168,15 +171,50 @@ static __device__ __forceinline__ float vec_dot_iq_sign_dp4a(
     }
 }
 
-// the same with the table in global memory, a vec_dot_q_cuda_t
+// the copy of the codebook in shared memory of the block's kernel, see mmvq_iq_grid_load
 template <ggml_type type>
-static __device__ __forceinline__ float vec_dot_iq_sign_dp4a_global(
-        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
-    return vec_dot_iq_sign_dp4a<type>(vbq, bq8_1, kbx, iqs, mmvq_iq_grid<type>::table());
+static __device__ __forceinline__ typename mmvq_iq_grid<type>::T * mmvq_iq_grid_shared() {
+    __shared__ typename mmvq_iq_grid<type>::T grid_s[mmvq_iq_grid<type>::n];
+    return grid_s;
 }
 
-// sign_dp4a: the IQ grid types apply their signs with a second dp4a, see mmvq_sign_dp4a_type
-static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type, bool sign_dp4a = false) {
+// every thread of a block of nthreads copies its part of the codebook to mmvq_iq_grid_shared, then waits for the others
+template <ggml_type type, int nthreads>
+static __device__ __forceinline__ void mmvq_iq_grid_load(const int tid) {
+    constexpr int n = mmvq_iq_grid<type>::n;
+    typename mmvq_iq_grid<type>::T * grid_s = mmvq_iq_grid_shared<type>();
+#pragma unroll
+    for (int i0 = 0; i0 < n; i0 += nthreads) {
+        if (n % nthreads == 0 || i0 + tid < n) {
+            grid_s[i0 + tid] = mmvq_iq_grid<type>::table()[i0 + tid];
+        }
+    }
+    __syncthreads();
+}
+
+// the same as a vec_dot_q_cuda_t, the table in global memory or (grid_shared) in mmvq_iq_grid_shared
+template <ggml_type type, bool grid_shared>
+static __device__ __forceinline__ float vec_dot_iq_sign_dp4a_table(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    if constexpr (grid_shared) {
+        return vec_dot_iq_sign_dp4a<type>(vbq, bq8_1, kbx, iqs, mmvq_iq_grid_shared<type>());
+    } else {
+        return vec_dot_iq_sign_dp4a<type>(vbq, bq8_1, kbx, iqs, mmvq_iq_grid<type>::table());
+    }
+}
+
+// the vec dot of a grid IQ type: plain, or with sign_dp4a and the table in global or (grid_shared) shared memory
+template <ggml_type type>
+static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_iq_grid(const vec_dot_q_cuda_t plain, const bool sign_dp4a, const bool grid_shared) {
+    if (!sign_dp4a) {
+        return plain;
+    }
+    return grid_shared ? vec_dot_iq_sign_dp4a_table<type, true> : vec_dot_iq_sign_dp4a_table<type, false>;
+}
+
+// sign_dp4a: the IQ grid types apply their signs with a second dp4a, see mmvq_sign_dp4a_type; grid_shared: their codebook
+//   is in mmvq_iq_grid_shared
+static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type, bool sign_dp4a = false, bool grid_shared = false) {
     switch (type) {
         case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
         case GGML_TYPE_Q2_0:    return vec_dot_q2_0_q8_1;
@@ -192,15 +230,15 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type, 
         case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1;
         case GGML_TYPE_Q5_K:    return vec_dot_q5_K_q8_1;
         case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1<true>;
-        case GGML_TYPE_IQ2_XXS: return sign_dp4a ? vec_dot_iq_sign_dp4a_global<GGML_TYPE_IQ2_XXS> : vec_dot_iq2_xxs_q8_1;
-        case GGML_TYPE_IQ2_XS:  return sign_dp4a ? vec_dot_iq_sign_dp4a_global<GGML_TYPE_IQ2_XS>  : vec_dot_iq2_xs_q8_1;
-        case GGML_TYPE_IQ2_S:   return sign_dp4a ? vec_dot_iq_sign_dp4a_global<GGML_TYPE_IQ2_S>   : vec_dot_iq2_s_q8_1;
-        case GGML_TYPE_IQ3_XXS: return sign_dp4a ? vec_dot_iq_sign_dp4a_global<GGML_TYPE_IQ3_XXS> : vec_dot_iq3_xxs_q8_1;
+        case GGML_TYPE_IQ2_XXS: return get_vec_dot_iq_grid<GGML_TYPE_IQ2_XXS>(vec_dot_iq2_xxs_q8_1, sign_dp4a, grid_shared);
+        case GGML_TYPE_IQ2_XS:  return get_vec_dot_iq_grid<GGML_TYPE_IQ2_XS>(vec_dot_iq2_xs_q8_1,  sign_dp4a, grid_shared);
+        case GGML_TYPE_IQ2_S:   return get_vec_dot_iq_grid<GGML_TYPE_IQ2_S>(vec_dot_iq2_s_q8_1,   sign_dp4a, grid_shared);
+        case GGML_TYPE_IQ3_XXS: return get_vec_dot_iq_grid<GGML_TYPE_IQ3_XXS>(vec_dot_iq3_xxs_q8_1, sign_dp4a, grid_shared);
         case GGML_TYPE_IQ1_S:   return vec_dot_iq1_s_q8_1;
         case GGML_TYPE_IQ1_M:   return vec_dot_iq1_m_q8_1;
         case GGML_TYPE_IQ4_NL:  return vec_dot_iq4_nl_q8_1;
         case GGML_TYPE_IQ4_XS:  return vec_dot_iq4_xs_q8_1;
-        case GGML_TYPE_IQ3_S:   return sign_dp4a ? vec_dot_iq_sign_dp4a_global<GGML_TYPE_IQ3_S>   : vec_dot_iq3_s_q8_1;
+        case GGML_TYPE_IQ3_S:   return get_vec_dot_iq_grid<GGML_TYPE_IQ3_S>(vec_dot_iq3_s_q8_1,   sign_dp4a, grid_shared);
         default:                return nullptr;
     }
 }
@@ -330,7 +368,8 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda_wide(ggml_type t
 // mul_mat_vec_q reuses a thread's weights for its ncols_dst columns: from 2 columns the q3_K / q6_K offsets cost less as one
 //   __vsub4 per int than as a second dp4a per column (V100, 4096 x 14336 at 4 tokens: 3% / 2%), and q2_K keeps its byte
 //   scale loads and 4x m fill
-static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda_cols(ggml_type type, int ncols_dst, bool sign_dp4a = false) {
+static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda_cols(ggml_type type, int ncols_dst, bool sign_dp4a = false,
+        bool grid_shared = false) {
     if (ncols_dst > 1) {
         switch (type) {
             case GGML_TYPE_Q2_K: return vec_dot_q2_K_q8_1<false>;
@@ -339,7 +378,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda_cols(ggml_type t
             default:             break;
         }
     }
-    return get_vec_dot_q_cuda(type, sign_dp4a);
+    return get_vec_dot_q_cuda(type, sign_dp4a, grid_shared);
 }
 
 // Per-architecture maximum batch size for which MMVQ should be used for MUL_MAT_ID.
@@ -906,7 +945,10 @@ static __global__ void mul_mat_vec_q(
     constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = wide ? get_vec_dot_q_cuda_wide(type) : get_vec_dot_q_cuda_cols(type, ncols_dst, sign_dp4a);
+    // sign_dp4a, one column: the codebook in shared memory, see mmvq_sign_dp4a_type
+    constexpr bool grid_shared = sign_dp4a && ncols_dst == 1 && mmvq_sign_dp4a_type(type);
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = wide ? get_vec_dot_q_cuda_wide(type) :
+        get_vec_dot_q_cuda_cols(type, ncols_dst, sign_dp4a, grid_shared);
 
     static_assert(!paired || (has_fusion && ncols_dst == 1), "paired needs a fused gate and one column");
     const     int half = paired ? threadIdx.y / nwarps : 0; // 1: the warps of the gate
@@ -1089,6 +1131,11 @@ static __global__ void mul_mat_vec_q(
                 conv_wv[k] = conv_args.w[int64_t(row0)*conv_args.w_stride + k];
             }
         }
+    }
+
+    // after the loads above are issued; no thread has returned yet
+    if constexpr (grid_shared) {
+        mmvq_iq_grid_load<type, (paired ? 2 : 1)*nwarps*warp_size>(threadIdx.y*warp_size + threadIdx.x);
     }
 
     // partial sum for each thread
@@ -1336,7 +1383,10 @@ static __global__ void mul_mat_vec_q_short(
     constexpr int rows_per_warp  = WARP_SIZE / lanes;
     constexpr int rows_per_slice = MMVQ_SHORT_NWARPS*rows_per_warp;
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type, sign_dp4a);
+    // sign_dp4a: the codebook in shared memory, see mmvq_sign_dp4a_type; only the 256-entry ones, the bigger ones cost some
+    //   variants a block per SM (V100: registers or 8 KiB a block), not measured
+    constexpr bool grid_shared = sign_dp4a && mmvq_sign_dp4a_type(type) && mmvq_iq_grid<type>::n <= 256;
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type, sign_dp4a, grid_shared);
     static_assert(lanes == MMVQ_SHORT_LANES || lanes == WARP_SIZE, "a row takes 16 lanes or a warp");
     static_assert(lanes % (qi/vdr) == 0, "a block's ints must not straddle two rows");
 
@@ -1379,6 +1429,10 @@ static __global__ void mul_mat_vec_q_short(
                 x_sig = ggml_cuda_op_sigmoid_single(*fusion.x_sigmoid);
             }
         }
+    }
+
+    if constexpr (grid_shared) {
+        mmvq_iq_grid_load<type, MMVQ_SHORT_NWARPS*WARP_SIZE>(threadIdx.y*WARP_SIZE + threadIdx.x);
     }
 
     float tmp[rows_per_thread] = { 0.0f };
@@ -1656,14 +1710,11 @@ static __global__ void mul_mat_vec_q_moe(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type, sign_dp4a);
-
-    // sign_dp4a: the codebook in shared memory, which every warp of the block reads for its token and rows; the lookups
-    //   then skip the L1 (V100, DS4.1 experts at 4 and 8 tokens: IQ3_XXS -9%, IQ2_XS -20%). Every thread copies before
-    //   any can return.
+    // sign_dp4a: the codebook in shared memory, see mmvq_sign_dp4a_type; every thread copies before any can return
     constexpr bool grid_shared = sign_dp4a && mmvq_sign_dp4a_type(type);
-    [[maybe_unused]] __shared__ typename mmvq_iq_grid<type>::T grid_s[grid_shared ? mmvq_iq_grid<type>::n : 1];
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type, sign_dp4a, grid_shared);
     if constexpr (grid_shared) {
+        typename mmvq_iq_grid<type>::T * grid_s = mmvq_iq_grid_shared<type>();
         const int tid = threadIdx.y*blockDim.x + threadIdx.x;
         for (int i = tid; i < mmvq_iq_grid<type>::n; i += blockDim.x*blockDim.y) {
             grid_s[i] = mmvq_iq_grid<type>::table()[i];
@@ -1761,15 +1812,6 @@ static __global__ void mul_mat_vec_q_moe(
 
 #pragma unroll
             for (int i = 0; i < c_rows_per_block; ++i) {
-                if constexpr (grid_shared) {
-                    tmp[i] += vec_dot_iq_sign_dp4a<type>(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs, grid_s);
-                    if constexpr (has_fusion) {
-                        if (use_gate) {
-                            tmp_gate[i] += vec_dot_iq_sign_dp4a<type>(vgate, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs, grid_s);
-                        }
-                    }
-                    continue;
-                }
                 tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
                 if constexpr (has_fusion) {
                     if (use_gate) {
