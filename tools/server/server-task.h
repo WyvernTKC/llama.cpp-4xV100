@@ -755,8 +755,9 @@ struct server_prompt_cache {
     size_t limit_tokens = 0;
 
     // The largest state the cache restored from, kept for the next save: a few hundred MiB cost ~50 ms to free and
-    //   ~100 ms of page faults to fill again, both while the request waits.
+    //   ~100 ms of page faults to fill again, both while the request waits. One for the main and one for the draft state.
     common_state_bytes spare;
+    common_state_bytes spare_drft;
 
     // A save of at most save_async_max bytes queues its copies (LLAMA_STATE_SEQ_FLAGS_ASYNC): one batch of
     //   device-to-pinned copies on the compute streams instead of a waited pageable copy per tensor, which ran at

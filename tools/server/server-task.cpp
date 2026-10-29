@@ -1841,13 +1841,16 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     // check if we can allocate enough memory for the new state
     try {
         // a conversation comes back a little longer than it left, so a new buffer gets room to be taken as the spare
-        if (spare.cap >= state_size_tgt) {
-            std::swap(state_data_tgt, spare);
-        } else {
-            state_data_tgt.resize(state_size_tgt + state_size_tgt/8);
-        }
-        state_data_tgt.resize(state_size_tgt);
-        state_data_dft.resize(state_size_dft);
+        auto take = [](common_state_bytes & data, common_state_bytes & spare, size_t size) {
+            if (size > 0 && spare.cap >= size) {
+                std::swap(data, spare);
+            } else if (size > 0) {
+                data.resize(size + size/8);
+            }
+            data.resize(size);
+        };
+        take(state_data_tgt, spare,      state_size_tgt);
+        take(state_data_dft, spare_drft, state_size_dft);
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
 
@@ -1947,6 +1950,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                     return false;
                 }
 
+                if (data.cap > spare_drft.cap) {
+                    std::swap(data, spare_drft);
+                }
                 data.clear();
             }
         }

@@ -15,6 +15,7 @@
 #include <array>
 #include <map>
 #include <set>
+#include <tuple>
 #include <vector>
 
 struct llama_model;
@@ -208,6 +209,25 @@ struct llama_context {
 
     // wait for the queued reads and copy them to their destinations
     void state_read_async_wait();
+
+    // grow the pinned staging of the state copies to at least n_bytes, from the host buffer type of dev
+    bool state_read_buf_reserve(ggml_backend_dev_t dev, size_t n_bytes);
+
+    // a waited copy between a tensor and host memory: n_rows rows of size bytes, at offset + i*stride in the tensor
+    //   and at data + i*data_stride in host memory
+    struct state_copy {
+        ggml_tensor * tensor;
+        size_t        offset;
+        size_t        size;
+        size_t        n_rows;
+        size_t        stride;
+        uint8_t     * data;
+        size_t        data_stride;
+    };
+
+    // run the copies through the pinned staging in chunks: the transfers of one chunk run while the host copies the
+    //   chunk before it. false if they cannot, nothing is copied then
+    bool state_copy_staged(const std::vector<state_copy> & copies, bool to_host);
 
     // pinned host memory for the 2-D state copies to and from buft (llama_io_tensor_2d), nullptr if there is none
     uint8_t * state_stage(ggml_backend_buffer_type_t buft);
@@ -543,6 +563,10 @@ private:
 
     // pinned staging of the 2-D state copies, one per buffer type, see state_stage()
     std::vector<std::pair<ggml_backend_buffer_type_t, ggml_backend_buffer_ptr>> state_stage_bufs;
+
+    // state_copy_staged: backends for the device parts of split tensors, an event per backend and staging half
+    std::vector<ggml_backend_ptr> state_copy_backends;
+    std::vector<std::tuple<ggml_backend_t, int, ggml_backend_event_ptr>> state_copy_events;
 
 
     bool has_evaluated_once = false;

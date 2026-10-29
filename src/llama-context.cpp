@@ -3384,6 +3384,31 @@ struct llama_io_block {
     std::vector<llama_io_tensor_2d> parts;
 };
 
+// a range of a tensor as a staged copy: whole rows of a 2-D tensor can go in different chunks, unless it is split so
+//   that one row is not a whole part on every device
+static llama_context::state_copy llama_io_copy_range(ggml_tensor * t, size_t offset, size_t size, const uint8_t * data) {
+    uint8_t * p = const_cast<uint8_t *>(data);
+    const size_t row = t->nb[1];
+    if (t->ne[2] == 1 && t->ne[3] == 1 && size > row && offset % row == 0 && size % row == 0) {
+        ggml_tensor * st = nullptr;
+        size_t offset_j = 0;
+        size_t size_j   = 0;
+        if (ggml_backend_meta_tensor_n_simple(t) == 0 || ggml_backend_meta_tensor_simple_range(t, offset, row, 0, &st, &offset_j, &size_j)) {
+            return { t, offset, row, size/row, row, p, row };
+        }
+    }
+    return { t, offset, size, 1, size, p, size };
+}
+
+template <typename T>
+static void llama_io_copies_add(std::vector<llama_context::state_copy> & copies, const std::vector<llama_io_block<T>> & blocks) {
+    for (const auto & block : blocks) {
+        for (const auto & p : block.parts) {
+            copies.push_back({ p.tensor, p.offset, p.size, p.n_rows, p.stride, const_cast<uint8_t *>(block.data) + p.data_offset, p.data_stride });
+        }
+    }
+}
+
 // size of the pinned staging per buffer type, see llama_context::state_stage
 static constexpr size_t llama_state_stage_size = 16*1024*1024;
 
@@ -3542,6 +3567,17 @@ public:
             lctx->synchronize();
         }
 
+        if (ctx_stage != nullptr) {
+            std::vector<llama_context::state_copy> copies;
+            for (const auto & winfo : winfos) {
+                copies.push_back(llama_io_copy_range(winfo.tensor, winfo.offset, winfo.size, winfo.ptr));
+            }
+            llama_io_copies_add(copies, blocks);
+            if (ctx_stage->state_copy_staged(copies, true)) {
+                return;
+            }
+        }
+
         // TODO: add backend support to batch tensor_get? or some other way to speed this up
         for (const auto & winfo : winfos) {
             ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
@@ -3618,6 +3654,17 @@ public:
     llama_io_read_host(const uint8_t * p, size_t len, llama_context * ctx_stage = nullptr) : ptr(p), buf_size(len), ctx_stage(ctx_stage) {}
 
     ~llama_io_read_host() {
+        if (ctx_stage != nullptr) {
+            std::vector<llama_context::state_copy> copies;
+            for (const auto & rinfo : rinfos) {
+                copies.push_back(llama_io_copy_range(rinfo.tensor, rinfo.offset, rinfo.size, rinfo.ptr));
+            }
+            llama_io_copies_add(copies, blocks);
+            if (ctx_stage->state_copy_staged(copies, false)) {
+                return;
+            }
+        }
+
         // flush the reads
         for (const auto & rinfo : rinfos) {
             ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
@@ -4202,11 +4249,11 @@ ggml_backend_t llama_context::state_async_backend(const ggml_tensor * tensor) co
     return nullptr;
 }
 
-// one thread faults in or copies only ~3-5 GB/s on some hosts: a large state goes over several, one per 16 MiB
+// one thread faults in or copies only ~3-5 GB/s on some hosts: a large state goes over several, one per n_per_thread
 // (an 800 MiB SWA checkpoint: fault-in 164 -> 43 ms, copy 126 -> 45 ms with 16 instead of 1 / 4 threads)
 template <typename F>
-static void llama_state_copy_parallel(size_t n_bytes, F && f) {
-    const int n_threads = (int) std::min<size_t>(16, n_bytes/(16u << 20) + 1);
+static void llama_state_copy_parallel(size_t n_bytes, F && f, size_t n_per_thread = 16u << 20) {
+    const int n_threads = (int) std::min<size_t>(16, n_bytes/n_per_thread + 1);
 
     std::vector<std::thread> workers;
     for (int ith = 1; ith < n_threads; ++ith) {
@@ -4216,6 +4263,33 @@ static void llama_state_copy_parallel(size_t n_bytes, F && f) {
     for (auto & w : workers) {
         w.join();
     }
+}
+
+bool llama_context::state_read_buf_reserve(ggml_backend_dev_t dev, size_t n_bytes) {
+    const size_t n_cur = state_read_buf ? ggml_backend_buffer_get_size(state_read_buf.get()) : 0;
+    if (n_cur >= n_bytes) {
+        return true;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev);
+    if (buft == nullptr) {
+        return false;
+    }
+    // pinning costs ~0.3 ms per MiB (more once the OS runs out of zeroed pages): with a state that grows with its
+    //   tokens (a prompt cache save), an exact fit would be pinned again for every slightly longer one
+    const size_t n_alloc = GGML_PAD(std::max(n_bytes + n_bytes/4, n_cur + n_cur/2), 16u << 20);
+    // freeing pinned memory waits for the device: the old buffer goes at the next synchronize()
+    ggml_backend_buffer_ptr buf(ggml_backend_buft_alloc_buffer(buft, n_alloc));
+    if (!buf) {
+        buf.reset(ggml_backend_buft_alloc_buffer(buft, n_bytes));
+    }
+    if (!buf) {
+        return false;
+    }
+    if (state_read_buf) {
+        state_read_buf_old.push_back(std::move(state_read_buf));
+    }
+    state_read_buf = std::move(buf);
+    return true;
 }
 
 bool llama_context::state_read_async(const std::vector<state_tensor_read> & reads) {
@@ -4254,27 +4328,8 @@ bool llama_context::state_read_async(const std::vector<state_tensor_read> & read
         events.push_back(it->second.get());
     }
 
-    const size_t n_cur = state_read_buf ? ggml_backend_buffer_get_size(state_read_buf.get()) : 0;
-    if (n_cur < n_bytes) {
-        ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(used[0]));
-        if (buft == nullptr) {
-            return false;
-        }
-        // pinning costs ~0.3 ms per MiB (more once the OS runs out of zeroed pages): with a state that grows with its
-        //   tokens (a prompt cache save), an exact fit would be pinned again for every slightly longer one
-        const size_t n_alloc = GGML_PAD(std::max(n_bytes + n_bytes/4, n_cur + n_cur/2), 16u << 20);
-        // freeing pinned memory waits for the device: the old buffer goes at the next synchronize()
-        ggml_backend_buffer_ptr buf(ggml_backend_buft_alloc_buffer(buft, n_alloc));
-        if (!buf) {
-            buf.reset(ggml_backend_buft_alloc_buffer(buft, n_bytes));
-        }
-        if (!buf) {
-            return false;
-        }
-        if (state_read_buf) {
-            state_read_buf_old.push_back(std::move(state_read_buf));
-        }
-        state_read_buf = std::move(buf);
+    if (!state_read_buf_reserve(ggml_backend_get_device(used[0]), n_bytes)) {
+        return false;
     }
 
     uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(state_read_buf.get());
@@ -4339,6 +4394,248 @@ void llama_context::state_read_async_wait() {
 
     state_read_copies.clear();
     state_read_events_used.clear();
+}
+
+// the staged copies move at most this much per chunk; the staging holds two chunks
+static constexpr size_t llama_state_chunk_size = 128u << 20;
+
+bool llama_context::state_copy_staged(const std::vector<state_copy> & copies, bool to_host) {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_STATE_COPY_STAGED");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!enabled) {
+        return false;
+    }
+
+    // the device parts of a split tensor have no backend in the context: they get one of their own device. Its
+    //   stream is not ordered with the compute streams, which the waited copies do not need
+    auto copy_backend = [&](const ggml_tensor * tensor) -> ggml_backend_t {
+        if (ggml_backend_t backend = state_async_backend(tensor)) {
+            return backend;
+        }
+        if (tensor->buffer == nullptr || ggml_backend_buffer_is_host(tensor->buffer)) {
+            return nullptr;
+        }
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
+        for (const auto & b : state_copy_backends) {
+            if (ggml_backend_get_device(b.get()) == dev) {
+                return b.get();
+            }
+        }
+        ggml_backend_t backend = dev != nullptr ? ggml_backend_dev_init(dev, nullptr) : nullptr;
+        if (backend != nullptr) {
+            state_copy_backends.emplace_back(backend);
+        }
+        return backend;
+    };
+
+    std::vector<ggml_backend_t> backends_cpy(copies.size(), nullptr);
+    std::vector<ggml_backend_t> used;
+    for (size_t i = 0; i < copies.size(); ++i) {
+        const auto & c = copies[i];
+        backends_cpy[i] = c.size*c.n_rows > 0 ? copy_backend(c.tensor) : nullptr;
+        if (backends_cpy[i] != nullptr && std::find(used.begin(), used.end(), backends_cpy[i]) == used.end()) {
+            used.push_back(backends_cpy[i]);
+        }
+    }
+
+    // a restore writes the same host rows to each device that holds a copy of a KV head: the first copy stages them,
+    //   the others take them from there
+    std::vector<size_t> first(copies.size());
+    std::vector<std::vector<size_t>> also(copies.size());
+    for (size_t i = 0; i < copies.size(); ++i) {
+        first[i] = i;
+        if (to_host || i == 0 || backends_cpy[i - 1] == nullptr || backends_cpy[i] == nullptr) {
+            continue;
+        }
+        const auto & a = copies[i - 1];
+        const auto & b = copies[i];
+        if (a.data == b.data && a.size == b.size && a.n_rows == b.n_rows && a.data_stride == b.data_stride) {
+            first[i] = first[i - 1];
+            also[first[i]].push_back(i);
+        }
+    }
+
+    size_t n_bytes = 0;
+    size_t row_max = 0;
+    for (size_t i = 0; i < copies.size(); ++i) {
+        const auto & c = copies[i];
+        if (backends_cpy[i] != nullptr && first[i] == i) {
+            n_bytes += GGML_PAD(c.size*c.n_rows, 256);
+            row_max  = std::max(row_max, GGML_PAD(c.size, 256));
+        }
+    }
+    if (n_bytes < (1u << 20)) {
+        return false;
+    }
+
+    std::vector<ggml_backend_event_t> events[2];
+    for (int s = 0; s < 2; ++s) {
+        for (ggml_backend_t backend : used) {
+            auto it = std::find_if(state_copy_events.begin(), state_copy_events.end(),
+                    [&](const auto & e) { return std::get<0>(e) == backend && std::get<1>(e) == s; });
+            if (it == state_copy_events.end()) {
+                state_copy_events.emplace_back(backend, s, ggml_backend_event_new(ggml_backend_get_device(backend)));
+                it = std::prev(state_copy_events.end());
+            }
+            if (!std::get<2>(*it)) {
+                return false;
+            }
+            events[s].push_back(std::get<2>(*it).get());
+        }
+    }
+
+    // the staging is shared with the async saves
+    state_read_async_wait();
+    if (!state_read_buf_reserve(ggml_backend_get_device(used[0]), std::min(std::max(n_bytes, 2*row_max), 2*llama_state_chunk_size))) {
+        return false;
+    }
+    uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(state_read_buf.get());
+    const size_t n_slot = std::min(llama_state_chunk_size, ggml_backend_buffer_get_size(state_read_buf.get())/2/256*256);
+
+    // cut the copies into chunks of whole rows; a row larger than a chunk is copied directly
+    struct piece {
+        size_t i;
+        size_t r0;
+        size_t n;
+        size_t offs;
+    };
+    std::vector<std::vector<piece>> chunks(1);
+    std::vector<size_t> direct;
+    size_t n_used = 0;
+    for (size_t i = 0; i < copies.size(); ++i) {
+        const auto & c = copies[i];
+        if (c.size*c.n_rows == 0 || first[i] != i) {
+            continue;
+        }
+        if (backends_cpy[i] == nullptr || c.size > n_slot) {
+            direct.push_back(i);
+            for (size_t j : also[i]) {
+                direct.push_back(j);
+            }
+            continue;
+        }
+        for (size_t r = 0; r < c.n_rows;) {
+            const size_t offs = GGML_PAD(n_used, 256);
+            const size_t n    = offs < n_slot ? std::min(c.n_rows - r, (n_slot - offs)/c.size) : 0;
+            if (n == 0) {
+                chunks.emplace_back();
+                n_used = 0;
+                continue;
+            }
+            chunks.back().push_back({ i, r, n, offs });
+            n_used = offs + n*c.size;
+            r += n;
+        }
+    }
+
+    auto transfer_one = [&](size_t i, const piece & p, uint8_t * stage) {
+        const auto & c = copies[i];
+        uint8_t * buf = stage + p.offs;
+        const size_t offset = c.offset + p.r0*c.stride;
+        if (p.n == 1 || c.stride == c.size) {
+            if (to_host) {
+                ggml_backend_tensor_get_async(backends_cpy[i], c.tensor, buf, offset, p.n*c.size);
+            } else {
+                ggml_backend_tensor_set_async(backends_cpy[i], c.tensor, buf, offset, p.n*c.size);
+            }
+        } else if (to_host) {
+            ggml_backend_tensor_get_2d_async(backends_cpy[i], c.tensor, buf, offset, c.size, p.n, c.stride, c.size);
+        } else {
+            ggml_backend_tensor_set_2d_async(backends_cpy[i], c.tensor, buf, offset, c.size, p.n, c.stride, c.size);
+        }
+    };
+    auto transfer = [&](const piece & p, uint8_t * stage) {
+        transfer_one(p.i, p, stage);
+        for (size_t j : also[p.i]) {
+            transfer_one(j, p, stage);
+        }
+    };
+
+    // the rows of a chunk sit back to back in the staging; the host side spreads or gathers them
+    auto host_copy = [&](const std::vector<piece> & chunk, uint8_t * stage) {
+        size_t n = 0;
+        for (const auto & p : chunk) {
+            n += p.n*copies[p.i].size;
+        }
+        llama_state_copy_parallel(n, [&](size_t lo, size_t hi) {
+            size_t pos = 0;
+            for (const auto & p : chunk) {
+                const auto & c = copies[p.i];
+                const size_t nb = p.n*c.size;
+                if (lo < pos + nb && pos < hi) {
+                    const size_t b = std::min(hi, pos + nb) - pos;
+                    for (size_t a = std::max(lo, pos) - pos; a < b;) {
+                        const size_t len = c.data_stride == c.size ? b - a : std::min(c.size - a % c.size, b - a);
+                        uint8_t * h = c.data + (p.r0 + a/c.size)*c.data_stride + a % c.size;
+                        if (to_host) {
+                            memcpy(h, stage + p.offs + a, len);
+                        } else {
+                            memcpy(stage + p.offs + a, h, len);
+                        }
+                        a += len;
+                    }
+                }
+                pos += nb;
+            }
+        }, 8u << 20);
+    };
+
+    auto record_half = [&](int s) {
+        for (size_t j = 0; j < used.size(); ++j) {
+            ggml_backend_event_record(events[s][j], used[j]);
+        }
+    };
+    auto wait_half = [&](int s) {
+        for (ggml_backend_event_t e : events[s]) {
+            ggml_backend_event_synchronize(e);
+        }
+    };
+
+    for (size_t k = 0; k < chunks.size(); ++k) {
+        const int s = (int) (k % 2);
+        uint8_t * stage = base + s*n_slot;
+        if (to_host) {
+            for (const auto & p : chunks[k]) {
+                transfer(p, stage);
+            }
+            record_half(s);
+            if (k > 0) {
+                wait_half(1 - s);
+                host_copy(chunks[k - 1], base + (1 - s)*n_slot);
+            }
+        } else {
+            // the transfers of chunk k - 2 read this half
+            if (k > 1) {
+                wait_half(s);
+            }
+            host_copy(chunks[k], stage);
+            for (const auto & p : chunks[k]) {
+                transfer(p, stage);
+            }
+            record_half(s);
+        }
+    }
+    const int s_last = (int) ((chunks.size() - 1) % 2);
+    wait_half(s_last);
+    if (to_host) {
+        host_copy(chunks.back(), base + s_last*n_slot);
+    } else if (chunks.size() > 1) {
+        wait_half(1 - s_last);
+    }
+
+    for (size_t i : direct) {
+        const auto & c = copies[i];
+        const bool flat = c.stride == c.size && c.data_stride == c.size;
+        if (to_host) {
+            ggml_backend_tensor_get_2d(c.tensor, c.data, c.offset, flat ? c.size*c.n_rows : c.size, flat ? 1 : c.n_rows, c.stride, c.data_stride);
+        } else {
+            ggml_backend_tensor_set_2d(c.tensor, c.data, c.offset, flat ? c.size*c.n_rows : c.size, flat ? 1 : c.n_rows, c.stride, c.data_stride);
+        }
+    }
+
+    return true;
 }
 
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
