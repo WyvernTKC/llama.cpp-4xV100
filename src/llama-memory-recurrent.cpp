@@ -35,6 +35,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
+    rs_view_back.assign(n_seq_max, 0);
 
     cells.clear();
     cells.resize(mem_size);
@@ -160,6 +161,7 @@ void llama_memory_recurrent::clear(bool data) {
     }
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
+    std::fill(rs_view_back.begin(), rs_view_back.end(), 0);
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -425,6 +427,42 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
     }
 
     return result;
+}
+
+bool llama_memory_recurrent::seq_rs_view(llama_seq_id seq_id, int32_t n_back) {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max || (uint32_t) seq_id >= size) {
+        return false;
+    }
+
+    const int32_t tail_id = cells[seq_id].tail;
+
+    if (n_back == 0) {
+        if (rs_view_back[seq_id] != 0) {
+            GGML_ASSERT(tail_id >= 0);
+            cells[tail_id].pos += rs_view_back[seq_id];
+            rs_view_back[seq_id] = 0;
+            set_rs_idx(seq_id, 0);
+        }
+        return true;
+    }
+
+    if (tail_id < 0) {
+        return false;
+    }
+
+    auto & cell = cells[tail_id];
+
+    // the snapshot group n_back is read through the rollback index, so it must be free
+    if (n_back < 0 || (uint32_t) n_back > n_rs_seq || rs_view_back[seq_id] != 0 || rs_idx[seq_id] != 0 ||
+            cell.seq_id.size() > 1 || cell.pos < n_back) {
+        return false;
+    }
+
+    set_rs_idx(seq_id, (uint32_t) n_back);
+    cell.pos -= n_back;
+    rs_view_back[seq_id] = n_back;
+
+    return true;
 }
 
 void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {

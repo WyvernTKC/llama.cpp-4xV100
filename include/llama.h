@@ -817,6 +817,15 @@ extern "C" {
             llama_memory_t mem,
               llama_seq_id seq_id);
 
+    // Show the recurrent state of seq_id as it was n_back tokens ago, from its rollback snapshot (needs n_rs_seq >= n_back
+    // and a last ubatch of seq_id with at least n_back tokens). Undo with n_back = 0 before the next decode
+    // In between, only the state getters and the position queries may be used
+    // Returns false if the memory has no such snapshot [EXPERIMENTAL]
+    LLAMA_API bool llama_memory_seq_rs_view(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                   int32_t n_back);
+
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 

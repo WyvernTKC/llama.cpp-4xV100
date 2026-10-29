@@ -154,6 +154,10 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
+    // show the recurrent state of seq_id as it was n_back tokens ago, read from its rollback snapshot, until called with n_back = 0
+    // only state_write and the position queries may run in between. returns false if there is no such snapshot
+    virtual bool seq_rs_view(llama_seq_id seq_id, int32_t n_back) { GGML_UNUSED(seq_id); GGML_UNUSED(n_back); return false; }
+
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
     //

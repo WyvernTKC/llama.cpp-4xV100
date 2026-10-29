@@ -317,6 +317,9 @@ struct server_slot {
     int32_t n_keep  = 0;
     int32_t i_batch = -1;
 
+    // batch index of the prompt token 5 before its end, whose state is kept as the checkpoint 4 tokens before the end
+    int32_t i_ckpt_tail = -1;
+
     // effective generation limit for the current task, -1 means unlimited
     int32_t n_predict_max = -1;
 
@@ -572,6 +575,8 @@ struct server_slot {
 
         task_prev = std::move(task);
         task.reset();
+
+        i_ckpt_tail = -1;
 
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
@@ -1248,6 +1253,9 @@ private:
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
+    // write the checkpoint 4 tokens before the end of a prompt from the recurrent rollback snapshot, see create_checkpoint_tail()
+    bool ckpt_tail_snap = false;
+
     common_speculative_ptr spec;
 
     bool add_bos_token = true;
@@ -1634,6 +1642,22 @@ private:
 
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
             SRV_TRC("%s", "speculative decoding will use checkpoints\n");
+        }
+
+        // LLAMA_CKPT_TAIL_SNAP=0: decode the last 4 prompt tokens in their own batch for their checkpoint, as upstream
+        // only with MTP: the other drafters with rollback snapshots keep draft or boundary state that would be taken at the prompt end
+        {
+            const char * env = getenv("LLAMA_CKPT_TAIL_SNAP");
+            const auto & types = params_base.speculative.types;
+            const bool spec_ok = std::none_of(types.begin(), types.end(), [](common_speculative_type t) {
+                return t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                       t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            });
+            ckpt_tail_snap = (env == nullptr || atoi(env) != 0) && spec_ok && llama_n_rs_seq(ctx_tgt) >= 4 &&
+                llama_memory_seq_rs_view(llama_get_memory(ctx_tgt), 0, 0);
+            if (ckpt_tail_snap) {
+                SRV_INF("%s", "the context checkpoint 4 tokens before the end of a prompt is read from the recurrent rollback snapshot\n");
+            }
         }
 
         // setup slots
@@ -3137,6 +3161,36 @@ private:
                 fill(cur);
             }
         }
+    }
+
+    // the checkpoint 4 tokens before the end of the prompt, written after the first token is out from the recurrent rollback
+    // snapshot of the decode that read the prompt end, instead of before a decode of the last 4 tokens on their own.
+    // must run before the next decode of the slot: the snapshots and the cell positions are those of the prompt decode
+    void create_checkpoint_tail(server_slot & slot, int32_t off) {
+        if (slot.i_ckpt_tail < 0) {
+            return;
+        }
+
+        const int32_t i_tail = slot.i_ckpt_tail;
+        slot.i_ckpt_tail = -1;
+
+        auto * mem = llama_get_memory(ctx_tgt);
+
+        // a batch view that starts inside the last 5 tokens leaves no snapshot of the state before them
+        if (i_tail < off || !llama_memory_seq_rs_view(mem, slot.id, 4)) {
+            SLT_WRN(slot, "%s", "no rollback snapshot 4 tokens before the prompt end, no context checkpoint there\n");
+            return;
+        }
+
+        const auto pos_min = llama_memory_seq_pos_min(mem, slot.id);
+        const auto pos_max = llama_memory_seq_pos_max(mem, slot.id);
+
+        create_checkpoint(slot, slot.prompt.n_tokens() - (slot.task->n_tokens() - 4), pos_min, pos_max);
+
+        llama_memory_seq_rs_view(mem, slot.id, 0);
+
+        // the async copies must land before anything copies the checkpoint, and no decode follows when the slot stops here
+        llama_synchronize(ctx_tgt);
     }
 
     // checkpoints are appended to the slot save file, after the llama state payload
@@ -4918,6 +4972,13 @@ private:
                             for (int offset : checkpoint_offsets) {
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
+                                    // the decode keeps the state 4 tokens before the end of its batch as a recurrent rollback
+                                    // snapshot, so the last 4 tokens stay in this batch if they fit, see create_checkpoint_tail()
+                                    if (offset == 4 && ckpt_tail_snap && !has_mtmd && batch.size() + 4 <= n_batch &&
+                                            (!prompt_can_split || (int32_t) (batch.size() - n_tokens_prev) + 4 <= n_batch_slot)) {
+                                        slot.i_ckpt_tail = batch.size() - 1;
+                                        break;
+                                    }
                                     should_break = true;
                                     break;
                                 }
@@ -4926,6 +4987,11 @@ private:
                                 break;
                             }
                         }
+                    }
+
+                    if (slot.i_ckpt_tail >= 0 && slot.prompt.n_tokens() < slot.task->n_tokens()) {
+                        SLT_WRN(slot, "%s", "the prompt end is not in this batch, no context checkpoint 4 tokens before it\n");
+                        slot.i_ckpt_tail = -1;
                     }
 
                     // the number of tokens added to the batch for the current slot
@@ -5320,10 +5386,13 @@ private:
                 // release slot because of stop condition
                 slot.print_timings();
                 send_final_response(slot);
+                create_checkpoint_tail(slot, off);
                 slot.release();
 
                 return;
             }
+
+            create_checkpoint_tail(slot, off);
 
             slot.print_timings_tg();
         });

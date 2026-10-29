@@ -53,6 +53,8 @@ public:
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
+    bool seq_rs_view(llama_seq_id seq_id, int32_t n_back) override;
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
     bool prepare(const std::vector<llama_ubatch> & ubatches);
@@ -76,6 +78,9 @@ public:
 
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
+
+    // per-seq number of tokens seq_rs_view() moved the state back
+    std::vector<int32_t> rs_view_back;
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
