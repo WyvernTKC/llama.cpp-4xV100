@@ -36,9 +36,11 @@ llama_kv_cache_msa::llama_kv_cache_msa(
             v_trans, offload, unified, kv_size, n_seq_max,
             n_swa, swa_type, nullptr, filter, reuse, nullptr);
 
-    // the MSA indexer uses a single key head per layer
+    // the MSA indexer uses a single key head per layer and no values
     std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
     hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
+    hparams_idx.n_embd_head_v_full = 0;
+    hparams_idx.n_embd_head_v_swa  = 0;
     // the rope parameters are kept identical to the main cache
 
     LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
