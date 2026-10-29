@@ -79,13 +79,17 @@ void llama_model_minimax_m3::load_arch_tensors(llama_model_loader &) {
             layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
             layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {        n_ff_exp * n_expert_shared, n_embd}, 0);
             layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
-
-            // indexer
-            layer.index_q_proj = create_tensor(tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", i), {n_embd, hparams.indexer_n_head * hparams.indexer_head_size}, 0);
-            layer.index_k_proj = create_tensor(tn(LLM_TENSOR_INDEXER_K_PROJ, "weight", i), {n_embd, hparams.indexer_head_size}, 0);
-            layer.index_q_norm = create_tensor(tn(LLM_TENSOR_INDEXER_Q_NORM, "weight", i), {hparams.indexer_head_size}, 0);
-            layer.index_k_norm = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM, "weight", i), {hparams.indexer_head_size}, 0);
         }
+
+        // indexer: a layer is sparse (MSA) iff it has one. M3 keeps its leading dense layers on full
+        // attention and ships no indexer there, M3.1 (sparse_attention_freq all 1) has one in every layer
+        const int idx_flags = i < (int) hparams.n_layer_dense_lead ? TENSOR_NOT_REQUIRED : 0;
+        layer.index_q_proj = create_tensor(tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", i), {n_embd, hparams.indexer_n_head * hparams.indexer_head_size}, idx_flags);
+        layer.index_k_proj = create_tensor(tn(LLM_TENSOR_INDEXER_K_PROJ, "weight", i), {n_embd, hparams.indexer_head_size}, idx_flags);
+        layer.index_q_norm = create_tensor(tn(LLM_TENSOR_INDEXER_Q_NORM, "weight", i), {hparams.indexer_head_size}, idx_flags);
+        layer.index_k_norm = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM, "weight", i), {hparams.indexer_head_size}, idx_flags);
+        GGML_ASSERT((layer.index_q_proj && layer.index_k_proj && layer.index_q_norm && layer.index_k_norm) ||
+                    (!layer.index_q_proj && !layer.index_k_proj && !layer.index_q_norm && !layer.index_k_norm));
     }
 }
 
@@ -331,7 +335,7 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
-            const bool is_sparse = msa_enabled && il >= (int) hparams.n_layer_dense_lead;
+            const bool is_sparse = msa_enabled && model.layers[il].index_q_proj != nullptr;
 
             if (!is_sparse) {
                 cur = build_attn(inp_attn, model.layers[il].wo, NULL, model.layers[il].wo_s,
