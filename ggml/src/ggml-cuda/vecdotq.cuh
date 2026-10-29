@@ -125,6 +125,40 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     return s * 0x01010101;
 }
 
+// The signs s_i of an IQ grid entry g, whose bytes are all in [1, 127], as a second dp4a (the *_sign_dp4a vec dots):
+//   sum_i s_i*g_i*u_i = dp4a(g, u) - 2*dp4a(g & m, u), m being 0xFF in the negative bytes. The integer sum is that of the
+//   __vcmpne4 / __vsub4 negation, which NVIDIA GPUs emulate with about ten integer instructions per int.
+// Byte j of .x (.y) is 0xFF where bit j (4 + j) of s is set.
+static __device__ __forceinline__ uint2 iq_sign_masks(const uint32_t s) {
+    // the multiplies move bit j (4 + j) to bit 8j + 7 and its other copies to distinct lower bits, so nothing carries
+    const uint32_t lo = (s & 0x0F) * 0x10204080;
+    const uint32_t hi = (s & 0xF0) * 0x01020408;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // every byte its top bit, replicated
+    uint32_t m_lo;
+    uint32_t m_hi;
+    asm("prmt.b32 %0, %1, 0, 0xBA98;" : "=r"(m_lo) : "r"(lo));
+    asm("prmt.b32 %0, %1, 0, 0xBA98;" : "=r"(m_hi) : "r"(hi));
+    return make_uint2(m_lo, m_hi);
+#else
+    return make_uint2(((lo >> 7) & 0x01010101) * 0xFF, ((hi >> 7) & 0x01010101) * 0xFF);
+#endif
+}
+
+// the masks of 7 stored signs and their parity bit, the signs of unpack_ksigns
+static __device__ __forceinline__ uint2 iq_ksign_masks(const uint8_t v) {
+    return iq_sign_masks(v ^ (__popc(v) & 1) << 7);
+}
+
+// sumi += g.u, sumi_neg += (g & m).u over the 8 bytes of a grid entry
+static __device__ __forceinline__ void iq_dot8_sign_dp4a(
+        const int g0, const int g1, const uint2 m, const int u0, const int u1, int & sumi, int & sumi_neg) {
+    sumi     = ggml_cuda_dp4a(g0,             u0, sumi);
+    sumi     = ggml_cuda_dp4a(g1,             u1, sumi);
+    sumi_neg = ggml_cuda_dp4a(g0 & (int) m.x, u0, sumi_neg);
+    sumi_neg = ggml_cuda_dp4a(g1 & (int) m.y, u1, sumi_neg);
+}
+
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
 // MMVQ = mul_mat_vec_q, MMQ = mul_mat_q
 
@@ -1575,6 +1609,173 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
         sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
         sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
     }
+
+    sumi *= 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
+
+    const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
+    return d * sumi;
+}
+
+// The vec dots of the grid types above with the signs as a second dp4a (see iq_sign_masks): the same integer sums, so the
+//   same results. grid: the type's codebook (iq2xxs_grid, ...) or a copy of it in shared memory.
+static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1_sign_dp4a(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs,
+    const uint64_t * grid) {
+
+    const block_iq2_xxs * bq2 = (const block_iq2_xxs *) vbq + kbx;
+
+    const int q2 = get_int_b2(bq2->qs, iqs);
+    const uint8_t * aux8 = (const uint8_t *) &q2;
+    const uint32_t aux32 = get_int_b2(bq2->qs, iqs + 1);
+
+    int sumi = 0;
+    int sumi_neg = 0;
+#pragma unroll
+    for (int k0 = 0; k0 < 8; k0 += 2) {
+        const uint2 grid_pos = ((const uint2 *) grid)[aux8[k0/2]];
+        const uint2 m = iq_ksign_masks(aux32 >> (7 * k0 / 2));
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, k0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, k0 + 1);
+        iq_dot8_sign_dp4a(grid_pos.x, grid_pos.y, m, u0, u1, sumi, sumi_neg);
+    }
+    sumi -= 2*sumi_neg;
+
+    const int ls = aux32 >> 27 | 1; // (scale * 2 + 1)
+    sumi = sumi * ls / 8;           // (sumi * scale + sumi / 2) / 4
+    const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
+    return d * sumi;
+}
+
+static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1_sign_dp4a(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs,
+    const uint64_t * grid) {
+
+    const block_iq2_xs * bq2 = (const block_iq2_xs *) vbq + kbx;
+
+    const int2 q2_packed = make_int2(get_int_b2(bq2->qs, iqs + 0), get_int_b2(bq2->qs, iqs + 1));
+    const uint16_t * q2 = (const uint16_t *) &q2_packed;
+    const int ls0 = bq2->scales[iqs/2] & 0x0F;
+    const int ls1 = bq2->scales[iqs/2] >> 4;
+
+    int sumi0 = 0;
+    int sumi1 = 0;
+    int sumi0_neg = 0;
+    int sumi1_neg = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const uint2 grid_pos = ((const uint2 *) grid)[q2[l0/2] & 0x1FF];
+        const uint2 m = iq_ksign_masks(q2[l0/2] >> 9);
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+        if (l0 < 4) {
+            iq_dot8_sign_dp4a(grid_pos.x, grid_pos.y, m, u0, u1, sumi0, sumi0_neg);
+        } else {
+            iq_dot8_sign_dp4a(grid_pos.x, grid_pos.y, m, u0, u1, sumi1, sumi1_neg);
+        }
+    }
+    sumi0 -= 2*sumi0_neg;
+    sumi1 -= 2*sumi1_neg;
+    const int sumi = (sumi0*ls0 + sumi1*ls1 + (sumi0 + sumi1)/2)/4;
+    const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
+    return d * sumi;
+}
+
+static __device__ __forceinline__ float vec_dot_iq2_s_q8_1_sign_dp4a(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs,
+    const uint64_t * grid) {
+
+    const block_iq2_s * bq2 = (const block_iq2_s *) vbq + kbx;
+
+    const int       qs_packed = get_int_b2(bq2->qs, iqs/2);
+    const uint8_t * qs        = (const uint8_t *) &qs_packed;
+
+    const int qh = bq2->qh[iqs/2];
+
+    const int       signs_packed_32 = get_int_b2(bq2->qs, QK_K/32 + iqs/2);
+    const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
+
+    const int ls0 = bq2->scales[iqs/2] & 0x0F;
+    const int ls1 = bq2->scales[iqs/2] >> 4;
+
+    int sumi0 = 0;
+    int sumi1 = 0;
+    int sumi0_neg = 0;
+    int sumi1_neg = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const uint2 grid_pos = ((const uint2 *) grid)[qs[l0/2] | ((qh << (8-l0)) & 0x300)];
+        const uint2 m = iq_sign_masks(signs_packed_8[l0/2]);
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+        if (l0 < 4) {
+            iq_dot8_sign_dp4a(grid_pos.x, grid_pos.y, m, u0, u1, sumi0, sumi0_neg);
+        } else {
+            iq_dot8_sign_dp4a(grid_pos.x, grid_pos.y, m, u0, u1, sumi1, sumi1_neg);
+        }
+    }
+    sumi0 -= 2*sumi0_neg;
+    sumi1 -= 2*sumi1_neg;
+    const int sumi = (sumi0*ls0 + sumi1*ls1 + (sumi0 + sumi1)/2)/4;
+
+    const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
+    return d * sumi;
+}
+
+static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1_sign_dp4a(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs,
+    const uint32_t * grid) {
+
+    const block_iq3_xxs * bq3 = (const block_iq3_xxs *) vbq + kbx;
+
+    const int2 q3_packed = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs+1));
+    const uint8_t * q3 = (const uint8_t *) &q3_packed;
+    const uint32_t aux32 = get_int_b2(bq3->qs, QK_K/16 + iqs/2);
+
+    int sumi = 0;
+    int sumi_neg = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int2 grid_pos = make_int2(grid[q3[l0 + 0]], grid[q3[l0 + 1]]);
+        const uint2 m = iq_ksign_masks(aux32 >> (7*l0/2));
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+        iq_dot8_sign_dp4a(grid_pos.x, grid_pos.y, m, u0, u1, sumi, sumi_neg);
+    }
+    sumi -= 2*sumi_neg;
+
+    const int ls = aux32 >> 28;
+    sumi = (ls*sumi + sumi/2)/2;
+    const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
+    return d * sumi;
+}
+
+static __device__ __forceinline__ float vec_dot_iq3_s_q8_1_sign_dp4a(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs,
+    const uint32_t * grid) {
+
+    const block_iq3_s * bq3 = (const block_iq3_s *) vbq + kbx;
+
+    const int2      qs_packed = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
+    const uint8_t * qs        = (const uint8_t *) &qs_packed;
+
+    const int qh = bq3->qh[iqs/2];
+
+    const int       signs_packed_32 = get_int_b2(bq3->signs, iqs/2);
+    const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
+
+    int sumi = 0;
+    int sumi_neg = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int2 grid_pos = make_int2(
+            grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+            grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+        const uint2 m = iq_sign_masks(signs_packed_8[l0/2]);
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+        iq_dot8_sign_dp4a(grid_pos.x, grid_pos.y, m, u0, u1, sumi, sumi_neg);
+    }
+    sumi -= 2*sumi_neg;
 
     sumi *= 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
 

@@ -15324,6 +15324,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 4, false, 16, 10, 256));
     }
 
+    // the CUDA mat-vec paths of the grid IQ types (signs as a second dp4a): one token with K over 16 lanes, a warp or the
+    //   plain kernel, 2-8 tokens in the MoE kernel, and a fused gate, of experts and dense (the paired layout)
+    for (ggml_type type_a : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S}) {
+        for (int n = 1; n <= 8; ++n) {
+            for (int k : {512, 768, 2048}) {
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 6, false, 128, n, k));
+            }
+        }
+        for (int64_t m_batch : {1, 2, 4, 8}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type_a, GGML_GLU_OP_SWIGLU, m_batch, 64, 1024,
+                true, 16, 6, false, false, true, false, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type_a, GGML_GLU_OP_SWIGLU, 1, 4096, 1024,
+            false, 1, 1, false, false, true, false, {1, 1}));
+    }
+
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
             for (int n_mats : {4, 8}) {
@@ -16950,6 +16966,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+
+    // DeepSeek-V4.1-1017 (IQ3_XXS experts, IQ2_XS gate/up in some layers): top-6 of 384 experts, n_ff_exp 2304, n_embd 5120.
+    //   One device's share under the 4-way -sm tensor split: gate/up 576 rows, down K 512 or 768 (9 blocks of 256 split
+    //   2/2/2/3). 32 experts keep the IQ quantization at init short and the weights (32-36 MB) out of the L2.
+    for (int n : {1, 4, 8}) {
+        for (ggml_type type_a : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_XS}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 6, false, 576, n, 5120)); // gate/up
+        }
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 32, 6, false, 5120, n, 512)); // down
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 32, 6, false, 5120, n, 768));
+    }
 
     // Ornith-1.5-35B-A3B (qwen35moe): 256 experts, top-8, n_ff_exp 512, n_embd 2048, ubatch 2048.
     // One device's share of the MoE under the 4-way -sm tensor split: gate/up loses output
