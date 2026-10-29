@@ -1735,6 +1735,28 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+server_prompt_cache::server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+    this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
+    this->limit_tokens = limit_tokens;
+
+    if (const char * env = getenv("LLAMA_CACHE_SAVE_ASYNC")) {
+        save_async = atoi(env);
+    }
+    // the staging is pinned once and kept: a longer conversation keeps the waited copies
+    size_t max_mib = 1024;
+    if (const char * env = getenv("LLAMA_CACHE_SAVE_ASYNC_MAX_MIB")) {
+        max_mib = (size_t) std::max(0, atoi(env));
+    }
+    save_async_max = max_mib*1024*1024;
+}
+
+void server_prompt_cache::wait_saves() {
+    for (llama_context * ctx : ctx_saving) {
+        llama_synchronize(ctx);
+    }
+    ctx_saving.clear();
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -1795,6 +1817,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         if (len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
+            wait_saves();
             it = states.erase(it);
         } else {
             ++it;
@@ -1807,6 +1830,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
+            wait_saves();
             states.pop_front();
         }
     }
@@ -1935,6 +1959,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             *replaced = true;
         }
 
+        wait_saves();
         states.erase(it_best);
     }
 
@@ -1946,6 +1971,7 @@ void server_prompt_cache::update() {
         while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
+            wait_saves();
             states.pop_front();
         }
     }
@@ -1961,6 +1987,7 @@ void server_prompt_cache::update() {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
+            wait_saves();
             states.pop_front();
         }
     }

@@ -384,13 +384,24 @@ struct server_slot {
             return nullptr;
         }
 
-        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_NONE;
+
+        size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, flags);
+        size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, flags) : 0;
+
+        // see server_prompt_cache::save_async; the size follows the flags (an async save stores repeated KV head rows)
+        if (prompt_cache.save_async > 0 && cur_size_tgt + cur_size_dft <= prompt_cache.save_async_max) {
+            flags = LLAMA_STATE_SEQ_FLAGS_ASYNC;
+
+            cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, flags);
+            cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, flags) : 0;
+        }
 
         const size_t cur_size = cur_size_tgt + cur_size_dft;
 
-        SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
-                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
+        SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)%s\n",
+                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0),
+                flags & LLAMA_STATE_SEQ_FLAGS_ASYNC ? ", async" : "");
 
         const int64_t t_start = ggml_time_us();
 
@@ -401,12 +412,29 @@ struct server_slot {
 
         const int64_t t_alloc = ggml_time_us();
 
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, flags);
         if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, flags);
         }
 
-        SRV_TRC(" - saved prompt state: alloc %.2f ms, state %.2f ms\n", (t_alloc - t_start) / 1000.0, (ggml_time_us() - t_alloc) / 1000.0);
+        const int64_t t_state = ggml_time_us();
+
+        if (flags & LLAMA_STATE_SEQ_FLAGS_ASYNC) {
+            if (prompt_cache.save_async == 1) {
+                llama_synchronize(ctx_tgt);
+                if (ctx_dft) {
+                    llama_synchronize(ctx_dft);
+                }
+            } else {
+                prompt_cache.ctx_saving = { ctx_tgt };
+                if (ctx_dft) {
+                    prompt_cache.ctx_saving.push_back(ctx_dft);
+                }
+            }
+        }
+
+        SRV_TRC(" - saved prompt state: alloc %.2f ms, state %.2f ms, wait %.2f ms\n",
+                (t_alloc - t_start) / 1000.0, (t_state - t_alloc) / 1000.0, (ggml_time_us() - t_state) / 1000.0);
 
         return cur;
     }
@@ -1299,6 +1327,10 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        if (prompt_cache) {
+            prompt_cache->wait_saves();
+        }
+
         spec.reset();
         spec_init.reset();
 

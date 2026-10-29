@@ -4254,13 +4254,20 @@ bool llama_context::state_read_async(const std::vector<state_tensor_read> & read
         events.push_back(it->second.get());
     }
 
-    if (!state_read_buf || ggml_backend_buffer_get_size(state_read_buf.get()) < n_bytes) {
+    const size_t n_cur = state_read_buf ? ggml_backend_buffer_get_size(state_read_buf.get()) : 0;
+    if (n_cur < n_bytes) {
         ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(used[0]));
         if (buft == nullptr) {
             return false;
         }
+        // pinning costs ~0.3 ms per MiB (more once the OS runs out of zeroed pages): with a state that grows with its
+        //   tokens (a prompt cache save), an exact fit would be pinned again for every slightly longer one
+        const size_t n_alloc = GGML_PAD(std::max(n_bytes + n_bytes/4, n_cur + n_cur/2), 16u << 20);
         // freeing pinned memory waits for the device: the old buffer goes at the next synchronize()
-        ggml_backend_buffer_ptr buf(ggml_backend_buft_alloc_buffer(buft, n_bytes));
+        ggml_backend_buffer_ptr buf(ggml_backend_buft_alloc_buffer(buft, n_alloc));
+        if (!buf) {
+            buf.reset(ggml_backend_buft_alloc_buffer(buft, n_bytes));
+        }
         if (!buf) {
             return false;
         }

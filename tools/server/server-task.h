@@ -744,10 +744,7 @@ struct server_prompt_cache_state {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
-        this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
-        this->limit_tokens = limit_tokens;
-    }
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens);
 
     std::list<server_prompt_cache_state> states;
 
@@ -760,6 +757,19 @@ struct server_prompt_cache {
     // The largest state the cache restored from, kept for the next save: a few hundred MiB cost ~50 ms to free and
     //   ~100 ms of page faults to fill again, both while the request waits.
     common_state_bytes spare;
+
+    // A save of at most save_async_max bytes queues its copies (LLAMA_STATE_SEQ_FLAGS_ASYNC): one batch of
+    //   device-to-pinned copies on the compute streams instead of a waited pageable copy per tensor, which ran at
+    //   1.6-2 GB/s with the new entry's page faults. The pinned staging grows to the largest async save.
+    //   env LLAMA_CACHE_SAVE_ASYNC: 0 = waited copies, 1 = queued copies waited for in the save,
+    //   2 (default) = the bytes land in the entry when the next decode returns, its graphs queued behind the copies
+    int    save_async     = 2;
+    size_t save_async_max = 0;
+
+    // contexts whose async save may still be copying into an entry: wait_saves() before an entry is freed
+    std::vector<llama_context *> ctx_saving;
+
+    void wait_saves();
 
     size_t size() const;
 
