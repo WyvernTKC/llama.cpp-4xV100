@@ -971,35 +971,81 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
 
     dst += sequence*ne02*ne01*D + jt*ne02*(ncols1*D) + zt_Q*D + (j*ne02 + c)*D + tid;
 
+    // Partial i is the one of block b_first + i. The last one is in dst, the others are added to it from i = nfix-1 down to 0.
+    const int nfix = blocks_per_tile - 1;
+    extern __shared__ float2 meta[];  // [nfix + 1]: KQ max and rowsum of each partial
+    float2 * scale = meta + nfix + 1; // [nfix]: scale of the sum so far and of partial i, in step i
+
     ggml_cuda_pdl_sync();
     // Load the partial result that needs a fixup
     float dst_val = *dst;
-    float max_val;
-    float rowsum;
-    {
-        const float2 tmp = dst_fixup[b_last*ncols + jc];
-        max_val = tmp.x;
-        rowsum  = tmp.y;
+    for (int i = tid; i <= nfix; i += D) {
+        meta[i] = dst_fixup[i == nfix ? b_last*ncols + jc : (nblocks_stream_k + b_first + i)*ncols + jc];
     }
 
-    // Combine with all previous blocks in this tile.
-    for (int bidx = b_last - 1; bidx >= b_first; --bidx) {
-        const float dst_add = dst_fixup_data[bidx*ncols*D + jc*D + tid];
+    // One block per column and the partials are in DRAM: the loads of nchunk partials go out before their steps, and the
+    //     scales are computed while the first chunk loads.
+    constexpr int nchunk = 32;
+    float rowsum = 0.0f;
+    for (int i0 = nfix - 1; i0 >= 0; i0 -= nchunk) {
+        float dst_add[nchunk];
+#pragma unroll
+        for (int k = 0; k < nchunk; ++k) {
+            if (i0 - k >= 0) {
+                dst_add[k] = dst_fixup_data[(b_first + i0 - k)*ncols*D + jc*D + tid];
+            }
+        }
 
-        const float2 tmp = dst_fixup[(nblocks_stream_k + bidx)*ncols + jc];
+        if (i0 == nfix - 1) {
+            __syncthreads();
 
-        const float max_val_new = fmaxf(max_val, tmp.x);
+            // The max after step i is the max of partials i..nfix (exact in any order): one warp finds it for all steps
+            //     with a scan, so that the scales of each step are computed once per block.
+            if (tid < WARP_SIZE) {
+                float max_val = meta[nfix].x;
+                for (int j0 = nfix - 1; j0 >= 0; j0 -= WARP_SIZE) {
+                    const int   i       = j0 - tid;
+                    const float max_add = i >= 0 ? meta[i].x : -INFINITY;
 
-        const float diff_val = max_val - max_val_new;
-        const float diff_add = tmp.x   - max_val_new;
+                    float max_val_new = max_add;
+#pragma unroll
+                    for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
+                        const float t = __shfl_up_sync(0xFFFFFFFF, max_val_new, offset, WARP_SIZE);
+                        if (tid >= offset) {
+                            max_val_new = fmaxf(max_val_new, t);
+                        }
+                    }
+                    max_val_new = fmaxf(max_val_new, max_val);
 
-        const float scale_val = diff_val >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_val) : 0.0f;
-        const float scale_add = diff_add >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_add) : 0.0f;
+                    const float max_val_prev = __shfl_up_sync(0xFFFFFFFF, max_val_new, 1, WARP_SIZE);
+                    const float max_val_old  = tid == 0 ? max_val : max_val_prev;
 
-        dst_val = scale_val*dst_val + scale_add*dst_add;
-        rowsum  = scale_val*rowsum  + scale_add*tmp.y;
+                    if (i >= 0) {
+                        const float diff_val = max_val_old - max_val_new;
+                        const float diff_add = max_add     - max_val_new;
 
-        max_val = max_val_new;
+                        const float scale_val = diff_val >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_val) : 0.0f;
+                        const float scale_add = diff_add >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_add) : 0.0f;
+
+                        scale[i] = make_float2(scale_val, scale_add);
+                    }
+                    max_val = __shfl_sync(0xFFFFFFFF, max_val_new, WARP_SIZE - 1, WARP_SIZE);
+                }
+            }
+            __syncthreads();
+
+            rowsum = meta[nfix].y;
+        }
+
+#pragma unroll
+        for (int k = 0; k < nchunk; ++k) {
+            if (i0 - k >= 0) {
+                const float2 s = scale[i0 - k];
+
+                dst_val = s.x*dst_val + s.y*dst_add[k];
+                rowsum  = s.x*rowsum  + s.y*meta[i0 - k].y;
+            }
+        }
     }
 
     // Write back final result:
@@ -1642,8 +1688,9 @@ void launch_fattn(
 
             const dim3 block_dim_combine(DV, 1, 1);
             const dim3 blocks_num_combine = {(unsigned)ntiles_dst, ncols1, ncols2};
+            const size_t nbytes_shared_combine = 2*bpt*sizeof(float2); // meta and scales of the partials
 
-            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
             ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>, launch_params,
                 (float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
