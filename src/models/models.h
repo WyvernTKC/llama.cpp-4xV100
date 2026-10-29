@@ -2607,12 +2607,13 @@ struct llama_model_minimax_m3 : public llama_model_base {
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);
 
+        // returns [D, Gp, C, R], contiguous
         ggml_tensor * build_attn_msa_fa(
-                ggml_tensor * q_cur,   // [D, HQ, S] f32
-                ggml_tensor * k,       // [D, n_keys, 1, C]  C = HKV or HKV*n_stream
+                ggml_tensor * q,       // [D, Gp, C, R] f32, C = HKV or HKV*n_stream (group outermost)
+                ggml_tensor * k,       // [D, n_keys, 1, C]
                 ggml_tensor * v,       // [D, n_keys, 1, C]
-                ggml_tensor * mask,    // [n_keys, R, 1, C] f16, R = HQ*T/(Gp*C)
-                int64_t Gp, float kq_scale, int il) const;
+                ggml_tensor * mask,    // [n_keys, R, 1, C] f16
+                float kq_scale, int il) const;
     };
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };

@@ -2016,6 +2016,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 return src_ss[0];
             }
         }
+        // batched rows with replicated indices: each device gathers from its own batches with its slice of the
+        //   indices, which ggml_backend_meta_buffer_init_tensor_impl cuts out (MiniMax-M3 MSA, k/v split by group)
+        if ((src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_3) &&
+                src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[0].n_segments == 1 && src_ss[0].nr[0] == 1 &&
+                tensor->src[1]->ne[int(src_ss[0].axis) - 1] == tensor->src[0]->ne[src_ss[0].axis]) {
+            return src_ss[0];
+        }
         return handle_generic(src_ss, /*scalar_only =*/ true);
     };
 
@@ -2049,6 +2056,18 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
+
+        // Independent attention problems along dim 3, split the same way in q, k and v (MiniMax-M3 MSA puts its
+        //   kv groups there): each device solves its own. A replicated mask is cut to the device's share of
+        //   dim 3 by ggml_backend_meta_buffer_init_tensor_impl.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_3) {
+            GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]) && split_states_equal(src_ss[0], src_ss[2]));
+            GGML_ASSERT(src_ss[0].n_segments == 1 && src_ss[0].nr[0] == 1);
+            GGML_ASSERT(tensor->src[4] == nullptr);
+            GGML_ASSERT(tensor->src[3] == nullptr || tensor->src[3]->ne[3] == 1 ||
+                        tensor->src[3]->ne[3] == tensor->src[0]->ne[3]);
+            return src_ss[0];
         }
 
         // Q is always split by head. K and V are split the same way, except when a single kv head is
@@ -2843,6 +2862,34 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             slice_tokens(0, 2); // q
             slice_tokens(2, 1); // weights
             slice_tokens(3, 1); // mask
+        }
+
+        // A replicated src of an op split along a batch dim (handle_get_rows, handle_flash_attn_ext): this device
+        //   reads its share of that dim only. The kernels address it by strides, so a view with an offset will do.
+        auto slice_replicated = [&](int i, int dim) {
+            ggml_tensor * src = t_ij->src[i];
+            if (src == nullptr || src->ne[dim] == 1 || !ggml_backend_buffer_is_meta(tensor->src[i]->buffer) ||
+                    ggml_backend_meta_get_split_state(tensor->src[i], /*assume_sync =*/ true).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                return;
+            }
+            GGML_ASSERT(split_state.n_segments == 1 && split_state.nr[0] == 1);
+            int64_t i0 = 0;
+            for (size_t jj = 0; jj < j; jj++) {
+                i0 += split_state.ne[jj];
+            }
+            int64_t ne[GGML_MAX_DIMS] = { src->ne[0], src->ne[1], src->ne[2], src->ne[3] };
+            ne[dim] = split_state.ne[j];
+            ggml_tensor * v = ggml_view_4d(simple_ctx, src, ne[0], ne[1], ne[2], ne[3],
+                src->nb[1], src->nb[2], src->nb[3], i0*src->nb[dim]);
+            v->buffer = src->buffer;
+            t_ij->src[i] = v;
+        };
+        if (tensor->op == GGML_OP_GET_ROWS &&
+                (split_state.axis == GGML_BACKEND_SPLIT_AXIS_2 || split_state.axis == GGML_BACKEND_SPLIT_AXIS_3)) {
+            slice_replicated(1, int(split_state.axis) - 1); // indices
+        }
+        if (tensor->op == GGML_OP_FLASH_ATTN_EXT && split_state.axis == GGML_BACKEND_SPLIT_AXIS_3) {
+            slice_replicated(3, 3); // mask
         }
 
         simple_tensors.push_back(t_ij);

@@ -300,6 +300,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_vocab = 3072; // TODO: should be 4096, but user code cannot get `n_vocab_out` yet [TAG_LLAMA_N_VOCAB_OUT]
     } else if (arch == LLM_ARCH_HRM_TEXT) {
         n_layer = 6; // 1 layer per stack x 2 h-cycles x (2 l-cycles + 1) cache slots
+    } else if (arch == LLM_ARCH_MINIMAX_M3) {
+        // GQA with head size 128 like the real model; 4 kv groups give every device its own group under -sm tensor
+        n_embd = 1024;
+        n_head = 8;
     }
 
     // these architectures compress k and v into a single latent vector shared by all heads, so like the
@@ -325,6 +329,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_head    = 4;
         n_head_kv = 2;
         n_layer   = 4;
+    }
+    if (arch == LLM_ARCH_MINIMAX_M3) {
+        n_head_kv = 4;
     }
     const uint32_t n_embd_head = n_embd / n_head;
 
@@ -527,8 +534,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_PLE_HEAD_VOCAB_SIZES,        ple_head_vocab_sizes);
     }
 
-    // minimax-m3 keeps one indexer head per GQA head; the rest use a fixed 64 to match the fused
-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,   arch == LLM_ARCH_MINIMAX_M3 ? n_head : uint32_t(64));
+    // minimax-m3 keeps one indexer head per GQA group; the rest use a fixed 64 to match the fused
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,   arch == LLM_ARCH_MINIMAX_M3 ? n_head_kv : uint32_t(64));
     // qwen4exp ropes indexer keys with the main rotary width, so its head can't be < n_rot
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,
               arch == LLM_ARCH_QWEN4EXP ? n_embd_head : uint32_t(128));

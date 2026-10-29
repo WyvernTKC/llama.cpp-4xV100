@@ -46,7 +46,7 @@ llama_kv_cache_msa::llama_kv_cache_msa(
     kv_idx = std::make_unique<llama_kv_cache>(
             model, no_alloc, hparams_idx, type_k, type_v,
             v_trans, offload, unified, kv_size, n_seq_max,
-            n_swa, swa_type, nullptr, filter_idx, reuse, nullptr);
+            n_swa, swa_type, nullptr, filter_idx, reuse, nullptr, "idx_");
 }
 
 void llama_kv_cache_msa::clear(bool data) {
