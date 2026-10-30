@@ -55,7 +55,8 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 void ggml_vec_dot_q5_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q6_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 
-// vec_dot_segs of ggml_type_traits_cpu (x86 AVX-512 only)
+// vec_dot_segs of ggml_type_traits_cpu (x86 only: q8_0 with AVX2, the K-quants with AVX-512)
+void ggml_vec_dot_q8_0_q8_0_segs(int ns, const int * GGML_RESTRICT n, float * GGML_RESTRICT s, const void * const * GGML_RESTRICT vx, const void * const * GGML_RESTRICT vy);
 void ggml_vec_dot_q4_K_q8_K_segs(int ns, const int * GGML_RESTRICT n, float * GGML_RESTRICT s, const void * const * GGML_RESTRICT vx, const void * const * GGML_RESTRICT vy);
 void ggml_vec_dot_q5_K_q8_K_segs(int ns, const int * GGML_RESTRICT n, float * GGML_RESTRICT s, const void * const * GGML_RESTRICT vx, const void * const * GGML_RESTRICT vy);
 void ggml_vec_dot_q6_K_q8_K_segs(int ns, const int * GGML_RESTRICT n, float * GGML_RESTRICT s, const void * const * GGML_RESTRICT vx, const void * const * GGML_RESTRICT vy);

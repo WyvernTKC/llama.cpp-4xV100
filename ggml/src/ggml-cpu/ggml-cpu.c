@@ -278,6 +278,9 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
 #else
         .nrows                    = 1,
 #endif
+#if defined(__AVX2__)
+        .vec_dot_segs             = ggml_vec_dot_q8_0_q8_0_segs,
+#endif
     },
     [GGML_TYPE_Q8_1] = {
         .from_float               = quantize_row_q8_1,

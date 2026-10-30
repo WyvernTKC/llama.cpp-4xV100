@@ -244,8 +244,8 @@ static int test_vec_dot_q(bool verbose) {
     return num_failed;
 }
 
-// vec_dot_segs: every row the same bits as vec_dot, for 1 to 9 rows of 1 to 8 blocks (rows 2i and 2i+1 of equal length, but
-// rows 2 and 3 and rows 6 and 7 one block apart)
+// vec_dot_segs: every row the same bits as vec_dot, for 1 to 9 rows of 1 to 8 blocks and of 4 to 29 blocks (rows 2i and 2i+1
+// of equal length, but rows 2 and 3 and rows 6 and 7 one block apart)
 static int test_vec_dot_segs(bool verbose) {
     int num_failed = 0;
 
@@ -261,32 +261,34 @@ static int test_vec_dot_segs(bool verbose) {
 
         int n_rows = 0;
         int n_diff = 0;
-        for (int ns = 1; ns <= 9; ns++) {
-            std::vector<std::vector<uint8_t>> qx(ns);
-            std::vector<std::vector<uint8_t>> qy(ns);
-            std::vector<const void *> px(ns);
-            std::vector<const void *> py(ns);
-            std::vector<int> n(ns);
-            std::vector<float> s(ns, INFINITY);
-            for (int q = 0; q < ns; q++) {
-                n[q] = (int) (blck*(1 + ((q/2)*3 + ns) % 7 + (q % 4 == 3)));
-                std::vector<float> a(n[q]);
-                std::vector<float> b(n[q]);
-                generate_data(0.37f*q + ns, n[q], a.data());
-                generate_data(1.91f*q - ns, n[q], b.data(), 1.0f + 0.25f*q);
-                qx[q].resize(ggml_row_size(type, n[q]));
-                qy[q].resize(ggml_row_size(qfns_cpu->vec_dot_type, n[q]));
-                qfns_cpu->from_float(a.data(), qx[q].data(), n[q]);
-                vdot->from_float(b.data(), qy[q].data(), n[q]);
-                px[q] = qx[q].data();
-                py[q] = qy[q].data();
-            }
-            qfns_cpu->vec_dot_segs(ns, n.data(), s.data(), px.data(), py.data());
-            for (int q = 0; q < ns; q++) {
-                float ref = 0.0f;
-                qfns_cpu->vec_dot(n[q], &ref, 0, px[q], 0, py[q], 0, 1);
-                n_diff += memcmp(&ref, &s[q], sizeof(float)) != 0;
-                n_rows++;
+        for (const int len : { 1, 4 }) {
+            for (int ns = 1; ns <= 9; ns++) {
+                std::vector<std::vector<uint8_t>> qx(ns);
+                std::vector<std::vector<uint8_t>> qy(ns);
+                std::vector<const void *> px(ns);
+                std::vector<const void *> py(ns);
+                std::vector<int> n(ns);
+                std::vector<float> s(ns, INFINITY);
+                for (int q = 0; q < ns; q++) {
+                    n[q] = (int) (blck*(len*(1 + ((q/2)*3 + ns) % 7) + (q % 4 == 3)));
+                    std::vector<float> a(n[q]);
+                    std::vector<float> b(n[q]);
+                    generate_data(0.37f*q + ns, n[q], a.data());
+                    generate_data(1.91f*q - ns, n[q], b.data(), 1.0f + 0.25f*q);
+                    qx[q].resize(ggml_row_size(type, n[q]));
+                    qy[q].resize(ggml_row_size(qfns_cpu->vec_dot_type, n[q]));
+                    qfns_cpu->from_float(a.data(), qx[q].data(), n[q]);
+                    vdot->from_float(b.data(), qy[q].data(), n[q]);
+                    px[q] = qx[q].data();
+                    py[q] = qy[q].data();
+                }
+                qfns_cpu->vec_dot_segs(ns, n.data(), s.data(), px.data(), py.data());
+                for (int q = 0; q < ns; q++) {
+                    float ref = 0.0f;
+                    qfns_cpu->vec_dot(n[q], &ref, 0, px[q], 0, py[q], 0, 1);
+                    n_diff += memcmp(&ref, &s[q], sizeof(float)) != 0;
+                    n_rows++;
+                }
             }
         }
 

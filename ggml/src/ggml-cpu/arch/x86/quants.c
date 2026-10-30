@@ -552,6 +552,13 @@ static inline __m128i get_scale_shuffle(int i) {
 }
 #endif
 
+// for the block functions shared by vec_dot and vec_dot_segs
+#if defined(_MSC_VER)
+#define BLOCK_INLINE static __forceinline
+#else
+#define BLOCK_INLINE static inline __attribute__((always_inline))
+#endif
+
 #if defined(__AVX512F__) && defined(__AVX512BW__)
 // The 512-bit K-quant dot products put two 256-bit halves in a vector: the sum of the halves gives the int32 lanes of
 // the AVX2 code, and the float part is the same, so the result is the same bits.
@@ -591,13 +598,7 @@ static inline void prefetch_block_1k(const void * p, const int size) {
 
 // One block of the 512-bit q4_K, q5_K and q6_K dot products, shared by vec_dot and vec_dot_segs so that a row gives the
 // same bits in either. The vector arguments are the loop constants of the caller.
-#if defined(_MSC_VER)
-#define BLOCK_512_INLINE static __forceinline
-#else
-#define BLOCK_512_INLINE static inline __attribute__((always_inline))
-#endif
-
-BLOCK_512_INLINE void q4_K_block_512(const block_q4_K * GGML_RESTRICT x, const block_q8_K * GGML_RESTRICT y,
+BLOCK_INLINE void q4_K_block_512(const block_q4_K * GGML_RESTRICT x, const block_q8_K * GGML_RESTRICT y,
         __m256 * GGML_RESTRICT acc, __m128 * GGML_RESTRICT acc_m, const __m512i m4, const __m512i idx0, const __m512i two) {
     static const uint32_t kmask1 = 0x3f3f3f3f;
     static const uint32_t kmask2 = 0x0f0f0f0f;
@@ -654,14 +655,14 @@ BLOCK_512_INLINE void q4_K_block_512(const block_q4_K * GGML_RESTRICT x, const b
     *acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), *acc);
 }
 
-BLOCK_512_INLINE float q4_K_sum_512(const __m256 acc, __m128 acc_m) {
+BLOCK_INLINE float q4_K_sum_512(const __m256 acc, __m128 acc_m) {
     acc_m = _mm_add_ps(acc_m, _mm_movehl_ps(acc_m, acc_m));
     acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
 
     return hsum_float_8(acc) + _mm_cvtss_f32(acc_m);
 }
 
-BLOCK_512_INLINE void q5_K_block_512(const block_q5_K * GGML_RESTRICT x, const block_q8_K * GGML_RESTRICT y,
+BLOCK_INLINE void q5_K_block_512(const block_q5_K * GGML_RESTRICT x, const block_q8_K * GGML_RESTRICT y,
         __m256 * GGML_RESTRICT acc, float * GGML_RESTRICT summs, const __m512i m4, const __m512i m16, const __m512i idx0,
         const __m512i two, const __m512i hmask0) {
     static const uint32_t kmask1 = 0x3f3f3f3f;
@@ -726,7 +727,7 @@ BLOCK_512_INLINE void q5_K_block_512(const block_q5_K * GGML_RESTRICT x, const b
     *acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), *acc);
 }
 
-BLOCK_512_INLINE void q6_K_block_512(const block_q6_K * GGML_RESTRICT x, const block_q8_K * GGML_RESTRICT y,
+BLOCK_INLINE void q6_K_block_512(const block_q6_K * GGML_RESTRICT x, const block_q8_K * GGML_RESTRICT y,
         __m256 * GGML_RESTRICT acc, const __m512i m15, const __m512i mh_a, const __m512i mh_b, const __m512i sh_a,
         const __m512i sh_b, const __m512i idx0, const __m512i four) {
     prefetch_block_1k(x, sizeof(block_q6_K));
@@ -1586,6 +1587,21 @@ void ggml_vec_dot_q5_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
+#if defined(__AVX2__)
+// acc + d(x)*d(y)*dot(x, y) of one block, shared by vec_dot and vec_dot_segs
+BLOCK_INLINE __m256 q8_0_block_256(const block_q8_0 * GGML_RESTRICT x, const block_q8_0 * GGML_RESTRICT y, const __m256 acc) {
+    // Compute combined scale for the block
+    const __m256 d = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x->d) * GGML_CPU_FP16_TO_FP32(y->d));
+    __m256i qx = _mm256_loadu_si256((const __m256i *)x->qs);
+    __m256i qy = _mm256_loadu_si256((const __m256i *)y->qs);
+
+    const __m256 q = mul_sum_i8_pairs_float(qx, qy);
+
+    // Multiply q with scale and accumulate
+    return _mm256_fmadd_ps( d, q, acc );
+}
+#endif
+
 void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;
@@ -1609,15 +1625,7 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
     // Main loop
     for (; ib < nb; ++ib) {
-        // Compute combined scale for the block
-        const __m256 d = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d));
-        __m256i qx = _mm256_loadu_si256((const __m256i *)x[ib].qs);
-        __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
-
-        const __m256 q = mul_sum_i8_pairs_float(qx, qy);
-
-        // Multiply q with scale and accumulate
-        acc = _mm256_fmadd_ps( d, q, acc );
+        acc = q8_0_block_256(&x[ib], &y[ib], acc);
     }
 
     sumf = hsum_float_8(acc);
@@ -1653,6 +1661,59 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
     *s = sumf;
 }
+
+#if defined(__AVX2__)
+// The rows two at a time in lockstep, with the two lines 1 KiB ahead of each row every 4 blocks: the CPU expert split
+// (ggml-cuda/expert-cpu.cu) reads the rows of a down piece one after the other, so these are its next rows. Not in vec_dot:
+// for the KV cache (CPU flash attention) the lines ahead are often never read. Rows of unequal length go one by one.
+void ggml_vec_dot_q8_0_q8_0_segs(int ns, const int * GGML_RESTRICT n, float * GGML_RESTRICT s, const void * const * GGML_RESTRICT vx, const void * const * GGML_RESTRICT vy) {
+    int q = 0;
+    for (; q + 1 < ns; q += 2) {
+        if (n[q] != n[q + 1]) {
+            ggml_vec_dot_q8_0_q8_0(n[q],     s + q,     0, vx[q],     0, vy[q],     0, 1);
+            ggml_vec_dot_q8_0_q8_0(n[q + 1], s + q + 1, 0, vx[q + 1], 0, vy[q + 1], 0, 1);
+            continue;
+        }
+        const int nb = n[q] / QK8_0;
+        const block_q8_0 * GGML_RESTRICT x0 = vx[q];
+        const block_q8_0 * GGML_RESTRICT x1 = vx[q + 1];
+        const block_q8_0 * GGML_RESTRICT y0 = vy[q];
+        const block_q8_0 * GGML_RESTRICT y1 = vy[q + 1];
+
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+
+        // pointers of their own: MSVC computes &x[ib] + 1024 with an imul in every step
+        const char * pf0 = (const char *) x0 + 1024;
+        const char * pf1 = (const char *) x1 + 1024;
+        int ib = 0;
+        for (; ib + 3 < nb; ib += 4, pf0 += 4*sizeof(block_q8_0), pf1 += 4*sizeof(block_q8_0)) {
+            _mm_prefetch(pf0,      _MM_HINT_T0);
+            _mm_prefetch(pf0 + 64, _MM_HINT_T0);
+            _mm_prefetch(pf1,      _MM_HINT_T0);
+            _mm_prefetch(pf1 + 64, _MM_HINT_T0);
+            acc0 = q8_0_block_256(x0 + ib + 0, y0 + ib + 0, acc0);
+            acc1 = q8_0_block_256(x1 + ib + 0, y1 + ib + 0, acc1);
+            acc0 = q8_0_block_256(x0 + ib + 1, y0 + ib + 1, acc0);
+            acc1 = q8_0_block_256(x1 + ib + 1, y1 + ib + 1, acc1);
+            acc0 = q8_0_block_256(x0 + ib + 2, y0 + ib + 2, acc0);
+            acc1 = q8_0_block_256(x1 + ib + 2, y1 + ib + 2, acc1);
+            acc0 = q8_0_block_256(x0 + ib + 3, y0 + ib + 3, acc0);
+            acc1 = q8_0_block_256(x1 + ib + 3, y1 + ib + 3, acc1);
+        }
+        for (; ib < nb; ++ib) {
+            acc0 = q8_0_block_256(x0 + ib, y0 + ib, acc0);
+            acc1 = q8_0_block_256(x1 + ib, y1 + ib, acc1);
+        }
+
+        s[q]     = hsum_float_8(acc0);
+        s[q + 1] = hsum_float_8(acc1);
+    }
+    if (q < ns) {
+        ggml_vec_dot_q8_0_q8_0(n[q], s + q, 0, vx[q], 0, vy[q], 0, 1);
+    }
+}
+#endif
 
 void ggml_vec_dot_tq1_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
