@@ -104,8 +104,7 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         if (pos_slot_i) { mctx->set_input_pos_slot(pos_slot_i, ubatch); }
-        if (pos_slot_f) { mctx->set_input_pos_slot(pos_slot_f, ubatch); }
-        if (cell_blk)   { mctx->set_input_cell_pos(cell_blk, ubatch, blk); }
+        if (pos_cell)   { mctx->set_input_pos_slot(pos_cell, ubatch, -1); }
         if (pos_mask)   { mctx->set_input_pos_mask(pos_mask, ubatch); }
 
         // local-force bias over position blocks
@@ -126,7 +125,7 @@ public:
     }
 
     // valid as long as the tensor dims still match the new ubatch/cache window and the
-    // ubatch is in the same regime (decode graphs have pos_slot_f, batch graphs cell_blk)
+    // ubatch is in the same regime (batch graphs have pos_cell, decode graphs do not)
     bool can_reuse(const llm_graph_params & params) override {
         const auto * mctx_new = static_cast<const llama_kv_cache_msa_context *>(params.mctx);
 
@@ -148,17 +147,11 @@ public:
         res &= pos_slot_i->ne[0] == n_ps;
         res &= pos_slot_i->ne[1] == ns;
 
-        res &= decode == (pos_slot_f != nullptr);
-        res &= decode == (cell_blk   == nullptr);
+        res &= decode == (pos_cell == nullptr);
 
-        if (pos_slot_f) {
-            res &= pos_slot_f->ne[0] == n_ps;
-            res &= pos_slot_f->ne[1] == ns;
-        }
-
-        if (cell_blk) {
-            res &= cell_blk->ne[0] == (int64_t) mctx_new->get_base()->get_n_kv();
-            res &= cell_blk->ne[1] == ns;
+        if (pos_cell) {
+            res &= pos_cell->ne[0] == n_ps;
+            res &= pos_cell->ne[1] == ns;
         }
 
         return res;
@@ -167,8 +160,7 @@ public:
     ggml_tensor * bias       = nullptr; // F32 [nblk, n_tokens] local-force bias (position blocks)
     ggml_tensor * pos_mask   = nullptr; // F32 [n_ps, n_tokens] 0/-inf visibility, by position
     ggml_tensor * pos_slot_i = nullptr; // I32 [n_ps, ns]       pos -> cell (get_rows index)
-    ggml_tensor * pos_slot_f = nullptr; // F32 [n_ps, ns]       pos -> cell (gatherable values, decode)
-    ggml_tensor * cell_blk   = nullptr; // I32 [n_kv, ns]       cell -> position block (batch)
+    ggml_tensor * pos_cell   = nullptr; // I32 [n_ps, ns]       pos -> cell, -1 without a cell (batch)
 
     const llama_kv_cache_msa_context * mctx;
 
@@ -252,7 +244,6 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
     // hoisted per-graph MSA state (shared by every sparse layer)
     llm_graph_input_msa * msa = nullptr;
     ggml_tensor * msa_kqm = nullptr;
-    ggml_tensor * msa_mf  = nullptr;   // F32 copy of the FA mask for the final mask add
     int64_t n_kv = 0, n_ps = 0, nblk = 0, ns = 1, n_tps = 0;
     bool msa_decode = false;           // gather (1 token per stream) vs mask
     const int     blk = mm.msa_p.blk;
@@ -284,14 +275,9 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
         inp->pos_slot_i = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_ps, ns);
         ggml_set_input(inp->pos_slot_i);
 
-        if (msa_decode) {
-            inp->pos_slot_f = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_ps, ns);
-            ggml_set_input(inp->pos_slot_f);
-        } else {
-            inp->cell_blk = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, ns);
-            ggml_set_input(inp->cell_blk);
-
-            msa_mf = ggml_cast(ctx0, msa_kqm, GGML_TYPE_F32);
+        if (!msa_decode) {
+            inp->pos_cell = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_ps, ns);
+            ggml_set_input(inp->pos_cell);
         }
 
         msa = (llm_graph_input_msa *) res->add_input(std::move(inp));
@@ -404,22 +390,15 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                             ggml_reshape_4d(ctx0, msa->bias, nblk, 1, 1, ns));
                     ggml_tensor * idx = ggml_top_k(ctx0, bsf, K);   // position blocks
 
-                    // pos idx:  tj[t,k,h,s] = blk*idx[k,h,s] + t   (positions - mask gather)
-                    // cell idx: cs[t,k,h,s] = pos_slot[tj]         (pos -> cell translation, K/V gather batched by group)
-                    ggml_tensor * a = ggml_scale(ctx0, ggml_cast(ctx0, idx, GGML_TYPE_F32), (float) blk);
-                    a = ggml_reshape_4d(ctx0, a, 1, K, Hd, ns);
-                    ggml_tensor * tj = ggml_add(ctx0,
-                            ggml_repeat_4d(ctx0, a, blk, K, Hd, ns),
-                            ggml_reshape_3d(ctx0, ggml_arange(ctx0, 0.0f, (float) blk, 1.0f), blk, 1, 1));
-
-                    ggml_tensor * tokj = ggml_cast(ctx0, ggml_reshape_2d(ctx0, tj, (int64_t) blk*K*Hd, ns), GGML_TYPE_I32);
-
+                    // a picked block is a row of blk positions: gather its cells (pos -> cell map) and its mask by position
+                    ggml_tensor * idx2 = ggml_reshape_2d(ctx0, idx, (int64_t) K*Hd, ns);
                     ggml_tensor * cs = ggml_get_rows(ctx0,
-                            ggml_reshape_3d(ctx0, msa->pos_slot_f, 1, n_ps, ns), tokj);   // [1, blk*K*Hd, ns]
+                            ggml_reshape_3d(ctx0, msa->pos_slot_i, blk, nblk, ns), idx2);   // [blk, K*Hd, ns] i32
                     cs = ggml_reshape_4d(ctx0, cs, blk, K, Hd, ns);
 
-                    ggml_tensor * mp = ggml_reshape_3d(ctx0, msa->pos_mask, 1, n_ps, ns);
-                    ggml_tensor * mg = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, mp, tokj), (int64_t) blk*K, Hd, ns);
+                    ggml_tensor * mg = ggml_get_rows(ctx0,
+                            ggml_reshape_3d(ctx0, msa->pos_mask, blk, nblk, ns), idx2);
+                    mg = ggml_reshape_3d(ctx0, mg, (int64_t) blk*K, Hd, ns);
 
                     // the FA channel is (group, stream) with the group outermost, see build_attn_msa_fa;
                     //   with one stream that is already the [.., group, stream] order the indices come in
@@ -433,7 +412,7 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
 
                     // the rows of a group are its cells: gather from [D, n_kv, ns, HKV] views with one batch
                     //   per (stream, group), so that a split of the kv heads keeps each device on its own groups
-                    ggml_tensor * tokr = ggml_cast(ctx0, ggml_reshape_3d(ctx0, cs, (int64_t) blk*K, ns, Hd), GGML_TYPE_I32);
+                    ggml_tensor * tokr = ggml_reshape_3d(ctx0, cs, (int64_t) blk*K, ns, Hd);
                     ggml_tensor * kg = ggml_get_rows(ctx0, ggml_permute(ctx0, k, 0, 3, 1, 2), tokr);
                     ggml_tensor * vg = ggml_get_rows(ctx0, ggml_permute(ctx0, v, 0, 3, 1, 2), tokr);
 
@@ -463,10 +442,10 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                                 st*msa->pos_slot_i->nb[1]);
                         ggml_tensor * pm_s = ggml_view_3d(ctx0, msa->pos_mask, n_ps, 1, n_tps,
                                 msa->pos_mask->nb[1], msa->pos_mask->nb[1], st*n_tps*msa->pos_mask->nb[1]);
-                        ggml_tensor * cb_s = ggml_view_1d(ctx0, msa->cell_blk, n_kv,
-                                st*msa->cell_blk->nb[1]);
-                        ggml_tensor * mf_s = ggml_view_3d(ctx0, msa_mf, n_kv, n_tps, 1,
-                                msa_mf->nb[1], msa_mf->nb[3], st*msa_mf->nb[3]);
+                        ggml_tensor * pc_s = ggml_view_2d(ctx0, msa->pos_cell, blk, nblk,
+                                blk*msa->pos_cell->nb[0], st*msa->pos_cell->nb[1]);   // [blk, nblk]: the cells of each block
+                        ggml_tensor * km_s = ggml_view_2d(ctx0, msa_kqm, n_kv, n_tps,
+                                msa_kqm->nb[1], st*msa_kqm->nb[3]);
                         ggml_tensor * bias_s = ggml_view_3d(ctx0, msa->bias, nblk, 1, n_tps,
                                 msa->bias->nb[1], msa->bias->nb[1], st*n_tps*msa->bias->nb[1]);
                         ggml_tensor * q_s = ggml_view_3d(ctx0, Qcur, D, n_head, n_tps,
@@ -495,30 +474,10 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
 
                         ggml_tensor * idx = ggml_top_k(ctx0, bsf, K);   // [K, Hd, n_tps] i32
 
-                        ggml_tensor * ninf = ggml_cast(ctx0,
-                                ggml_scale_bias(ctx0, bias_s, 0.0f, -1e30f),
-                                GGML_TYPE_F16);                              // [nblk, 1, n_tps]
-                        ninf = ggml_repeat_4d(ctx0, ninf, nblk, Hd, n_tps, 1);
-                        ggml_tensor * zero = ggml_scale(ctx0,
-                                ggml_cast(ctx0, idx, GGML_TYPE_F32), 0.0f);
-                        ggml_tensor * bm = ggml_set_rows(ctx0,
-                                ggml_reshape_3d(ctx0, ninf, 1, nblk, Hd*n_tps),
-                                ggml_reshape_3d(ctx0, zero, 1, K,    Hd*n_tps),
-                                ggml_reshape_2d(ctx0, idx,     K,    Hd*n_tps));
-                        bm = ggml_reshape_3d(ctx0, bm, nblk, Hd, n_tps);
-                        bm = ggml_cont(ctx0, ggml_permute(ctx0, bm, 0, 2, 1, 3)); // [nblk, n_tps, Hd]
-                        cb(bm, "msa_block_mask", il);
-
-                        // expand block -> cell granularity through the cell -> position block
-                        // map, then combine with the causal mask. empty cells are masked by the causal mask.
-                        ggml_tensor * bm2 = ggml_cont(ctx0, ggml_transpose(ctx0,
-                                ggml_reshape_2d(ctx0, bm, nblk, n_tps*Hd)));       // [n_tps*Hd, nblk]
-                        ggml_tensor * bmc = ggml_get_rows(ctx0, bm2, cb_s);        // [n_tps*Hd, n_kv] F32
-                        ggml_tensor * bmx = ggml_cont(ctx0, ggml_transpose(ctx0, bmc));
-                        bmx = ggml_reshape_3d(ctx0, bmx, n_kv, n_tps, Hd);
-                        ggml_tensor * mask4 = ggml_add_inplace(ctx0, bmx, mf_s);
-                        mask4 = ggml_cast(ctx0,
-                                ggml_reshape_4d(ctx0, mask4, n_kv, n_tps, 1, Hd), GGML_TYPE_F16);
+                        // the cells of the picked blocks keep their causal mask, all other cells are -inf
+                        ggml_tensor * mask4 = ggml_top_k_mask(ctx0, km_s,
+                                ggml_permute(ctx0, idx, 0, 2, 1, 3), nullptr, pc_s, nullptr);   // [n_kv, n_tps, Hd] f16
+                        mask4 = ggml_reshape_4d(ctx0, mask4, n_kv, n_tps, 1, Hd);
                         cb(mask4, "msa_mask4", il);
 
                         // cache views with groups on ne[3];

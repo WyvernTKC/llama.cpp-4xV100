@@ -274,38 +274,9 @@ uint32_t llama_kv_cache_msa_context::get_n_pos() const {
     return std::max(n_pad, GGML_PAD((uint32_t) (pos_max + 1), n_pad));
 }
 
-void llama_kv_cache_msa_context::set_input_cell_pos(ggml_tensor * dst, const llama_ubatch * ubatch, int32_t div) const {
+void llama_kv_cache_msa_context::set_input_pos_slot(ggml_tensor * dst, const llama_ubatch * ubatch, int32_t fill) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
-    GGML_ASSERT(div > 0);
-
-    const int64_t n_tokens    = ubatch->n_tokens;
-    const int64_t n_kv        = dst->ne[0];
-    const int64_t n_stream_ub = dst->ne[1];
-
-    GGML_ASSERT(n_tokens % n_stream_ub == 0);
-    const int64_t n_tps = n_tokens/n_stream_ub;
-
-    int32_t * data = (int32_t *) dst->data;
-
-    for (int64_t s = 0; s < n_stream_ub; ++s) {
-        const llama_seq_id seq_id = ubatch->seq_id[s*n_tps][0];
-
-        const auto & cells = kv->get_base()->get_cells(seq_id);
-
-        for (int64_t j = 0; j < n_kv; ++j) {
-            // the value for empty or other-sequence cells is irrelevant as consumers mask them
-            data[s*n_kv + j] =
-                cells.is_empty(j) || !cells.seq_has(j, seq_id)
-                    ? 0
-                    : (int32_t) (cells.pos_get(j)/div);
-        }
-    }
-}
-
-void llama_kv_cache_msa_context::set_input_pos_slot(ggml_tensor * dst, const llama_ubatch * ubatch) const {
-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-    GGML_ASSERT(dst->type == GGML_TYPE_I32 || dst->type == GGML_TYPE_F32);
 
     const int64_t n_tokens    = ubatch->n_tokens;
     const int64_t n_pos       = dst->ne[0];
@@ -319,7 +290,7 @@ void llama_kv_cache_msa_context::set_input_pos_slot(ggml_tensor * dst, const lla
 
         const auto & cells = kv->get_base()->get_cells(seq_id);
 
-        std::vector<int32_t> map(n_pos, 0);
+        std::vector<int32_t> map(n_pos, fill);
 
         for (uint32_t j = 0; j < cells.size(); ++j) {
             if (cells.is_empty(j) || !cells.seq_has(j, seq_id)) {
@@ -335,15 +306,7 @@ void llama_kv_cache_msa_context::set_input_pos_slot(ggml_tensor * dst, const lla
             map[p0] = (int32_t) j;
         }
 
-        if (dst->type == GGML_TYPE_I32) {
-            int32_t * data = (int32_t *) dst->data + s*n_pos;
-            std::copy(map.begin(), map.end(), data);
-        } else {
-            float * data = (float *) dst->data + s*n_pos;
-            for (int64_t p = 0; p < n_pos; ++p) {
-                data[p] = (float) map[p];
-            }
-        }
+        std::copy(map.begin(), map.end(), (int32_t *) dst->data + s*n_pos);
     }
 }
 

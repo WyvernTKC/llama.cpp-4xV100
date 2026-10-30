@@ -50,34 +50,29 @@ static __global__ void top_k_mask_kernel(
 
     __syncthreads();
 
-    // one thread per pick or extra cell; cells kept twice get the same value
-    for (int64_t i = threadIdx.x; i < n_top + n_extra; i += blockDim.x) {
-        if (i >= n_top) {
-            const int32_t c = extra[(i - n_top)*se0 + i1*se1 + i2*se2 + i3*se3];
+    // one thread per member cell of a pick (a pick is its own cell without blocks, n_blk 1) or extra cell; cells kept
+    //   twice get the same value
+    const int64_t n_pc = n_top*n_blk;
+    for (int64_t i = threadIdx.x; i < n_pc + n_extra; i += blockDim.x) {
+        if (i >= n_pc) {
+            const int32_t c = extra[(i - n_pc)*se0 + i1*se1 + i2*se2 + i3*se3];
             if (c >= 0 && c < n_kv) {
                 dst_row[c] = mask_row[c];
             }
             continue;
         }
 
-        const int32_t p = top_k_row[i*sk0];
+        const int64_t j = blocks ? i / n_blk : i;
+        const int32_t p = top_k_row[j*sk0];
         if (p < 0 || p >= n_pick) {
             continue;
         }
         if (score && !(score[p*ss0 + i1*ss1 + i2*ss2 + i3*ss3] > -INFINITY)) {
             continue;
         }
-        if (!blocks) {
-            if (p < n_kv) {
-                dst_row[p] = mask_row[p];
-            }
-            continue;
-        }
-        for (int64_t k = 0; k < n_blk; ++k) {
-            const int32_t c = blocks[k*sb0 + p*sb1];
-            if (c >= 0 && c < n_kv) {
-                dst_row[c] = mask_row[c];
-            }
+        const int32_t c = blocks ? blocks[(i - j*n_blk)*sb0 + p*sb1] : p;
+        if (c >= 0 && c < n_kv) {
+            dst_row[c] = mask_row[c];
         }
     }
 }
