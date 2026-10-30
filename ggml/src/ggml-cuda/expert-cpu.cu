@@ -325,6 +325,7 @@ struct expert_cpu_group {
     const void *             key[3] = { nullptr, nullptr, nullptr };
     ggml_cuda_expert_cpu_mat mat[3]; // gate, up, down
     int                      glu_op    = 0;
+    float                    glu_alpha = 1.0f;
     float                    glu_limit = 0.0f;
     ggml_type                xq_type   = GGML_TYPE_COUNT; // vec_dot type of gate and up
     ggml_type                hq_type   = GGML_TYPE_COUNT; // of down
@@ -623,6 +624,11 @@ static inline float expert_cpu_row_dot(const ggml_cuda_expert_cpu_mat & m, const
 }
 
 static inline float expert_cpu_glu(const expert_cpu_group & G, float a, float b) {
+    if (G.glu_op == GGML_GLU_OP_SWIGLU_OAI) {
+        a = std::min(a, G.glu_limit);
+        b = std::max(-G.glu_limit, std::min(b, G.glu_limit));
+        return a / (1.0f + expf(G.glu_alpha * (-a))) * (b + 1.0f);
+    }
     if (G.glu_op == GGML_GLU_OP_SWIGLU_CLAMP) {
         a = std::min(a, G.glu_limit);
         b = std::max(-G.glu_limit, std::min(b, G.glu_limit));
@@ -1184,14 +1190,14 @@ static bool expert_cpu_group_ksplit(expert_cpu_group & G, const int n_grps) {
 }
 
 int ggml_cuda_expert_cpu_group(const ggml_tensor * gate_pool, const ggml_tensor * up_pool, const ggml_tensor * down_pool,
-        int glu_op, float glu_limit, int64_t n_embd) {
+        int glu_op, float glu_alpha, float glu_limit, int64_t n_embd) {
     if (!ggml_cuda_expert_cpu_enabled()) {
         return -1;
     }
     expert_cpu_group G;
     const ggml_tensor * pools[3] = { gate_pool, up_pool, down_pool };
     // gate and up give 0 for a CPU expert, so their GLU is 0 and down may read any slot
-    bool ok = (glu_op == GGML_GLU_OP_SWIGLU || glu_op == GGML_GLU_OP_SWIGLU_CLAMP) &&
+    bool ok = (glu_op == GGML_GLU_OP_SWIGLU || glu_op == GGML_GLU_OP_SWIGLU_CLAMP || glu_op == GGML_GLU_OP_SWIGLU_OAI) &&
         ggml_cuda_expert_cache_zero_slot(gate_pool) && ggml_cuda_expert_cache_zero_slot(up_pool);
     for (int i = 0; i < 3 && ok; i++) {
         ok = ggml_cuda_expert_cache_cpu_mat(pools[i], G.mat[i]);
@@ -1212,6 +1218,7 @@ int ggml_cuda_expert_cpu_group(const ggml_tensor * gate_pool, const ggml_tensor 
         G.xq_type   = tg->vec_dot_type;
         G.hq_type   = td->vec_dot_type;
         G.glu_op    = glu_op;
+        G.glu_alpha = glu_alpha;
         G.glu_limit = glu_limit;
         ok = expert_cpu_mat_ok(G.mat[0], G.xq_type) && expert_cpu_mat_ok(G.mat[1], G.xq_type) &&
              expert_cpu_mat_ok(G.mat[2], G.hq_type) && G.mat[0].k == n_embd && G.mat[1].k == n_embd &&
@@ -1438,8 +1445,8 @@ bool ggml_cuda_expert_cpu_host_free(void * ptr) {
 }
 
 int ggml_cuda_expert_cpu_group(const ggml_tensor * gate_pool, const ggml_tensor * up_pool, const ggml_tensor * down_pool,
-        int glu_op, float glu_limit, int64_t n_embd) {
-    GGML_UNUSED_VARS(gate_pool, up_pool, down_pool, glu_op, glu_limit, n_embd);
+        int glu_op, float glu_alpha, float glu_limit, int64_t n_embd) {
+    GGML_UNUSED_VARS(gate_pool, up_pool, down_pool, glu_op, glu_alpha, glu_limit, n_embd);
     return -1;
 }
 

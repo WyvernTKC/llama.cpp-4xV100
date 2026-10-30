@@ -75,9 +75,9 @@ struct ggml_cuda_expert_cpu_mat {
 bool ggml_cuda_expert_cpu_enabled();
 
 // The group of a layer's gate, up and down pools (ggml_cuda_expert_cache pools of one MUL_MAT_ID group), the same on
-//   every device; -1 if the CPU cannot take it. glu_op is GGML_GLU_OP_SWIGLU or GGML_GLU_OP_SWIGLU_CLAMP.
+//   every device; -1 if the CPU cannot take it. glu_op is GGML_GLU_OP_SWIGLU, GGML_GLU_OP_SWIGLU_CLAMP or GGML_GLU_OP_SWIGLU_OAI.
 int ggml_cuda_expert_cpu_group(const ggml_tensor * gate_pool, const ggml_tensor * up_pool, const ggml_tensor * down_pool,
-    int glu_op, float glu_limit, int64_t n_embd);
+    int glu_op, float glu_alpha, float glu_limit, int64_t n_embd);
 
 // the plan arguments of a group on a device
 void ggml_cuda_expert_cpu_args_get(int device, int group, const float * x, const float * w, int n_embd,

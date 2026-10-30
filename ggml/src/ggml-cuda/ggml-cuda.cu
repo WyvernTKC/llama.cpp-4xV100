@@ -6480,7 +6480,7 @@ static bool ggml_cuda_expert_cpu_try_args(ggml_backend_cuda_context * cuda_ctx, 
         return false;
     }
     const int glu_op = (int) ggml_get_glu_op(glu);
-    if (glu_op != GGML_GLU_OP_SWIGLU && glu_op != GGML_GLU_OP_SWIGLU_CLAMP) {
+    if (glu_op != GGML_GLU_OP_SWIGLU && glu_op != GGML_GLU_OP_SWIGLU_CLAMP && glu_op != GGML_GLU_OP_SWIGLU_OAI) {
         return false;
     }
     const ggml_tensor * gate = glu->src[0];
@@ -6488,7 +6488,8 @@ static bool ggml_cuda_expert_cpu_try_args(ggml_backend_cuda_context * cuda_ctx, 
     if (!((gate == gu[0] && up == gu[1]) || (gate == gu[1] && up == gu[0]))) {
         return false;
     }
-    const float limit = glu_op == GGML_GLU_OP_SWIGLU_CLAMP ? ggml_get_op_params_f32(glu, 3) : 0.0f;
+    const float alpha = glu_op == GGML_GLU_OP_SWIGLU_OAI ? ggml_get_op_params_f32(glu, 2) : 1.0f;
+    const float limit = glu_op != GGML_GLU_OP_SWIGLU     ? ggml_get_op_params_f32(glu, 3) : 0.0f;
 
     // the routing weights: the MUL of the down outputs right after them, computed before node i
     int j_down = -1;
@@ -6518,7 +6519,7 @@ static bool ggml_cuda_expert_cpu_try_args(ggml_backend_cuda_context * cuda_ctx, 
         return false;
     }
 
-    const int group = ggml_cuda_expert_cpu_group(gate->src[0], up->src[0], down->src[0], glu_op, limit, x->ne[0]);
+    const int group = ggml_cuda_expert_cpu_group(gate->src[0], up->src[0], down->src[0], glu_op, alpha, limit, x->ne[0]);
     if (group < 0) {
         return false;
     }
