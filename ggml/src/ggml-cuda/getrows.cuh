@@ -27,6 +27,13 @@ void ggml_cuda_op_get_rows_set_rows(ggml_backend_cuda_context & ctx, const ggml_
         const ggml_tensor * get_rows1 = nullptr, ggml_tensor * set_rows1 = nullptr);
 void ggml_cuda_op_get_rows_add(ggml_backend_cuda_context & ctx, const ggml_tensor * get_rows, ggml_tensor * add);
 
+// GET_ROWS of f16 rows of 128 (i32 indices per stream), MUL_MAT of them with 1, 2, 4 or 8 f32 columns, ADD of a mask per row and
+//   POOL_2D max over runs of rows, in one launch that reads each gathered row once (the MiniMax-M3 MSA indexer at decode)
+bool ggml_cuda_should_fuse_get_rows_dot_max(const ggml_tensor * get_rows, const ggml_tensor * mul_mat, const ggml_tensor * add,
+        const ggml_tensor * pool);
+void ggml_cuda_op_get_rows_dot_max(ggml_backend_cuda_context & ctx, const ggml_tensor * get_rows, const ggml_tensor * mul_mat,
+        const ggml_tensor * add, ggml_tensor * pool);
+
 // whether two fusable GET_ROWS -> SET_ROWS pairs share their indices, types and row count and neither writes what the other reads
 bool ggml_cuda_can_pair_get_rows_set_rows(const ggml_tensor * get_rows0, const ggml_tensor * set_rows0,
         const ggml_tensor * get_rows1, const ggml_tensor * set_rows1);

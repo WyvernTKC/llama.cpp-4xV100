@@ -1030,3 +1030,137 @@ void ggml_cuda_op_get_rows_add(ggml_backend_cuda_context & ctx, const ggml_tenso
     }
     CUDA_CHECK(cudaGetLastError());
 }
+
+#define GET_ROWS_DOT_MAX_D 128
+
+// dst[b, h, s] = max over the rows p of block b of dot(src[idx[p, s], s], q[h, s]) + m[p, s] for nh columns q. Four
+//   threads per gathered row, each loads 4 of its 16-byte pieces (a warp reads 8 rows as runs of 64 bytes), a block of
+//   4*blk threads per (b, s): one thread per row (16 loads, 4 warps per SM) took 14.8 us at 7680 rows.
+template <int nh>
+static __global__ void k_get_rows_dot_max(const char * src, const int32_t * idx, const float * q, const float * m, float * dst,
+        const int64_t n_blk, const int64_t src_nb1, const int64_t src_nb2, const int64_t idx_s1,
+        const int64_t q_s1, const int64_t q_s3, const int64_t m_s3, const int64_t dst_s1, const int64_t dst_s3) {
+    constexpr int D  = GET_ROWS_DOT_MAX_D;
+    constexpr int TR = 4;          // threads per row
+    constexpr int NL = D/8/TR;     // 16-byte loads per thread
+    __shared__ float s_q[nh*D];
+    __shared__ float s_max[nh][32];
+
+    const int64_t b = blockIdx.x;
+    const int64_t s = blockIdx.y;
+    for (int i = threadIdx.x; i < nh*D; i += blockDim.x) {
+        s_q[i] = q[s*q_s3 + (i / D)*q_s1 + i % D];
+    }
+
+    const int     part = threadIdx.x % TR;
+    const int64_t p    = b*(blockDim.x/TR) + threadIdx.x/TR;
+    const uint4 * row  = (const uint4 *) (src + s*src_nb2 + (int64_t) idx[s*idx_s1 + p]*src_nb1);
+    uint4 v[NL];
+#pragma unroll
+    for (int j = 0; j < NL; ++j) {
+        v[j] = __ldg(row + j*TR + part);
+    }
+    const float mv = m[s*m_s3 + p];
+    __syncthreads();
+
+    float acc[nh] = { 0.0f };
+#pragma unroll
+    for (int j = 0; j < NL; ++j) {
+        const half2 * h2 = (const half2 *) &v[j];
+        const int     e0 = 8*(j*TR + part);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const float2 f = __half22float2(h2[e]);
+#pragma unroll
+            for (int h = 0; h < nh; ++h) {
+                acc[h] += f.x*s_q[h*D + e0 + 2*e] + f.y*s_q[h*D + e0 + 2*e + 1];
+            }
+        }
+    }
+
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+#pragma unroll
+    for (int h = 0; h < nh; ++h) {
+#pragma unroll
+        for (int off = 1; off < TR; off <<= 1) {
+            acc[h] += __shfl_xor_sync(0xffffffff, acc[h], off);
+        }
+        const float mx = warp_reduce_max(acc[h] + mv);
+        if (lane == 0) {
+            s_max[h][warp] = mx;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < nh) {
+        float mx = -INFINITY;
+        for (int w = 0; w < (int) blockDim.x/WARP_SIZE; ++w) {
+            mx = fmaxf(mx, s_max[threadIdx.x][w]);
+        }
+        dst[s*dst_s3 + threadIdx.x*dst_s1 + b] = mx;
+    }
+}
+
+bool ggml_cuda_should_fuse_get_rows_dot_max(const ggml_tensor * get_rows, const ggml_tensor * mul_mat, const ggml_tensor * add,
+        const ggml_tensor * pool) {
+    const ggml_tensor * src = get_rows->src[0];
+    const ggml_tensor * idx = get_rows->src[1];
+    const ggml_tensor * a   = mul_mat->src[0];
+    const ggml_tensor * q   = mul_mat->src[1];
+    const ggml_tensor * m   = add->src[1];
+    const int32_t * pp = (const int32_t *) pool->op_params;
+
+    const int64_t n_rows = get_rows->ne[1];
+    const int64_t n_s    = get_rows->ne[2];
+    const int     blk    = pp[1];
+
+    // the gathered rows: f16 rows of 128, 16-byte aligned, one batch of indices per stream
+    const bool rows_ok = src->type == GGML_TYPE_F16 && src->ne[0] == GET_ROWS_DOT_MAX_D && src->nb[0] == sizeof(half) &&
+        src->ne[2] == n_s && src->ne[3] == 1 && src->nb[1] % 16 == 0 && src->nb[2] % 16 == 0 && (uintptr_t) src->data % 16 == 0 &&
+        idx->type == GGML_TYPE_I32 && idx->ne[0] == n_rows && idx->ne[1] == n_s && idx->ne[2] == 1 && idx->nb[0] == sizeof(int32_t) &&
+        get_rows->type == GGML_TYPE_F32 && get_rows->ne[0] == GET_ROWS_DOT_MAX_D && get_rows->ne[3] == 1 &&
+        ggml_is_contiguous(get_rows);
+    // MUL_MAT of a contiguous view of all of them as [128, n_rows, 1, n_s] with q [128, n_h, 1, n_s]
+    const bool mm_ok = (a == get_rows || a->view_src == get_rows) && ggml_is_contiguous(a) && a->view_offs == 0 &&
+        a->ne[0] == GET_ROWS_DOT_MAX_D && a->ne[1] == n_rows && a->ne[2] == 1 && a->ne[3] == n_s &&
+        q->type == GGML_TYPE_F32 && q->nb[0] == sizeof(float) && q->ne[0] == GET_ROWS_DOT_MAX_D &&
+        (q->ne[1] == 1 || q->ne[1] == 2 || q->ne[1] == 4 || q->ne[1] == 8) && q->ne[2] == 1 && q->ne[3] == n_s &&
+        mul_mat->type == GGML_TYPE_F32 && ggml_is_contiguous(mul_mat) && mul_mat->ne[0] == n_rows && mul_mat->ne[1] == q->ne[1];
+    // ADD of a mask [n_rows, 1, 1, n_s] in place, POOL_2D max over runs of blk rows
+    const bool add_ok = add->src[0] == mul_mat && add->type == GGML_TYPE_F32 && ggml_are_same_shape(add, mul_mat) &&
+        m->type == GGML_TYPE_F32 && m->nb[0] == sizeof(float) && m->ne[0] == n_rows && m->ne[1] == 1 && m->ne[2] == 1 &&
+        m->ne[3] == n_s;
+    const bool pool_ok = pool->src[0] == add && pool->type == GGML_TYPE_F32 && pp[0] == GGML_OP_POOL_MAX && pp[2] == 1 &&
+        pp[3] == blk && pp[4] == 1 && pp[5] == 0 && pp[6] == 0 && blk % 8 == 0 && blk <= 256 && n_rows % blk == 0 &&
+        pool->ne[0] == n_rows/blk && pool->ne[1] == q->ne[1] && pool->ne[2] == 1 && pool->ne[3] == n_s &&
+        pool->nb[0] == sizeof(float) && n_rows/blk <= INT32_MAX && n_s <= 65535;
+
+    return rows_ok && mm_ok && add_ok && pool_ok &&
+        !ggml_cuda_tensors_overlap(pool, src) && !ggml_cuda_tensors_overlap(pool, idx) &&
+        !ggml_cuda_tensors_overlap(pool, q) && !ggml_cuda_tensors_overlap(pool, m);
+}
+
+void ggml_cuda_op_get_rows_dot_max(ggml_backend_cuda_context & ctx, const ggml_tensor * get_rows, const ggml_tensor * mul_mat,
+        const ggml_tensor * add, ggml_tensor * pool) {
+    const ggml_tensor * src = get_rows->src[0];
+    const ggml_tensor * idx = get_rows->src[1];
+    const ggml_tensor * q   = mul_mat->src[1];
+    const ggml_tensor * m   = add->src[1];
+    const int blk = ((const int32_t *) pool->op_params)[1];
+
+    const dim3 grid((unsigned) pool->ne[0], (unsigned) pool->ne[3], 1);
+    auto launch = [&](auto kernel) {
+        kernel<<<grid, 4*blk, 0, ctx.stream()>>>((const char *) src->data, (const int32_t *) idx->data,
+            (const float *) q->data, (const float *) m->data, (float *) pool->data, pool->ne[0],
+            src->nb[1], src->nb[2], idx->nb[1]/sizeof(int32_t), q->nb[1]/sizeof(float), q->nb[3]/sizeof(float),
+            m->nb[3]/sizeof(float), pool->nb[1]/sizeof(float), pool->nb[3]/sizeof(float));
+    };
+    switch (q->ne[1]) {
+        case 1:  launch(k_get_rows_dot_max<1>); break;
+        case 2:  launch(k_get_rows_dot_max<2>); break;
+        case 4:  launch(k_get_rows_dot_max<4>); break;
+        case 8:  launch(k_get_rows_dot_max<8>); break;
+        default: GGML_ABORT("unsupported column count");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}

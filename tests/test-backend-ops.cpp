@@ -12573,6 +12573,77 @@ struct test_top_k_mask : public test_case {
     }
 };
 
+// GET_ROWS -> MUL_MAT -> ADD -> POOL_2D (max): the block maxima of masked scores of gathered rows, as the MiniMax-M3 MSA
+//   indexer computes them at decode (one CUDA launch)
+struct test_get_rows_dot_max : public test_case {
+    const int64_t n_kv;
+    const int64_t n_rows;
+    const int64_t n_h;
+    const int     blk;
+    const int64_t ns;
+
+    ggml_tensor * out = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GET_ROWS_DOT_MAX";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_kv, n_rows, n_h, blk, ns);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
+
+    test_get_rows_dot_max(int64_t n_kv = 2048, int64_t n_rows = 1024, int64_t n_h = 4, int blk = 128, int64_t ns = 1)
+        : n_kv(n_kv), n_rows(n_rows), n_h(n_h), blk(blk), ns(ns) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_kv, ns);
+        ggml_set_name(k, "k");
+        ggml_tensor * idx = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_rows, ns);
+        ggml_set_name(idx, "idx");
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, n_h, 1, ns);
+        ggml_set_name(q, "q");
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_rows, 1, 1, ns);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * g  = ggml_get_rows(ctx, k, idx);
+        ggml_tensor * sc = ggml_mul_mat(ctx, ggml_reshape_4d(ctx, g, 128, n_rows, 1, ns), q);
+        sc  = ggml_add_inplace(ctx, sc, m);
+        out = ggml_pool_2d(ctx, sc, GGML_OP_POOL_MAX, blk, 1, blk, 1, 0, 0);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x6D78);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "idx") == 0) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                std::uniform_int_distribution<int32_t> cell(0, n_kv - 1);
+                for (auto & c : data) {
+                    c = cell(gen);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "m") == 0) {
+                // -inf on some rows, never on a whole block (an infinite result makes the error vacuous)
+                std::vector<float> data(ggml_nelements(t));
+                std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = i % blk != 0 && gen() % 4 == 0 ? -INFINITY : dis(gen);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+            } else if (t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_F32) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // Deserializable generic test case
 struct input_tensor {
     ggml_type type;
@@ -13412,6 +13483,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k_mask(type, 1001, 4, 70, 16, 3, true, 7, 1, 1, false, true));
         test_cases.emplace_back(new test_top_k_mask(type, 512, 8, 16, 32, 7, true, 5, 1, 4, false, true));
     }
+    test_cases.emplace_back(new test_get_rows_dot_max());
+    test_cases.emplace_back(new test_get_rows_dot_max(4096, 3072, 4, 128, 2));
+    test_cases.emplace_back(new test_get_rows_dot_max(1000, 512, 1, 64, 1));
+    test_cases.emplace_back(new test_get_rows_dot_max(1000, 512, 8, 256, 3));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {

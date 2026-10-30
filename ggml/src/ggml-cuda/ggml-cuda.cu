@@ -7465,6 +7465,31 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     static const bool no_get_rows_fusion = getenv("GGML_CUDA_NO_GET_ROWS_FUSION") != nullptr;
     if (node->op == GGML_OP_GET_ROWS && !no_get_rows_fusion && (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
             ggml_node_get_use_count(cgraph, i) == 1) {
+        // the gathered rows' dot products with a few columns, a mask added, the max over runs of rows (the MiniMax-M3 MSA
+        //   indexer at decode): GET_ROWS, MUL_MAT, ADD and POOL_2D, the nodes between them views
+        {
+            int j = i;
+            auto next = [&]() -> ggml_tensor * {
+                for (j++; j < cgraph->n_nodes && j <= i + 8; j++) {
+                    if (!ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+                        return cgraph->nodes[j];
+                    }
+                }
+                return nullptr;
+            };
+            ggml_tensor * mm   = next();
+            const int     i_mm = j;
+            ggml_tensor * add  = mm  != nullptr && mm->op  == GGML_OP_MUL_MAT ? next() : nullptr;
+            const int     i_add = j;
+            ggml_tensor * pool = add != nullptr && add->op == GGML_OP_ADD     ? next() : nullptr;
+            if (pool != nullptr && pool->op == GGML_OP_POOL_2D &&
+                    ggml_node_get_use_count(cgraph, i_mm) == 1 && ggml_node_get_use_count(cgraph, i_add) == 1 &&
+                    ((mm->flags | add->flags) & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+                    ggml_cuda_should_fuse_get_rows_dot_max(node, mm, add, pool)) {
+                ggml_cuda_op_get_rows_dot_max(*cuda_ctx, node, mm, add, pool);
+                return j - i;
+            }
+        }
         if (ggml_can_fuse(cgraph, i, { GGML_OP_GET_ROWS, GGML_OP_ADD }) &&
                 ggml_cuda_should_fuse_get_rows_add(node, cgraph->nodes[i + 1])) {
             ggml_cuda_op_get_rows_add(*cuda_ctx, node, cgraph->nodes[i + 1]);

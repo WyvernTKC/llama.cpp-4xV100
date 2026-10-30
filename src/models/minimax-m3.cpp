@@ -344,6 +344,8 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                                    freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
                 ik = ggml_rope_ext(ctx0, ik, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig,
                                    freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+                // the queries before the gathered keys, so that the decode scores follow the gather (one CUDA launch)
+                ggml_build_forward_expand(gf, iq);
 
                 const auto * mctx_msa_l = static_cast<const llama_kv_cache_msa_context *>(mctx);
                 const auto * mctx_cur = mctx_msa_l->get_base();
