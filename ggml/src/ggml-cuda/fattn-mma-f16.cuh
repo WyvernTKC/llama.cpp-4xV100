@@ -2236,7 +2236,8 @@ static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_u
            (DKQ == 576 && DV == 512 && ncols1 == 1 && ncols2 == 16) ||
            (DKQ == 256 && DV == 256 && ncols1 == 1 && ncols2 == 8) ||
            (DKQ == 256 && DV == 256 && ncols1 == 4 && ncols2 == 8) ||
-           (DKQ == 256 && DV == 256 && ncols1 == 8 && ncols2 == 8);
+           (DKQ == 256 && DV == 256 && ncols1 == 8 && ncols2 == 8) ||
+           (DKQ == 128 && DV == 128 && ncols1 == 4 && ncols2 == 8);
 }
 
 // type_KV is F16 for K/V in FP16 (or converted to it) and the quantized type for K/V read directly

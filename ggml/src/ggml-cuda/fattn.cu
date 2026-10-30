@@ -154,8 +154,9 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 
     // Volta's multi-query tile also pays for the gather and is narrower than the dense tile, so it needs more
     //   headroom: measured on DS4-FV (4x V100) the 4-wide tile costs ~45% of the dense pass at 16k keys, which
-    //   puts its crossover near 3x its worst-case union rather than 2x
-    const int64_t break_even = (volta_mma_available(cc) && ncols1 > 1 ? 3 : 2) * n_gather;
+    //   puts its crossover near 3x its worst-case union rather than 2x. At head size 128 the 4-wide tile is cheaper:
+    //   16 q heads on 1 kv head, 256 queries and n_kv_max 2048 (MiniMax-M3) cross over near 10k keys, 1.25x the union
+    const int64_t break_even = (volta_mma_available(cc) && ncols1 > 1 && Q->ne[0] > 128 ? 3 : 2) * n_gather;
 
     return GGML_CUDA_CC_IS_NVIDIA(cc) && (turing_mma_available(cc) || volta_mma_available(cc)) &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&

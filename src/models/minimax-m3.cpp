@@ -182,6 +182,7 @@ ggml_tensor * llama_model_minimax_m3::graph::build_attn_msa_fa(
         ggml_tensor * k,       // [D, n_keys, 1, C]
         ggml_tensor * v,       // [D, n_keys, 1, C]
         ggml_tensor * mask,    // [n_keys, R, 1, C] f16, contiguous
+        int64_t n_kv_max,
         float kq_scale, int il) const {
 
     GGML_ASSERT(q->ne[2] == k->ne[3]);
@@ -192,6 +193,8 @@ ggml_tensor * llama_model_minimax_m3::graph::build_attn_msa_fa(
 
     ggml_tensor * o = ggml_flash_attn_ext(ctx0, q, k, v, mask, kq_scale,
                                           hparams.f_max_alibi_bias, 0.0f);
+    // a backend may gather the finite cells of each mask row instead of a pass over all keys
+    ggml_flash_attn_ext_set_n_kv_max(o, (int32_t) n_kv_max);
     ggml_prec_set_acc(o, GGML_PREC_F32);
     cb(o, "msa_fattn", il);
 
@@ -435,7 +438,7 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                     // the FA mask must be F16
                     ggml_tensor * mfa = ggml_cast(ctx0, ggml_reshape_4d(ctx0, mg, (int64_t) blk*K, 1, 1, ns*Hd), GGML_TYPE_F16);
 
-                    ggml_tensor * o = build_attn_msa_fa(q4, kfa, vfa, mfa, kq_scale, il);   // [D, Gp, ns*HKV, 1]
+                    ggml_tensor * o = build_attn_msa_fa(q4, kfa, vfa, mfa, 0, kq_scale, il);   // [D, Gp, ns*HKV, 1]
                     if (ns > 1) {
                         o = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_4d(ctx0, o, D, Gp, ns, HKV), 0, 1, 3, 2));
                     }
@@ -506,8 +509,9 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                             mask4 = ggml_reshape_4d(ctx0, mask4, n_kv, nt, 1, Hd);
                             cb(mask4, "msa_mask4", il);
 
+                            // a mask row keeps at most K blocks of blk cells
                             ggml_tensor * o = build_attn_msa_fa(ggml_reshape_4d(ctx0, q_c, D, Gp, HKV, nt),
-                                    kfa, vfa, mask4, kq_scale, il);
+                                    kfa, vfa, mask4, (int64_t) blk*K, kq_scale, il);
                             outs.push_back(ggml_reshape_2d(ctx0, o, D*n_head, nt));
                         }
                     }

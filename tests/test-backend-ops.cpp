@@ -11919,6 +11919,61 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     }
 };
 
+// a sparse mask of picked blocks (MiniMax-M3 MSA): each row keeps n_pick blocks of blk cells and rows of the same group
+//     of 8 share most picks, so the union of a query tile is far below the bound n_kv_max = n_pick*blk
+struct test_flash_attn_ext_sparse_blocks : public test_flash_attn_ext {
+    const int64_t blk;
+    const int64_t n_pick;
+    const float   q_range; // large Q values make the online softmax rescale between blocks
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",blk=" + std::to_string(blk) + ",n_pick=" + std::to_string(n_pick) +
+            ",q_range=" + std::to_string(q_range);
+    }
+
+    test_flash_attn_ext_sparse_blocks(int64_t hsk, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb,
+                                      int64_t blk, int64_t n_pick, ggml_type type_KV = GGML_TYPE_F16, float q_range = 1.0f)
+        : test_flash_attn_ext(hsk, hsv, nh, nr23, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3},
+                              true, false, blk*n_pick),
+          blk(blk), n_pick(n_pick), q_range(q_range) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        init_tensor_uniform(ggml_get_tensor(ctx, "q"), -q_range, q_range);
+
+        ggml_tensor * m = ggml_get_tensor(ctx, "m");
+        const int64_t n_blk = m->ne[0] / blk;
+        GGML_ASSERT(n_blk >= n_pick);
+        std::vector<float> data_f32(ggml_nelements(m), -INFINITY);
+        std::vector<ggml_fp16_t> data_f16(ggml_nelements(m));
+        std::mt19937 gen(0xB10C);
+        std::uniform_int_distribution<int64_t> pick(0, n_blk - 1);
+        std::uniform_real_distribution<float> dis(-1.0f, 0.0f);
+        std::vector<int64_t> shared(n_pick);
+        for (int64_t s = 0; s < m->ne[3]; ++s) {
+            for (int64_t j = 0; j < m->ne[1]; ++j) {
+                if (j % 8 == 0) {
+                    for (int64_t & b : shared) {
+                        b = pick(gen);
+                    }
+                }
+                // the last two picks of a row are its own
+                std::set<int64_t> picks(shared.begin(), shared.end() - 2);
+                picks.insert(pick(gen));
+                picks.insert(pick(gen));
+                float * row = data_f32.data() + (s*m->ne[1] + j)*m->ne[0];
+                for (int64_t b : picks) {
+                    for (int64_t t = 0; t < blk; ++t) {
+                        row[b*blk + t] = dis(gen);
+                    }
+                }
+            }
+        }
+        ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), data_f16.size());
+        ggml_backend_tensor_set(m, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+    }
+};
+
 // a sliding window in a ring cache: query j of sequence s sees the window cells (offset + 997*s + j + t) % kv,
 //     t < window, which can wrap around the end of the ring; everything else is -INF
 struct test_flash_attn_ext_window : public test_flash_attn_ext {
@@ -16254,6 +16309,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, { 6, 1}, 32768, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2051));
+    // the same tile at head size 128 for 16 q heads on 1 kv head (MiniMax-M3 MSA prefill): one kv group per device, or
+    //   all 4 groups on ne[3]
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        for (int nb : { 5, 64, 66 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {16, 1}, 8192, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false, 512));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {16, 4}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 512));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {16, 1}, 32768, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
+    // picked blocks: the unions are far below the n_kv_max bound, with large Q values the softmax rescales between blocks
+    test_cases.emplace_back(new test_flash_attn_ext_sparse_blocks(128, 128, 1, {16, 1}, 32768, 256, 128, 16));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse_blocks(128, 128, 1, {16, 4}, 16384,  64, 128, 16));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse_blocks(128, 128, 1, {16, 1}, 32768,  66, 128, 16, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse_blocks(128, 128, 1, {16, 1}, 32768, 256, 128, 16, GGML_TYPE_F16, 20.0f));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse_blocks(256, 256, 1, { 6, 1}, 32768, 256, 128, 16, GGML_TYPE_F16, 20.0f));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse_blocks(512, 512, 1, { 8, 1}, 32768,  64, 128,  4, GGML_TYPE_F16, 20.0f));
 
     // sparse attn (qwen4 shape - gqa 12)
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
@@ -17130,6 +17201,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // Qwen QSA prefill on one of 4 devices: 6 q heads on 1 kv head, ubatch 1024, q8_0 cache
     for (int64_t kv : {16384, 24576, 32768, 65536, 131072}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, { 6, 1}, kv, 1024, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2051));
+    }
+    // MiniMax-M3 MSA prefill on one of 4 devices: 16 q heads on 1 kv head, chunks of 256 tokens, 16 blocks of 128 cells
+    for (int64_t kv : {8192, 16384, 24576, 32768, 65536, 131072}) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {16, 1}, kv, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
     }
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
