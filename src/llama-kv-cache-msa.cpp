@@ -310,6 +310,39 @@ void llama_kv_cache_msa_context::set_input_pos_slot(ggml_tensor * dst, const lla
     }
 }
 
+void llama_kv_cache_msa_context::set_input_pos_kv(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+
+    const int64_t n_tokens    = ubatch->n_tokens;
+    const int64_t n_pos       = dst->ne[0];
+    const int64_t n_stream_ub = dst->ne[3];
+
+    GGML_ASSERT(n_tokens % n_stream_ub == 0);
+    const int64_t n_tps = n_tokens/n_stream_ub;
+
+    for (int64_t s = 0; s < n_stream_ub; ++s) {
+        const llama_seq_id seq_id = ubatch->seq_id[s*n_tps][0];
+
+        const auto & cells = kv->get_base()->get_cells(seq_id);
+
+        int32_t * data = (int32_t *) dst->data + s*n_pos;
+        std::fill(data, data + n_pos, -1);
+
+        for (uint32_t j = 0; j < cells.size(); ++j) {
+            if (cells.is_empty(j) || !cells.seq_has(j, seq_id)) {
+                continue;
+            }
+
+            const llama_pos p0 = cells.pos_get(j);
+
+            if (p0 >= 0 && p0 < n_pos) {
+                data[p0] = p0;
+            }
+        }
+    }
+}
+
 void llama_kv_cache_msa_context::set_input_pos_mask(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     GGML_ASSERT(dst->type == GGML_TYPE_F32);

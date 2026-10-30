@@ -946,7 +946,11 @@ bool llm_graph_input_attn_kv_msa::can_reuse(const llm_graph_params & params) {
         res &= self_k_idxs_idx->ne[0] == params.ubatch.n_tokens;
     }
 
-    res &= can_reuse_kq_mask(self_kq_mask, this->mctx, params.ubatch, params.cparams);
+    if (self_kq_pos) {
+        res &= can_reuse_kq_mask_any(self_kq_mask, self_kq_pos, self_kq_qpos, this->mctx, hparams, params);
+    } else {
+        res &= can_reuse_kq_mask(self_kq_mask, this->mctx, params.ubatch, params.cparams);
+    }
 
     return res;
 }
@@ -4128,9 +4132,11 @@ llm_graph_input_attn_kv_msa * llm_graph_context::build_attn_inp_kv_msa(bool msa_
         inp->self_k_idxs = mctx_base->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_base->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_base, ubatch, cparams);
-        inp->self_kq_mask_cnv = inp->self_kq_mask;
+        build_attn_inp_kq_mask_any(ctx0, mctx_base, ubatch, hparams, cparams,
+                &inp->self_kq_mask, &inp->self_kq_pos, &inp->self_kq_qpos, &inp->self_kq_mask_cnv);
     }
+
+    build_attn_inp_kq_mask_first(gf, sched, mctx_base, inp->self_kq_pos, inp->self_kq_mask_cnv);
 
     inp->self_k_rot = mctx_base->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_base->build_input_v_rot(ctx0);

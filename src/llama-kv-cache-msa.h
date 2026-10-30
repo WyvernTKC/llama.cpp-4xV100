@@ -132,6 +132,8 @@ public:
     // the model graph relates cache contents to token positions only through these per ubatch inputs
     // positions without a cell map to fill (cell 0 by default, consumers must mask them), assumes one sequence per stream
     void set_input_pos_slot(ggml_tensor * dst, const llama_ubatch * ubatch, int32_t fill = 0) const;
+    // the position p where a cell holds it, else -1 (kv positions of ggml_kq_mask over the position axis)
+    void set_input_pos_kv(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_pos_mask(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
 private:
