@@ -114,11 +114,16 @@ extern "C" {
     typedef void (*ggml_vec_dot_t)  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT x, size_t bx,
                                        const void * GGML_RESTRICT y, size_t by, int nrc);
 
+    // s[i] = the dot of row x[i] (n[i] values) with y[i] in vec_dot_type, for i < ns: the same bits as vec_dot per row
+    typedef void (*ggml_vec_dot_segs_t)(int ns, const int * GGML_RESTRICT n, float * GGML_RESTRICT s,
+                                        const void * const * GGML_RESTRICT x, const void * const * GGML_RESTRICT y);
+
     struct ggml_type_traits_cpu {
         ggml_from_float_t        from_float;
         ggml_vec_dot_t           vec_dot;
         enum ggml_type           vec_dot_type;
         int64_t                  nrows; // number of rows to process simultaneously
+        ggml_vec_dot_segs_t      vec_dot_segs; // optional: many short rows per call
     };
 
     GGML_BACKEND_API const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type);

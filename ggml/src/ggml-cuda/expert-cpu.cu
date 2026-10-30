@@ -773,20 +773,57 @@ static void expert_cpu_work_k(expert_cpu_service & S, expert_cpu_socket & K, con
     const int     n_seg = G.n_seg[g];
     const expert_cpu_dseg * seg = G.seg[g];
     float * out = g == 0 ? S.mb_host->out : S.mb_host->out1;
-    for (int64_t row = n_out*r/ng; row < n_out*(r + 1)/ng; row++) {
-        float acc = 0.0f;
+    const int64_t row0 = n_out*r/ng;
+    const int64_t row1 = n_out*(r + 1)/ng;
+    if (td->vec_dot_segs != nullptr) {
+        // the k*n_seg segments of a row in one call, the same bits as vec_dot: a segment is a few blocks (3 for MiniMax-M3.1,
+        //   K 768 per device), and one call each left the down phase at 145 us instead of 127 (Q4_K, 2 experts, 14 threads)
+        const int    ns = k*n_seg;
+        const char * xs0[GGML_CUDA_EXPERT_CPU_MAX_K*GGML_CUDA_MAX_DEVICES];
+        size_t       rb[GGML_CUDA_EXPERT_CPU_MAX_K*GGML_CUDA_MAX_DEVICES];
+        const void * xs[GGML_CUDA_EXPERT_CPU_MAX_K*GGML_CUDA_MAX_DEVICES];
+        const void * ys[GGML_CUDA_EXPERT_CPU_MAX_K*GGML_CUDA_MAX_DEVICES];
+        int          nv[GGML_CUDA_EXPERT_CPU_MAX_K*GGML_CUDA_MAX_DEVICES];
+        float        v[GGML_CUDA_EXPERT_CPU_MAX_K*GGML_CUDA_MAX_DEVICES];
         for (int j = 0; j < k; j++) {
-            const char *    x = md.base + (size_t) K.ids[j]*md.expert_bytes;
-            const uint8_t * y = K.hq + (size_t) j*hq_row;
-            float s = 0.0f;
             for (int q = 0; q < n_seg; q++) {
-                float v = 0.0f;
-                td->vec_dot(seg[q].n, &v, 0, x + seg[q].x_off + (size_t) row*seg[q].row_bytes, 0, y + seg[q].y_off, 0, 1);
-                s += v;
+                xs0[j*n_seg + q] = md.base + (size_t) K.ids[j]*md.expert_bytes + seg[q].x_off;
+                rb [j*n_seg + q] = seg[q].row_bytes;
+                ys [j*n_seg + q] = K.hq + (size_t) j*hq_row + seg[q].y_off;
+                nv [j*n_seg + q] = seg[q].n;
             }
-            acc += K.w[j]*s;
         }
-        out[row] = acc;
+        for (int64_t row = row0; row < row1; row++) {
+            for (int i = 0; i < ns; i++) {
+                xs[i] = xs0[i] + (size_t) row*rb[i];
+            }
+            td->vec_dot_segs(ns, nv, v, xs, ys);
+            float acc = 0.0f;
+            for (int j = 0; j < k; j++) {
+                float s = 0.0f;
+                for (int q = 0; q < n_seg; q++) {
+                    s += v[j*n_seg + q];
+                }
+                acc += K.w[j]*s;
+            }
+            out[row] = acc;
+        }
+    } else {
+        for (int64_t row = row0; row < row1; row++) {
+            float acc = 0.0f;
+            for (int j = 0; j < k; j++) {
+                const char *    x = md.base + (size_t) K.ids[j]*md.expert_bytes;
+                const uint8_t * y = K.hq + (size_t) j*hq_row;
+                float s = 0.0f;
+                for (int q = 0; q < n_seg; q++) {
+                    float v = 0.0f;
+                    td->vec_dot(seg[q].n, &v, 0, x + seg[q].x_off + (size_t) row*seg[q].row_bytes, 0, y + seg[q].y_off, 0, 1);
+                    s += v;
+                }
+                acc += K.w[j]*s;
+            }
+            out[row] = acc;
+        }
     }
     EXPERT_CPU_MARK(S, t, 5);
     if (S.prof) {

@@ -317,12 +317,18 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
 #else
         .nrows                    = 1,
 #endif
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        .vec_dot_segs             = ggml_vec_dot_q4_K_q8_K_segs,
+#endif
     },
     [GGML_TYPE_Q5_K] = {
         .from_float               = quantize_row_q5_K,
         .vec_dot                  = ggml_vec_dot_q5_K_q8_K,
         .vec_dot_type             = GGML_TYPE_Q8_K,
         .nrows                    = 1,
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        .vec_dot_segs             = ggml_vec_dot_q5_K_q8_K_segs,
+#endif
     },
     [GGML_TYPE_Q6_K] = {
         .from_float               = quantize_row_q6_K,
@@ -332,6 +338,9 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .nrows                    = 2,
 #else
         .nrows                    = 1,
+#endif
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        .vec_dot_segs             = ggml_vec_dot_q6_K_q8_K_segs,
 #endif
     },
     [GGML_TYPE_IQ2_XXS] = {

@@ -588,6 +588,185 @@ static inline void prefetch_block_1k(const void * p, const int size) {
         _mm_prefetch(q + 192, _MM_HINT_T0);
     }
 }
+
+// One block of the 512-bit q4_K, q5_K and q6_K dot products, shared by vec_dot and vec_dot_segs so that a row gives the
+// same bits in either. The vector arguments are the loop constants of the caller.
+#if defined(_MSC_VER)
+#define BLOCK_512_INLINE static __forceinline
+#else
+#define BLOCK_512_INLINE static inline __attribute__((always_inline))
+#endif
+
+BLOCK_512_INLINE void q4_K_block_512(const block_q4_K * GGML_RESTRICT x, const block_q8_K * GGML_RESTRICT y,
+        __m256 * GGML_RESTRICT acc, __m128 * GGML_RESTRICT acc_m, const __m512i m4, const __m512i idx0, const __m512i two) {
+    static const uint32_t kmask1 = 0x3f3f3f3f;
+    static const uint32_t kmask2 = 0x0f0f0f0f;
+    static const uint32_t kmask3 = 0x03030303;
+
+    uint32_t utmp[4];
+
+    prefetch_block_1k(x, sizeof(block_q4_K));
+
+    const float d = y->d * GGML_CPU_FP16_TO_FP32(x->d);
+    const float dmin = -y->d * GGML_CPU_FP16_TO_FP32(x->dmin);
+
+    memcpy(utmp, x->scales, 12);
+    utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+    const uint32_t uaux = utmp[1] & kmask1;
+    utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+    utmp[2] = uaux;
+    utmp[0] &= kmask1;
+
+    const __m256i mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]));
+
+    const __m256i q8sums = _mm256_loadu_si256((const __m256i*)y->bsums);
+    const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0), _mm256_extracti128_si256(q8sums, 1));
+    const __m128i prod = _mm_madd_epi16(_mm256_extracti128_si256(mins_and_scales, 1), q8s);
+    *acc_m = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod), *acc_m);
+
+    const __m512i scales = scale_pair_512(_mm512_cvtepu16_epi32(mins_and_scales));
+
+    const uint8_t * GGML_RESTRICT q4 = x->qs;
+    const int8_t  * GGML_RESTRICT q8 = y->qs;
+
+    // two sums for shorter dependency chains
+    __m512i sumi0 = _mm512_setzero_si512();
+    __m512i sumi1 = _mm512_setzero_si512();
+    __m512i idx = idx0;
+
+    for (int j = 0; j < QK_K/64; j += 2) {
+        // 32 bytes of q4: the low nibbles in the low half, the high nibbles in the high half
+        const __m512i q4bits0 = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i*)q4)); q4 += 32;
+        const __m512i q4bits1 = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i*)q4)); q4 += 32;
+        const __m512i q4v0 = _mm512_and_si512(_mm512_mask_srli_epi16(q4bits0, 0xFFFF0000, q4bits0, 4), m4);
+        const __m512i q4v1 = _mm512_and_si512(_mm512_mask_srli_epi16(q4bits1, 0xFFFF0000, q4bits1, 4), m4);
+
+        const __m512i q8v0 = _mm512_loadu_si512(q8); q8 += 64;
+        const __m512i q8v1 = _mm512_loadu_si512(q8); q8 += 64;
+
+        sumi0 = dot_scale_512(sumi0, q4v0, q8v0, _mm512_permutexvar_epi32(idx, scales));
+        idx = _mm512_add_epi32(idx, two);
+        sumi1 = dot_scale_512(sumi1, q4v1, q8v1, _mm512_permutexvar_epi32(idx, scales));
+        idx = _mm512_add_epi32(idx, two);
+    }
+
+    const __m256i sumi = fold_i32_512(_mm512_add_epi32(sumi0, sumi1));
+    *acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), *acc);
+}
+
+BLOCK_512_INLINE float q4_K_sum_512(const __m256 acc, __m128 acc_m) {
+    acc_m = _mm_add_ps(acc_m, _mm_movehl_ps(acc_m, acc_m));
+    acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
+
+    return hsum_float_8(acc) + _mm_cvtss_f32(acc_m);
+}
+
+BLOCK_512_INLINE void q5_K_block_512(const block_q5_K * GGML_RESTRICT x, const block_q8_K * GGML_RESTRICT y,
+        __m256 * GGML_RESTRICT acc, float * GGML_RESTRICT summs, const __m512i m4, const __m512i m16, const __m512i idx0,
+        const __m512i two, const __m512i hmask0) {
+    static const uint32_t kmask1 = 0x3f3f3f3f;
+    static const uint32_t kmask2 = 0x0f0f0f0f;
+    static const uint32_t kmask3 = 0x03030303;
+
+    uint32_t utmp[4];
+
+    const __m128i mzero = _mm_setzero_si128();
+
+    prefetch_block_1k(x, sizeof(block_q5_K));
+
+    const uint8_t * GGML_RESTRICT q5 = x->qs;
+    const int8_t  * GGML_RESTRICT q8 = y->qs;
+
+    const float d = y->d * GGML_CPU_FP16_TO_FP32(x->d);
+    const float dmin = -y->d * GGML_CPU_FP16_TO_FP32(x->dmin);
+
+    memcpy(utmp, x->scales, 12);
+    utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+    const uint32_t uaux = utmp[1] & kmask1;
+    utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+    utmp[2] = uaux;
+    utmp[0] &= kmask1;
+
+    const __m256i mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]));
+
+    const __m256i q8sums = _mm256_loadu_si256((const __m256i*)y->bsums);
+    const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0), _mm256_extracti128_si256(q8sums, 1));
+    const __m128i prod = _mm_madd_epi16(_mm256_extracti128_si256(mins_and_scales, 1), q8s);
+    const __m128i hsum = _mm_hadd_epi32(_mm_hadd_epi32(prod, mzero), mzero);
+    *summs += dmin * _mm_extract_epi32(hsum, 0);
+
+    const __m512i scales = scale_pair_512(_mm512_cvtepu16_epi32(mins_and_scales));
+    const __m512i hbits = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i*)x->qh));
+
+    __m512i sumi0 = _mm512_setzero_si512();
+    __m512i sumi1 = _mm512_setzero_si512();
+    __m512i idx = idx0;
+    __m512i hmask = hmask0;
+
+    for (int j = 0; j < QK_K/64; j += 2) {
+        const __m512i q5bits0 = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i*)q5)); q5 += 32;
+        const __m512i q5bits1 = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i*)q5)); q5 += 32;
+        __m512i q5v0 = _mm512_and_si512(_mm512_mask_srli_epi16(q5bits0, 0xFFFF0000, q5bits0, 4), m4);
+        q5v0 = _mm512_mask_add_epi8(q5v0, _mm512_test_epi8_mask(hbits, hmask), q5v0, m16);
+        hmask = _mm512_slli_epi16(hmask, 2);
+        __m512i q5v1 = _mm512_and_si512(_mm512_mask_srli_epi16(q5bits1, 0xFFFF0000, q5bits1, 4), m4);
+        q5v1 = _mm512_mask_add_epi8(q5v1, _mm512_test_epi8_mask(hbits, hmask), q5v1, m16);
+        hmask = _mm512_slli_epi16(hmask, 2);
+
+        const __m512i q8v0 = _mm512_loadu_si512(q8); q8 += 64;
+        const __m512i q8v1 = _mm512_loadu_si512(q8); q8 += 64;
+
+        sumi0 = dot_scale_512(sumi0, q5v0, q8v0, _mm512_permutexvar_epi32(idx, scales));
+        idx = _mm512_add_epi32(idx, two);
+        sumi1 = dot_scale_512(sumi1, q5v1, q8v1, _mm512_permutexvar_epi32(idx, scales));
+        idx = _mm512_add_epi32(idx, two);
+    }
+
+    const __m256i sumi = fold_i32_512(_mm512_add_epi32(sumi0, sumi1));
+    *acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), *acc);
+}
+
+BLOCK_512_INLINE void q6_K_block_512(const block_q6_K * GGML_RESTRICT x, const block_q8_K * GGML_RESTRICT y,
+        __m256 * GGML_RESTRICT acc, const __m512i m15, const __m512i mh_a, const __m512i mh_b, const __m512i sh_a,
+        const __m512i sh_b, const __m512i idx0, const __m512i four) {
+    prefetch_block_1k(x, sizeof(block_q6_K));
+
+    const float d = y->d * GGML_CPU_FP16_TO_FP32(x->d);
+
+    const uint8_t * GGML_RESTRICT q4 = x->ql;
+    const uint8_t * GGML_RESTRICT qh = x->qh;
+    const int8_t  * GGML_RESTRICT q8 = y->qs;
+
+    const __m256i q8sums = _mm256_loadu_si256((const __m256i*)y->bsums);
+    const __m128i scales = _mm_loadu_si128((const __m128i*)x->scales);
+    const __m256i scales_16 = _mm256_cvtepi8_epi16(scales);
+    const __m256i q8sclsub = _mm256_slli_epi32(_mm256_madd_epi16(q8sums, scales_16), 5);
+
+    const __m512i scales_512 = scale_pair_512(_mm512_cvtepu16_epi32(scales_16));
+
+    __m512i sumi_a = _mm512_setzero_si512();
+    __m512i sumi_b = _mm512_setzero_si512();
+    __m512i idx = idx0;
+
+    for (int j = 0; j < QK_K/128; ++j) {
+        const __m512i q4bits = _mm512_loadu_si512(q4); q4 += 64;
+        const __m512i q4bitsH = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i*)qh)); qh += 32;
+
+        const __m512i q4a = _mm512_ternarylogic_epi32(q4bits, m15, _mm512_sllv_epi16(_mm512_and_si512(q4bitsH, mh_a), sh_a), 0xEA);
+        const __m512i q4b = _mm512_ternarylogic_epi32(_mm512_srli_epi16(q4bits, 4), m15, _mm512_srlv_epi16(_mm512_and_si512(q4bitsH, mh_b), sh_b), 0xEA);
+
+        const __m512i q8a = _mm512_loadu_si512(q8); q8 += 64;
+        const __m512i q8b = _mm512_loadu_si512(q8); q8 += 64;
+
+        sumi_a = dot_scale_512(sumi_a, q4a, q8a, _mm512_permutexvar_epi32(idx, scales_512));
+        idx = _mm512_add_epi32(idx, four);
+        sumi_b = dot_scale_512(sumi_b, q4b, q8b, _mm512_permutexvar_epi32(idx, scales_512));
+        idx = _mm512_add_epi32(idx, four);
+    }
+
+    const __m256i sumi = _mm256_sub_epi32(fold_i32_512(_mm512_add_epi32(sumi_a, sumi_b)), q8sclsub);
+    *acc = _mm256_fmadd_ps(_mm256_broadcast_ss(&d), _mm256_cvtepi32_ps(sumi), *acc);
+}
 #endif
 
 void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
@@ -2158,6 +2337,11 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
 #if defined(__AVX512F__) && defined(__AVX512BW__)
 
+    UNUSED(kmask1);
+    UNUSED(kmask2);
+    UNUSED(kmask3);
+    UNUSED(utmp);
+
     const __m512i m4 = _mm512_set1_epi8(0xF);
     // lanes 0-7 take the scale of the low nibbles (sub-block 2j), lanes 8-15 the one of the high nibbles (2j+1)
     const __m512i idx0 = _mm512_set_epi32(1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0);
@@ -2167,59 +2351,10 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
     __m128 acc_m = _mm_setzero_ps();
 
     for (int i = 0; i < nb; ++i) {
-        prefetch_block_1k(x + i, sizeof(block_q4_K));
-
-        const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
-        const float dmin = -y[i].d * GGML_CPU_FP16_TO_FP32(x[i].dmin);
-
-        memcpy(utmp, x[i].scales, 12);
-        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
-        const uint32_t uaux = utmp[1] & kmask1;
-        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
-        utmp[2] = uaux;
-        utmp[0] &= kmask1;
-
-        const __m256i mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]));
-
-        const __m256i q8sums = _mm256_loadu_si256((const __m256i*)y[i].bsums);
-        const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0), _mm256_extracti128_si256(q8sums, 1));
-        const __m128i prod = _mm_madd_epi16(_mm256_extracti128_si256(mins_and_scales, 1), q8s);
-        acc_m = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod), acc_m);
-
-        const __m512i scales = scale_pair_512(_mm512_cvtepu16_epi32(mins_and_scales));
-
-        const uint8_t * GGML_RESTRICT q4 = x[i].qs;
-        const int8_t  * GGML_RESTRICT q8 = y[i].qs;
-
-        // two sums for shorter dependency chains
-        __m512i sumi0 = _mm512_setzero_si512();
-        __m512i sumi1 = _mm512_setzero_si512();
-        __m512i idx = idx0;
-
-        for (int j = 0; j < QK_K/64; j += 2) {
-            // 32 bytes of q4: the low nibbles in the low half, the high nibbles in the high half
-            const __m512i q4bits0 = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i*)q4)); q4 += 32;
-            const __m512i q4bits1 = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i*)q4)); q4 += 32;
-            const __m512i q4v0 = _mm512_and_si512(_mm512_mask_srli_epi16(q4bits0, 0xFFFF0000, q4bits0, 4), m4);
-            const __m512i q4v1 = _mm512_and_si512(_mm512_mask_srli_epi16(q4bits1, 0xFFFF0000, q4bits1, 4), m4);
-
-            const __m512i q8v0 = _mm512_loadu_si512(q8); q8 += 64;
-            const __m512i q8v1 = _mm512_loadu_si512(q8); q8 += 64;
-
-            sumi0 = dot_scale_512(sumi0, q4v0, q8v0, _mm512_permutexvar_epi32(idx, scales));
-            idx = _mm512_add_epi32(idx, two);
-            sumi1 = dot_scale_512(sumi1, q4v1, q8v1, _mm512_permutexvar_epi32(idx, scales));
-            idx = _mm512_add_epi32(idx, two);
-        }
-
-        const __m256i sumi = fold_i32_512(_mm512_add_epi32(sumi0, sumi1));
-        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
+        q4_K_block_512(x + i, y + i, &acc, &acc_m, m4, idx0, two);
     }
 
-    acc_m = _mm_add_ps(acc_m, _mm_movehl_ps(acc_m, acc_m));
-    acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
-
-    *s = hsum_float_8(acc) + _mm_cvtss_f32(acc_m);
+    *s = q4_K_sum_512(acc, acc_m);
 
 #elif defined __AVX2__
 
@@ -2380,6 +2515,45 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+// The rows two at a time, in lockstep: two chains for the out-of-order core. Short rows one by one are latency bound
+// (the down pieces of the CPU expert split, ggml-cuda/expert-cpu.cu, are 3 blocks). Rows of unequal length go one by one.
+void ggml_vec_dot_q4_K_q8_K_segs(int ns, const int * GGML_RESTRICT n, float * GGML_RESTRICT s, const void * const * GGML_RESTRICT vx, const void * const * GGML_RESTRICT vy) {
+    const __m512i m4 = _mm512_set1_epi8(0xF);
+    const __m512i idx0 = _mm512_set_epi32(1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0);
+    const __m512i two  = _mm512_set1_epi32(2);
+
+    int q = 0;
+    for (; q + 1 < ns; q += 2) {
+        if (n[q] != n[q + 1]) {
+            ggml_vec_dot_q4_K_q8_K(n[q],     s + q,     0, vx[q],     0, vy[q],     0, 1);
+            ggml_vec_dot_q4_K_q8_K(n[q + 1], s + q + 1, 0, vx[q + 1], 0, vy[q + 1], 0, 1);
+            continue;
+        }
+        const block_q4_K * GGML_RESTRICT x0 = vx[q];
+        const block_q4_K * GGML_RESTRICT x1 = vx[q + 1];
+        const block_q8_K * GGML_RESTRICT y0 = vy[q];
+        const block_q8_K * GGML_RESTRICT y1 = vy[q + 1];
+
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+        __m128 acc_m0 = _mm_setzero_ps();
+        __m128 acc_m1 = _mm_setzero_ps();
+
+        for (int i = 0; i < n[q] / QK_K; ++i) {
+            q4_K_block_512(x0 + i, y0 + i, &acc0, &acc_m0, m4, idx0, two);
+            q4_K_block_512(x1 + i, y1 + i, &acc1, &acc_m1, m4, idx0, two);
+        }
+
+        s[q]     = q4_K_sum_512(acc0, acc_m0);
+        s[q + 1] = q4_K_sum_512(acc1, acc_m1);
+    }
+    if (q < ns) {
+        ggml_vec_dot_q4_K_q8_K(n[q], s + q, 0, vx[q], 0, vy[q], 0, 1);
+    }
+}
+#endif
+
 void ggml_vec_dot_q5_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy,  size_t by, int nrc) {
     assert(n % QK_K == 0);
     assert(nrc == 1);
@@ -2401,9 +2575,13 @@ void ggml_vec_dot_q5_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
 #if defined(__AVX512F__) && defined(__AVX512BW__)
 
+    UNUSED(kmask1);
+    UNUSED(kmask2);
+    UNUSED(kmask3);
+    UNUSED(utmp);
+
     const __m512i m4 = _mm512_set1_epi8(0xF);
     const __m512i m16 = _mm512_set1_epi8(16);
-    const __m128i mzero = _mm_setzero_si128();
     const __m512i idx0 = _mm512_set_epi32(1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0);
     const __m512i two  = _mm512_set1_epi32(2);
     // the high bit of sub-block 2j in the low half, of 2j+1 in the high half
@@ -2414,58 +2592,7 @@ void ggml_vec_dot_q5_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
     float summs = 0.f;
 
     for (int i = 0; i < nb; ++i) {
-        prefetch_block_1k(x + i, sizeof(block_q5_K));
-
-        const uint8_t * GGML_RESTRICT q5 = x[i].qs;
-        const int8_t  * GGML_RESTRICT q8 = y[i].qs;
-
-        const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
-        const float dmin = -y[i].d * GGML_CPU_FP16_TO_FP32(x[i].dmin);
-
-        memcpy(utmp, x[i].scales, 12);
-        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
-        const uint32_t uaux = utmp[1] & kmask1;
-        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
-        utmp[2] = uaux;
-        utmp[0] &= kmask1;
-
-        const __m256i mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]));
-
-        const __m256i q8sums = _mm256_loadu_si256((const __m256i*)y[i].bsums);
-        const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0), _mm256_extracti128_si256(q8sums, 1));
-        const __m128i prod = _mm_madd_epi16(_mm256_extracti128_si256(mins_and_scales, 1), q8s);
-        const __m128i hsum = _mm_hadd_epi32(_mm_hadd_epi32(prod, mzero), mzero);
-        summs += dmin * _mm_extract_epi32(hsum, 0);
-
-        const __m512i scales = scale_pair_512(_mm512_cvtepu16_epi32(mins_and_scales));
-        const __m512i hbits = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i*)x[i].qh));
-
-        __m512i sumi0 = _mm512_setzero_si512();
-        __m512i sumi1 = _mm512_setzero_si512();
-        __m512i idx = idx0;
-        __m512i hmask = hmask0;
-
-        for (int j = 0; j < QK_K/64; j += 2) {
-            const __m512i q5bits0 = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i*)q5)); q5 += 32;
-            const __m512i q5bits1 = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i*)q5)); q5 += 32;
-            __m512i q5v0 = _mm512_and_si512(_mm512_mask_srli_epi16(q5bits0, 0xFFFF0000, q5bits0, 4), m4);
-            q5v0 = _mm512_mask_add_epi8(q5v0, _mm512_test_epi8_mask(hbits, hmask), q5v0, m16);
-            hmask = _mm512_slli_epi16(hmask, 2);
-            __m512i q5v1 = _mm512_and_si512(_mm512_mask_srli_epi16(q5bits1, 0xFFFF0000, q5bits1, 4), m4);
-            q5v1 = _mm512_mask_add_epi8(q5v1, _mm512_test_epi8_mask(hbits, hmask), q5v1, m16);
-            hmask = _mm512_slli_epi16(hmask, 2);
-
-            const __m512i q8v0 = _mm512_loadu_si512(q8); q8 += 64;
-            const __m512i q8v1 = _mm512_loadu_si512(q8); q8 += 64;
-
-            sumi0 = dot_scale_512(sumi0, q5v0, q8v0, _mm512_permutexvar_epi32(idx, scales));
-            idx = _mm512_add_epi32(idx, two);
-            sumi1 = dot_scale_512(sumi1, q5v1, q8v1, _mm512_permutexvar_epi32(idx, scales));
-            idx = _mm512_add_epi32(idx, two);
-        }
-
-        const __m256i sumi = fold_i32_512(_mm512_add_epi32(sumi0, sumi1));
-        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
+        q5_K_block_512(x + i, y + i, &acc, &summs, m4, m16, idx0, two, hmask0);
     }
 
     *s = hsum_float_8(acc) + summs;
@@ -2661,6 +2788,46 @@ void ggml_vec_dot_q5_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+// as ggml_vec_dot_q4_K_q8_K_segs
+void ggml_vec_dot_q5_K_q8_K_segs(int ns, const int * GGML_RESTRICT n, float * GGML_RESTRICT s, const void * const * GGML_RESTRICT vx, const void * const * GGML_RESTRICT vy) {
+    const __m512i m4 = _mm512_set1_epi8(0xF);
+    const __m512i m16 = _mm512_set1_epi8(16);
+    const __m512i idx0 = _mm512_set_epi32(1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0);
+    const __m512i two  = _mm512_set1_epi32(2);
+    const __m512i hmask0 = _mm512_inserti64x4(_mm512_set1_epi8(1), _mm256_set1_epi8(2), 1);
+
+    int q = 0;
+    for (; q + 1 < ns; q += 2) {
+        if (n[q] != n[q + 1]) {
+            ggml_vec_dot_q5_K_q8_K(n[q],     s + q,     0, vx[q],     0, vy[q],     0, 1);
+            ggml_vec_dot_q5_K_q8_K(n[q + 1], s + q + 1, 0, vx[q + 1], 0, vy[q + 1], 0, 1);
+            continue;
+        }
+        const block_q5_K * GGML_RESTRICT x0 = vx[q];
+        const block_q5_K * GGML_RESTRICT x1 = vx[q + 1];
+        const block_q8_K * GGML_RESTRICT y0 = vy[q];
+        const block_q8_K * GGML_RESTRICT y1 = vy[q + 1];
+
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+        float summs0 = 0.f;
+        float summs1 = 0.f;
+
+        for (int i = 0; i < n[q] / QK_K; ++i) {
+            q5_K_block_512(x0 + i, y0 + i, &acc0, &summs0, m4, m16, idx0, two, hmask0);
+            q5_K_block_512(x1 + i, y1 + i, &acc1, &summs1, m4, m16, idx0, two, hmask0);
+        }
+
+        s[q]     = hsum_float_8(acc0) + summs0;
+        s[q + 1] = hsum_float_8(acc1) + summs1;
+    }
+    if (q < ns) {
+        ggml_vec_dot_q5_K_q8_K(n[q], s + q, 0, vx[q], 0, vy[q], 0, 1);
+    }
+}
+#endif
+
 void ggml_vec_dot_q6_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(n % QK_K == 0);
     assert(nrc == 1);
@@ -2690,43 +2857,7 @@ void ggml_vec_dot_q6_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
     __m256 acc = _mm256_setzero_ps();
 
     for (int i = 0; i < nb; ++i) {
-        prefetch_block_1k(x + i, sizeof(block_q6_K));
-
-        const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
-
-        const uint8_t * GGML_RESTRICT q4 = x[i].ql;
-        const uint8_t * GGML_RESTRICT qh = x[i].qh;
-        const int8_t  * GGML_RESTRICT q8 = y[i].qs;
-
-        const __m256i q8sums = _mm256_loadu_si256((const __m256i*)y[i].bsums);
-        const __m128i scales = _mm_loadu_si128((const __m128i*)x[i].scales);
-        const __m256i scales_16 = _mm256_cvtepi8_epi16(scales);
-        const __m256i q8sclsub = _mm256_slli_epi32(_mm256_madd_epi16(q8sums, scales_16), 5);
-
-        const __m512i scales_512 = scale_pair_512(_mm512_cvtepu16_epi32(scales_16));
-
-        __m512i sumi_a = _mm512_setzero_si512();
-        __m512i sumi_b = _mm512_setzero_si512();
-        __m512i idx = idx0;
-
-        for (int j = 0; j < QK_K/128; ++j) {
-            const __m512i q4bits = _mm512_loadu_si512(q4); q4 += 64;
-            const __m512i q4bitsH = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i*)qh)); qh += 32;
-
-            const __m512i q4a = _mm512_ternarylogic_epi32(q4bits, m15, _mm512_sllv_epi16(_mm512_and_si512(q4bitsH, mh_a), sh_a), 0xEA);
-            const __m512i q4b = _mm512_ternarylogic_epi32(_mm512_srli_epi16(q4bits, 4), m15, _mm512_srlv_epi16(_mm512_and_si512(q4bitsH, mh_b), sh_b), 0xEA);
-
-            const __m512i q8a = _mm512_loadu_si512(q8); q8 += 64;
-            const __m512i q8b = _mm512_loadu_si512(q8); q8 += 64;
-
-            sumi_a = dot_scale_512(sumi_a, q4a, q8a, _mm512_permutexvar_epi32(idx, scales_512));
-            idx = _mm512_add_epi32(idx, four);
-            sumi_b = dot_scale_512(sumi_b, q4b, q8b, _mm512_permutexvar_epi32(idx, scales_512));
-            idx = _mm512_add_epi32(idx, four);
-        }
-
-        const __m256i sumi = _mm256_sub_epi32(fold_i32_512(_mm512_add_epi32(sumi_a, sumi_b)), q8sclsub);
-        acc = _mm256_fmadd_ps(_mm256_broadcast_ss(&d), _mm256_cvtepi32_ps(sumi), acc);
+        q6_K_block_512(x + i, y + i, &acc, m15, mh_a, mh_b, sh_a, sh_b, idx0, four);
     }
 
     *s = hsum_float_8(acc);
@@ -2950,6 +3081,46 @@ static const int8_t keven_signs_q2xs[1024] = {
      1,  1,  1, -1, -1, -1, -1,  1, -1,  1,  1, -1, -1, -1, -1, -1,  1, -1,  1, -1, -1, -1, -1, -1, -1, -1,  1, -1, -1, -1, -1,  1,
      1,  1, -1, -1, -1, -1, -1, -1, -1,  1, -1, -1, -1, -1, -1,  1,  1, -1, -1, -1, -1, -1, -1,  1, -1, -1, -1, -1, -1, -1, -1, -1,
 };
+#endif
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+// as ggml_vec_dot_q4_K_q8_K_segs
+void ggml_vec_dot_q6_K_q8_K_segs(int ns, const int * GGML_RESTRICT n, float * GGML_RESTRICT s, const void * const * GGML_RESTRICT vx, const void * const * GGML_RESTRICT vy) {
+    const __m512i m15 = _mm512_set1_epi8(15);
+    const __m512i mh_a = _mm512_inserti64x4(_mm512_set1_epi8(0x03), _mm256_set1_epi8(0x0C), 1);
+    const __m512i mh_b = _mm512_inserti64x4(_mm512_set1_epi8(0x30), _mm256_set1_epi8((char) 0xC0), 1);
+    const __m512i sh_a = _mm512_inserti64x4(_mm512_set1_epi16(4), _mm256_set1_epi16(2), 1);
+    const __m512i sh_b = _mm512_inserti64x4(_mm512_set1_epi16(0), _mm256_set1_epi16(2), 1);
+    const __m512i idx0 = _mm512_set_epi32(3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0);
+    const __m512i four = _mm512_set1_epi32(4);
+
+    int q = 0;
+    for (; q + 1 < ns; q += 2) {
+        if (n[q] != n[q + 1]) {
+            ggml_vec_dot_q6_K_q8_K(n[q],     s + q,     0, vx[q],     0, vy[q],     0, 1);
+            ggml_vec_dot_q6_K_q8_K(n[q + 1], s + q + 1, 0, vx[q + 1], 0, vy[q + 1], 0, 1);
+            continue;
+        }
+        const block_q6_K * GGML_RESTRICT x0 = vx[q];
+        const block_q6_K * GGML_RESTRICT x1 = vx[q + 1];
+        const block_q8_K * GGML_RESTRICT y0 = vy[q];
+        const block_q8_K * GGML_RESTRICT y1 = vy[q + 1];
+
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+
+        for (int i = 0; i < n[q] / QK_K; ++i) {
+            q6_K_block_512(x0 + i, y0 + i, &acc0, m15, mh_a, mh_b, sh_a, sh_b, idx0, four);
+            q6_K_block_512(x1 + i, y1 + i, &acc1, m15, mh_a, mh_b, sh_a, sh_b, idx0, four);
+        }
+
+        s[q]     = hsum_float_8(acc0);
+        s[q + 1] = hsum_float_8(acc1);
+    }
+    if (q < ns) {
+        ggml_vec_dot_q6_K_q8_K(n[q], s + q, 0, vx[q], 0, vy[q], 0, 1);
+    }
+}
 #endif
 
 void ggml_vec_dot_iq2_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
