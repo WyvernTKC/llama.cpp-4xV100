@@ -306,6 +306,10 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
 
             auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
                     n_embd_head, n_head, n_head_kv, il);
+            // the K and V projections back to back, before any norm: one matvec launch for both at decode (the CUDA
+            //   sibling rows; Q has its own type)
+            ggml_build_forward_expand(gf, Kcur);
+            ggml_build_forward_expand(gf, Vcur);
 
             // per-head QK RMSNorm (weights already include Gemma's +1)
             Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, NULL, LLM_NORM_RMS, il);
@@ -339,6 +343,9 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                 // Index Branch, project, norm, partial RoPE, cache
                 ggml_tensor * iq = build_lora_mm(model.layers[il].index_q_proj, cur);
                 ggml_tensor * ik = build_lora_mm(model.layers[il].index_k_proj, cur);
+                // likewise the two projections back to back: one launch at decode
+                ggml_build_forward_expand(gf, iq);
+                ggml_build_forward_expand(gf, ik);
                 iq = ggml_reshape_3d(ctx0, iq, n_idx_dim, Hd, n_tokens);
                 ik = ggml_reshape_3d(ctx0, ik, n_idx_dim, 1,  n_tokens);
                 iq = build_norm(iq, model.layers[il].index_q_norm, NULL, LLM_NORM_RMS, il);  // +1 baked
