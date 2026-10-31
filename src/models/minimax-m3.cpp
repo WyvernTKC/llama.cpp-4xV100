@@ -480,38 +480,40 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                             const int64_t nt = std::min(n_chunk, n_tps - t0);
                             const int64_t it = st*n_tps + t0;   // first token of the chunk in the ubatch
 
+                            // the heads outermost, [n_idx_dim, nt, Hd]: under -sm tensor a device holds the indexer
+                            //   heads of its own kv groups, a split that the scores, the picks and the mask keep
                             ggml_tensor * iq_c = ggml_view_3d(ctx0, iq, n_idx_dim, Hd, nt,
                                     iq->nb[1], iq->nb[2], it*iq->nb[2]);
+                            iq_c = ggml_cont(ctx0, ggml_permute(ctx0, iq_c, 0, 2, 1, 3));
                             ggml_tensor * qp_c = ggml_view_4d(ctx0, inp_pos, nt, 1, 1, 1,
                                     inp_pos->nb[1], inp_pos->nb[2], inp_pos->nb[3], it*inp_pos->nb[0]);
                             ggml_tensor * km_c = ggml_view_2d(ctx0, msa_kqm, n_kv, nt,
                                     msa_kqm->nb[1], t0*msa_kqm->nb[1] + st*msa_kqm->nb[3]);
-                            ggml_tensor * bias_c = ggml_view_3d(ctx0, msa->bias, nblk, 1, nt,
-                                    msa->bias->nb[1], msa->bias->nb[1], it*msa->bias->nb[1]);
+                            ggml_tensor * bias_c = ggml_view_2d(ctx0, msa->bias, nblk, nt,
+                                    msa->bias->nb[1], it*msa->bias->nb[1]);
                             ggml_tensor * q_c = ggml_view_3d(ctx0, Qcur, D, n_head, nt,
                                     Qcur->nb[1], Qcur->nb[2], it*Qcur->nb[2]);
 
                             // block scores, unscaled: only the top-k ordering matters
                             ggml_tensor * sc = ggml_mul_mat(ctx0, ikp,
-                                    ggml_reshape_2d(ctx0, iq_c, n_idx_dim, Hd*nt));
+                                    ggml_reshape_2d(ctx0, iq_c, n_idx_dim, nt*Hd));
                             // indexer scores run in F32
                             ggml_prec_set_acc(sc, GGML_PREC_F32);
-                            sc = ggml_reshape_3d(ctx0, sc, n_ps, Hd, nt);
+                            sc = ggml_reshape_3d(ctx0, sc, n_ps, nt, Hd);
                             // positions after the token or without a cell are -inf
                             ggml_tensor * pm_c = ggml_kq_mask(ctx0, pk_s, qp_c, GGML_KQ_MASK_SWA_NONE, 0, GGML_TYPE_F32);
-                            sc = ggml_add_inplace(ctx0, sc, ggml_reshape_3d(ctx0, pm_c, n_ps, 1, nt));
+                            sc = ggml_add_inplace(ctx0, sc, ggml_reshape_3d(ctx0, pm_c, n_ps, nt, 1));
                             ggml_tensor * bs = ggml_pool_2d(ctx0, sc, GGML_OP_POOL_MAX, blk, 1, blk, 1, 0, 0);
                             cb(bs, "msa_bs", il);
 
                             // bias the scores so locally-forced blocks always rank first
-                            ggml_tensor * bsf = ggml_add(ctx0, bs, bias_c);   // [nblk, Hd, nt]
+                            ggml_tensor * bsf = ggml_add(ctx0, bs, bias_c);   // [nblk, nt, Hd]
                             cb(bsf, "msa_bsf", il);
 
-                            ggml_tensor * idx = ggml_top_k(ctx0, bsf, K);   // [K, Hd, nt] i32
+                            ggml_tensor * idx = ggml_top_k(ctx0, bsf, K);   // [K, nt, Hd] i32
 
                             // the cells of the picked blocks keep their causal mask, all other cells are -inf
-                            ggml_tensor * mask4 = ggml_top_k_mask(ctx0, km_c,
-                                    ggml_permute(ctx0, idx, 0, 2, 1, 3), nullptr, pc_s, nullptr);   // [n_kv, nt, Hd] f16
+                            ggml_tensor * mask4 = ggml_top_k_mask(ctx0, km_c, idx, nullptr, pc_s, nullptr);   // [n_kv, nt, Hd] f16
                             mask4 = ggml_reshape_4d(ctx0, mask4, n_kv, nt, 1, Hd);
                             cb(mask4, "msa_mask4", il);
 

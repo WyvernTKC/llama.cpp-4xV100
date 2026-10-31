@@ -444,6 +444,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_attn_q_b_weight ("blk\\.\\d*\\.attn_q_b\\.weight");
     static const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
     static const std::regex pattern_attn_norm_2     ("blk\\.\\d*\\.attn_norm_2\\.weight");
+    static const std::regex pattern_idx_q_weight    ("blk\\.\\d*\\.indexer\\.q_proj\\.weight");
 
     // multi-head latent attention
     static const std::regex pattern_q_a_weight      ("blk\\.\\d*\\.attn_q_a\\.weight");
@@ -753,6 +754,18 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight");
             }
+        }
+
+        // MiniMax-M3 MSA has one indexer query head per kv group, and each head picks the blocks of its own group only:
+        //   its queries split with the kv heads, so that every device scores and picks for its own groups instead of
+        //   all of them (one indexer key head, k_proj stays mirrored). LLAMA_MSA_INDEXER_MIRRORED=1 mirrors it.
+        if (ud->model->arch == LLM_ARCH_MINIMAX_M3 && std::regex_match(tensor_name, pattern_idx_q_weight)) {
+            static const bool idx_mirrored = getenv("LLAMA_MSA_INDEXER_MIRRORED") != nullptr;
+            const uint32_t il = std::stoul(tensor_name.substr(4, tensor_name.find('.', 4)));
+            if (idx_mirrored || in_mqa_layer() || tensor->ne[1] != hparams.n_head_kv(il)*hparams.indexer_head_size) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
         }
 
         // the qsa indexer has one key head and its projections are mirrored, so its cache cannot be split
@@ -1467,6 +1480,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
 
             const int64_t granularity_kv = granularity_q / n_gqa;
+            // MiniMax-M3 indexer queries: one head per kv head, so the same heads as attn_k
+            if (std::regex_match(tensor_name, pattern_idx_q_weight)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {granularity_kv / hparams.n_embd_head_k(il) * hparams.indexer_head_size};
+            }
             // the V head size can differ from the K head size (e.g. MiMo d_k=192 d_v=128):
             // align V tensors to whole V heads at the same head-index scale as Q and K so all
             // three stay in lockstep per device

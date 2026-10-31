@@ -2023,6 +2023,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 tensor->src[1]->ne[int(src_ss[0].axis) - 1] == tensor->src[0]->ne[src_ss[0].axis]) {
             return src_ss[0];
         }
+        // replicated rows picked by split indices: each device gathers the rows of its own indices, dim d of src1 is dim
+        //   d + 1 of dst (MiniMax-M3 MSA decode, the picked blocks of each indexer head)
+        if (tensor->op == GGML_OP_GET_ROWS && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                src_ss[1].axis >= GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis < GGML_BACKEND_SPLIT_AXIS_3) {
+            ggml_backend_meta_split_state ret = src_ss[1];
+            ret.axis = ggml_backend_meta_split_axis(int(src_ss[1].axis) + 1);
+            return ret;
+        }
         return handle_generic(src_ss, /*scalar_only =*/ true);
     };
 
@@ -2047,9 +2055,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_flash_attn_ext = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        // a mask split along dim 3 like q: the problems along dim 3 below, each device made the mask of its own
+        const bool mask_split = tensor->src[3] != nullptr && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_3 &&
+            split_states_equal(src_ss[3], src_ss[0]);
+        GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || mask_split);
         // the KV ranges of the mask rows (ggml_flash_attn_ext_set_kv_ranges) go with the mask
-        GGML_ASSERT(tensor->src[5] == nullptr || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        GGML_ASSERT(tensor->src[5] == nullptr || (src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && !mask_split));
 
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
@@ -2060,7 +2071,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
         // Independent attention problems along dim 3, split the same way in q, k and v (MiniMax-M3 MSA puts its
         //   kv groups there): each device solves its own. A replicated mask is cut to the device's share of
-        //   dim 3 by ggml_backend_meta_buffer_init_tensor_impl.
+        //   dim 3 by ggml_backend_meta_buffer_init_tensor_impl, a split one is the device's share already.
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_3) {
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]) && split_states_equal(src_ss[0], src_ss[2]));
             GGML_ASSERT(src_ss[0].n_segments == 1 && src_ss[0].nr[0] == 1);
@@ -2399,8 +2410,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_CONV_2D:
             case GGML_OP_CONV_3D:
             case GGML_OP_CONV_2D_DW:
+            // pools dims 0 and 1 of each matrix: a split of dims 2 and 3 carries through, and one of dim 1 when its window
+            //   is one row with stride 1 (MiniMax-M3 MSA block scores, split by indexer head)
+            case GGML_OP_POOL_2D: {
+                const int32_t * p = tensor->op_params; // op, k0, k1, s0, s1, p0, p1
+                const int axis = src_ss[0].axis;
+                if (axis == GGML_BACKEND_SPLIT_AXIS_2 || axis == GGML_BACKEND_SPLIT_AXIS_3 ||
+                        (axis == GGML_BACKEND_SPLIT_AXIS_1 && p[2] == 1 && p[4] == 1 && ggml_get_op_params_f32(tensor, 6) == 0.0f)) {
+                    split_state = src_ss[0];
+                } else {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+                }
+            } break;
             case GGML_OP_CONV_TRANSPOSE_2D:
-            case GGML_OP_POOL_2D:
             case GGML_OP_POOL_2D_BACK:
             case GGML_OP_UPSCALE: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
@@ -2465,9 +2487,22 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_DSV4_HC_COMB:
             case GGML_OP_DSV4_HC_PRE:
-            case GGML_OP_DSV4_HC_POST:
-            case GGML_OP_TOP_K_MASK: {
+            case GGML_OP_DSV4_HC_POST: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
+            // the picks (src1) split along a dim that the mask broadcasts, everything else replicated: each device masks
+            //   for its own picks (MiniMax-M3 MSA prefill, split by indexer head)
+            case GGML_OP_TOP_K_MASK: {
+                const int axis = src_ss[1].axis;
+                if (axis >= GGML_BACKEND_SPLIT_AXIS_1 && axis < GGML_MAX_DIMS && tensor->src[0]->ne[axis] == 1 &&
+                        src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                        (tensor->src[2] == nullptr || split_states_equal(src_ss[2], src_ss[1])) &&
+                        (tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) &&
+                        (tensor->src[4] == nullptr || split_states_equal(src_ss[4], src_ss[1]))) {
+                    split_state = src_ss[1];
+                } else {
+                    split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+                }
             } break;
             case GGML_OP_UNARY: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
