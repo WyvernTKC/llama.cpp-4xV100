@@ -1202,10 +1202,13 @@ static bool expert_cpu_group_ksplit(expert_cpu_group & G, const int n_grps) {
     const int64_t n_ff = G.mat[0].n_rows;
     const int64_t bq   = ggml_blck_size(G.hq_type);
     const int64_t bd   = ggml_blck_size(md.type);
+    // the boundaries at the nearest whole block of both types: DeepSeek-V4.1's 2304 (9 blocks of 256) splits 5 + 4
+    const int64_t bl   = std::max(bq, bd) % std::min(bq, bd) == 0 ? std::max(bq, bd) : bq*bd;
+    const auto bound = [&](const int g) { return std::min(n_ff, (n_ff*g/n_grps + bl/2)/bl*bl); };
     for (int g = 0; g < n_grps; g++) {
-        G.f0[g] = n_ff*g/n_grps;
-        G.nh[g] = n_ff*(g + 1)/n_grps - G.f0[g];
-        if (G.f0[g] % bq != 0 || G.nh[g] % bq != 0 || expert_cpu_hq_row(G.hq_type, G.nh[g]) > EXPERT_CPU_HQ_ROW) {
+        G.f0[g] = g == 0 ? 0 : bound(g);
+        G.nh[g] = (g == n_grps - 1 ? n_ff : bound(g + 1)) - G.f0[g];
+        if (G.nh[g] <= 0 || G.f0[g] % bq != 0 || G.nh[g] % bq != 0 || expert_cpu_hq_row(G.hq_type, G.nh[g]) > EXPERT_CPU_HQ_ROW) {
             return false;
         }
         G.n_seg[g] = 0;
