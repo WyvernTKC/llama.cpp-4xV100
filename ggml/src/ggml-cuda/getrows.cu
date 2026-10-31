@@ -316,6 +316,38 @@ static void get_rows_cuda_float(
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
 
+    // same type: int4 copies when rows, strides and pointers allow them
+    constexpr int VEC = 16 / sizeof(dst_t);
+    const int64_t ne00v = ne00 / VEC;
+    const int64_t vec_block_num_y = (ne00v + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
+    const bool enough_blocks = vec_block_num_y * ne10 * ne11 * ne12 >= 128;
+    const bool can_vec = std::is_same<src0_t, dst_t>::value && VEC > 1 && enough_blocks &&
+        (ne00 % VEC == 0) &&
+        (nb01 % 16 == 0) && (nb02 % 16 == 0) && (nb03 % 16 == 0) &&
+        (nb1  % 16 == 0) && (nb2  % 16 == 0) && (nb3  % 16 == 0) &&
+        (((uintptr_t) src0_d) % 16 == 0) && (((uintptr_t) dst_d) % 16 == 0);
+
+    // A row of at most half a block of int4 would leave the rest of a block-per-row launch idle (the 1 KB K rows of an MLA
+    //   latent that sparse decode gathers): several rows per block, a power of two of lanes for a row under a warp. Rows
+    //   of 8 to 31 int4 take it too instead of the narrow path's one element per thread: MiniMax-M3 MSA decode gathers K
+    //   and V rows of 128 f16, 2048 of each per layer
+    if (can_vec && ne00v <= CUDA_GET_ROWS_BLOCK_SIZE/2 && (ne00 >= CUDA_GET_ROWS_BLOCK_SIZE || ne00v >= 8)) {
+        if constexpr (std::is_same<src0_t, dst_t>::value) {
+            const int threads_x = ne00v >= WARP_SIZE ? (int) GGML_PAD(ne00v, WARP_SIZE) : ne00v > 16 ? 32 : ne00v > 8 ? 16 : 8;
+            const int rows      = CUDA_GET_ROWS_BLOCK_SIZE / threads_x;
+            const dim3 block_dims_rows(threads_x, rows, 1);
+            const dim3 block_nums((ne10 + rows - 1) / rows, 1, MIN(ne11*ne12, UINT16_MAX));
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims_rows, 0, stream};
+            ggml_cuda_kernel_launch(k_get_rows_float_vec_rows<dst_t>, launch_params,
+                (const dst_t *) src0_d, src1_d, dst_d,
+                ne00v, ne10, ne11, ne12_fdv,
+                s1, s2, s3,
+                nb01, nb02, nb03,
+                s10, s11, s12);
+            return;
+        }
+    }
+
     // a row narrower than a block leaves most of a block-per-row launch idle
     // fastdiv sums two 32-bit terms, so the flat index must stay below 2^31
     const int64_t n_narrow = ne00*ne10*ne11*ne12;
@@ -332,32 +364,6 @@ static void get_rows_cuda_float(
     }
 
     if constexpr (std::is_same<src0_t, dst_t>::value) {
-        constexpr int VEC = 16 / sizeof(dst_t);
-        const int64_t ne00v = ne00 / VEC;
-        const int64_t vec_block_num_y = (ne00v + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
-        const bool enough_blocks = vec_block_num_y * ne10 * ne11 * ne12 >= 128;
-        const bool can_vec = VEC > 1 && enough_blocks &&
-            (ne00 % VEC == 0) &&
-            (nb01 % 16 == 0) && (nb02 % 16 == 0) && (nb03 % 16 == 0) &&
-            (nb1  % 16 == 0) && (nb2  % 16 == 0) && (nb3  % 16 == 0) &&
-            (((uintptr_t) src0_d) % 16 == 0) && (((uintptr_t) dst_d) % 16 == 0);
-
-        // a row of at most half a block of int4 would leave the rest of a block-per-row launch idle (the 1 KB K rows
-        //   of an MLA latent that sparse decode gathers): several rows per block
-        if (can_vec && ne00v <= CUDA_GET_ROWS_BLOCK_SIZE/2) {
-            const int threads_x = (int) GGML_PAD(ne00v, WARP_SIZE);
-            const int rows      = CUDA_GET_ROWS_BLOCK_SIZE / threads_x;
-            const dim3 block_dims_rows(threads_x, rows, 1);
-            const dim3 block_nums((ne10 + rows - 1) / rows, 1, MIN(ne11*ne12, UINT16_MAX));
-            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims_rows, 0, stream};
-            ggml_cuda_kernel_launch(k_get_rows_float_vec_rows<dst_t>, launch_params,
-                (const dst_t *) src0_d, src1_d, dst_d,
-                ne00v, ne10, ne11, ne12_fdv,
-                s1, s2, s3,
-                nb01, nb02, nb03,
-                s10, s11, s12);
-            return;
-        }
         if (can_vec) {
             const int block_num_y = vec_block_num_y;
             const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));

@@ -13639,6 +13639,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_get_rows(type, 256,    5, 4, 1, 1, false, false, 0, true));
         test_cases.emplace_back(new test_get_rows(type, n_view, 9, 7, 2, 1, false, true,  0, true));
     }
+    // float rows of 8 to 31 int4 copied several per block (the MiniMax-M3 MSA decode K/V gather is 128 f16), batched, and
+    //   a row count that leaves a partial block
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        for (int n : {64, 72, 128, 136, 248}) {
+            test_cases.emplace_back(new test_get_rows(type, n, 600, 300, 1, 1, false, false, 0, true));
+            test_cases.emplace_back(new test_get_rows(type, n, 300,  77, 2, 3, true,  false, 0, true));
+        }
+    }
     // quantized rows narrower than a block are copied one unit per thread: the qwen4exp K/V cell, batches with
     // strided indices, a 34-byte row copied bytewise, and a 4 KiB row that keeps the block per row
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q8_0, 512,  3000, 2304, 1, 1, false, false, 0, true));
@@ -16842,6 +16850,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // MiniMax-M3 MSA decode attention: 16 q heads on one kv group, one token, the 2048 picked cells gathered contiguous
+    //   (-sm tensor: one group per device; one device: four)
+    for (int64_t nh : {1, 4}) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, nh, {16, 1}, 2048, 1, true, false, 0, 0, GGML_PREC_F32,
+            GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, false));
+    }
+    // MiniMax-M3.1 one-token matvecs per device under -sm tensor: the f32 router and indexer projections (128 rows, the
+    //   indexer queries 512 mirrored) and the q6_K attention output (2048 of its 8192 columns)
+    for (int64_t m : {128, 512}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, 1, 6144, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 6144, 1, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 2048, 1, 6144, {1, 1}, {1, 1}));
+    // its decode K/V gather: 2048 picked rows of 128 f16 from a 32k-cell cache, in their own type
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16, 128, 32768, 2048, 1, 1, false, false, 0, true));
 
     // get_rows of one-float rows: the qwen4exp QSA score expansion at decode, and a MoE weight gather at prefill
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 22592, 90368));
