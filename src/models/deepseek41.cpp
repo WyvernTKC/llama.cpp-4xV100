@@ -738,7 +738,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
     idx_q = ggml_rope_set_offset(idx_q, n_idx_head_nope);
     cb(idx_q, "idx_q", il);
 
-    ggml_tensor * idx_k_rot = inp_dsv4->get_lid().k_rot;
+    ggml_tensor * idx_k_rot = inp_dsv4->get_lid().k_rot[il];
     if (idx_k_rot) {
         idx_q = llama_mul_mat_hadamard(ctx0, idx_q, idx_k_rot);
         cb(idx_q, "idx_q_rot", il);
@@ -955,16 +955,16 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
             idx_k = ggml_rope_set_offset(idx_k, n_idx_head_dim - n_idx_head_rope);
             cb(idx_k, "idx_k_new", il);
 
-            if (inp_dsv4->get_lid().k_rot) {
-                idx_k = llama_mul_mat_hadamard(ctx0, idx_k, inp_dsv4->get_lid().k_rot);
+            if (inp_dsv4->get_lid().k_rot[il]) {
+                idx_k = llama_mul_mat_hadamard(ctx0, idx_k, inp_dsv4->get_lid().k_rot[il]);
             }
 
             ggml_build_forward_expand(gf, inp_dsv4->mctx->get_lid()->cpy_k(
                         ctx0, idx_k, inp_comp.state_write_idxs, il));
         }
 
-        if (inp_dsv4->get_csa().k_rot) {
-            latent = llama_mul_mat_hadamard(ctx0, latent, inp_dsv4->get_csa().k_rot);
+        if (inp_dsv4->get_csa().k_rot[il]) {
+            latent = llama_mul_mat_hadamard(ctx0, latent, inp_dsv4->get_csa().k_rot[il]);
             cb(latent, "comp_kv_rot", il);
         }
 
@@ -1006,7 +1006,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
         top_k = topk_idxs;
     }
 
-    ggml_tensor * k_rot = inp_attn->self_k_rot;
+    ggml_tensor * k_rot = inp_attn->self_k_rot[il];
     if (k_rot) {
         q  = llama_mul_mat_hadamard(ctx0, q, k_rot);
         kv = llama_mul_mat_hadamard(ctx0, kv, k_rot);

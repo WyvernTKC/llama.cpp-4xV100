@@ -236,8 +236,8 @@ public:
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
 
-    ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
-    ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
+    std::vector<ggml_tensor *> get_k_rot() const;
+    std::vector<ggml_tensor *> get_v_rot() const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
@@ -258,9 +258,6 @@ public:
 
     llama_swa_type get_swa_type() const { return swa_type; }
     uint32_t       get_n_swa()    const { return n_swa; }
-
-    void set_input_k_rot(ggml_tensor * dst) const;
-    void set_input_v_rot(ggml_tensor * dst) const;
 
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
@@ -287,6 +284,9 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        ggml_tensor * k_rot = nullptr;
+        ggml_tensor * v_rot = nullptr;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -312,13 +312,10 @@ private:
     // pre-computed hadamard martrices
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
 
-    // the K and V rotation matrices, written once to a buffer of their own on the device of the last layer, so that
-    //   no graph uploads them again (a graph input is copied from the host every step); null without a rotation or
-    //   without allocations, then graphs take them as inputs
-    ggml_context_ptr        attn_rot_ctx;
-    ggml_backend_buffer_ptr attn_rot_buf;
-    ggml_tensor *           attn_rot_k_mat = nullptr;
-    ggml_tensor *           attn_rot_v_mat = nullptr;
+    // keep constants separate from mutable KV buffers
+    llama_memory_bufs attn_rot_bufs;
+
+    void init_rotation(const char * name_tag);
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
@@ -463,8 +460,8 @@ public:
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
 
-    ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
-    ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
+    std::vector<ggml_tensor *> get_k_rot() const;
+    std::vector<ggml_tensor *> get_v_rot() const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
@@ -481,9 +478,6 @@ public:
 
     llama_swa_type get_swa_type() const;
     uint32_t       get_n_swa()    const;
-
-    void set_input_k_rot(ggml_tensor * dst) const;
-    void set_input_v_rot(ggml_tensor * dst) const;
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;

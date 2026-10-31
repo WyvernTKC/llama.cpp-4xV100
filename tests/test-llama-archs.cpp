@@ -18,6 +18,7 @@
 #include <cstring>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <random>
 #include <regex>
 #include <sstream>
@@ -275,6 +276,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_embd = 160; // exercise per-head tensor split granularity with head size 80
     } else if (arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_AFMOE) {
         n_head = 4;
+    } else if (arch == LLM_ARCH_LIMITE) {
+        n_head  = 4;
+        n_layer = 4; // dense connections on the last two layers
     } else if (arch == LLM_ARCH_DEEPSEEK2
             || arch == LLM_ARCH_DEEPSEEK32
             || arch == LLM_ARCH_GLM_DSA
@@ -284,6 +288,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             || arch == LLM_ARCH_KIMI_K3
             || arch == LLM_ARCH_GLM5_NEXT
             || arch == LLM_ARCH_MISTRAL4
+            || arch == LLM_ARCH_MISTRAL_LARGE4
             || arch == LLM_ARCH_HY_V4) {
         n_embd = 128;
         // more than one head so that the per-head split of tensor parallelism is actually exercised;
@@ -291,6 +296,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         //   glm5-next needs 4 MLA heads per device (flash attention GQA) on up to 4 devices.
         n_head = arch == LLM_ARCH_GLM5_NEXT ? 16 : 8;
         n_ff   = 192;
+        if (arch == LLM_ARCH_MISTRAL_LARGE4) {
+            n_layer = 4; // cover NoPE, shared indexer and KV sharing layers
+        }
     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         n_layer = 3;
     } else if (arch == LLM_ARCH_CHAMELEON) {
@@ -316,13 +324,14 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             || arch == LLM_ARCH_BAILINGMOE3
             || arch == LLM_ARCH_KIMI_K3
             || arch == LLM_ARCH_MISTRAL4
+            || arch == LLM_ARCH_MISTRAL_LARGE4
             || arch == LLM_ARCH_HY_V4;
 
     uint32_t n_head_kv = n_head;
     if (is_mla || arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_GLM5_NEXT) {
         n_head_kv = 1; // MLA shares one latent kv head; QWEN3 gives MQA coverage
     } else if (arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_MUSE_SPARK || arch == LLM_ARCH_AFMOE || arch == LLM_ARCH_MAION_CODER ||
-            arch == LLM_ARCH_KOLIBRI1) {
+            arch == LLM_ARCH_KOLIBRI1 || arch == LLM_ARCH_LIMITE) {
         n_head_kv = 2; // GQA coverage
     }
     if (arch == LLM_ARCH_BEAM) {
@@ -495,7 +504,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,     true);
     }
 
-    if (arch == LLM_ARCH_KOLIBRI1) {
+    if (arch == LLM_ARCH_KOLIBRI1 || arch == LLM_ARCH_LIMITE) {
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM, false);
     }
 
@@ -573,6 +582,14 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, indexer_types);
     }
 
+    if (arch == LLM_ARCH_MISTRAL_LARGE4) {
+        // layer 3 reads the KV cache of layer 2, both are NoPE
+        ms.add_kv(LLM_KV_ATTENTION_ROPE_PATTERN,     std::vector<uint32_t>({1, 1, 0, 0}));
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES,    std::vector<uint32_t>({1, 0, 1, 1}));
+        ms.add_kv(LLM_KV_ATTENTION_KV_SOURCE_MAP,    std::vector<uint32_t>({0, 1, 2, 2}));
+        ms.add_kv(LLM_KV_FINAL_LOGIT_SOFTCAPPING,    30.0f);
+    }
+
     if (arch == LLM_ARCH_DEEPSEEK4) {
         ms.add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,          uint32_t(8));
         ms.add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,            uint32_t(32));
@@ -629,6 +646,15 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
 
     if (arch == LLM_ARCH_MAPLE) {
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP, 7.0f);
+    }
+
+    if (arch == LLM_ARCH_LIMITE) {
+        ms.add_kv(LLM_KV_ATTENTION_SCALE,             0.1f);
+        ms.add_kv(LLM_KV_ATTENTION_XSA_EPS,           1e-4f);
+        ms.add_kv(LLM_KV_FINAL_LOGIT_SIGMOID_CAPPING, std::vector<float>({23.0f, 5.0f, 7.5f}));
+        ms.add_kv(LLM_KV_MUDD_FEED_FORWARD_LENGTH,    uint32_t(8));
+        ms.add_kv(LLM_KV_MUDD_TAP_COUNT,              uint32_t(2));
+        ms.add_kv(LLM_KV_MUDD_TAP_INDICES,            std::vector<int32_t>({-1, -1, -1, -1, 0, 2, 1, 3}));
     }
 
     // dummy tokenizer: token ids are derived from fixed-size chunks and detokenized as hex ids
@@ -1121,6 +1147,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_GLM5_NEXT:
         case LLM_ARCH_STEP35:
         case LLM_ARCH_MISTRAL4:
+        case LLM_ARCH_MISTRAL_LARGE4:
         case LLM_ARCH_MELLUM:
         case LLM_ARCH_LAGUNA:
         case LLM_ARCH_MAPLE:

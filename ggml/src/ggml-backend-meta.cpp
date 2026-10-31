@@ -3510,6 +3510,9 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
     /* .cpy_tensor      = */ nullptr,
     /* .clear           = */ ggml_backend_meta_buffer_clear,
     /* .reset           = */ ggml_backend_meta_buffer_reset,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
 };
 
 size_t ggml_backend_meta_tensor_n_simple(const ggml_tensor * tensor) {
