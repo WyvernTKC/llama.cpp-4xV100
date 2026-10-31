@@ -426,8 +426,14 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                     // the rows of a group are its cells: gather from [D, n_kv, ns, HKV] views with one batch
                     //   per (stream, group), so that a split of the kv heads keeps each device on its own groups
                     ggml_tensor * tokr = ggml_reshape_3d(ctx0, cs, (int64_t) blk*K, ns, Hd);
-                    ggml_tensor * kg = ggml_get_rows(ctx0, ggml_permute(ctx0, k, 0, 3, 1, 2), tokr);
-                    ggml_tensor * vg = ggml_get_rows(ctx0, ggml_permute(ctx0, v, 0, 3, 1, 2), tokr);
+                    // a float cache is gathered in its own type (an f16 cache gathered as f32 was cast back for FA), a
+                    //   quantized one as f32 and cast to f16 below
+                    auto gather = [&](ggml_tensor * c) {
+                        ggml_tensor * src = ggml_permute(ctx0, c, 0, 3, 1, 2);
+                        return ggml_is_quantized(c->type) ? ggml_get_rows(ctx0, src, tokr) : ggml_get_rows_same_type(ctx0, src, tokr);
+                    };
+                    ggml_tensor * kg = gather(k);
+                    ggml_tensor * vg = gather(v);
 
                     const ggml_type kt = ggml_is_quantized(k->type) ? GGML_TYPE_F16 : k->type;
                     const ggml_type vt = ggml_is_quantized(v->type) ? GGML_TYPE_F16 : v->type;
