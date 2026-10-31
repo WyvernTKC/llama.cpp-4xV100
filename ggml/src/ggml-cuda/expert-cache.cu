@@ -228,10 +228,26 @@ static __device__ void expert_cache_cpu_publish(const ggml_cuda_expert_cpu_args 
             mb->w[s_cpu[i]]   = cpu.w[i];
         }
     }
+    // 8 loads of each lane in flight before its stores: one load then its store per step waited out the L2 latency 48
+    //   times at n_embd 6144 (MiniMax-M3.1: the publishing plan 21 us, 5 us without a CPU request)
+    constexpr int nu = 8;
     const float4 * x4 = (const float4 *) cpu.x;
     float4 *       d4 = (float4 *) mb->x;
-    for (int j = lane; j < cpu.n_embd/4; j += WARP_SIZE) {
-        d4[j] = x4[j];
+    const int      n4 = cpu.n_embd/4;
+    for (int j0 = lane; j0 < n4; j0 += nu*WARP_SIZE) {
+        float4 v[nu];
+#pragma unroll
+        for (int u = 0; u < nu; ++u) {
+            if (j0 + u*WARP_SIZE < n4) {
+                v[u] = x4[j0 + u*WARP_SIZE];
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < nu; ++u) {
+            if (j0 + u*WARP_SIZE < n4) {
+                d4[j0 + u*WARP_SIZE] = v[u];
+            }
+        }
     }
     if (lane == 0) {
         mb->group = cpu.group;
