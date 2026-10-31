@@ -1913,9 +1913,10 @@ static std::pair<dim3, dim3> calc_launch_params(
     return {block_nums, block_dims};
 }
 
-// the types whose one-token launches can take an all-reduce fold (each one more kernel per layout)
+// the types whose one-token launches can take an all-reduce fold (each one more kernel per layout); q6_K: the attention
+//   output of MiniMax-M3.1, whose all-reduce and norm were two launches in each of its 60 layers
 static constexpr bool ggml_cuda_mmvq_ar_fold_type(const ggml_type type) {
-    return type == GGML_TYPE_Q8_0;
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q6_K;
 }
 
 template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, bool wide = false, bool paired = false,
