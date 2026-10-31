@@ -343,10 +343,10 @@ static std::atomic<int>  g_n_groups{0};
 static std::mutex        g_groups_mutex;
 static std::vector<std::pair<std::vector<const void *>, int>> g_group_keys; // key -> group or -1
 
-// x in the vec_dot type of gate and up, by each socket's leader before its threads start: quantize_row_q8_K is the scalar
-//   reference on x86 (12.3 us at n_embd 4096); this is the same bytes in 2.4 us (checked against it over 20000 random
-//   rows with ties and zero blocks, and once at start, see expert_cpu_q8_K_ok). The first value of the largest magnitude
-//   sets the scale, as there.
+// x in the vec_dot type of gate and up, by each socket's leader before its threads start, and the hidden rows of down:
+//   quantize_row_q8_K is the scalar reference on x86 (12.3 us at n_embd 4096); this is the same bytes in 2.4 us (checked
+//   against it over 20000 random rows with ties and zero blocks, and once at start, see expert_cpu_q8_K_ok). The first
+//   value of the largest magnitude sets the scale, as there.
 static void expert_cpu_quantize_q8_K(const float * x, block_q8_K * y, const int64_t k) {
     const __m512  abs_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7fffffff));
     const __m512  magic    = _mm512_set1_ps(12582912.f);
@@ -424,13 +424,18 @@ static bool expert_cpu_q8_K_ok() {
     return ok;
 }
 
-static void expert_cpu_quantize_x(const expert_cpu_group & G, const float * x, uint8_t * xq) {
+static void expert_cpu_quantize(const ggml_type type, const float * x, void * y, const int64_t n) {
     static const bool fast = getenv("GGML_CUDA_EXPERT_CPU_REF_Q8K") == nullptr;
-    if (fast && G.xq_type == GGML_TYPE_Q8_K && G.mat[0].k % QK_K == 0 && expert_cpu_q8_K_ok()) {
-        expert_cpu_quantize_q8_K(x, (block_q8_K *) xq, G.mat[0].k);
+    if (fast && type == GGML_TYPE_Q8_K && n % QK_K == 0 && expert_cpu_q8_K_ok()) {
+        expert_cpu_quantize_q8_K(x, (block_q8_K *) y, n);
     } else {
-        ggml_get_type_traits_cpu(G.xq_type)->from_float(x, xq, G.mat[0].k);
+        ggml_get_type_traits_cpu(type)->from_float(x, y, n);
     }
+}
+
+// the rows of the quantized hidden start on a cache line, so that one thread writes each (see expert_cpu_work_k)
+static size_t expert_cpu_hq_row(const ggml_type type, const int64_t n) {
+    return GGML_PAD(ggml_row_size(type, n), 64);
 }
 
 // ---- the service: a pool of pinned spinning threads ----
@@ -734,7 +739,6 @@ static void expert_cpu_work_k(expert_cpu_service & S, expert_cpu_socket & K, con
     const ggml_type_traits_cpu * tg = ggml_get_type_traits_cpu(mg.type);
     const ggml_type_traits_cpu * tu = ggml_get_type_traits_cpu(mu.type);
     const ggml_type_traits_cpu * td = ggml_get_type_traits_cpu(md.type);
-    const ggml_type_traits_cpu * th = ggml_get_type_traits_cpu(G.hq_type);
     const int     g  = S.grp[t];
     const int     ng = S.n_grp[g];
     const int     r  = S.rank[t];
@@ -757,12 +761,10 @@ static void expert_cpu_work_k(expert_cpu_service & S, expert_cpu_socket & K, con
 
     // The hidden rows in the vec_dot type of down. Every thread of the socket reads all of them for every output row, and
     //   lines that several cores wrote stay slow to read for all of them: chunks of 256 by every thread made the down
-    //   phase 107 us instead of 88 (1.86 experts, 14 threads). So one thread writes each expert's row when the rows are
-    //   whole cache lines (Q8_0: 1024 inputs are 17), else the first thread all of them.
-    const size_t hq_row  = ggml_row_size(G.hq_type, nh);
-    const bool   by_row  = hq_row % 64 == 0;
-    for (int j = by_row ? r : (r == 0 ? 0 : k); j < k; j += by_row ? ng : 1) {
-        th->from_float(K.hidden + (size_t) j*nh, K.hq + (size_t) j*hq_row, nh);
+    //   phase 107 us instead of 88 (1.86 experts, 14 threads). So one thread writes each expert's row.
+    const size_t hq_row = expert_cpu_hq_row(G.hq_type, nh);
+    for (int j = r; j < k; j += ng) {
+        expert_cpu_quantize(G.hq_type, K.hidden + (size_t) j*nh, K.hq + (size_t) j*hq_row, nh);
     }
     EXPERT_CPU_MARK(S, t, 3);
     expert_cpu_barrier_n(K.bar_cnt, K.bar_gen, ng);
@@ -941,7 +943,7 @@ static void expert_cpu_lead_k(expert_cpu_service * S, int t) {
                 }
                 // by the leader alone: x quantized by all threads (lines written by several cores, see expert_cpu_work_k)
                 //   made gate/up 310 us instead of 155, and all threads quantizing a copy each took 15 us
-                expert_cpu_quantize_x(*K.G, mb->x, K.xq);
+                expert_cpu_quantize(K.G->xq_type, mb->x, K.xq, K.G->mat[0].k);
                 K.t_q = __rdtsc();
                 K.gen.fetch_add(1, std::memory_order_acq_rel);
                 expert_cpu_work_k(*S, K, t);
@@ -1000,7 +1002,7 @@ static void expert_cpu_serve(expert_cpu_service * S) {
                 if (zero) {
                     memset(mb->out, 0, S->G->mat[2].n_rows*sizeof(float));
                 } else {
-                    expert_cpu_quantize_x(*S->G, mb->x, S->xq.data());
+                    expert_cpu_quantize(S->G->xq_type, mb->x, S->xq.data(), S->G->mat[0].k);
                     S->sock[0]->t_q = __rdtsc();
                     S->gen.fetch_add(1, std::memory_order_acq_rel);
                     expert_cpu_work_rows(*S, 0);
@@ -1203,7 +1205,7 @@ static bool expert_cpu_group_ksplit(expert_cpu_group & G, const int n_grps) {
     for (int g = 0; g < n_grps; g++) {
         G.f0[g] = n_ff*g/n_grps;
         G.nh[g] = n_ff*(g + 1)/n_grps - G.f0[g];
-        if (G.f0[g] % bq != 0 || G.nh[g] % bq != 0 || ggml_row_size(G.hq_type, G.nh[g]) > EXPERT_CPU_HQ_ROW) {
+        if (G.f0[g] % bq != 0 || G.nh[g] % bq != 0 || expert_cpu_hq_row(G.hq_type, G.nh[g]) > EXPERT_CPU_HQ_ROW) {
             return false;
         }
         G.n_seg[g] = 0;
