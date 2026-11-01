@@ -1417,7 +1417,6 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_LFM3:     // not attempted: shortconv split rules are keyed to LFM2/LFM2MOE, per-head attn gate
         case LLM_ARCH_MINIMAX_M2:
         case LLM_ARCH_MISTRAL4: // [TAG_MOE_AMAX_SCALE]
-        case LLM_ARCH_MISTRAL_LARGE4:
         case LLM_ARCH_MELLUM:   // [TAG_MOE_AMAX_SCALE]
         case LLM_ARCH_FLINT:    // [TAG_MOE_AMAX_SCALE]
         case LLM_ARCH_LAGUNA:   // [TAG_MOE_AMAX_SCALE]

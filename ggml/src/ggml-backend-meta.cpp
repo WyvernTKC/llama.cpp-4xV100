@@ -1762,6 +1762,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             return src_ss[0]; // GGML_OP_ADD_ID
         }
         GGML_ASSERT(tensor->src[2] == nullptr || src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        // a mirrored src over the whole split dim: each device reads its own slice of it, see slice_replicated
+        for (int i : {0, 1}) {
+            const ggml_backend_meta_split_state & ss = src_ss[1 - i];
+            if (src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && ss.axis >= 0 && ss.axis < GGML_MAX_DIMS &&
+                    ss.n_segments == 1 && ss.nr[0] == 1 && tensor->src[i]->ne[ss.axis] == tensor->ne[ss.axis]) {
+                return ss;
+            }
+        }
         return handle_generic(src_ss, /*scalar_only =*/ false);
     };
 
@@ -2925,6 +2933,11 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         }
         if (tensor->op == GGML_OP_FLASH_ATTN_EXT && split_state.axis == GGML_BACKEND_SPLIT_AXIS_3) {
             slice_replicated(3, 3); // mask
+        }
+        if ((tensor->op == GGML_OP_ADD || tensor->op == GGML_OP_SUB || tensor->op == GGML_OP_MUL || tensor->op == GGML_OP_DIV ||
+                tensor->op == GGML_OP_CONCAT) && split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
+            slice_replicated(0, int(split_state.axis));
+            slice_replicated(1, int(split_state.axis));
         }
 
         simple_tensors.push_back(t_ij);

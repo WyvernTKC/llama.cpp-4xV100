@@ -440,6 +440,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_idx_cache       ("cache_idx_(k|v|p|r|c)_l\\d*");
     static const std::regex pattern_dsv4_state      ("dsv4_(csa|hca|lid)_state_(kv|score)_l\\d*");
     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
+    static const std::regex pattern_attn_ssmax      ("blk\\.\\d*\\.attn_ssmax\\.(weight|bias)");
     static const std::regex pattern_attn_gate_bias  ("blk\\.\\d*\\.attn_gate\\.bias");
     static const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
     static const std::regex pattern_attn_out_bias   ("blk\\.\\d*\\.attn_output.bias");
@@ -750,7 +751,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         // A shared expert split like the routed ones gives a partial sum, which the meta backend reduces in the same
         //   all-reduce as theirs if the model adds it right after them. Otherwise it is mirrored.
         if (is_dsv4 || ud->model->arch == LLM_ARCH_QWEN35MOE || ud->model->arch == LLM_ARCH_QWEN4EXP ||
-                ud->model->arch == LLM_ARCH_GLM5_NEXT || ud->model->arch == LLM_ARCH_MINIMAX_M3) {
+                ud->model->arch == LLM_ARCH_GLM5_NEXT || ud->model->arch == LLM_ARCH_MINIMAX_M3 ||
+                ud->model->arch == LLM_ARCH_MISTRAL_LARGE4) {
             if (std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                     std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight");
@@ -810,6 +812,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             if (std::regex_match(tensor_name, pattern_k_b_weight) || std::regex_match(tensor_name, pattern_v_b_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output.weight");
+            }
+            // SSMax query scaling, one value per query head
+            if (std::regex_match(tensor_name, pattern_attn_ssmax)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
             }
         }
 
@@ -1401,7 +1407,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             // attn_sinks is one value per query head, same granule as attn_k_b/attn_v_b - it has to
             //   line up with the Q head split that flash attention sees after the absorption optimization
-            if (std::regex_match(tensor_name, pattern_attn_sinks)) {
+            if (std::regex_match(tensor_name, pattern_attn_sinks) || std::regex_match(tensor_name, pattern_attn_ssmax)) {
                 GGML_ASSERT(segments.size() == 1);
                 return {g_heads};
             }
