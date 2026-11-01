@@ -3330,6 +3330,23 @@ static inline __m512i iq_grid64_8(const uint64_t * GGML_RESTRICT g, const int i0
     return _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_castpd_si256(lo)), _mm256_castpd_si256(hi), 1);
 }
 
+// vectors j and j + 1 of an iq2_xxs block (j a constant: the block is straight code, the scale indices stay in registers)
+BLOCK_INLINE void iq2_xxs_pair_512(const uint8_t * GGML_RESTRICT ix, const int8_t * GGML_RESTRICT q8, iq2_signs_512 * GGML_RESTRICT sg, const __m512i sc,
+                                   const iq2_consts_512 * GGML_RESTRICT c, const int j, __m512i * GGML_RESTRICT sumi0, __m512i * GGML_RESTRICT sumi1) {
+    // half the indices loaded one by one, half shifted out of words: the load ports and the ALUs share the work
+    uint32_t a2, a3;
+    memcpy(&a2, ix + 16*j + 16, 4);
+    memcpy(&a3, ix + 16*j + 24, 4);
+    const __m512i g0 = iq_grid64_8(iq2xxs_grid, ix[16*j + 0], ix[16*j + 1], ix[16*j +  2], ix[16*j +  3],
+                                                ix[16*j + 8], ix[16*j + 9], ix[16*j + 10], ix[16*j + 11]);
+    const __m512i g1 = iq_grid64_8(iq2xxs_grid, a2 & 0xff, (a2 >> 8) & 0xff, (a2 >> 16) & 0xff, a2 >> 24,
+                                                a3 & 0xff, (a3 >> 8) & 0xff, (a3 >> 16) & 0xff, a3 >> 24);
+    const __m512i q80 = iq_neg_by_mask_512(_mm512_loadu_si512(q8 + 64*j),      _load_mask64((__mmask64 *) &sg->q[j]));
+    const __m512i q81 = iq_neg_by_mask_512(_mm512_loadu_si512(q8 + 64*j + 64), _load_mask64((__mmask64 *) &sg->q[j + 1]));
+    *sumi0 = dot_scale_512(*sumi0, g0, q80, _mm512_permutexvar_epi32(c->sidx[j],     sc));
+    *sumi1 = dot_scale_512(*sumi1, g1, q81, _mm512_permutexvar_epi32(c->sidx[j + 1], sc));
+}
+
 // iq2_xxs: per group of 32 a 32-bit word of 4 grid indices, then one of 4 sign fields of 7 bits and the scale
 BLOCK_INLINE void iq2_xxs_block_512(const block_iq2_xxs * GGML_RESTRICT x, const block_q8_K * GGML_RESTRICT y, __m256 * GGML_RESTRICT acc,
                                     const iq2_consts_512 * GGML_RESTRICT c) {
@@ -3346,24 +3363,28 @@ BLOCK_INLINE void iq2_xxs_block_512(const block_iq2_xxs * GGML_RESTRICT x, const
     // 2*s + 1
     const __m512i sc = scale_pair_512(_mm512_ternarylogic_epi32(_mm512_srli_epi32(w, 27), c->m1e, c->one, 0xEA));
 
-    const uint8_t * GGML_RESTRICT ix = (const uint8_t *) x->qs;
     __m512i sumi0 = _mm512_setzero_si512();
     __m512i sumi1 = _mm512_setzero_si512();
-    for (int j = 0; j < 4; j += 2) {
-        // half the indices loaded one by one, half shifted out of words: the load ports and the ALUs share the work
-        uint32_t a2, a3;
-        memcpy(&a2, ix + 16*j + 16, 4);
-        memcpy(&a3, ix + 16*j + 24, 4);
-        const __m512i g0 = iq_grid64_8(iq2xxs_grid, ix[16*j + 0], ix[16*j + 1], ix[16*j +  2], ix[16*j +  3],
-                                                    ix[16*j + 8], ix[16*j + 9], ix[16*j + 10], ix[16*j + 11]);
-        const __m512i g1 = iq_grid64_8(iq2xxs_grid, a2 & 0xff, (a2 >> 8) & 0xff, (a2 >> 16) & 0xff, a2 >> 24,
-                                                    a3 & 0xff, (a3 >> 8) & 0xff, (a3 >> 16) & 0xff, a3 >> 24);
-        const __m512i q80 = iq_neg_by_mask_512(_mm512_loadu_si512(y->qs + 64*j),      _load_mask64((__mmask64 *) &sg.q[j]));
-        const __m512i q81 = iq_neg_by_mask_512(_mm512_loadu_si512(y->qs + 64*j + 64), _load_mask64((__mmask64 *) &sg.q[j + 1]));
-        sumi0 = dot_scale_512(sumi0, g0, q80, _mm512_permutexvar_epi32(c->sidx[j],     sc));
-        sumi1 = dot_scale_512(sumi1, g1, q81, _mm512_permutexvar_epi32(c->sidx[j + 1], sc));
-    }
+    iq2_xxs_pair_512((const uint8_t *) x->qs, y->qs, &sg, sc, c, 0, &sumi0, &sumi1);
+    iq2_xxs_pair_512((const uint8_t *) x->qs, y->qs, &sg, sc, c, 2, &sumi0, &sumi1);
     *acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(fold_i32_512(_mm512_add_epi32(sumi0, sumi1))), *acc);
+}
+
+// as iq2_xxs_pair_512
+BLOCK_INLINE void iq2_xs_pair_512(const uint16_t * GGML_RESTRICT ix, const int8_t * GGML_RESTRICT q8, iq2_signs_512 * GGML_RESTRICT sg, const __m512i sc,
+                                  const iq2_consts_512 * GGML_RESTRICT c, const int j, __m512i * GGML_RESTRICT sumi0, __m512i * GGML_RESTRICT sumi1) {
+    uint64_t w[2];
+    memcpy(w, ix + 8*j + 8, 16);
+    w[0] &= 0x01ff01ff01ff01ffull;
+    w[1] &= 0x01ff01ff01ff01ffull;
+    const __m512i g0 = iq_grid64_8(iq2xs_grid, ix[8*j + 0] & 511, ix[8*j + 1] & 511, ix[8*j + 2] & 511, ix[8*j + 3] & 511,
+                                               ix[8*j + 4] & 511, ix[8*j + 5] & 511, ix[8*j + 6] & 511, ix[8*j + 7] & 511);
+    const __m512i g1 = iq_grid64_8(iq2xs_grid, (int) (w[0] & 0xffff), (int) ((w[0] >> 16) & 0xffff), (int) ((w[0] >> 32) & 0xffff), (int) (w[0] >> 48),
+                                               (int) (w[1] & 0xffff), (int) ((w[1] >> 16) & 0xffff), (int) ((w[1] >> 32) & 0xffff), (int) (w[1] >> 48));
+    const __m512i q80 = iq_neg_by_mask_512(_mm512_loadu_si512(q8 + 64*j),      _load_mask64((__mmask64 *) &sg->q[j]));
+    const __m512i q81 = iq_neg_by_mask_512(_mm512_loadu_si512(q8 + 64*j + 64), _load_mask64((__mmask64 *) &sg->q[j + 1]));
+    *sumi0 = dot_scale_512(*sumi0, g0, q80, _mm512_permutexvar_epi32(c->sidx[j],     sc));
+    *sumi1 = dot_scale_512(*sumi1, g1, q81, _mm512_permutexvar_epi32(c->sidx[j + 1], sc));
 }
 
 // iq2_xs: per group of 8 a uint16 of a 9-bit grid index and 7 sign bits; a 4-bit scale per 16 values
@@ -3382,24 +3403,10 @@ BLOCK_INLINE void iq2_xs_block_512(const block_iq2_xs * GGML_RESTRICT x, const b
     sc = _mm512_srlv_epi32(sc, c->sh04);
     sc = scale_pair_512(_mm512_ternarylogic_epi32(_mm512_slli_epi32(sc, 1), c->m1e, c->one, 0xEA));
 
-    const uint16_t * GGML_RESTRICT ix = x->qs;
     __m512i sumi0 = _mm512_setzero_si512();
     __m512i sumi1 = _mm512_setzero_si512();
-    for (int j = 0; j < 4; j += 2) {
-        // as iq2_xxs
-        uint64_t w[2];
-        memcpy(w, ix + 8*j + 8, 16);
-        w[0] &= 0x01ff01ff01ff01ffull;
-        w[1] &= 0x01ff01ff01ff01ffull;
-        const __m512i g0 = iq_grid64_8(iq2xs_grid, ix[8*j + 0] & 511, ix[8*j + 1] & 511, ix[8*j + 2] & 511, ix[8*j + 3] & 511,
-                                                   ix[8*j + 4] & 511, ix[8*j + 5] & 511, ix[8*j + 6] & 511, ix[8*j + 7] & 511);
-        const __m512i g1 = iq_grid64_8(iq2xs_grid, (int) (w[0] & 0xffff), (int) ((w[0] >> 16) & 0xffff), (int) ((w[0] >> 32) & 0xffff), (int) (w[0] >> 48),
-                                                   (int) (w[1] & 0xffff), (int) ((w[1] >> 16) & 0xffff), (int) ((w[1] >> 32) & 0xffff), (int) (w[1] >> 48));
-        const __m512i q80 = iq_neg_by_mask_512(_mm512_loadu_si512(y->qs + 64*j),      _load_mask64((__mmask64 *) &sg.q[j]));
-        const __m512i q81 = iq_neg_by_mask_512(_mm512_loadu_si512(y->qs + 64*j + 64), _load_mask64((__mmask64 *) &sg.q[j + 1]));
-        sumi0 = dot_scale_512(sumi0, g0, q80, _mm512_permutexvar_epi32(c->sidx[j],     sc));
-        sumi1 = dot_scale_512(sumi1, g1, q81, _mm512_permutexvar_epi32(c->sidx[j + 1], sc));
-    }
+    iq2_xs_pair_512(x->qs, y->qs, &sg, sc, c, 0, &sumi0, &sumi1);
+    iq2_xs_pair_512(x->qs, y->qs, &sg, sc, c, 2, &sumi0, &sumi1);
     *acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(fold_i32_512(_mm512_add_epi32(sumi0, sumi1))), *acc);
 }
 
