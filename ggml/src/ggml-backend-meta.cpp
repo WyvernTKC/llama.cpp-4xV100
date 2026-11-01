@@ -2916,6 +2916,19 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                 return;
             }
             GGML_ASSERT(split_state.n_segments == 1 && split_state.nr[0] == 1);
+            // A device reads a strided slice of the src and writes a contiguous output. If ggml-alloc runs the op in place
+            //   over the src (the meta tensors have the same layout), blocks overwrite src rows that other blocks did not read yet.
+            {
+                const char * src_lo = (const char *) tensor->src[i]->data;
+                const char * dst_lo = (const char *) tensor->data;
+                const size_t src_size = ggml_nbytes(tensor->src[i]);
+                const size_t dst_size = ggml_nbytes(tensor);
+                if (src_lo != nullptr && dst_lo != nullptr && src_size > 0 && dst_size > 0 &&
+                        dst_lo < src_lo + src_size && src_lo < dst_lo + dst_size) {
+                    GGML_ABORT("%s (%s) would write over the replicated src %s it reads a slice of on each device",
+                        tensor->name, ggml_op_desc(tensor), tensor->src[i]->name);
+                }
+            }
             int64_t i0 = 0;
             for (size_t jj = 0; jj < j; jj++) {
                 i0 += split_state.ne[jj];

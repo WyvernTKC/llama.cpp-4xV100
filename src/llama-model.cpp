@@ -813,9 +813,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (std::regex_match(tensor_name, pattern_k_b_weight) || std::regex_match(tensor_name, pattern_v_b_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output.weight");
             }
-            // SSMax query scaling, one value per query head
+            // SSMax query scaling, one value per query head: replicated, so the scale is mirrored and Q reads its slice of it.
+            //   Split per head, the first op of the scale ran in place over the mirrored log-pos it reads a slice of (see slice_replicated).
             if (std::regex_match(tensor_name, pattern_attn_ssmax)) {
-                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
         }
 
@@ -1407,7 +1408,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             // attn_sinks is one value per query head, same granule as attn_k_b/attn_v_b - it has to
             //   line up with the Q head split that flash attention sees after the absorption optimization
-            if (std::regex_match(tensor_name, pattern_attn_sinks) || std::regex_match(tensor_name, pattern_attn_ssmax)) {
+            if (std::regex_match(tensor_name, pattern_attn_sinks)) {
                 GGML_ASSERT(segments.size() == 1);
                 return {g_heads};
             }
