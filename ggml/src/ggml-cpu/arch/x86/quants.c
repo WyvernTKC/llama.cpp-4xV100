@@ -3865,6 +3865,41 @@ void ggml_vec_dot_iq2_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 #endif
 }
 
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+// as ggml_vec_dot_q4_K_q8_K_segs
+void ggml_vec_dot_iq2_xs_q8_K_segs(int ns, const int * GGML_RESTRICT n, float * GGML_RESTRICT s, const void * const * GGML_RESTRICT vx, const void * const * GGML_RESTRICT vy) {
+    iq2_consts_512 c;
+    iq2_consts_512_init(&c, true);
+
+    int q = 0;
+    for (; q + 1 < ns; q += 2) {
+        if (n[q] != n[q + 1]) {
+            ggml_vec_dot_iq2_xs_q8_K(n[q],     s + q,     0, vx[q],     0, vy[q],     0, 1);
+            ggml_vec_dot_iq2_xs_q8_K(n[q + 1], s + q + 1, 0, vx[q + 1], 0, vy[q + 1], 0, 1);
+            continue;
+        }
+        const block_iq2_xs * GGML_RESTRICT x0 = vx[q];
+        const block_iq2_xs * GGML_RESTRICT x1 = vx[q + 1];
+        const block_q8_K   * GGML_RESTRICT y0 = vy[q];
+        const block_q8_K   * GGML_RESTRICT y1 = vy[q + 1];
+
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+
+        for (int i = 0; i < n[q] / QK_K; ++i) {
+            iq2_xs_block_512(x0 + i, y0 + i, &acc0, &c);
+            iq2_xs_block_512(x1 + i, y1 + i, &acc1, &c);
+        }
+
+        s[q]     = 0.125f * hsum_float_8(acc0);
+        s[q + 1] = 0.125f * hsum_float_8(acc1);
+    }
+    if (q < ns) {
+        ggml_vec_dot_iq2_xs_q8_K(n[q], s + q, 0, vx[q], 0, vy[q], 0, 1);
+    }
+}
+#endif
+
 void ggml_vec_dot_iq2_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(n % QK_K == 0);
     assert(nrc == 1);

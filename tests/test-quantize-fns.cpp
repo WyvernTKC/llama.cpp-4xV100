@@ -424,7 +424,13 @@ static int test_vec_dot_segs(bool verbose) {
                     generate_data(1.91f*q - ns, n[q], b.data(), 1.0f + 0.25f*q);
                     qx[q].resize(ggml_row_size(type, n[q]));
                     qy[q].resize(ggml_row_size(qfns_cpu->vec_dot_type, n[q]));
-                    qfns_cpu->from_float(a.data(), qx[q].data(), n[q]);
+                    if (qfns_cpu->from_float) {
+                        qfns_cpu->from_float(a.data(), qx[q].data(), n[q]);
+                    } else {
+                        // the IQ types quantize only with importance weights
+                        const std::vector<float> qw(n[q], 1.0f);
+                        ggml_quantize_chunk(type, a.data(), qx[q].data(), 0, 1, n[q], qw.data());
+                    }
                     vdot->from_float(b.data(), qy[q].data(), n[q]);
                     px[q] = qx[q].data();
                     py[q] = qy[q].data();
