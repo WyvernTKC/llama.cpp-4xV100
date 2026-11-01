@@ -35,10 +35,12 @@ void llama_log_callback_default(ggml_log_level level, const char * text, void * 
 // helpers
 //
 
+// the constructor must be user-provided: with `= default`, std::vector::resize value-initialises the
+// elements, which zero-fills every byte of a loader staging buffer before the read overwrites it
 template <typename T>
 struct no_init {
     T value;
-    no_init() = default;
+    no_init() {} // NOLINT(modernize-use-equals-default)
 };
 
 template <typename dst_t, typename src_t>

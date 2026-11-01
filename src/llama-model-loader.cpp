@@ -57,6 +57,16 @@ static size_t llama_load_window_bytes() {
     return window;
 }
 
+// LLAMA_LOAD_REUSE=0 gives every staged tensor a fresh buffer instead of a slot in the reused ring
+static bool llama_load_reuse() {
+    static const bool reuse = []() {
+        const char * env = getenv("LLAMA_LOAD_REUSE");
+        return env == nullptr || atoi(env) != 0;
+    }();
+
+    return reuse;
+}
+
 // size of one unit of work handed to a reader. small enough that several readers share even a
 // modest tensor, large enough that each read is still a bulk transfer
 static const size_t LLAMA_LOAD_JOB_SIZE = 16*MiB;
@@ -78,8 +88,10 @@ struct llama_load_pipeline {
         size_t        offs   = 0;   // within the file
         size_t        size   = 0;
         uint8_t *     dst    = nullptr;
+        bool          upload = false;   // dst is staging memory, uploaded to the tensor once complete
+        bool          ring   = false;   // the staging memory is a slot of the ring
 
-        // staging buffer, empty when dst points straight at a host tensor's own memory
+        // staging buffer of its own: a tensor too large for the ring, or LLAMA_LOAD_REUSE=0
         std::vector<no_init<uint8_t>> buf;
 
         std::atomic<size_t> jobs_left{0};
@@ -168,10 +180,7 @@ struct llama_load_pipeline {
         if (dst) {
             e->dst = dst;
         } else {
-            const auto t0 = ggml_time_us();
-            e->buf.resize(size);
-            t_alloc += (ggml_time_us() - t0)/1e6;
-            e->dst = reinterpret_cast<uint8_t *>(e->buf.data());
+            stage(*e);
         }
 
         const size_t n_jobs = std::max<size_t>((size + LLAMA_LOAD_JOB_SIZE - 1)/LLAMA_LOAD_JOB_SIZE, 1);
@@ -203,6 +212,61 @@ struct llama_load_pipeline {
     size_t n_read   = 0;
 
 private:
+    // point e.dst at staging memory. fresh memory costs a page fault per page on first touch, several
+    // times the read itself from a local disk, so tensors share one ring that is reused in submission
+    // order and faulted in only once. a tensor larger than the ring gets a buffer of its own.
+    void stage(entry & e) {
+        e.upload = true;
+
+        if (llama_load_reuse()) {
+            if (e.size <= llama_load_window_bytes()) {
+                const size_t offs = ring_alloc(e.size);
+                ring_live.push_back(offs);
+                ring_head = offs + e.size;
+                e.dst  = reinterpret_cast<uint8_t *>(ring.data()) + offs;
+                e.ring = true;
+                return;
+            }
+
+            // a tensor larger than the window is admitted alone, so the ring is empty: release it
+            // rather than hold both
+            std::vector<no_init<uint8_t>>().swap(ring);
+        }
+
+        const auto t0 = ggml_time_us();
+        e.buf.resize(e.size);
+        t_alloc += (ggml_time_us() - t0)/1e6;
+        e.dst = reinterpret_cast<uint8_t *>(e.buf.data());
+    }
+
+    // offset of a free ring slot of the given size, consuming the oldest tensors until one is free.
+    // slots are freed in the order they were taken, so the live part of the ring runs from
+    // ring_live.front() to ring_head, wrapped around the end or not
+    size_t ring_alloc(size_t size) {
+        if (ring.empty()) {
+            const auto t0 = ggml_time_us();
+            ring.resize(llama_load_window_bytes());
+            t_alloc += (ggml_time_us() - t0)/1e6;
+        }
+
+        while (!ring_live.empty()) {
+            const size_t tail = ring_live.front();
+            if (ring_head > tail) {
+                if (size <= ring.size() - ring_head) {
+                    return ring_head;
+                }
+                if (size <= tail) {
+                    return 0;
+                }
+            } else if (size <= tail - ring_head) {
+                return ring_head;
+            }
+            consume_one();
+        }
+
+        return 0;
+    }
+
     void run_reader(size_t r) {
         while (true) {
             job j;
@@ -257,7 +321,12 @@ private:
             std::rethrow_exception(error);
         }
 
-        finish(e->tensor, e->dst, e->size, !e->buf.empty());
+        finish(e->tensor, e->dst, e->size, e->upload);
+
+        // the slot is free only once the upload has read it
+        if (e->ring) {
+            ring_live.pop_front();
+        }
     }
 
     // fallback when there is no reader pool: exactly the old serial path
@@ -308,6 +377,10 @@ private:
     // main thread only
     std::deque<std::unique_ptr<entry>> in_flight;
     size_t                             bytes_in_flight = 0;
+
+    std::vector<no_init<uint8_t>> ring;        // staging memory, LLAMA_LOAD_WINDOW_MB, allocated on first use
+    std::deque<size_t>            ring_live;   // offsets of the slots in flight, oldest first
+    size_t                        ring_head = 0;
 };
 
 const char * llama_file_version_name(llama_fver version) {
