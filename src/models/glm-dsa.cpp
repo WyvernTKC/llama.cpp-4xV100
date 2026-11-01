@@ -347,6 +347,12 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
                 // get indices of top k indexer scores
                 uint32_t n_top_k = indexer_score->ne[0] < n_indexer_top_k ? indexer_score->ne[0] : n_indexer_top_k;
                 top_k = ggml_top_k(ctx0, indexer_score, n_top_k);
+
+                // under -sm tensor a prefill indexer scores a slice of the tokens per device (handle_lightning_indexer in
+                //   the meta backend), but every device needs all rows for the mask: gather the token-major flattening
+                ggml_tensor * top_k_flat = ggml_cont(ctx0, ggml_reshape_2d(ctx0, top_k, n_top_k*top_k->ne[1], top_k->ne[3]));
+                top_k_flat->flags |= GGML_TENSOR_FLAG_MIRRORED;
+                top_k = ggml_reshape_4d(ctx0, top_k_flat, n_top_k, top_k->ne[1], 1, top_k->ne[3]);
                 prev_top_k = top_k;
                 cb(top_k, "top_k", il);
             } else {

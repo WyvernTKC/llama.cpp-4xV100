@@ -414,7 +414,13 @@ ggml_tensor * llama_model_hy_v4::graph::build_indexer_top_k(
 
     const uint32_t n_top_k = score->ne[0] < (int64_t) hparams.indexer_top_k ? score->ne[0] : hparams.indexer_top_k;
 
-    return ggml_top_k(ctx0, score, n_top_k);
+    ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_k);
+
+    // under -sm tensor a prefill indexer scores a slice of the tokens per device (handle_lightning_indexer in
+    //   the meta backend), but every device needs all rows for the mask: gather the token-major flattening
+    ggml_tensor * top_k_flat = ggml_cont(ctx0, ggml_reshape_2d(ctx0, top_k, n_top_k*top_k->ne[1], top_k->ne[3]));
+    top_k_flat->flags |= GGML_TENSOR_FLAG_MIRRORED;
+    return ggml_reshape_4d(ctx0, top_k_flat, n_top_k, top_k->ne[1], 1, top_k->ne[3]);
 }
 
 llama_model_hy_v4::graph::attn_dsa
