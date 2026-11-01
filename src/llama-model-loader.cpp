@@ -67,6 +67,16 @@ static bool llama_load_reuse() {
     return reuse;
 }
 
+// LLAMA_LOAD_PIN=0 leaves the ring pageable instead of pinning it through the backend of the staged tensors
+static bool llama_load_pin() {
+    static const bool pin = []() {
+        const char * env = getenv("LLAMA_LOAD_PIN");
+        return env == nullptr || atoi(env) != 0;
+    }();
+
+    return pin;
+}
+
 // size of one unit of work handed to a reader. small enough that several readers share even a
 // modest tensor, large enough that each read is still a bulk transfer
 static const size_t LLAMA_LOAD_JOB_SIZE = 16*MiB;
@@ -104,8 +114,19 @@ struct llama_load_pipeline {
         size_t  size   = 0;
     };
 
-    llama_load_pipeline(const llama_files & files, bool check_tensors)
-            : files(files), check_tensors(check_tensors) {}
+    // pin_dev: the device the staged tensors upload to; its backend pins the ring if it can (nullptr: pageable ring)
+    llama_load_pipeline(const llama_files & files, bool check_tensors, ggml_backend_dev_t pin_dev)
+            : files(files), check_tensors(check_tensors) {
+        if (pin_dev && llama_load_pin()) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(pin_dev);
+            pin   = (ggml_backend_pin_host_buffer_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_pin_host_buffer");
+            unpin = (ggml_backend_unpin_host_buffer_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_unpin_host_buffer");
+            if (!pin || !unpin) {
+                pin   = nullptr;
+                unpin = nullptr;
+            }
+        }
+    }
 
     // opened on the first submit(), so an mmap load - which reads nothing here - does not pay for
     // a pool of handles it will never use
@@ -150,9 +171,17 @@ struct llama_load_pipeline {
         for (auto & reader : readers) {
             reader.join();
         }
+
+        // every upload has synchronised, so nothing reads the ring any more
+        ring_release();
     }
 
     size_t n_readers() const { return std::max<size_t>(readers.size(), 1); }
+
+    // what the staged tensors went through, for the summary line
+    const char * ring_kind() const {
+        return !ring_used ? "no ring" : ring_pinned_once ? "pinned ring" : "pageable ring";
+    }
 
     // hand a tensor to the pipeline. dst is where the bytes go; pass nullptr to have the pipeline
     // allocate a staging buffer and upload it to the tensor once it is complete.
@@ -223,14 +252,14 @@ private:
                 const size_t offs = ring_alloc(e.size);
                 ring_live.push_back(offs);
                 ring_head = offs + e.size;
-                e.dst  = reinterpret_cast<uint8_t *>(ring.data()) + offs;
+                e.dst  = ring + offs;
                 e.ring = true;
                 return;
             }
 
             // a tensor larger than the window is admitted alone, so the ring is empty: release it
             // rather than hold both
-            std::vector<no_init<uint8_t>>().swap(ring);
+            ring_release();
         }
 
         const auto t0 = ggml_time_us();
@@ -243,16 +272,14 @@ private:
     // slots are freed in the order they were taken, so the live part of the ring runs from
     // ring_live.front() to ring_head, wrapped around the end or not
     size_t ring_alloc(size_t size) {
-        if (ring.empty()) {
-            const auto t0 = ggml_time_us();
-            ring.resize(llama_load_window_bytes());
-            t_alloc += (ggml_time_us() - t0)/1e6;
+        if (ring == nullptr) {
+            ring_init();
         }
 
         while (!ring_live.empty()) {
             const size_t tail = ring_live.front();
             if (ring_head > tail) {
-                if (size <= ring.size() - ring_head) {
+                if (size <= ring_size - ring_head) {
                     return ring_head;
                 }
                 if (size <= tail) {
@@ -265,6 +292,58 @@ private:
         }
 
         return 0;
+    }
+
+    // an upload from pageable memory goes through the driver's own pinned bounce buffers, one from pinned memory is a
+    // DMA, so pin the ring when the backend can
+    void ring_init() {
+        const auto t0 = ggml_time_us();
+        ring_size = llama_load_window_bytes();
+        ring_mem.resize(ring_size + page_size);
+        ring = reinterpret_cast<uint8_t *>(GGML_PAD(reinterpret_cast<uintptr_t>(ring_mem.data()), page_size));
+        ring_used = true;
+        if (pin) {
+            const size_t n_threads = prefault(ring, ring_size);
+            const auto   t1        = ggml_time_us();
+            ring_pinned = pin(ring, ring_size);
+            ring_pinned_once = ring_pinned_once || ring_pinned;
+            LLAMA_LOG_INFO("%s: %s the %zu MiB staging ring in %.2f s (faulted in by %zu threads in %.2f s)\n", __func__,
+                ring_pinned ? "pinned" : "failed to pin, pageable", ring_size/MiB, (ggml_time_us() - t0)/1e6,
+                n_threads, (t1 - t0)/1e6);
+        }
+        t_alloc += (ggml_time_us() - t0)/1e6;
+    }
+
+    // a fresh page costs a fault, in which the kernel also zeroes it: about 1 GB/s on one thread, and pinning would
+    // take the faults one after the other on this thread (8 GiB in ~9 s). touched from several threads first, the
+    // pages are resident and pinning only locks them.
+    static size_t prefault(uint8_t * data, size_t size) {
+        const size_t n_pages   = size/page_size;
+        const size_t n_threads = std::clamp<size_t>(std::thread::hardware_concurrency()/2, 1, 16);
+
+        std::vector<std::thread> workers;
+        for (size_t t = 0; t < n_threads; ++t) {
+            workers.emplace_back([=] {
+                for (size_t i = n_pages*t/n_threads; i < n_pages*(t + 1)/n_threads; ++i) {
+                    data[i*page_size] = 0;
+                }
+            });
+        }
+        for (auto & worker : workers) {
+            worker.join();
+        }
+
+        return n_threads;
+    }
+
+    void ring_release() {
+        if (ring_pinned) {
+            unpin(ring);
+            ring_pinned = false;
+        }
+        std::vector<no_init<uint8_t>>().swap(ring_mem);
+        ring      = nullptr;
+        ring_size = 0;
     }
 
     void run_reader(size_t r) {
@@ -378,8 +457,18 @@ private:
     std::deque<std::unique_ptr<entry>> in_flight;
     size_t                             bytes_in_flight = 0;
 
-    std::vector<no_init<uint8_t>> ring;        // staging memory, LLAMA_LOAD_WINDOW_MB, allocated on first use
-    std::deque<size_t>            ring_live;   // offsets of the slots in flight, oldest first
+    static constexpr size_t page_size = 4096;
+
+    ggml_backend_pin_host_buffer_t   pin   = nullptr;
+    ggml_backend_unpin_host_buffer_t unpin = nullptr;
+
+    std::vector<no_init<uint8_t>> ring_mem;                  // staging memory, allocated on first use
+    uint8_t *                     ring      = nullptr;       // ring_mem from its first page on, ring_size bytes
+    size_t                        ring_size = 0;             // LLAMA_LOAD_WINDOW_MB
+    bool                          ring_pinned      = false;
+    bool                          ring_pinned_once = false;
+    bool                          ring_used        = false;
+    std::deque<size_t>            ring_live;                 // offsets of the slots in flight, oldest first
     size_t                        ring_head = 0;
 };
 
@@ -1983,6 +2072,29 @@ static void llama_kv_rep_upload(ggml_tensor * t, const uint8_t * data, size_t si
     ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
 }
 
+// the device the first staged tensor (one in a non-host buffer) uploads to; a meta buffer (-sm tensor) has no backend
+// of its own to pin memory with, so take the device of the tensor's first piece
+static ggml_backend_dev_t llama_staging_device(const std::vector<ggml_tensor *> & tensors) {
+    for (const ggml_tensor * t : tensors) {
+        if (t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer)) {
+            continue;
+        }
+        ggml_backend_buffer_t buf = t->buffer;
+        if (ggml_backend_meta_tensor_n_simple(t) > 0) {
+            ggml_tensor * simple = nullptr;
+            size_t offset_j = 0;
+            size_t size_j   = 0;
+            if (!ggml_backend_meta_tensor_simple_range(t, 0, 0, 0, &simple, &offset_j, &size_j) || simple->buffer == nullptr) {
+                continue;
+            }
+            buf = simple->buffer;
+        }
+        return ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+    }
+
+    return nullptr;
+}
+
 bool llama_model_loader::load_all_data(
         struct ggml_context * ctx,
         std::vector<ggml_backend_buffer_t> & bufs,
@@ -2123,7 +2235,7 @@ bool llama_model_loader::load_all_data(
 
     // reads the file ahead of the uploads, over several handles at once
     const auto t_load_start = ggml_time_us();
-    llama_load_pipeline pipeline(files, check_tensors);
+    llama_load_pipeline pipeline(files, check_tensors, use_mmap ? nullptr : llama_staging_device(tensors));
 
     // the file data of the K/V weights of repeated kv heads, read by the pipeline and uploaded after it drained
     std::vector<std::pair<ggml_tensor *, std::vector<uint8_t>>> kv_rep_data;
@@ -2278,9 +2390,9 @@ bool llama_model_loader::load_all_data(
 
     if (pipeline.n_read > 0) {
         const double t_total = (ggml_time_us() - t_load_start)/1e6;
-        LLAMA_LOG_INFO("%s: read %.2f GiB in %.1fs wall (%.2f Gbps) | read-wait %.1fs | alloc %.1fs | upload %.1fs | %zu readers\n",
+        LLAMA_LOG_INFO("%s: read %.2f GiB in %.1fs wall (%.2f Gbps) | read-wait %.1fs | alloc %.1fs | upload %.1fs | %zu readers | %s\n",
             __func__, pipeline.n_read/(double)GiB, t_total, pipeline.n_read*8/(t_total*1e9),
-            pipeline.t_read, pipeline.t_alloc, pipeline.t_upload, pipeline.n_readers());
+            pipeline.t_read, pipeline.t_alloc, pipeline.t_upload, pipeline.n_readers(), pipeline.ring_kind());
     }
 
     // free temporary resources used for async uploads

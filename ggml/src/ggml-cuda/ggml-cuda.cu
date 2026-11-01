@@ -11030,6 +11030,33 @@ void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
     }
 }
 
+// pins memory for a while on the caller's request (the loader's staging ring), so unlike register_host_buffer it is
+// not behind GGML_CUDA_REGISTER_HOST; GGML_CUDA_NO_PINNED still turns it off. Portable: copies to every device DMA.
+static bool ggml_backend_cuda_pin_host_buffer(void * buffer, size_t size) {
+    if (ggml_cuda_pinned_memory_disabled()) {
+        return false;
+    }
+
+    cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable);
+    if (err != cudaSuccess) {
+        // clear the error
+        (void)cudaGetLastError();
+
+        GGML_LOG_DEBUG("%s: failed to pin %.2f MiB of host memory: %s\n", __func__,
+                           size / 1024.0 / 1024.0, cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+static void ggml_backend_cuda_unpin_host_buffer(void * buffer) {
+    cudaError_t err = cudaHostUnregister(buffer);
+    if (err != cudaSuccess) {
+        // clear the error
+        (void)cudaGetLastError();
+    }
+}
+
 
 // backend device
 
@@ -11949,6 +11976,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_pin_host_buffer") == 0) {
+        return (void *)ggml_backend_cuda_pin_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_unpin_host_buffer") == 0) {
+        return (void *)ggml_backend_cuda_unpin_host_buffer;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;

@@ -251,6 +251,10 @@ extern "C" {
         const char * value;
     };
     typedef struct ggml_backend_feature * (*ggml_backend_get_features_t)(ggml_backend_reg_t reg);
+    // Page-lock host memory the caller allocated, so that copies from it to the backend's devices run by DMA
+    //   ("ggml_backend_pin_host_buffer"); false when the backend cannot. Unpin it before freeing it.
+    typedef bool                         (*ggml_backend_pin_host_buffer_t)(void * buffer, size_t size);
+    typedef void                         (*ggml_backend_unpin_host_buffer_t)(void * buffer);
 
     //
     // Backend registry
