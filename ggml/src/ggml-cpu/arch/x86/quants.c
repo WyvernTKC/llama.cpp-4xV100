@@ -3234,49 +3234,15 @@ void ggml_vec_dot_q6_K_q8_K_segs(int ns, const int * GGML_RESTRICT n, float * GG
 
 #if defined(__AVX512F__) && defined(__AVX512BW__)
 // The 512-bit iq2_xxs, iq2_xs and iq3_xxs dot products: two groups of 32 values per vector, with the int32 lanes of the
-//   AVX2 code after fold_i32_512 and the same float part, so the result is the same bits. The grid values are scalar loads
-//   inserted into the vector (a gather costs ~25 cycles on Cascade Lake: twice the AVX2 kernels), the signs a byte mask.
-
-// The signs of 8 groups of 8 values as a byte mask: f holds the 7 stored sign bits of group g in qword g, the 8th bit is
-//   their parity (keven_signs_q2xs as bits)
-static inline __mmask64 iq_sign_mask_512(__m512i f) {
-    __m512i p = _mm512_xor_si512(f, _mm512_srli_epi64(f, 4));
-    p = _mm512_xor_si512(p, _mm512_srli_epi64(p, 2));
-    p = _mm512_xor_si512(p, _mm512_srli_epi64(p, 1));
-    f = _mm512_or_si512(f, _mm512_slli_epi64(_mm512_and_si512(p, _mm512_set1_epi64(1)), 7));
-    return _cvtu64_mask64((uint64_t) _mm_cvtsi128_si64(_mm512_cvtepi64_epi8(f)));
-}
-
-// the 7-bit fields at bits 0, 7, 14, 21 of both 32-bit halves of aux, one per qword
-static inline __m512i iq_sign_fields_512(const uint64_t aux) {
-    const __m512i sh = _mm512_set_epi64(53, 46, 39, 32, 21, 14, 7, 0);
-    return _mm512_and_si512(_mm512_srlv_epi64(_mm512_set1_epi64((long long) aux), sh), _mm512_set1_epi64(127));
-}
+//   AVX2 code after fold_i32_512 and the same float part, so the result is the same bits. The grid values are broadcast
+//   loads put together by blends (a gather costs ~25 cycles on Cascade Lake: twice the AVX2 kernels), the signs a byte mask.
 
 static inline __m512i iq_neg_by_mask_512(const __m512i q8, const __mmask64 m) {
     return _mm512_mask_sub_epi8(q8, m, _mm512_setzero_si512(), q8);
 }
 
-// the scales of two groups of 32 values, int32 lanes 0-7 and 8-15
-static inline __m512i iq_scales_2_512(const int sa, const int sb) {
-    return scale_pair_512(_mm512_mask_blend_epi32(0xFF00, _mm512_set1_epi32(sa), _mm512_set1_epi32(sb)));
-}
-
-static inline __m512i iq_insert4_512(const __m128i a, const __m128i b, const __m128i c, const __m128i d) {
-    return _mm512_inserti32x4(_mm512_inserti32x4(_mm512_inserti32x4(_mm512_zextsi128_si512(a), b, 1), c, 2), d, 3);
-}
-
-// 16 grid entries of 4 bytes (iq3_xxs)
-static inline __m512i iq_grid32_16(const uint32_t * GGML_RESTRICT g, const uint8_t * GGML_RESTRICT q) {
-    return iq_insert4_512(
-        _mm_set_epi32((int) g[q[ 3]], (int) g[q[ 2]], (int) g[q[ 1]], (int) g[q[ 0]]),
-        _mm_set_epi32((int) g[q[ 7]], (int) g[q[ 6]], (int) g[q[ 5]], (int) g[q[ 4]]),
-        _mm_set_epi32((int) g[q[11]], (int) g[q[10]], (int) g[q[ 9]], (int) g[q[ 8]]),
-        _mm_set_epi32((int) g[q[15]], (int) g[q[14]], (int) g[q[13]], (int) g[q[12]]));
-}
-
-// The iq2_xxs and iq2_xs blocks make the signs and scales of all 8 groups at once: the sign bytes go to the masks through
-//   the stack (a 256-bit store and 64-bit mask loads, no port 5 work), the scales to the lanes by one permute per vector.
+// The blocks make the signs and scales of all 8 groups at once: the sign bytes go to the masks through the stack (a 256-bit
+//   store and 64-bit mask loads, no port 5 work), the scales to the lanes by one permute per vector.
 
 // the sign masks of the 4 vectors of a block: a 256-bit store forwards to the 64-bit mask loads when it is aligned
 typedef union {
@@ -3290,11 +3256,11 @@ typedef struct {
     __m512i m1e;
     __m512i one;
     __m512i odd;      // iq2_xxs: the sign and scale words (odd dwords) to lanes 0-7
-    __m512i m16;      // iq2_xxs: 0x0000ffff per dword
-    __m512i m8;       // iq2_xxs: 0x00ff00ff per dword
+    __m512i m16;      // iq2_xxs, iq3_xxs: 0x0000ffff per dword
+    __m512i m8;       // iq2_xxs, iq3_xxs: 0x00ff00ff per dword
     __m512i sh04;     // iq2_xs: 0, 4, 0, 4, ...
     __m128i dup;      // iq2_xs: 0, 0, 1, 1, ..., 7, 7
-    __m512i sidx[4];  // the scale of each lane of vector j: iq2_xxs 2j (lanes 0-7), 2j + 1; iq2_xs 4j, ..., 4j + 3 (4 lanes each)
+    __m512i sidx[4];  // the scale of each lane of vector j: iq2_xxs, iq3_xxs 2j (lanes 0-7), 2j + 1; iq2_xs 4j, ..., 4j + 3 (4 lanes each)
 } iq2_consts_512;
 
 static inline void iq2_consts_512_init(iq2_consts_512 * c, const bool xs) {
@@ -3330,6 +3296,33 @@ static inline __m512i iq_grid64_8(const uint64_t * GGML_RESTRICT g, const int i0
     return _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_castpd_si256(lo)), _mm256_castpd_si256(hi), 1);
 }
 
+// 8 grid entries of 4 bytes, as iq_grid64_8
+static inline __m256 iq_grid32_8(const uint32_t * GGML_RESTRICT g, const int i0, const int i1, const int i2, const int i3,
+                                 const int i4, const int i5, const int i6, const int i7) {
+    const float * gf = (const float *) g;
+    const __m256 a = _mm256_blend_ps(_mm256_broadcast_ss(gf + i0), _mm256_broadcast_ss(gf + i1), 0xAA);
+    const __m256 b = _mm256_blend_ps(_mm256_broadcast_ss(gf + i2), _mm256_broadcast_ss(gf + i3), 0xAA);
+    const __m256 c = _mm256_blend_ps(_mm256_broadcast_ss(gf + i4), _mm256_broadcast_ss(gf + i5), 0xAA);
+    const __m256 d = _mm256_blend_ps(_mm256_broadcast_ss(gf + i6), _mm256_broadcast_ss(gf + i7), 0xAA);
+    return _mm256_blend_ps(_mm256_blend_ps(a, b, 0xCC), _mm256_blend_ps(c, d, 0xCC), 0xF0);
+}
+
+static inline __m512i iq_cat_512(const __m256 lo, const __m256 hi) {
+    return _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_castps_si256(lo)), _mm256_castps_si256(hi), 1);
+}
+
+// iq2_xxs and iq3_xxs: the signs to sg and the scales 2*s + 1 of the 8 groups of 32 from their words in lanes 0-7 of w:
+//   4 sign fields of 7 bits at bits 0, 7, 14, 21, the scale s at bits 28-31
+static inline __m512i iq_xxs_signs_scales_512(const __m512i w, const iq2_consts_512 * GGML_RESTRICT c, iq2_signs_512 * GGML_RESTRICT sg) {
+    // the fields to bytes 0-3 with bit 7 junk, then bit 7 = junk ^ parity(bits 0-3) ^ parity(bits 4-6 and the junk)
+    __m512i u = _mm512_ternarylogic_epi32(c->m16, w, _mm512_slli_epi32(w, 2), 0xCA);
+    u = _mm512_ternarylogic_epi32(c->m8, u, _mm512_slli_epi32(u, 1), 0xCA);
+    const __m512i plo = _mm512_shuffle_epi8(c->par, _mm512_and_si512(u, c->m0f));
+    const __m512i phi = _mm512_shuffle_epi8(c->par, _mm512_and_si512(_mm512_srli_epi16(u, 4), c->m0f));
+    _mm256_store_si256(&sg->v, _mm512_castsi512_si256(_mm512_ternarylogic_epi32(u, plo, phi, 0x96)));
+    return scale_pair_512(_mm512_ternarylogic_epi32(_mm512_srli_epi32(w, 27), c->m1e, c->one, 0xEA));
+}
+
 // vectors j and j + 1 of an iq2_xxs block (j a constant: the block is straight code, the scale indices stay in registers)
 BLOCK_INLINE void iq2_xxs_pair_512(const uint8_t * GGML_RESTRICT ix, const int8_t * GGML_RESTRICT q8, iq2_signs_512 * GGML_RESTRICT sg, const __m512i sc,
                                    const iq2_consts_512 * GGML_RESTRICT c, const int j, __m512i * GGML_RESTRICT sumi0, __m512i * GGML_RESTRICT sumi1) {
@@ -3352,16 +3345,8 @@ BLOCK_INLINE void iq2_xxs_block_512(const block_iq2_xxs * GGML_RESTRICT x, const
                                     const iq2_consts_512 * GGML_RESTRICT c) {
     prefetch_block_1k(x, sizeof(block_iq2_xxs));
     const float d = GGML_CPU_FP16_TO_FP32(x->d) * y->d;
-    const __m512i w = _mm512_permutexvar_epi32(c->odd, _mm512_loadu_si512(x->qs));
-    // the fields at bits 0, 7, 14, 21 to bytes 0-3 with bit 7 junk, then bit 7 = junk ^ parity(bits 0-3) ^ parity(bits 4-6 and the junk)
-    __m512i u = _mm512_ternarylogic_epi32(c->m16, w, _mm512_slli_epi32(w, 2), 0xCA);
-    u = _mm512_ternarylogic_epi32(c->m8, u, _mm512_slli_epi32(u, 1), 0xCA);
-    const __m512i plo = _mm512_shuffle_epi8(c->par, _mm512_and_si512(u, c->m0f));
-    const __m512i phi = _mm512_shuffle_epi8(c->par, _mm512_and_si512(_mm512_srli_epi16(u, 4), c->m0f));
     iq2_signs_512 sg;
-    _mm256_store_si256(&sg.v, _mm512_castsi512_si256(_mm512_ternarylogic_epi32(u, plo, phi, 0x96)));
-    // 2*s + 1
-    const __m512i sc = scale_pair_512(_mm512_ternarylogic_epi32(_mm512_srli_epi32(w, 27), c->m1e, c->one, 0xEA));
+    const __m512i sc = iq_xxs_signs_scales_512(_mm512_permutexvar_epi32(c->odd, _mm512_loadu_si512(x->qs)), c, &sg);
 
     __m512i sumi0 = _mm512_setzero_si512();
     __m512i sumi1 = _mm512_setzero_si512();
@@ -3410,29 +3395,37 @@ BLOCK_INLINE void iq2_xs_block_512(const block_iq2_xs * GGML_RESTRICT x, const b
     *acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(fold_i32_512(_mm512_add_epi32(sumi0, sumi1))), *acc);
 }
 
-BLOCK_INLINE void iq3_xxs_block_512(const block_iq3_xxs * GGML_RESTRICT x, const block_q8_K * GGML_RESTRICT y, __m256 * GGML_RESTRICT acc) {
+// as iq2_xxs_pair_512
+BLOCK_INLINE void iq3_xxs_pair_512(const uint8_t * GGML_RESTRICT ix, const int8_t * GGML_RESTRICT q8, iq2_signs_512 * GGML_RESTRICT sg, const __m512i sc,
+                                   const iq2_consts_512 * GGML_RESTRICT c, const int j, __m512i * GGML_RESTRICT sumi0, __m512i * GGML_RESTRICT sumi1) {
+    const uint8_t * a = ix + 16*j;
+    // 1 in 8 indices shifted out of a word, the others loaded: twice the grid loads of iq2_xxs leave less room on the load ports
+    uint32_t w;
+    memcpy(&w, a + 28, 4);
+    const __m512i g0 = iq_cat_512(iq_grid32_8(iq3xxs_grid, a[ 0], a[ 1], a[ 2], a[ 3], a[ 4], a[ 5], a[ 6], a[ 7]),
+                                  iq_grid32_8(iq3xxs_grid, a[ 8], a[ 9], a[10], a[11], a[12], a[13], a[14], a[15]));
+    const __m512i g1 = iq_cat_512(iq_grid32_8(iq3xxs_grid, a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23]),
+                                  iq_grid32_8(iq3xxs_grid, a[24], a[25], a[26], a[27], w & 0xff, (w >> 8) & 0xff, (w >> 16) & 0xff, w >> 24));
+    const __m512i q80 = iq_neg_by_mask_512(_mm512_loadu_si512(q8 + 64*j),      _load_mask64((__mmask64 *) &sg->q[j]));
+    const __m512i q81 = iq_neg_by_mask_512(_mm512_loadu_si512(q8 + 64*j + 64), _load_mask64((__mmask64 *) &sg->q[j + 1]));
+    *sumi0 = dot_scale_512(*sumi0, g0, q80, _mm512_permutexvar_epi32(c->sidx[j],     sc));
+    *sumi1 = dot_scale_512(*sumi1, g1, q81, _mm512_permutexvar_epi32(c->sidx[j + 1], sc));
+}
+
+// iq3_xxs: per group of 32 8 grid indices of one byte, then (after all the indices) a 32-bit word of 4 sign fields of 7 bits
+//   and the scale, as iq2_xxs
+BLOCK_INLINE void iq3_xxs_block_512(const block_iq3_xxs * GGML_RESTRICT x, const block_q8_K * GGML_RESTRICT y, __m256 * GGML_RESTRICT acc,
+                                    const iq2_consts_512 * GGML_RESTRICT c) {
     prefetch_block_1k(x, sizeof(block_iq3_xxs));
     const float d = GGML_CPU_FP16_TO_FP32(x->d) * y->d;
-    const uint8_t * GGML_RESTRICT q3  = x->qs;
-    const uint8_t * GGML_RESTRICT gas = x->qs + QK_K/4;
-    const int8_t  * GGML_RESTRICT q8  = y->qs;
+    // zext: MSVC makes a cast to 512 bits a store and a reload
+    iq2_signs_512 sg;
+    const __m512i sc = iq_xxs_signs_scales_512(_mm512_zextsi256_si512(_mm256_loadu_si256((const __m256i *) (x->qs + QK_K/4))), c, &sg);
+
     __m512i sumi0 = _mm512_setzero_si512();
     __m512i sumi1 = _mm512_setzero_si512();
-    for (int ib32 = 0; ib32 < QK_K/32; ib32 += 4) {
-        // per group of 32 a 32-bit word of the 4 sign fields and the scale
-        uint64_t aux0, aux1;
-        memcpy(&aux0, gas, 8);
-        memcpy(&aux1, gas + 8, 8);
-        gas += 16;
-        const __m512i g0 = iq_grid32_16(iq3xxs_grid, q3);
-        const __m512i g1 = iq_grid32_16(iq3xxs_grid, q3 + 16);
-        q3 += 32;
-        const __m512i q80 = iq_neg_by_mask_512(_mm512_loadu_si512(q8),      iq_sign_mask_512(iq_sign_fields_512(aux0)));
-        const __m512i q81 = iq_neg_by_mask_512(_mm512_loadu_si512(q8 + 64), iq_sign_mask_512(iq_sign_fields_512(aux1)));
-        q8 += 128;
-        sumi0 = dot_scale_512(sumi0, g0, q80, iq_scales_2_512(2*(int) ((uint32_t) aux0 >> 28) + 1, 2*(int) (aux0 >> 60) + 1));
-        sumi1 = dot_scale_512(sumi1, g1, q81, iq_scales_2_512(2*(int) ((uint32_t) aux1 >> 28) + 1, 2*(int) (aux1 >> 60) + 1));
-    }
+    iq3_xxs_pair_512(x->qs, y->qs, &sg, sc, c, 0, &sumi0, &sumi1);
+    iq3_xxs_pair_512(x->qs, y->qs, &sg, sc, c, 2, &sumi0, &sumi1);
     *acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(fold_i32_512(_mm512_add_epi32(sumi0, sumi1))), *acc);
 }
 #endif
@@ -4107,9 +4100,11 @@ void ggml_vec_dot_iq3_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 
 #if defined(__AVX512F__) && defined(__AVX512BW__)
 
+    iq2_consts_512 c;
+    iq2_consts_512_init(&c, false);
     __m256 accumf = _mm256_setzero_ps();
     for (int i = 0; i < nb; ++i) {
-        iq3_xxs_block_512(x + i, y + i, &accumf);
+        iq3_xxs_block_512(x + i, y + i, &accumf, &c);
     }
     *s = 0.25f * hsum_float_8(accumf);
 
