@@ -3729,6 +3729,48 @@ ggml_tensor * llm_graph_context::build_attn(
         kq_mask = inp->get_kq_mask_lid();
     }
 
+    ggml_tensor * q = q_cur;
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+
+    // MLA: V is a view of the first n_embd_v elements of K
+    const int64_t n_embd_v = v_cur ? v_cur->ne[0] : v_mla->ne[0];
+
+    // one token attends over its picked cells alone, their latent rows and mask values copied out of the cache (as
+    //   deepseek4 build_picked_k and glm5-next do), instead of a dense attention over all cells under the top-k mask:
+    //   the cost no longer grows with the depth. LLAMA_DSA_GATHER=0 turns it off
+    static const bool dsa_gather = [] {
+        const char * env = getenv("LLAMA_DSA_GATHER");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    const int64_t n_top = top_k->ne[0];
+    const bool use_gather = dsa_gather && kq_b == nullptr && q->ne[2] == 1 && k->ne[1] == 1 && k->ne[3] == 1 &&
+        k->ne[2] > n_top && n_top % 256 == 0 && top_k->ne[1] == 1 && top_k->ne[3] == 1 && kq_mask->ne[1] == 1;
+
+    if (use_gather) {
+        ggml_tensor * idx   = ggml_view_1d(ctx0, top_k, n_top, 0);
+        ggml_tensor * rows  = ggml_view_2d(ctx0, k, k->ne[0], k->ne[2], k->nb[2], 0);
+        ggml_tensor * k_sel = ggml_reshape_4d(ctx0, ggml_get_rows_same_type(ctx0, rows, idx), k->ne[0], 1, n_top, 1);
+        cb(k_sel, "k_sel", il);
+        ggml_tensor * v_sel = ggml_view_4d(ctx0, k_sel, n_embd_v, 1, n_top, 1, k_sel->nb[1], k_sel->nb[2], k_sel->nb[3], 0);
+
+        ggml_tensor * m_rows = ggml_view_2d(ctx0, kq_mask, 1, kq_mask->ne[0], kq_mask->nb[0], 0);
+        ggml_tensor * m_sel  = ggml_reshape_4d(ctx0, ggml_get_rows_same_type(ctx0, m_rows, idx), n_top, 1, 1, 1);
+        cb(m_sel, "kq_mask_sel", il);
+
+        ggml_tensor * cur = build_attn_mha(q, k_sel, v_sel, kq_b, m_sel, sinks, v_mla, 0, kq_scale, il);
+        cb(cur, "kqv_out", il);
+
+        if (wo) {
+            cur = build_lora_mm(wo, cur, wo_s);
+        }
+
+        if (wo_b) {
+            cur = ggml_add(ctx0, cur, wo_b);
+        }
+
+        return cur;
+    }
+
     ggml_tensor * kq_mask_top_k = nullptr;
     if (cparams.fused_top_k_mask) {
         kq_mask_top_k = build_fused_top_k_mask(kq_mask, top_k, il);
@@ -3760,11 +3802,6 @@ ggml_tensor * llm_graph_context::build_attn(
         kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
     }
 
-    ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-
-    // MLA: V is a view of the first n_embd_v elements of K
-    const int64_t n_embd_v = v_cur ? v_cur->ne[0] : v_mla->ne[0];
     ggml_tensor * v = ggml_view_4d(ctx0, k, n_embd_v, k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, top_k->ne[0], kq_scale, il);
