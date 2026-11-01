@@ -4219,6 +4219,42 @@ void ggml_vec_dot_iq3_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 #endif
 }
 
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+// as ggml_vec_dot_iq2_xs_q8_K_segs, also for two segments of different lengths (DeepSeek-V4.1 down: 9 blocks over 4 devices)
+void ggml_vec_dot_iq3_xxs_q8_K_segs(int ns, const int * GGML_RESTRICT n, float * GGML_RESTRICT s, const void * const * GGML_RESTRICT vx, const void * const * GGML_RESTRICT vy) {
+    iq2_consts_512 c;
+    iq2_consts_512_init(&c, false);
+
+    int q = 0;
+    for (; q + 1 < ns; q += 2) {
+        const block_iq3_xxs * GGML_RESTRICT x0 = vx[q];
+        const block_iq3_xxs * GGML_RESTRICT x1 = vx[q + 1];
+        const block_q8_K    * GGML_RESTRICT y0 = vy[q];
+        const block_q8_K    * GGML_RESTRICT y1 = vy[q + 1];
+        const int nb0 = n[q] / QK_K;
+        const int nb1 = n[q + 1] / QK_K;
+
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+
+        for (int i = 0; i < nb0 || i < nb1; ++i) {
+            if (i < nb0) {
+                iq3_xxs_block_512(x0 + i, y0 + i, &acc0, &c);
+            }
+            if (i < nb1) {
+                iq3_xxs_block_512(x1 + i, y1 + i, &acc1, &c);
+            }
+        }
+
+        s[q]     = 0.25f * hsum_float_8(acc0);
+        s[q + 1] = 0.25f * hsum_float_8(acc1);
+    }
+    if (q < ns) {
+        ggml_vec_dot_iq3_xxs_q8_K(n[q], s + q, 0, vx[q], 0, vy[q], 0, 1);
+    }
+}
+#endif
+
 void ggml_vec_dot_iq3_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(n % QK_K == 0);
     assert(nrc == 1);
