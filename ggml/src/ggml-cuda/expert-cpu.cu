@@ -334,6 +334,10 @@ struct expert_cpu_group {
     int64_t                  nh[2]    = { 0, 0 };
     int                      n_seg[2] = { 0, 0 };
     expert_cpu_dseg          seg[2][GGML_CUDA_MAX_DEVICES];
+    // the gate and up rows [r0, r1) each socket computes: not bound to whole blocks like the hidden rows, so that both
+    //   sockets get as much work. Rows of the other socket's hidden are computed first and handed over (x_req)
+    int64_t                  r0[2]    = { 0, 0 };
+    int64_t                  r1[2]    = { 0, 0 };
 };
 
 #define EXPERT_CPU_MAX_GROUPS 1024
@@ -460,6 +464,9 @@ struct expert_cpu_socket {
     alignas(64) std::atomic<int>      done_cnt{0};
     alignas(64) std::atomic<int>      sleeping{0};
     std::atomic<uint32_t>             wake{0};
+    // the threads of the other socket that wrote their rows of this socket's hidden, and the request of the last of them
+    alignas(64) std::atomic<int>      x_cnt{0};
+    alignas(64) std::atomic<uint32_t> x_req{0};
 
     // the job, written by the leader before gen
     alignas(64) const expert_cpu_group * G = nullptr;
@@ -727,9 +734,11 @@ static void expert_cpu_call_done(expert_cpu_service & S, expert_cpu_socket & K, 
     }
 }
 
-// The K split: socket g computes the hidden rows [f0, f0 + nh) of every expert (its half of gate and up, on its node),
-//   quantizes them and multiplies them with the down pieces of the same K range, for every output row: a partial sum the
-//   GPU adds to the other socket's. The barriers are within the socket, and each socket signals its own completion.
+// The K split: socket g has the hidden rows [f0, f0 + nh) of every expert, quantizes them and multiplies them with the
+//   down pieces of the same K range, for every output row: a partial sum the GPU adds to the other socket's. It computes
+//   the gate and up rows [r0, r1), which are its hidden rows unless the K range splits unevenly on whole blocks
+//   (DeepSeek-V4.1: 2304 = 5 + 4 blocks of 256): then one socket also computes some of the other's hidden rows, first,
+//   and hands them over. The barriers are within the socket, and each socket signals its own completion.
 static void expert_cpu_work_k(expert_cpu_service & S, expert_cpu_socket & K, const int t) {
     EXPERT_CPU_MARK(S, t, 0);
     const expert_cpu_group &        G  = *K.G;
@@ -745,25 +754,49 @@ static void expert_cpu_work_k(expert_cpu_service & S, expert_cpu_socket & K, con
     const int     k  = K.k;
     const int64_t f0 = G.f0[g];
     const int64_t nh = G.nh[g];
+    const int     o  = 1 - g;
+    expert_cpu_socket & KO = *S.sock[o];
 
-    // gate and up: the socket's hidden rows of every expert
-    const int64_t n1 = (int64_t) k*nh;
-    for (int64_t i = n1*r/ng; i < n1*(r + 1)/ng; i++) {
-        const int     j  = (int) (i / nh);
-        const int64_t hr = i % nh;
-        const float   gv = expert_cpu_row_dot(mg, tg, K.ids[j], f0 + hr, K.xq, G.xq_type);
-        const float   uv = expert_cpu_row_dot(mu, tu, K.ids[j], f0 + hr, K.xq, G.xq_type);
-        K.hidden[(size_t) j*nh + hr] = expert_cpu_glu(G, gv, uv);
+    // gate and up: the rows [a, b) of every expert, into the hidden of the socket that has them
+    auto gate_up = [&](const int64_t a, const int64_t b, expert_cpu_socket & KH, const int64_t h0, const int64_t hn) {
+        if (b <= a) {
+            return;
+        }
+        const int64_t n  = b - a;
+        const int64_t n1 = (int64_t) k*n;
+        for (int64_t i = n1*r/ng; i < n1*(r + 1)/ng; i++) {
+            const int     j   = (int) (i / n);
+            const int64_t row = a + i % n;
+            const float   gv  = expert_cpu_row_dot(mg, tg, K.ids[j], row, K.xq, G.xq_type);
+            const float   uv  = expert_cpu_row_dot(mu, tu, K.ids[j], row, K.xq, G.xq_type);
+            KH.hidden[(size_t) j*hn + (row - h0)] = expert_cpu_glu(G, gv, uv);
+        }
+    };
+    // first the rows of the other socket's hidden, then the own ones
+    const int64_t x0 = std::max(G.r0[g], G.f0[o]);
+    const int64_t x1 = std::min(G.r1[g], G.f0[o] + G.nh[o]);
+    if (x0 < x1) {
+        gate_up(x0, x1, KO, G.f0[o], G.nh[o]);
+        if (KO.x_cnt.fetch_add(1, std::memory_order_acq_rel) == ng - 1) {
+            KO.x_cnt.store(0, std::memory_order_relaxed);
+            KO.x_req.store(K.req, std::memory_order_release);
+        }
     }
+    gate_up(std::max(G.r0[g], f0), std::min(G.r1[g], f0 + nh), K, f0, nh);
     EXPERT_CPU_MARK(S, t, 1);
     expert_cpu_barrier_n(K.bar_cnt, K.bar_gen, ng);
     EXPERT_CPU_MARK(S, t, 2);
 
     // The hidden rows in the vec_dot type of down. Every thread of the socket reads all of them for every output row, and
     //   lines that several cores wrote stay slow to read for all of them: chunks of 256 by every thread made the down
-    //   phase 107 us instead of 88 (1.86 experts, 14 threads). So one thread writes each expert's row.
+    //   phase 107 us instead of 88 (1.86 experts, 14 threads). So one thread writes each expert's row, once the rows the
+    //   other socket computes are in.
+    const bool   recv   = std::max(G.r0[o], f0) < std::min(G.r1[o], f0 + nh);
     const size_t hq_row = expert_cpu_hq_row(G.hq_type, nh);
     for (int j = r; j < k; j += ng) {
+        while (recv && K.x_req.load(std::memory_order_acquire) != K.req) {
+            _mm_pause();
+        }
         expert_cpu_quantize(G.hq_type, K.hidden + (size_t) j*nh, K.hq + (size_t) j*hq_row, nh);
     }
     EXPERT_CPU_MARK(S, t, 3);
@@ -1227,6 +1260,21 @@ static bool expert_cpu_group_ksplit(expert_cpu_group & G, const int n_grps) {
             s.y_off     = ggml_row_size(G.hq_type, lo - G.f0[g]);
             s.n         = (int) (hi - lo);
         }
+        G.r0[g] = G.f0[g];
+        G.r1[g] = G.f0[g] + G.nh[g];
+    }
+    // Uneven hidden ranges: the gate and up rows split so that both sockets get as much work, gate and up rows against
+    //   down columns by their bytes, a byte of down costing GGML_CUDA_EXPERT_CPU_DOWN_COST of gate and up (DeepSeek-V4.1
+    //   IQ3_XXS: 15.5 vs 25.6 GB/s per socket), on cache lines of the hidden. GGML_CUDA_EXPERT_CPU_BALANCE=0: the own rows.
+    static const bool  balance   = expert_cpu_env_f("GGML_CUDA_EXPERT_CPU_BALANCE", 1.0f) != 0.0f;
+    static const float down_cost = expert_cpu_env_f("GGML_CUDA_EXPERT_CPU_DOWN_COST", 1.65f);
+    if (balance && n_grps == 2 && G.nh[0] != G.nh[1]) {
+        const double c_gu   = (double) (ggml_row_size(G.mat[0].type, G.mat[0].k) + ggml_row_size(G.mat[1].type, G.mat[1].k));
+        const double c_down = down_cost*(double) md.n_rows*(double) ggml_type_size(md.type)/(double) bd;
+        const double h      = 0.5*((double) n_ff + c_down/c_gu*(double) (G.nh[1] - G.nh[0]));
+        const int64_t h0    = std::min(n_ff, std::max<int64_t>(0, ((int64_t) llround(h) + 8)/16*16));
+        G.r1[0] = h0;
+        G.r0[1] = h0;
     }
     return true;
 }
@@ -1290,8 +1338,8 @@ int ggml_cuda_expert_cpu_group(const ggml_tensor * gate_pool, const ggml_tensor 
                 fprintf(stderr, "\n");
             }
             for (int g = 0; S != nullptr && S->ksplit && g < S->n_grps; g++) {
-                fprintf(stderr, "expert-cpu: group %d socket %d hidden [%lld, %lld) down segments:", idx, g, (long long) G.f0[g],
-                    (long long) (G.f0[g] + G.nh[g]));
+                fprintf(stderr, "expert-cpu: group %d socket %d hidden [%lld, %lld) gate/up rows [%lld, %lld) down segments:", idx, g,
+                    (long long) G.f0[g], (long long) (G.f0[g] + G.nh[g]), (long long) G.r0[g], (long long) G.r1[g]);
                 for (int q = 0; q < G.n_seg[g]; q++) {
                     fprintf(stderr, " [x_off %zu rb %zu y_off %zu n %d]", G.seg[g][q].x_off, G.seg[g][q].row_bytes, G.seg[g][q].y_off,
                         G.seg[g][q].n);
