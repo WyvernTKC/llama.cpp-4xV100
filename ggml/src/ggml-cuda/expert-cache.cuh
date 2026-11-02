@@ -18,10 +18,17 @@ struct ggml_cuda_expert_cache;
 // host_buf/host_buf_size: the ggml buffer holding the weight, registered with CUDA once (page-locked, mapped).
 // host_ptr: the weight's data. chunk_full/chunk_dev/offset_dev/n_chunks describe this device's slice of one
 // expert, see ggml_backend_meta_set_tensor_async_dev. Returns nullptr when the memory cannot be registered.
+// slot_stride: bytes between pool slots, 0 = one slot. cap_now (optional): device memory with the slots in use now, see
+// ggml_cuda_expert_cache_lend.
 void * ggml_cuda_expert_cache_create(int device, const void * host_buf, size_t host_buf_size,
     const void * host_ptr, int64_t n_expert, int cap, size_t expert_bytes, size_t chunk_full, size_t chunk_dev,
-    size_t offset_dev, int64_t n_chunks, int max_ids);
+    size_t offset_dev, int64_t n_chunks, int max_ids, size_t slot_stride, int32_t * cap_now);
 void ggml_cuda_expert_cache_free(void * cache);
+
+// Lending part of the pools: every cache of ctx's device created with cap_now loses the experts of its slots at and past
+//   cap, and *cap_now = cap, so the plans only use the slots below it; cap = the full capacity gives them back. zero
+//   (optional) is cleared first. Waits for every stream of the device before and for the stream of ctx after.
+bool ggml_cuda_expert_cache_lend(ggml_backend_cuda_context & ctx, int32_t * cap_now, int cap, void * zero, size_t zero_size);
 
 bool ggml_cuda_expert_cache_is(const ggml_tensor * pool);
 

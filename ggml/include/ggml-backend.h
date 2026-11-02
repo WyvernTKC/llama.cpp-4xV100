@@ -224,10 +224,16 @@ extern "C" {
     // into the extra of a pool tensor holding cap experts of this device's slice; MUL_MAT_ID on that pool gathers
     // the routed experts from host memory itself. The slice of one expert is n_chunks pieces of chunk_dev bytes
     // at offset_dev inside chunks of chunk_full bytes; host_buf/host_buf_size is the buffer to page-lock.
+    //   slot_stride: bytes between slots (0 = one slot); cap_now (optional): device memory holding how many slots are in use
     typedef void * (*ggml_backend_expert_cache_create_t)(ggml_backend_dev_t dev, const void * host_buf, size_t host_buf_size,
         const void * host_ptr, int64_t n_expert, int cap, size_t expert_bytes, size_t chunk_full, size_t chunk_dev,
-        size_t offset_dev, int64_t n_chunks, int max_ids);
+        size_t offset_dev, int64_t n_chunks, int max_ids, size_t slot_stride, int32_t * cap_now);
     typedef void   (*ggml_backend_expert_cache_free_t)(void * cache);
+    // The caches of backend's device made with cap_now empty their slots at and past cap and use only the slots below it;
+    //   zero/zero_size (optional) is cleared first. Synchronizes the device.
+    typedef bool   (*ggml_backend_expert_cache_lend_t)(ggml_backend_t backend, int32_t * cap_now, int cap, void * zero, size_t zero_size);
+    // A buffer of the device's default type over device memory the caller owns and keeps after the buffer is freed
+    typedef ggml_backend_buffer_t (*ggml_backend_dev_buffer_from_dev_ptr_t)(ggml_backend_dev_t dev, void * ptr, size_t size);
     // For a ubatch too wide for the pool: copies the experts the pool holds from pool_data into dst, a whole copy of
     //   this device's slice with one pool-sized slot per expert, on the stream of backend. read_slots gives the pool
     //   slot of every expert (-1 when absent), so the caller can copy the others from host memory.
@@ -436,6 +442,17 @@ extern "C" {
     // offloaded weight. The cache is all-or-nothing, so this means the cap does not fit the VRAM
     // left at this context length and decode fell back to whole-layer staging.
     GGML_API bool                 ggml_backend_expert_cache_degraded(void);
+
+    // Lending the device memory a context uses only for wide ubatches (its main compute buffer and the staging slots)
+    //   to the device expert cache while the graph slots run (GGML_META_EXPERT_LEND=0: off). init lays the pools of the
+    //   given host MoE weights out in one arena per device, sized for compute_size bytes of main compute buffer, and
+    //   returns the buffer type the context's main scheduler allocates from, NULL when it does not lend. take gives the
+    //   memory back to the main scheduler: call it before a main graph sets its inputs. give lends it to the cache again:
+    //   call it before a graph of the slots runs. Both synchronize the devices when they change anything.
+    GGML_API ggml_backend_buffer_type_t ggml_backend_meta_expert_lend_init(ggml_backend_buffer_type_t meta_buft,
+                                                                           struct ggml_tensor ** weights, int n_weights, size_t compute_size);
+    GGML_API bool                       ggml_backend_meta_expert_lend_take(ggml_backend_t backend);
+    GGML_API bool                       ggml_backend_meta_expert_lend_give(ggml_backend_t backend);
 
     //
     // Meta backend

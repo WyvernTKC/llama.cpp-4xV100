@@ -536,6 +536,16 @@ private:
     uint32_t gf_slots_noout_max = 0;
     bool     gf_slots_host_experts = false; // some expert weights are in host memory
 
+    // While only slots run, the main compute buffer and the staging slots are lent to the device expert cache
+    //   (ggml_backend_meta_expert_lend_init); a main graph takes them back first. A give waits for lend_delay slot graphs
+    //   in a row, which doubles when the main graph comes back soon after a give (-np > 1, wide draft batches).
+    ggml_backend_buffer_type_t expert_lend_buft    = nullptr; // the main scheduler's in place of the meta backend's
+    ggml_backend_t             expert_lend_backend = nullptr;
+    int32_t                    expert_lend_delay   = 1;
+    int32_t                    expert_lend_slots   = 0; // slot graphs since the last main graph
+    int32_t                    expert_lend_lent    = 0; // slot graphs since the last give
+    void expert_lend_step(bool main_graph);
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 

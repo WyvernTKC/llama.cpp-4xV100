@@ -28,13 +28,15 @@ struct ggml_cuda_expert_cache_dev {
     size_t       chunk_full;   // bytes of one chunk of an expert in the full tensor
     size_t       chunk_dev;    // this device's share of a chunk
     size_t       offset_dev;   // where that share starts inside the chunk
-    size_t       slot_bytes;   // pool stride between slots, n_chunks*chunk_dev
+    size_t       slot_bytes;   // bytes of one slot, n_chunks*chunk_dev
+    size_t       slot_stride;  // pool stride between slots: slot_bytes, or the block of a lending arena (all pooled weights)
     int          n_chunks;
     int          n_expert;
     int          cap;
     int          max_ids;
     int          cpu_slot;  // what the ids of an expert the CPU computes read: cap, the zeroed slot past the pool, when the
                             //   pool has one (a whole slot of headroom: split by rows), else 0 (its input must be zero)
+    const int32_t * cap_now; // lending: the slots [0, *cap_now) in use now, the others are lent and empty; nullptr: cap
 
     int32_t  * slot_of;     // [n_expert] pool slot of an expert, -1 when absent
     int32_t  * expert_of;   // [cap]
@@ -295,6 +297,7 @@ static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_group g, c
 
     const int      n_ids = n_rows*n_per_row;
     const uint32_t clock = *d.clock;
+    const int      cap   = d.cap_now != nullptr ? *d.cap_now : d.cap; // the slots a miss may take
     const bool     fr    = d.freq != nullptr;
     const uint32_t win   = fr ? d.win_of[d.cap] + 1 : 0;           // this window
     const uint32_t tok   = fr ? d.win_of[d.cap + 1] + n_rows : 0;  // the token count after it
@@ -404,7 +407,7 @@ static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_group g, c
             int      best_i = 0x7fffffff;
             if (fr) {
                 float best_s = INFINITY;
-                for (int s = lane; s < d.cap; s += WARP_SIZE) {
+                for (int s = lane; s < cap; s += WARP_SIZE) {
                     const float sc = s_score[s];
                     if (sc != INFINITY && expert_cache_fr_less(sc, s_last[s], s, best_s, best, best_i)) {
                         best_s = sc;
@@ -423,7 +426,7 @@ static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_group g, c
                     }
                 }
             } else {
-                for (int s = lane; s < d.cap; s += WARP_SIZE) {
+                for (int s = lane; s < cap; s += WARP_SIZE) {
                     const uint32_t v = s_last[s];
                     if (v < best) {
                         best   = v;
@@ -508,7 +511,7 @@ static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_group g, c
         int      best_i = 0x7fffffff;
         float    best_s = INFINITY;
         if (fr) {
-            for (int s = threadIdx.x; s < d.cap; s += blockDim.x) {
+            for (int s = threadIdx.x; s < cap; s += blockDim.x) {
                 if (d.win_of[s] == win) {
                     continue; // used in this window
                 }
@@ -530,7 +533,7 @@ static __global__ void expert_cache_plan(const ggml_cuda_expert_cache_group g, c
                 }
             }
         } else {
-            for (int s = threadIdx.x; s < d.cap; s += blockDim.x) {
+            for (int s = threadIdx.x; s < cap; s += blockDim.x) {
                 const uint32_t v = d.last_used[s];
                 if (v < best) {
                     best   = v;
@@ -604,7 +607,7 @@ static __device__ __forceinline__ void expert_cache_copy_slot(const ggml_cuda_ex
     const int    e     = d.miss_expert[m];
     const int    s     = d.miss_slot[m];
     const char * src_e = d.host + (size_t) e*d.expert_bytes + d.offset_dev;
-    char       * dst_s = pool + (size_t) s*d.slot_bytes;
+    char       * dst_s = pool + (size_t) s*d.slot_stride;
 
     const size_t n = d.slot_bytes / sizeof(T);
     for (size_t i = (size_t) blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x*blockDim.x) {
@@ -623,7 +626,7 @@ static __device__ __forceinline__ void expert_cache_copy_slot_covering(const ggm
     const int    e     = d.miss_expert[m];
     const int    s     = d.miss_slot[m];
     const char * src_e = d.host + (size_t) e*d.expert_bytes + d.offset_dev;
-    char       * dst_s = pool + (size_t) s*d.slot_bytes;
+    char       * dst_s = pool + (size_t) s*d.slot_stride;
 
     const size_t nw = (d.chunk_dev + 14) / 8; // the words a chunk can touch
     const size_t n  = (size_t) d.n_chunks * nw;
@@ -676,7 +679,7 @@ static __global__ void expert_cache_fill(const ggml_cuda_expert_cache_dev d, con
         if (s < 0) {
             continue;
         }
-        const T * src_s = (const T *) (pool + (size_t) s*d.slot_bytes);
+        const T * src_s = (const T *) (pool + (size_t) s*d.slot_stride);
         T *       dst_e = (T *) (dst + (size_t) e*d.slot_bytes);
         for (size_t i = threadIdx.x; i < n; i += blockDim.x) {
             dst_e[i] = src_s[i];
@@ -702,6 +705,7 @@ static __global__ void expert_cache_warm_plan(const ggml_cuda_expert_cache_dev d
 
     // every stamp so far is below clock, see expert_cache_plan
     const uint32_t clock = *d.clock;
+    const int      cap   = d.cap_now != nullptr ? *d.cap_now : d.cap; // lent slots stay empty
     if (threadIdx.x == 0) {
         s_n_sel   = 0;
         s_n_empty = 0;
@@ -710,7 +714,7 @@ static __global__ void expert_cache_warm_plan(const ggml_cuda_expert_cache_dev d
     for (int e = threadIdx.x; e < d.n_expert; e += blockDim.x) {
         s_cnt[e] = 0;
     }
-    for (int s = threadIdx.x; s < d.cap; s += blockDim.x) {
+    for (int s = threadIdx.x; s < cap; s += blockDim.x) {
         s_last[s] = d.last_used[s];
         s_exp[s]  = d.expert_of[s];
         if (s_exp[s] < 0) {
@@ -765,7 +769,7 @@ static __global__ void expert_cache_warm_plan(const ggml_cuda_expert_cache_dev d
             const int c2 = s_cnt[e2];
             r += c2 > c || (c2 == c && e2 < e);
         }
-        if (r < d.cap) {
+        if (r < cap) {
             s_sel[r] = e;
             atomicAdd(&s_n_sel, 1);
         }
@@ -801,7 +805,7 @@ static __global__ void expert_cache_warm_plan(const ggml_cuda_expert_cache_dev d
         }
         uint32_t best   = 0xffffffffu;
         int      best_i = 0x7fffffff;
-        for (int s = lane; s < d.cap; s += WARP_SIZE) {
+        for (int s = lane; s < cap; s += WARP_SIZE) {
             const uint32_t v = top || s_exp[s] < 0 ? s_last[s] : 0xffffffffu;
             if (v < best) {
                 best   = v;
@@ -860,7 +864,7 @@ static __global__ void expert_cache_check(const ggml_cuda_expert_cache_dev d, co
         return;
     }
     const char * src_e = d.host + (size_t) e*d.expert_bytes + d.offset_dev;
-    const char * dst_s = pool + (size_t) blockIdx.x*d.slot_bytes;
+    const char * dst_s = pool + (size_t) blockIdx.x*d.slot_stride;
     unsigned int n_bad = 0;
     for (size_t off = threadIdx.x; off < d.slot_bytes; off += blockDim.x) {
         const size_t c = off / d.chunk_dev;
@@ -967,8 +971,8 @@ static int expert_cache_align(std::initializer_list<size_t> values) {
 
 void * ggml_cuda_expert_cache_create(int device, const void * host_buf, size_t host_buf_size,
         const void * host_ptr, int64_t n_expert, int cap, size_t expert_bytes, size_t chunk_full, size_t chunk_dev,
-        size_t offset_dev, int64_t n_chunks, int max_ids) {
-    if (cap <= 0 || max_ids <= 0 || chunk_dev == 0) {
+        size_t offset_dev, int64_t n_chunks, int max_ids, size_t slot_stride, int32_t * cap_now) {
+    if (cap <= 0 || max_ids <= 0 || chunk_dev == 0 || (slot_stride != 0 && slot_stride < (size_t) n_chunks*chunk_dev)) {
         return nullptr;
     }
 
@@ -985,6 +989,7 @@ void * ggml_cuda_expert_cache_create(int device, const void * host_buf, size_t h
     c->d.chunk_dev    = chunk_dev;
     c->d.offset_dev   = offset_dev;
     c->d.slot_bytes   = (size_t) n_chunks*chunk_dev;
+    c->d.slot_stride  = slot_stride != 0 ? slot_stride : c->d.slot_bytes;
     c->d.n_chunks     = (int) n_chunks;
     c->d.n_expert     = (int) n_expert;
     c->d.cap          = cap;
@@ -992,9 +997,11 @@ void * ggml_cuda_expert_cache_create(int device, const void * host_buf, size_t h
     // the meta backend leaves one chunk of zeroed headroom past the pool (ggml_backend_meta_gathered_weight_get): a whole
     //   slot when the weight is split by rows
     c->d.cpu_slot     = n_chunks == 1 && chunk_full == expert_bytes ? cap : 0;
+    c->d.cap_now      = cap_now;
     c->warm.cache     = c;
     c->host_cpu       = (const char *) host_ptr;
-    c->align = expert_cache_align({(size_t) (uintptr_t) dev_ptr, expert_bytes, chunk_full, chunk_dev, offset_dev, c->d.slot_bytes});
+    c->align = expert_cache_align({(size_t) (uintptr_t) dev_ptr, expert_bytes, chunk_full, chunk_dev, offset_dev, c->d.slot_bytes,
+        c->d.slot_stride});
     c->covering = c->align < 4 && expert_cache_align({(size_t) (uintptr_t) dev_ptr, expert_bytes, chunk_full}) >= 8;
 
     const expert_cache_policy pol = expert_cache_policy_get();
@@ -1114,7 +1121,7 @@ void ggml_cuda_expert_cache_gather_group(ggml_backend_cuda_context & ctx, const 
     for (int k = 0; k < n; k++) {
         const ggml_cuda_expert_cache * c = (const ggml_cuda_expert_cache *) pools[k]->extra;
         GGML_ASSERT(n_rows*n_per_row <= c->d.max_ids);
-        GGML_ASSERT(pools[k]->nb[2] == c->d.slot_bytes);
+        GGML_ASSERT(pools[k]->nb[2] == c->d.slot_stride);
         g.d[k]     = c->d;
         g.pool[k]  = (char *) pools[k]->data;
         g.align[k] = c->covering ? -c->align : c->align;
@@ -1250,7 +1257,7 @@ void ggml_cuda_expert_cache_warm(ggml_backend_cuda_context & ctx, const ggml_ten
     g.d[0].offset_dev   = 0;
     g.d[0].n_chunks     = 1;
     g.pool[0]           = tag->pool;
-    g.align[0]          = expert_cache_align({(size_t) (uintptr_t) staged->data, (size_t) (uintptr_t) tag->pool, d.slot_bytes});
+    g.align[0]          = expert_cache_align({(size_t) (uintptr_t) staged->data, (size_t) (uintptr_t) tag->pool, d.slot_bytes, d.slot_stride});
     const int nthreads = 256;
     const int nbx      = (int) std::min<size_t>(64, (d.slot_bytes/g.align[0] + nthreads - 1)/nthreads);
     expert_cache_copy<<<dim3(std::max(nbx, 1), d.cap, 1), nthreads, 0, stream>>>(g);
@@ -1322,4 +1329,60 @@ bool ggml_cuda_expert_cache_cpu_mat(const ggml_tensor * pool, ggml_cuda_expert_c
 bool ggml_cuda_expert_cache_zero_slot(const ggml_tensor * pool) {
     return ggml_cuda_expert_cache_is(pool) && ((const ggml_cuda_expert_cache *) pool->extra)->d.cpu_slot ==
         ((const ggml_cuda_expert_cache *) pool->extra)->d.cap;
+}
+
+// One block per cache: its slots at and past cap lose their experts
+static __global__ void expert_cache_lend_set(const ggml_cuda_expert_cache_dev * ds, const int n, int32_t * cap_now, const int cap) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        *cap_now = cap;
+    }
+    if ((int) blockIdx.x >= n) {
+        return;
+    }
+    const ggml_cuda_expert_cache_dev & d = ds[blockIdx.x];
+    for (int s = cap + threadIdx.x; s < d.cap; s += blockDim.x) {
+        const int e = d.expert_of[s];
+        if (e >= 0) {
+            d.slot_of[e] = -1;
+        }
+        d.expert_of[s] = -1;
+        d.last_used[s] = 0;
+        if (d.win_of != nullptr) {
+            d.win_of[s] = 0;
+        }
+    }
+}
+
+bool ggml_cuda_expert_cache_lend(ggml_backend_cuda_context & ctx, int32_t * cap_now, int cap, void * zero, size_t zero_size) {
+    if (cap_now == nullptr || cap <= 0) {
+        return false;
+    }
+    std::vector<ggml_cuda_expert_cache_dev> ds;
+    {
+        std::lock_guard<std::mutex> lock(g_caches_mutex);
+        for (const ggml_cuda_expert_cache * c : g_caches) {
+            if (c->device == ctx.device && c->d.cap_now == cap_now) {
+                if (cap > c->d.cap) {
+                    return false;
+                }
+                ds.push_back(c->d);
+            }
+        }
+    }
+    ggml_cuda_set_device(ctx.device);
+    // every stream of the device: the caches are shared by the contexts of the model, each with its own streams
+    CUDA_CHECK(cudaDeviceSynchronize());
+    cudaStream_t stream = ctx.stream();
+    if (zero != nullptr && zero_size > 0) {
+        CUDA_CHECK(cudaMemsetAsync(zero, 0, zero_size, stream));
+    }
+    ggml_cuda_pool_alloc<ggml_cuda_expert_cache_dev> ds_dev(ctx.pool(), std::max<size_t>(ds.size(), 1));
+    if (!ds.empty()) {
+        CUDA_CHECK(cudaMemcpyAsync(ds_dev.get(), ds.data(), ds.size()*sizeof(ds[0]), cudaMemcpyHostToDevice, stream));
+    }
+    expert_cache_lend_set<<<std::max<int>((int) ds.size(), 1), 256, 0, stream>>>(ds_dev.get(), (int) ds.size(), cap_now, cap);
+    CUDA_CHECK(cudaGetLastError());
+    // the next gathers of the other contexts and the copies of the staging streams come after it
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return true;
 }

@@ -943,6 +943,7 @@ struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+    bool owned = true; // false: device memory of the caller, see ggml_backend_cuda_buffer_from_dev_ptr
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
@@ -950,7 +951,9 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+        if (owned) {
+            CUDA_CHECK(cudaFree(dev_ptr));
+        }
     }
 };
 
@@ -11892,13 +11895,31 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 // Expert cache in device memory for a MoE weight left in host memory, see expert-cache.cuh.
 static void * ggml_backend_cuda_expert_cache_create(ggml_backend_dev_t dev, const void * host_buf, size_t host_buf_size,
         const void * host_ptr, int64_t n_expert, int cap, size_t expert_bytes, size_t chunk_full, size_t chunk_dev,
-        size_t offset_dev, int64_t n_chunks, int max_ids) {
+        size_t offset_dev, int64_t n_chunks, int max_ids, size_t slot_stride, int32_t * cap_now) {
     if (dev == nullptr || ggml_backend_dev_backend_reg(dev) != ggml_backend_cuda_reg()) {
         return nullptr;
     }
     const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
     return ggml_cuda_expert_cache_create(device, host_buf, host_buf_size, host_ptr, n_expert, cap, expert_bytes,
-        chunk_full, chunk_dev, offset_dev, n_chunks, max_ids);
+        chunk_full, chunk_dev, offset_dev, n_chunks, max_ids, slot_stride, cap_now);
+}
+
+static bool ggml_backend_cuda_expert_cache_lend(ggml_backend_t backend, int32_t * cap_now, int cap, void * zero, size_t zero_size) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    return ggml_cuda_expert_cache_lend(*(ggml_backend_cuda_context *) backend->context, cap_now, cap, zero, zero_size);
+}
+
+// A buffer of the device's default type over device memory the caller owns: freeing it leaves the memory alone
+static ggml_backend_buffer_t ggml_backend_cuda_buffer_from_dev_ptr(ggml_backend_dev_t dev, void * ptr, size_t size) {
+    if (dev == nullptr || ggml_backend_dev_backend_reg(dev) != ggml_backend_cuda_reg() || ptr == nullptr) {
+        return nullptr;
+    }
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(device, ptr);
+    ctx->owned = false;
+    return ggml_backend_buffer_init(ggml_backend_cuda_buffer_type(device), ggml_backend_cuda_buffer_interface, ctx, size);
 }
 
 static void ggml_backend_cuda_expert_cache_free(void * cache) {
@@ -11943,6 +11964,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_expert_cache_warm_tag") == 0) {
         return (void *)ggml_cuda_expert_cache_warm_tag;
+    }
+    if (strcmp(name, "ggml_backend_expert_cache_lend") == 0) {
+        return (void *)ggml_backend_cuda_expert_cache_lend;
+    }
+    if (strcmp(name, "ggml_backend_dev_buffer_from_dev_ptr") == 0) {
+        return (void *)ggml_backend_cuda_buffer_from_dev_ptr;
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_launch") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_launch;

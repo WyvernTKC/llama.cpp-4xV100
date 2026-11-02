@@ -767,8 +767,14 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
 }
 
 void llama_context::sched_new(size_t max_nodes, bool parallel) {
+    std::vector<ggml_backend_buffer_type_t> bufts = backend_buft;
+    for (size_t i = 0; i < bufts.size(); ++i) {
+        if (expert_lend_buft != nullptr && backend_ptrs[i] == expert_lend_backend) {
+            bufts[i] = expert_lend_buft;
+        }
+    }
     sched.reset(ggml_backend_sched_new(
-            backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
+            backend_ptrs.data(), bufts.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
@@ -838,6 +844,31 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
 
     resolve_fused_ops(mctx.get(), n_seqs);
+
+    // the device expert cache borrows the main compute buffer while the graph slots run: size it from the pp graph, then
+    //   allocate it in the arena of the pools of the host expert weights (not the MTP layers, the main graph skips them)
+    if (expert_lend_buft == nullptr && gf_slots_max > 0 && gf_slots_host_experts && !model.no_alloc() && !moe_cache &&
+            !cparams.pipeline_parallel && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        std::vector<size_t> sizes(backend_ptrs.size(), 0);
+        auto * gf = graph_reserve(n_tokens, n_seqs, std::min(n_tokens, cparams.n_outputs_max), mctx.get(), true, sizes.data());
+        std::vector<ggml_tensor *> weights;
+        for (uint32_t il = 0; gf != nullptr && il < model.hparams.n_layer() && il < model.layers.size(); ++il) {
+            const auto & layer = model.layers[il];
+            for (ggml_tensor * w : { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps, layer.ffn_gate_up_exps }) {
+                if (w != nullptr && w->buffer != nullptr && ggml_backend_buffer_is_host(w->buffer)) {
+                    weights.push_back(w);
+                }
+            }
+        }
+        for (size_t i = 0; !weights.empty() && expert_lend_buft == nullptr && i < backend_ptrs.size(); ++i) {
+            expert_lend_buft = ggml_backend_meta_expert_lend_init(backend_buft[i], weights.data(), (int) weights.size(), sizes[i]);
+            expert_lend_backend = expert_lend_buft != nullptr ? backend_ptrs[i] : nullptr;
+        }
+        if (expert_lend_buft != nullptr) {
+            sched_new(max_nodes, cparams.pipeline_parallel);
+            sched_cur = sched.get();
+        }
+    }
 
     // reserve worst-case graph
     int n_splits_pp        = -1;
@@ -1768,6 +1799,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     graph_slot * slot = get_gf_slot(ubatch);
+
+    if (expert_lend_buft != nullptr) {
+        expert_lend_step(slot == nullptr);
+    }
 
     sched_cur = slot ? slot->sched.get() : sched.get();
 
@@ -2949,6 +2984,22 @@ llama_context::graph_slot * llama_context::get_gf_slot(const llama_ubatch & ubat
         slot.active = false;
     }
     return &slot;
+}
+
+void llama_context::expert_lend_step(bool main_graph) {
+    if (main_graph) {
+        expert_lend_slots = 0;
+        if (ggml_backend_meta_expert_lend_take(expert_lend_backend)) {
+            expert_lend_delay = expert_lend_lent < 32 ? std::min(2*expert_lend_delay, 1024) : std::max(1, expert_lend_delay/2);
+            // the cache wrote over the compute buffer: build the graph again, so that nothing reads what an input left there
+            gf_res_prev_active = nullptr;
+        }
+        return;
+    }
+    if (++expert_lend_slots >= expert_lend_delay && ggml_backend_meta_expert_lend_give(expert_lend_backend)) {
+        expert_lend_lent = 0;
+    }
+    expert_lend_lent++;
 }
 
 void llama_context::gf_slots_invalidate(bool free_slots) {
