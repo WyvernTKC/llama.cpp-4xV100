@@ -126,10 +126,11 @@ void ggml_cuda_flash_attn_ext_compact_mask(
     const dim3 block_dim(256, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
     // the last group of queries is partial only if ncols1 does not divide n_queries
-    // ncols1 == 4 is the Volta union tile
-    GGML_ASSERT(ncols1 == 1 || ncols1 == 4 || ncols1 == 8);
+    // ncols1 == 4 and 2 are the Volta union tiles of 8 and 16 heads
+    GGML_ASSERT(ncols1 == 1 || ncols1 == 2 || ncols1 == 4 || ncols1 == 8);
     const bool oob = n_queries % ncols1 != 0;
     const auto kernel = ncols1 == 1 ? flash_attn_mask_to_sparse_indices<1, false> :
+                        ncols1 == 2 ? (oob ? flash_attn_mask_to_sparse_indices<2, true> : flash_attn_mask_to_sparse_indices<2, false>) :
                         ncols1 == 4 ? (oob ? flash_attn_mask_to_sparse_indices<4, true> : flash_attn_mask_to_sparse_indices<4, false>) :
                                       (oob ? flash_attn_mask_to_sparse_indices<8, true> : flash_attn_mask_to_sparse_indices<8, false>);
     ggml_cuda_kernel_launch(kernel, launch_params,
@@ -164,6 +165,11 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
         return false;
     }
 
+    // the multi-query 576/512 tiles are the Volta union tiles, the other archs gather for one query
+    if (Q->ne[0] == 576 && ncols1 > 1 && !volta_mma_available(cc)) {
+        return false;
+    }
+
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
 
     // the dense kernel handles up to 64/ncols2 queries per K/V pass, the single-query gather has to beat that
@@ -172,9 +178,14 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     // Volta's multi-query tile also pays for the gather and is narrower than the dense tile, so it needs more
     //   headroom: measured on DS4-FV (4x V100) the 4-wide tile costs ~45% of the dense pass at 16k keys, which
     //   puts its crossover near 3x its worst-case union rather than 2x. At head size 128 the 4-wide tile is cheaper:
-    //   16 q heads on 1 kv head, 256 queries and n_kv_max 2048 (MiniMax-M3) cross over near 10k keys, 1.25x the union
+    //   16 q heads on 1 kv head, 256 queries and n_kv_max 2048 (MiniMax-M3) cross over near 10k keys, 1.25x the union.
+    //   At 576/512 the dense kernel spills (255 registers, ~600 B of stack per thread) and the 2-query tile costs the same
+    //   per gathered key, so sparse wins as soon as the worst-case union is below the cache: 16 q heads on 1 kv head,
+    //   1024 queries, n_kv_max 2048 (Mistral-Large-4), q8_0 K, random picks: 10.3 vs 10.5 ms at 4k keys, 14.0 vs 83.1 at
+    //   32k; with the indexer's overlap between consecutive queries (union of 2 ~1.27x one query's picks) 9.4 ms at 32k
     const int64_t break_even = GGML_CUDA_CC_IS_NVIDIA(cc) ?
-        (volta_mma_available(cc) && ncols1 > 1 && Q->ne[0] > 128 ? 3 : 2) * n_gather : 2LL*n_kv_max;
+        (volta_mma_available(cc) && ncols1 > 1 && Q->ne[0] == 576 ? 1 :
+         volta_mma_available(cc) && ncols1 > 1 && Q->ne[0] >  128 ? 3 : 2) * n_gather : 2LL*n_kv_max;
 
     return ((GGML_CUDA_CC_IS_NVIDIA(cc) && (turing_mma_available(cc) || volta_mma_available(cc))) || amd_mfma_available(cc)) &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
@@ -183,7 +194,8 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 #endif // !defined(GGML_USE_MUSA)
 }
 
-// Volta has no device code below 32 columns, so its sparse tile is 4 queries of 8 heads each
+// Volta has no device code below 32 columns, so its sparse tile is 32 columns wide: 4 queries of 8 heads each, and
+//   2 queries of 16 heads for the 576/512 MLA shape (switch_ncols1() takes 32/ncols2)
 static constexpr int GGML_CUDA_VOLTA_SPARSE_NCOLS1 = 4;
 static constexpr int GGML_CUDA_VOLTA_SPARSE_NCOLS2 = 8;
 
@@ -211,10 +223,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
             return;
         }
     }
-    // Volta has no device code below 32 columns: its sparse tile is 4 queries wide with a union index row
-    if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, GGML_CUDA_VOLTA_SPARSE_NCOLS1, ncols2)) {
-        if (volta_mma_available(cc) && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, GGML_CUDA_VOLTA_SPARSE_NCOLS1, ncols2)) {
-            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, GGML_CUDA_VOLTA_SPARSE_NCOLS1, ncols2>(ctx, dst);
+    // Volta has no device code below 32 columns: its sparse tile is 32/ncols2 queries wide with a union index row
+    if constexpr (ncols2 <= 32 && ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 32/ncols2, ncols2)) {
+        if (volta_mma_available(cc) && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 32/ncols2, ncols2)) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
             return;
         }
     }

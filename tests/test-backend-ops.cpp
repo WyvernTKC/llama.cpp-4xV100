@@ -11949,9 +11949,10 @@ struct test_flash_attn_ext_sparse_blocks : public test_flash_attn_ext {
     }
 
     test_flash_attn_ext_sparse_blocks(int64_t hsk, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb,
-                                      int64_t blk, int64_t n_pick, ggml_type type_KV = GGML_TYPE_F16, float q_range = 1.0f)
+                                      int64_t blk, int64_t n_pick, ggml_type type_KV = GGML_TYPE_F16, float q_range = 1.0f,
+                                      bool v_is_view_of_k = false)
         : test_flash_attn_ext(hsk, hsv, nh, nr23, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3},
-                              true, false, blk*n_pick),
+                              true, v_is_view_of_k, blk*n_pick),
           blk(blk), n_pick(n_pick), q_range(q_range) {}
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -11983,6 +11984,66 @@ struct test_flash_attn_ext_sparse_blocks : public test_flash_attn_ext {
                     for (int64_t t = 0; t < blk; ++t) {
                         row[b*blk + t] = dis(gen);
                     }
+                }
+            }
+        }
+        ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), data_f16.size());
+        ggml_backend_tensor_set(m, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+    }
+};
+
+// a sparse mask of drifting top-k picks (DSA): each row keeps n_kv_max cells and swaps a fraction drift of them for new
+//     cells from one row to the next, so consecutive queries share most picks as the lightning indexer's top-k do
+//     (Mistral-Large-4 on wikitext: the union of 2 consecutive queries ~1.27x one query's picks, of 4 ~1.7x, drift ~0.25)
+struct test_flash_attn_ext_sparse_drift : public test_flash_attn_ext {
+    const float drift;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",drift=" + std::to_string(drift);
+    }
+
+    test_flash_attn_ext_sparse_drift(int64_t hsk, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb,
+                                     int64_t n_kv_max, float drift, ggml_type type_KV = GGML_TYPE_F16, bool v_is_view_of_k = false)
+        : test_flash_attn_ext(hsk, hsv, nh, nr23, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3},
+                              true, v_is_view_of_k, n_kv_max),
+          drift(drift) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+
+        ggml_tensor * m = ggml_get_tensor(ctx, "m");
+        const int64_t n_cells = m->ne[0];
+        GGML_ASSERT(n_kv_max > 0 && 2*n_kv_max <= n_cells);
+        std::vector<float> data_f32(ggml_nelements(m), -INFINITY);
+        std::vector<ggml_fp16_t> data_f16(ggml_nelements(m));
+        std::mt19937 gen(0xD21F);
+        std::uniform_int_distribution<int64_t> cell(0, n_cells - 1);
+        std::uniform_real_distribution<float> dis(-1.0f, 0.0f);
+        const int64_t n_swap = std::lround(drift*n_kv_max);
+        for (int64_t s = 0; s < m->ne[3]; ++s) {
+            std::vector<int64_t> picks;
+            std::vector<char> taken(n_cells, 0);
+            while ((int64_t) picks.size() < n_kv_max) {
+                const int64_t c = cell(gen);
+                if (!taken[c]) {
+                    taken[c] = 1;
+                    picks.push_back(c);
+                }
+            }
+            for (int64_t j = 0; j < m->ne[1]; ++j) {
+                for (int64_t k = 0; j > 0 && k < n_swap; ++k) {
+                    const size_t idx = gen() % picks.size();
+                    int64_t c;
+                    do {
+                        c = cell(gen);
+                    } while (taken[c]);
+                    taken[picks[idx]] = 0;
+                    taken[c] = 1;
+                    picks[idx] = c;
+                }
+                float * row = data_f32.data() + (s*m->ne[1] + j)*n_cells;
+                for (const int64_t c : picks) {
+                    row[c] = dis(gen);
                 }
             }
         }
@@ -16379,7 +16440,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {16, 4}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 512));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {16, 1}, 32768, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
+    // the 32-column tile for the 576/512 MLA shape with V a view of K (Mistral-Large-4, DeepSeek-V3.2: 16 q heads on 1 kv
+    //   head per device) is 2 queries of 16 heads and engages from max(4096, 2*n_kv_max) keys: odd batch sizes make the
+    //   last tile wrap, drifting picks share most of them between consecutive queries as the indexer's top-k do
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        for (int nb : { 2, 3, 7, 64, 67 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 8192, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, true, 512));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 2}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 512));
+    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 8192, 66, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, true, 512));
+    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 32768, 66, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, 2048));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse_drift(576, 512, 1, {16, 1}, 16384, 67, 512, 0.25f, GGML_TYPE_Q8_0, true));
     // picked blocks: the unions are far below the n_kv_max bound, with large Q values the softmax rescales between blocks
+    test_cases.emplace_back(new test_flash_attn_ext_sparse_blocks(576, 512, 1, {16, 1}, 32768, 66, 16, 128, GGML_TYPE_Q8_0, 20.0f, true));
     test_cases.emplace_back(new test_flash_attn_ext_sparse_blocks(128, 128, 1, {16, 1}, 32768, 256, 128, 16));
     test_cases.emplace_back(new test_flash_attn_ext_sparse_blocks(128, 128, 1, {16, 4}, 16384,  64, 128, 16));
     test_cases.emplace_back(new test_flash_attn_ext_sparse_blocks(128, 128, 1, {16, 1}, 32768,  66, 128, 16, GGML_TYPE_Q8_0));
@@ -17282,6 +17356,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // MiniMax-M3 MSA prefill on one of 4 devices: 16 q heads on 1 kv head, chunks of 256 tokens, 16 blocks of 128 cells
     for (int64_t kv : {8192, 16384, 24576, 32768, 65536, 131072}) {
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {16, 1}, kv, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
+    }
+    // Mistral-Large-4 prefill on one of 4 devices: 16 q heads on 1 kv head, V a view of K, ubatch 1024, q8_0 cache, DSA
+    //     top-k 2048: random picks (no overlap between the queries of a tile) and drifting picks (as the indexer's)
+    for (int64_t kv : {4096, 8192, 16384, 32768, 65536, 131072}) {
+        test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, kv, 1024, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true, 2048));
+        test_cases.emplace_back(new test_flash_attn_ext_sparse_drift(576, 512, 1, {16, 1}, kv, 1024, 2048, 0.25f, GGML_TYPE_Q8_0, true));
     }
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
