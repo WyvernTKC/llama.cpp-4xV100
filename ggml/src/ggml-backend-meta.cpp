@@ -438,12 +438,14 @@ struct ggml_backend_meta_expert_arena {
     ggml_backend_dev_t meta_dev = nullptr;
     int cap_fixed = 0;
     int cap_total = 0;
-    std::vector<ggml_backend_buffer_ptr> bufs;    // [device]
-    std::vector<char *>                  base;    // [device]
-    std::vector<size_t>                  block;   // [device] bytes from one slot to the next
-    std::vector<int32_t *>               cap_now; // [device] read by the plans of the caches
-    std::unordered_map<const ggml_tensor *, std::vector<size_t>> offs; // pooled weight -> [device] offset of its slot 0
-    size_t lend_bytes  = 0; // the region on every device, from block cap_fixed on
+    std::vector<ggml_backend_buffer_ptr> bufs;      // [device]
+    std::vector<char *>                  base;      // [device]
+    std::vector<size_t>                  lend_off;  // [device] where the region starts, at block cap_fixed
+    std::vector<size_t>                  lend_size; // [device] and its size
+    std::vector<int32_t *>               cap_now;   // [device] read by the plans of the caches
+    // pooled weight -> [device] offset of its slot 0 and its slot stride
+    std::unordered_map<const ggml_tensor *, std::vector<std::pair<size_t, size_t>>> offs;
+    size_t lend_bytes  = 0; // the region size every device has
     size_t compute_cap = 0; // the main compute buffer takes [0, compute_cap) of it
     size_t stage_size  = 0; // then n_stage staging slots of this size
     int    n_stage     = 0;
@@ -1467,10 +1469,10 @@ static ggml_backend_meta_gathered_weight * ggml_backend_meta_gathered_weight_get
         ggml_backend_dev_t dev = ggml_backend_meta_dev_simple_dev(meta_dev, j);
         if (in_arena) {
             // the arena is zeroed and has its own headroom
-            pool->nb[2]  = arena.block[j];
-            pool->nb[3]  = arena.block[j]*cap_pool;
+            pool->nb[2]  = it_arena->second[j].second;
+            pool->nb[3]  = pool->nb[2]*cap_pool;
             pool->buffer = arena.bufs[j].get();
-            pool->data   = arena.base[j] + it_arena->second[j];
+            pool->data   = arena.base[j] + it_arena->second[j].first;
         } else {
             // MMQ reads a little past the last row it is handed, so keep one chunk of headroom like the host
             // cache. The reserve is for whatever allocates after the pools; cudaGraphInstantiate aborts.
@@ -1495,7 +1497,7 @@ static ggml_backend_meta_gathered_weight * ggml_backend_meta_gathered_weight_get
         // device-major: after the devices before it, n_chunks pieces each
         const size_t slice_dev   = (size_t) n_chunks*chunk_dev;
         const size_t run_dev     = (size_t) n_chunks*offset_dev;
-        const size_t slot_stride = in_arena ? arena.block[j] : 0;
+        const size_t slot_stride = in_arena ? it_arena->second[j].second : 0;
         int32_t *    cap_now     = in_arena ? arena.cap_now[j] : nullptr;
         gw.caches[j] = dm
             ? cache_create(dev, ggml_backend_buffer_get_base(w->buffer), ggml_backend_buffer_get_size(w->buffer),
@@ -1556,9 +1558,11 @@ static int ggml_backend_meta_stage_n_slots();
 
 // Lending, see ggml_backend_meta_expert_arena. Block s of a device's arena holds slot s of every pooled weight, the weights
 //   whose ids of CPU experts read the zeroed slot cap_total first (gate, up), each at a multiple of 256 bytes, then
-//   headroom for what MMQ reads past a slot. Past block cap_total-1 only the zeroed part of block cap_total exists. The
-//   blocks from cap_fixed on hold the main compute buffer and then as many staging slots as keep the arena smallest; the
-//   staging slots that do not fit are allocated as without lending.
+//   headroom for what MMQ reads past a slot. The kernels address an expert in blocks of its type (int32), so the slot
+//   stride of a weight is a multiple of its type size: the strides of weights of different types differ a little, and the
+//   gaps of the layout absorb how far their slots drift apart over the blocks. Past block cap_total-1 only the zeroed
+//   slots of the first weights exist. The blocks from cap_fixed on hold the main compute buffer and then as many staging
+//   slots as keep the total small; the staging slots that do not fit are allocated as without lending.
 ggml_backend_buffer_type_t ggml_backend_meta_expert_lend_init(ggml_backend_buffer_type_t meta_buft, ggml_tensor ** weights,
         int n_weights, size_t compute_size) {
     static const bool on = [] {
@@ -1586,10 +1590,12 @@ ggml_backend_buffer_type_t ggml_backend_meta_expert_lend_init(ggml_backend_buffe
         return skip("the backend cannot lend");
     }
 
-    // per device: the bytes of a slot, what MMQ may read past it, and a whole staged copy (ggml_backend_meta_stage_weight)
+    // per device: the bytes of a slot, what MMQ may read past it, and a whole staged copy (ggml_backend_meta_stage_weight);
+    //   unit: a slot stride is a multiple of it
     struct lend_weight {
         const ggml_tensor * w;
         bool                zero;
+        size_t              unit;
         std::vector<size_t> len;
         std::vector<size_t> pad;
         std::vector<size_t> stage;
@@ -1600,8 +1606,6 @@ ggml_backend_buffer_type_t ggml_backend_meta_expert_lend_init(ggml_backend_buffe
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
-    // the kernels address an expert in blocks of its type (int32), so every type size divides the arena block
-    size_t unit = 256;
     for (int i = 0; i < n_weights; i++) {
         const ggml_tensor * w = weights[i];
         ggml_backend_meta_split_state ss;
@@ -1615,7 +1619,15 @@ ggml_backend_buffer_type_t ggml_backend_meta_expert_lend_init(ggml_backend_buffe
         const int64_t n_chunks   = w->nb[2] / chunk_full;
         const bool    dm         = ggml_backend_meta_dm_enabled() && axis == GGML_BACKEND_SPLIT_AXIS_0 && n_chunks > 1 &&
             w->extra == nullptr && w->buffer->iface.free_buffer != nullptr && w->ne[3] == 1;
-        lend_weight lw = { w, false, std::vector<size_t>(n_dev, 0), std::vector<size_t>(n_dev, 0), std::vector<size_t>(n_dev, 0) };
+        size_t x = 256;
+        size_t y = ggml_type_size(w->type);
+        while (y != 0) {
+            const size_t t = x % y;
+            x = y;
+            y = t;
+        }
+        lend_weight lw = { w, false, 256/x*ggml_type_size(w->type), std::vector<size_t>(n_dev, 0), std::vector<size_t>(n_dev, 0),
+            std::vector<size_t>(n_dev, 0) };
         for (size_t j = 0; j < n_dev; j++) {
             const int64_t ne_j = ss.ne[j];
             if (ne_j == 0) {
@@ -1635,92 +1647,156 @@ ggml_backend_buffer_type_t ggml_backend_meta_expert_lend_init(ggml_backend_buffe
             lw.pad[j]   = std::max(ggml_backend_buft_get_alloc_size(buft, slot) - ggml_nbytes(slot), axis == 0 ? chunk_dev : 0);
             lw.stage[j] = ggml_backend_buft_get_alloc_size(buft, whole);
         }
-        size_t x = unit;
-        size_t y = ggml_type_size(w->type);
-        while (y != 0) {
-            const size_t t = x % y;
-            x = y;
-            y = t;
-        }
-        unit = unit/x*ggml_type_size(w->type);
         lws.push_back(std::move(lw));
     }
     if (lws.empty()) {
         return skip("no pooled weight");
     }
-    std::stable_partition(lws.begin(), lws.end(), [](const lend_weight & lw) { return lw.zero; });
-
-    std::vector<size_t>              block(n_dev, 0);
-    std::vector<size_t>              zero_part(n_dev, 0);
-    std::vector<std::vector<size_t>> offs(lws.size(), std::vector<size_t>(n_dev, 0));
     size_t stage_size  = 0;
     size_t no_lend_max = 0; // the pools, the compute buffer and the staging slots as without lending
+    size_t raw_min     = SIZE_MAX;
     for (size_t j = 0; j < n_dev; j++) {
-        size_t off      = 0;
-        size_t pad      = 0;
-        size_t zero_end = 0;
-        size_t no_lend  = 0;
-        for (size_t k = 0; k < lws.size(); k++) {
-            const lend_weight & lw = lws[k];
-            if (lw.len[j] == 0) {
-                continue;
-            }
-            offs[k][j] = off;
-            off        = GGML_PAD(off + lw.len[j], 256);
-            pad        = std::max(pad, lw.pad[j]);
-            zero_end   = lw.zero ? off : zero_end;
+        size_t no_lend = 0;
+        size_t raw     = 0;
+        for (const lend_weight & lw : lws) {
             stage_size = std::max(stage_size, lw.stage[j]);
-            no_lend   += (size_t) cap*lw.len[j] + (lw.zero ? lw.len[j] : lw.pad[j]);
-        }
-        block[j]     = (off + pad + unit - 1)/unit*unit;
-        zero_part[j] = GGML_PAD(zero_end + pad, 256);
-        if (unit*16 > block[j]) {
-            return skip("the types of the experts need too much padding per slot");
+            no_lend   += (size_t) cap*lw.len[j] + (lw.len[j] == 0 ? 0 : lw.zero ? lw.len[j] : lw.pad[j]);
+            raw       += GGML_PAD(lw.len[j], 256);
         }
         no_lend_max = std::max(no_lend_max, no_lend);
+        raw_min     = std::min(raw_min, raw);
     }
     stage_size = GGML_PAD(stage_size, 256);
+    if (raw_min == 0) {
+        return skip("a device holds no slice of the pooled weights");
+    }
+
+    // device j for caches of up to n_slot slots: the offset and stride of every weight. The order: the zero-slot weights,
+    //   then the others, each by stride; a weight after one with a larger stride starts later by the drift over n_slot
+    //   slots, and the block is large enough that block s+1 of the first weight starts after block s of the last
+    struct lend_layout {
+        std::vector<size_t> off;    // [weight]
+        std::vector<size_t> stride; // [weight]
+        size_t first    = 0;        // the weight at the start of a block
+        size_t last     = 0;        // and the one at its end
+        size_t pad      = 0;
+        size_t last_end = 0;        // off + len of the last weight
+    };
+    auto layout = [&](size_t j, size_t n_slot) {
+        lend_layout L;
+        L.off.assign(lws.size(), 0);
+        L.stride.assign(lws.size(), 0);
+        std::vector<size_t> idx;
+        size_t raw = 0;
+        for (size_t k = 0; k < lws.size(); k++) {
+            if (lws[k].len[j] > 0) {
+                idx.push_back(k);
+                raw  += GGML_PAD(lws[k].len[j], 256);
+                L.pad = std::max(L.pad, lws[k].pad[j]);
+            }
+        }
+        size_t block = GGML_PAD(raw + L.pad, 256);
+        while (true) {
+            for (size_t k : idx) {
+                L.stride[k] = (block + lws[k].unit - 1)/lws[k].unit*lws[k].unit;
+            }
+            std::stable_sort(idx.begin(), idx.end(), [&](size_t p, size_t q) {
+                return lws[p].zero != lws[q].zero ? lws[p].zero : L.stride[p] < L.stride[q];
+            });
+            size_t off = 0;
+            for (size_t i = 0; i < idx.size(); i++) {
+                if (i > 0 && L.stride[idx[i - 1]] > L.stride[idx[i]]) {
+                    off += n_slot*(L.stride[idx[i - 1]] - L.stride[idx[i]]);
+                }
+                L.off[idx[i]] = off;
+                L.last_end    = off + lws[idx[i]].len[j];
+                off           = GGML_PAD(L.last_end, 256);
+            }
+            L.first = idx.front();
+            L.last  = idx.back();
+            const size_t drift = L.stride[L.last] > L.stride[L.first] ? n_slot*(L.stride[L.last] - L.stride[L.first]) : 0;
+            const size_t need  = GGML_PAD(off + L.pad + drift, 256);
+            if (need <= block) {
+                return L;
+            }
+            block = need; // larger strides: lay out again
+        }
+    };
+    // the lent region of device j from slot cap on with n slots lent: start and end. The end is rounded up for the
+    //   staging slots after the compute buffer; the next slot past it starts at a multiple of 256 too
+    auto region = [&](const lend_layout & L, int n) {
+        return std::make_pair((size_t) cap*L.stride[L.first], GGML_PAD(L.last_end + (size_t) (cap + n - 1)*L.stride[L.last] + L.pad, 256));
+    };
 
     // as many staging slots in the region as keep the arena and the staging slots outside it within 64 MiB of the
-    //   smallest total; 1% more room for the compute buffer than the reserve asked for
+    //   smallest total; 1% more room for the compute buffer than the reserve asked for. The layout depends on the slots
+    //   it is made for, so it is made again until it covers them.
     const int    n_slots      = ggml_backend_meta_stage_n_slots() >= 2 ? ggml_backend_meta_stage_n_slots() : 0;
     const size_t compute_need = GGML_PAD(compute_size + compute_size/100, 256);
-    std::vector<int>    n_lend_k(n_slots + 1, 0);
-    std::vector<size_t> total_k(n_slots + 1, 0);
-    size_t best_total = SIZE_MAX;
-    for (int k = 0; k <= n_slots; k++) {
-        const size_t need = compute_need + (size_t) k*stage_size;
+    std::vector<lend_layout> lays(n_dev);
+    int n_slot_max = cap + (int) ((compute_need + (size_t) n_slots*stage_size)/raw_min) + 2;
+    int n_stage    = 0;
+    int n_lend     = 0;
+    while (true) {
         for (size_t j = 0; j < n_dev; j++) {
-            n_lend_k[k] = std::max(n_lend_k[k], (int) ((need + block[j] - 1)/block[j]));
+            lays[j] = layout(j, (size_t) n_slot_max);
         }
-        for (size_t j = 0; j < n_dev; j++) {
-            total_k[k] = std::max(total_k[k], (size_t) n_lend_k[k]*block[j]);
+        std::vector<int>    n_lend_k(n_slots + 1, 0);
+        std::vector<size_t> total_k(n_slots + 1, 0);
+        size_t best_total = SIZE_MAX;
+        for (int k = 0; k <= n_slots; k++) {
+            const size_t need = compute_need + (size_t) k*stage_size;
+            for (size_t j = 0; j < n_dev; j++) {
+                int n = 1;
+                while (region(lays[j], n).second - region(lays[j], n).first < need) {
+                    n++;
+                }
+                n_lend_k[k] = std::max(n_lend_k[k], n);
+            }
+            for (size_t j = 0; j < n_dev; j++) {
+                const auto r = region(lays[j], n_lend_k[k]);
+                total_k[k] = std::max(total_k[k], r.second - r.first);
+            }
+            total_k[k] += (size_t) (n_slots - k)*stage_size;
+            best_total = std::min(best_total, total_k[k]);
         }
-        total_k[k] += (size_t) (n_slots - k)*stage_size;
-        best_total = std::min(best_total, total_k[k]);
+        for (int k = 0; k <= n_slots; k++) {
+            if (total_k[k] <= best_total + (64u << 20)) {
+                n_stage = k;
+            }
+        }
+        n_lend = n_lend_k[n_stage];
+        // the zeroed slots cap_total of the zero-slot weights count too
+        if (cap + n_lend + 1 <= n_slot_max) {
+            break;
+        }
+        n_slot_max = cap + n_lend + 1;
     }
-    int n_stage = 0;
-    for (int k = 0; k <= n_slots; k++) {
-        if (total_k[k] <= best_total + (64u << 20)) {
-            n_stage = k;
-        }
-    }
-    const int n_lend = n_lend_k[n_stage];
     const int cap_total = cap + n_lend;
-    for (const lend_weight & lw : lws) {
+    for (size_t k = 0; k < lws.size(); k++) {
         for (size_t j = 0; j < n_dev; j++) {
-            if ((size_t) (cap_total + 1)*block[j]/ggml_type_size(lw.w->type) >= (size_t) INT32_MAX) {
+            if ((size_t) (cap_total + 1)*lays[j].stride[k]/ggml_type_size(lws[k].w->type) >= (size_t) INT32_MAX) {
                 return skip("an expert offset in the arena would overflow int32");
             }
         }
     }
     size_t lend_bytes = SIZE_MAX;
-    for (size_t j = 0; j < n_dev; j++) {
-        lend_bytes = std::min(lend_bytes, (size_t) n_lend*block[j]);
-    }
+    std::vector<size_t> lend_off(n_dev);
+    std::vector<size_t> lend_size(n_dev);
     std::vector<size_t> arena_bytes(n_dev);
     for (size_t j = 0; j < n_dev; j++) {
-        arena_bytes[j] = (size_t) cap_total*block[j] + zero_part[j] + 256; // the last 256 bytes: cap_now
+        const lend_layout & L = lays[j];
+        const auto r = region(L, n_lend);
+        lend_off[j]  = r.first;
+        lend_size[j] = r.second - r.first;
+        lend_bytes   = std::min(lend_bytes, lend_size[j]);
+        size_t end = r.second;
+        for (size_t k = 0; k < lws.size(); k++) {
+            if (lws[k].zero && lws[k].len[j] > 0) {
+                end = std::max(end, L.off[k] + (size_t) cap_total*L.stride[k] + lws[k].len[j] + L.pad);
+            }
+        }
+        arena_bytes[j] = GGML_PAD(end, 256) + 256; // the last 256 bytes: cap_now
     }
 
     ggml_backend_meta_gather_registry & reg = ggml_backend_meta_gather_reg();
@@ -1768,7 +1844,8 @@ ggml_backend_buffer_type_t ggml_backend_meta_expert_lend_init(ggml_backend_buffe
     a.n_spill = 0;
     a.base.assign(n_dev, nullptr);
     a.cap_now.assign(n_dev, nullptr);
-    a.block = block;
+    a.lend_off  = lend_off;
+    a.lend_size = lend_size;
     for (size_t j = 0; j < n_dev; j++) {
         a.base[j]    = (char *) ggml_backend_buffer_get_base(bufs[j].get());
         a.cap_now[j] = (int32_t *) (a.base[j] + arena_bytes[j] - 256);
@@ -1787,7 +1864,10 @@ ggml_backend_buffer_type_t ggml_backend_meta_expert_lend_init(ggml_backend_buffe
     a.bufs = std::move(bufs);
     a.offs.clear();
     for (size_t k = 0; k < lws.size(); k++) {
-        a.offs[lws[k].w] = offs[k];
+        auto & o = a.offs[lws[k].w];
+        for (size_t j = 0; j < n_dev; j++) {
+            o.push_back({ lays[j].off[k], lays[j].stride[k] });
+        }
     }
 
     std::vector<ggml_backend_buffer_type_t> simple_bufts(n_dev);
@@ -1808,7 +1888,7 @@ ggml_backend_buffer_type_t ggml_backend_meta_expert_lend_init(ggml_backend_buffe
     no_lend_max += compute_size + (size_t) n_slots*stage_size;
     GGML_LOG_INFO("%s: the expert cache borrows the compute memory: %zu pooled weights, cap %d + %d lent = %d, block %.2f MiB, "
         "region %.0f MiB = main compute %.0f MiB (reserve %.0f) + %d of %d staging slots x %.0f MiB; %.0f MiB per device, "
-        "%+.0f MiB vs not lending\n", __func__, lws.size(), cap, n_lend, cap_total, block[0]/1024.0/1024.0,
+        "%+.0f MiB vs not lending\n", __func__, lws.size(), cap, n_lend, cap_total, lays[0].stride[lays[0].first]/1024.0/1024.0,
         lend_bytes/1024.0/1024.0, a.compute_cap/1024.0/1024.0, compute_size/1024.0/1024.0, n_stage, n_slots,
         stage_size/1024.0/1024.0, lend_max/1024.0/1024.0, ((double) lend_max - (double) no_lend_max)/1024.0/1024.0);
     return &a.buft;
@@ -1830,9 +1910,9 @@ static void ggml_backend_meta_expert_lend_set(ggml_backend_meta_expert_arena & a
     const size_t n_dev = ggml_backend_meta_n_backends(backend);
     GGML_ASSERT(n_dev == a.base.size());
     for (size_t j = 0; j < n_dev; j++) {
-        char * region = a.base[j] + (size_t) a.cap_fixed*a.block[j];
+        char * region = a.base[j] + a.lend_off[j];
         void * zero   = whole ? region : region + a.compute_cap;
-        size_t n_zero = whole ? (size_t) (a.cap_total - a.cap_fixed)*a.block[j] : (size_t) a.n_stage*a.stage_size;
+        size_t n_zero = whole ? a.lend_size[j] : (size_t) a.n_stage*a.stage_size;
         if (!a.lend_fn(ggml_backend_meta_simple_backend(backend, j), a.cap_now[j], cap, zero, n_zero)) {
             GGML_ABORT("%s: the expert cache of device %zu could not change its capacity to %d", __func__, j, cap);
         }
@@ -4094,7 +4174,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
         } else {
             for (size_t i = 0; i < n_simple_bufts; i++) {
                 ggml_backend_buffer_t b = arena.from_dev_ptr(ggml_backend_meta_dev_simple_dev(arena.meta_dev, i),
-                    arena.base[i] + (size_t) arena.cap_fixed*arena.block[i], size);
+                    arena.base[i] + arena.lend_off[i], size);
                 GGML_ASSERT(b != nullptr);
                 bufs.push_back(b);
                 max_size = std::max(max_size, ggml_backend_buffer_get_size(b));
@@ -5025,7 +5105,7 @@ static bool ggml_backend_meta_stage_ensure(ggml_backend_t backend, size_t need) 
                 ggml_backend_buffer_t buf = nullptr;
                 if (lend && (int) i < arena.n_stage && need <= arena.stage_size) {
                     buf = arena.from_dev_ptr(ggml_backend_get_device(ggml_backend_meta_simple_backend(backend, j)),
-                        arena.base[j] + (size_t) arena.cap_fixed*arena.block[j] + arena.compute_cap + i*arena.stage_size, need);
+                        arena.base[j] + arena.lend_off[j] + arena.compute_cap + i*arena.stage_size, need);
                 } else {
                     buf = ggml_backend_alloc_buffer(ggml_backend_meta_simple_backend(backend, j), need);
                 }
