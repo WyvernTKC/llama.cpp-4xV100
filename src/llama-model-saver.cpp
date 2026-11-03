@@ -282,9 +282,6 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT,  hparams.n_rel_attn_bkts);
     add_kv(LLM_KV_ATTENTION_ROPE_PATTERN,            hparams.rope_pattern, true);
     add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW,          hparams.n_swa);
-    if (hparams.n_layer_kv_from_start >= 0) {
-        add_kv(LLM_KV_ATTENTION_SHARED_KV_LAYERS,    uint32_t(hparams.n_layer_all - hparams.n_layer_kv_from_start));
-    }
     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
         // never collapsed to a scalar: the loaders read a scalar as a period
         add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, std::vector<uint32_t>(
@@ -311,10 +308,14 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ATTENTION_INDEXER_KPOOL_SELECT_TAIL, hparams.indexer_kpool_select_tail);
     add_kv(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS,    hparams.indexer_local_blocks);
     add_kv(LLM_KV_ATTENTION_INDEXER_TYPES,           hparams.is_indexer_full_impl, true);
-    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
-        if (hparams.kv_source(il) != il) {
-            add_kv(LLM_KV_ATTENTION_KV_SOURCE_MAP, hparams.kv_source_impl, true);
-            break;
+    if (hparams.n_layer_kv_from_start >= 0) {
+        add_kv(LLM_KV_ATTENTION_SHARED_KV_LAYERS,    uint32_t(hparams.n_layer_all - hparams.n_layer_kv_from_start));
+    } else {
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            if (hparams.kv_source(il) != il) {
+                add_kv(LLM_KV_ATTENTION_KV_SOURCE_MAP, hparams.kv_source_impl, true);
+                break;
+            }
         }
     }
     add_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS,        hparams.is_recr_impl, true);

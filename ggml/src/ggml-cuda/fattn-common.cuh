@@ -26,6 +26,7 @@ typedef void (* fattn_kernel_t)(
         const char * __restrict__ mask,
         const char * __restrict__ sinks,
         const int  * __restrict__ KV_max,
+        const int  * __restrict__ KV_rows,
         const int  * __restrict__ KV_ranges,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
@@ -1304,8 +1305,13 @@ void launch_fattn(
 
     const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
 
-    const ggml_tensor * mask  = dst->src[3];
-    const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * mask    = dst->src[3];
+    const ggml_tensor * sinks   = dst->src[4];
+    const ggml_tensor * kv_rows = dst->src[5];
+
+    // with kv_rows the kernel iterates over the mask columns and reads K/V rows through kv_rows
+    const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : K->ne[1];
+    GGML_ASSERT(!kv_rows || !use_sparse);
 
     ggml_tensor * KQV = dst;
 
@@ -1428,7 +1434,7 @@ void launch_fattn(
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
-    //     multiple sequences of possibly different lengths.
+    //     multiple sequences of possibly different lengths, or kv_rows lists that end with padding.
     // The vec and tile kernels (no stream-k) also skip the fully masked hole below the last visible run: at a few
     //     tokens that pays from a few thousand cells, e.g. a sliding-window layer reading its window of a ring cache
     //     sized for a large ubatch. GGML_CUDA_FATTN_RANGE_MIN_KV sets the threshold, 0 turns the scan off. The scan
@@ -1449,15 +1455,16 @@ void launch_fattn(
 
     // The KV ranges of the mask rows when the graph gives them (ggml_flash_attn_ext_set_kv_ranges): then no scan runs,
     //     and a bound on the cells a row sees (a sliding window) sizes the KV split of the vec and tile kernels to the
-    //     window instead of the cache. LLAMA_KQ_RANGES=0 leaves them out of the graph.
-    const ggml_tensor * ranges = KQV->src[5];
-    const bool use_ranges = ranges != nullptr && mask != nullptr && !use_sparse &&
+    //     window instead of the cache. LLAMA_KQ_RANGES=0 leaves them out of the graph. They are in cells, so not
+    //     for the mask columns of kv_rows.
+    const ggml_tensor * ranges = KQV->src[6];
+    const bool use_ranges = ranges != nullptr && !kv_rows && mask != nullptr && !use_sparse &&
         K->ne[1] % FATTN_KQ_STRIDE == 0 && ranges->ne[1] == mask->ne[1] && ranges->ne[3] == mask->ne[3];
     const int * KV_ranges_dev = use_ranges ? (const int *) ranges->data : nullptr;
     const int32_t n_visible_max = use_ranges && !stream_k ? ggml_get_op_params_i32(KQV, 5) : 0;
 
-    const bool scan_mask = !use_ranges && !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 &&
-        (Q->ne[1] >= 1024 || Q->ne[3] > 1 || scan_range);
+    const bool scan_mask = !use_ranges && !use_sparse && mask && n_kv_cols % FATTN_KQ_STRIDE == 0 &&
+        (Q->ne[1] >= 1024 || Q->ne[3] > 1 || scan_range || kv_rows);
     if (scan_mask && !stream_k) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
@@ -1521,7 +1528,7 @@ void launch_fattn(
         const dim3 block_dim_KV_max(FATTN_KQ_STRIDE/2, 1, 1);
 
         const int ne_KV_max = blocks_num_KV_max.x*blocks_num_KV_max.y;
-        const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
+        const int iter_k = n_kv_cols / FATTN_KQ_STRIDE;
 
         KV_max.alloc(ne_KV_max);
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
@@ -1530,13 +1537,19 @@ void launch_fattn(
         CUDA_CHECK(cudaGetLastError());
     }
 
+    // K/V are shared by all slices when read through kv_rows
+    if (kv_rows) {
+        nb13 = 0;
+        nb23 = 0;
+    }
+
     const dim3 block_dim(warp_size, nwarps, 1);
     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 
-    const int64_t n_kv = use_sparse ? n_kv_max : K->ne[1];
+    const int64_t n_kv = use_sparse ? n_kv_max : n_kv_cols;
     int64_t n_kv_split = n_kv;
     if (n_visible_max > 0) {
         // the chunks a tile can see: the window of each row plus the rows of the tile, at the 256-cell granularity of
@@ -1665,6 +1678,7 @@ void launch_fattn(
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_range ? KV_range : KV_max.ptr,
+        kv_rows ? (const int *) kv_rows->data : nullptr,
         KV_ranges_dev,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,

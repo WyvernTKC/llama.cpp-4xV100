@@ -1333,7 +1333,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    ggml_tensor * kq_mask = inp->get_kq_mask();
+    ggml_tensor * kq_mask = inp->self_attn_mask.raw;
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
@@ -1393,7 +1393,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         cb(m_sel, "kq_mask_picked", il);
 
         // the cells are the sparse set already, so no n_kv_max
-        ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, m_sel, nullptr, nullptr, 0, kq_scale, il);
+        ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, m_sel, nullptr, nullptr, nullptr, 0, kq_scale, il);
         cb(cur, "kqv_out", il);
 
         if (inp->self_v_rot[il]) {
@@ -1429,7 +1429,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     // combine with the original kq mask
     kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, nullptr, top_k->ne[0], kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
@@ -1453,7 +1453,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     // indexer reads the same block input as q/k/v; no cache or no ratio means dense
     const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
 
-    ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
+    // QSA reads the KQ mask by cell, so the cache cannot use kv_rows
+    GGML_ASSERT(!qsa || inp->self_attn_mask.rows == nullptr);
+
+    ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->self_attn_mask.raw, sections, il) : nullptr;
 
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]

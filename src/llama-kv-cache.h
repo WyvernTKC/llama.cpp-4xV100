@@ -182,8 +182,8 @@ public:
             llama_io_read_i & io,
                llama_seq_id   seq_id,
       llama_state_seq_flags   flags,
-          slot_info_vec_t *   sinfos_out,
-    const slot_info_vec_t *   sinfos_in);
+            slot_info_vec_t * sinfos_out,
+      const slot_info_vec_t * sinfos_in);
 
     // undo a state_read() of seq_id (-1 for the whole cache) that another memory module failed to complete
     void state_clear(llama_seq_id seq_id);
@@ -202,6 +202,15 @@ public:
     // the n_kv of the ubatch applied last
     uint32_t get_n_kv_cur() const { return n_kv_cur; }
     void     set_n_kv_cur(uint32_t n) { n_kv_cur = n; }
+
+    // attention over the cells of each sequence of the ubatch instead of the whole cache (see ggml_flash_attn_ext_rows)
+    // the ubatch splits into n_slices groups of tokens with one sequence each
+    // if it cannot (f.ex. interleaved or coupled sequences), it is a single slice over the cells of all its sequences
+    // TODO: allow slices with coupled sequences
+    static uint32_t get_n_kv_slices(const llama_ubatch & ubatch);
+
+    // padded length of the longest cell list of the slices; 0 if kv_rows are not used (multiple streams)
+    uint32_t get_n_kv_rows(const llama_ubatch & ubatch) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -244,13 +253,13 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_kq_ranges (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, int64_t n_kv) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     // the inputs of a mask built by ggml_kq_mask: per stream the position of each cell its sequence sees (-1 for the
-    //   others), and the positions of the tokens
-    void set_input_kq_pos(ggml_tensor * dst_kv, ggml_tensor * dst_q, const llama_ubatch * ubatch) const;
+    //   others), and the positions of the tokens. With kv_rows: per slice, the column of rows[c]
+    void set_input_kq_pos(ggml_tensor * dst_kv, ggml_tensor * dst_q, const llama_ubatch * ubatch, const ggml_tensor * rows = nullptr) const;
 
     // the rows of a mask built by ggml_kq_mask_prefix, n_desc values each; false if a row does not fit in that.
     //   dst nullptr only checks
@@ -429,6 +438,7 @@ public:
     // the n_kv the graph is built for, and the one this ubatch needs; they differ when the graph is shrunk in place
     uint32_t get_n_kv() const;
     uint32_t get_n_kv_used() const;
+    uint32_t get_n_kv_rows() const;
 
     // false when no layer stores K/V here, e.g. the non-SWA cache of a model whose layers all use SWA
     bool has_layers() const;
@@ -467,9 +477,9 @@ public:
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_kq_ranges (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, int64_t n_kv) const;
-    void set_input_kq_pos    (ggml_tensor * dst_kv, ggml_tensor * dst_q, const llama_ubatch * ubatch) const;
+    void set_input_kq_pos    (ggml_tensor * dst_kv, ggml_tensor * dst_q, const llama_ubatch * ubatch, const ggml_tensor * rows = nullptr) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     // the rows of a mask built by ggml_kq_mask_prefix, I32 [n_desc, n_tokens/n_stream, 1, n_stream]
@@ -518,4 +528,8 @@ private:
     bool    reshape   = false;
 
     mutable std::vector<std::pair<ggml_tensor *, int>> graph_roots;
+
+    // see llama_kv_cache::get_n_kv_rows, computed by get_n_kv_rows() after apply()
+    mutable uint32_t n_kv_rows       = 0;
+    mutable bool     n_kv_rows_valid = true;
 };

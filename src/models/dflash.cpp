@@ -1402,21 +1402,6 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 }
 
 // window of a block = window of its first query, see n_swa
-static void build_dspark_block_mask(llm_graph_context & g, llm_graph_input_attn_k_iswa * inp_attn) {
-    ggml_context * ctx0 = g.ctx0;
-
-    ggml_tensor * m = inp_attn->self_kq_mask_swa_cnv;
-    const int64_t n_tokens = g.n_tokens;
-    const int64_t n_blocks = g.ubatch.n_seqs_unq;
-    const int64_t bd       = n_blocks > 0 ? n_tokens / n_blocks : 0;
-    if (m && bd > 1 && n_tokens % n_blocks == 0 && m->ne[2] == 1 && m->ne[1] % bd == 0 && ggml_is_contiguous(m)) {
-        ggml_tensor * m4 = ggml_reshape_4d(ctx0, m, m->ne[0], bd, m->ne[1]/bd, m->ne[3]);
-        ggml_tensor * r0 = ggml_view_4d(ctx0, m4, m4->ne[0], 1, m4->ne[2], m4->ne[3], m4->nb[1], m4->nb[2], m4->nb[3], 0);
-        m4 = ggml_repeat(ctx0, r0, m4);
-        inp_attn->self_kq_mask_swa_cnv = ggml_reshape_4d(ctx0, m4, m->ne[0], m->ne[1], 1, m->ne[3]);
-        g.cb(inp_attn->self_kq_mask_swa_cnv, "dspark_block_mask", -1);
-    }
-}
 
 // Mistral Large 4 DSpark, dual-mode like graph_dsv41:
 // - embd batch: write latent K of target_norm(fc(features)) to the cache, no attn norm
@@ -1463,16 +1448,8 @@ llama_model_dflash::graph_mistral_large4::graph_mistral_large4(const llama_model
     };
 
     ASSERT_EMBD_OR_TOKEN(ubatch);
-    if (ubatch.embd) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
-
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
-        ggml_set_input(inp->embd);
-
-        ggml_tensor * inp_target = inp->embd;
-        cb(inp_target, "inp_target_features", -1);
-
-        res->add_input(std::move(inp));
+    if (ubatch.embd || ubatch.state_row) {
+        ggml_tensor * inp_target = build_inp_target_features(n_embd_inp);
 
         ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
         inp_g = build_norm(inp_g, model.output_norm_enc, nullptr, LLM_NORM_RMS, -1);
@@ -1533,7 +1510,8 @@ llama_model_dflash::graph_mistral_large4::graph_mistral_large4(const llama_model
     }
     cb(inpL, "inp_noise_embd", -1);
 
-    build_dspark_block_mask(*this, inp_attn);
+    // the whole block shares the mask row of its first query (the anchor)
+    inp_attn->self_attn_mask_swa.block_uniform = true;
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];

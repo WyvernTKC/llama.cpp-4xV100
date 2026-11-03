@@ -966,6 +966,32 @@ static const std::vector<ggml_tensor *> * ggml_backend_meta_buffer_simple_tensor
     return it == stc.simple_tensors.end() ? nullptr : &it->second;
 }
 
+// bytes spanned by all dims except skip_dim
+static size_t ggml_backend_meta_inner_extent(const struct ggml_tensor * tensor, int skip_dim) {
+    size_t extent = 0;
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        if (i != skip_dim && tensor->ne[i] > 1) {
+            extent += (size_t) (tensor->ne[i] - 1) * tensor->nb[i];
+        }
+    }
+    return extent;
+}
+
+// the view dim that holds the split axis of src, or -1
+// all other dims of src and view must stay inside one slab of that axis
+static int ggml_backend_meta_view_slab_dim(const struct ggml_tensor * view, const struct ggml_tensor * src, int axis) {
+    const size_t slab = src->nb[axis];
+    if (ggml_backend_meta_inner_extent(src, axis) >= slab) {
+        return -1;
+    }
+    for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
+        if (view->ne[dim] == src->ne[axis] && view->nb[dim] == slab) {
+            return ggml_backend_meta_inner_extent(view, dim) < slab ? dim : -1;
+        }
+    }
+    return -1;
+}
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
 
 // Device-major layout of an offloaded expert weight split on axis 0, where a device owns one chunk of every row (a K
@@ -2470,25 +2496,38 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             }
             GGML_ABORT("fatal error");
         }
-        // The split dim is the outermost dim of both the source and the view, and the view keeps it whole: each device's
-        //   slice is one outer block, so a view that only regroups the dims inside it stays inside every block.
-        //   Example: glm5-next's permuted q_absorbed, split by heads, cut into per-stream token groups by build_attn_mha.
-        if (axis >= 0 && axis < GGML_MAX_DIMS && tensor->view_offs == 0 &&
-                tensor->ne[axis] == tensor->src[0]->ne[axis] && tensor->nb[axis] == tensor->src[0]->nb[axis]) {
-            auto split_dim_outermost = [axis](const ggml_tensor * t) {
-                for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
-                    if (dim != axis && t->ne[dim] > 1 && t->nb[dim] >= t->nb[axis]) {
-                        return false;
-                    }
+        // permuted view: split the view dim that spans the src split axis, other dims must be inside one element of it or outside the span
+        if (ggml_is_permuted(tensor) && !ggml_is_permuted(tensor->src[0]) && axis >= 0 && axis < GGML_MAX_DIMS-1) {
+            const size_t nb_axis = tensor->src[0]->nb[axis];
+            const size_t nb_next = tensor->src[0]->nb[axis+1];
+            for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
+                if (tensor->ne[dim] == 1 || tensor->nb[dim] < nb_axis || tensor->nb[dim]*tensor->ne[dim] != nb_next) {
+                    continue;
                 }
-                return true;
-            };
-            if (split_dim_outermost(tensor) && split_dim_outermost(tensor->src[0])) {
-                return src_ss[0];
+                bool others_ok = true;
+                for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                    if (i == dim || tensor->ne[i] == 1) {
+                        continue;
+                    }
+                    others_ok = others_ok && (tensor->nb[i]*tensor->ne[i] <= tensor->nb[dim] || tensor->nb[i] % nb_next == 0);
+                }
+                if (others_ok) {
+                    return {ggml_backend_meta_split_axis(dim), {0}, {1}, 1};
+                }
             }
         }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
             return src_ss[0];
+        }
+        // a view that only regroups dims inside one slab of the split axis keeps the split,
+        // the per-device strides are only rescaled above nb[axis] (e.g. the KV streams of a permuted q)
+        if (axis >= 0 && axis < GGML_MAX_DIMS && tensor->view_offs == tensor->src[0]->view_offs) {
+            const int dim = ggml_backend_meta_view_slab_dim(tensor, tensor->src[0], axis);
+            if (dim >= 0) {
+                ggml_backend_meta_split_state ret = src_ss[0];
+                ret.axis = ggml_backend_meta_split_axis(dim);
+                return ret;
+            }
         }
         GGML_ABORT("view of permuted tensor not implemented");
         //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
@@ -2591,7 +2630,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             split_states_equal(src_ss[3], src_ss[0]);
         GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || mask_split);
         // the KV ranges of the mask rows (ggml_flash_attn_ext_set_kv_ranges) go with the mask
-        GGML_ASSERT(tensor->src[5] == nullptr || (src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && !mask_split));
+        GGML_ASSERT(tensor->src[6] == nullptr || (src_ss[6].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && !mask_split));
+        // the cell rows of a unified cache (ggml_flash_attn_ext_rows) are not used under -sm tensor (auto_fkvr)
+        GGML_ASSERT(tensor->src[5] == nullptr);
 
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
@@ -2966,14 +3007,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = handle_pad(src_ss);
             } break;
             case GGML_OP_PAD_REFLECT_1D:
-            case GGML_OP_ROLL:
-            case GGML_OP_TIMESTEP_EMBEDDING: {
+            case GGML_OP_ROLL: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
-            // the sequence comes from the op params and has no src, so every device builds the same
-            //   one. handle_generic() derives the state from the srcs and aborts when there are none.
             case GGML_OP_ARANGE: {
+                // no sources, every device computes the full range
                 split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+            } break;
+            case GGML_OP_TIMESTEP_EMBEDDING: {
+                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             case GGML_OP_ARGSORT:
             case GGML_OP_TOP_K: {

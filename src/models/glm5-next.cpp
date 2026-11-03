@@ -1280,13 +1280,13 @@ llama_model_glm5_next::graph::build_dsa_layer(
         k_sel = ggml_reshape_4d(ctx0, k_sel, kv_lora_rank, 1, sel->ne[0], 1);
         cb(k_sel, "k_sel", il);
 
-        out = build_attn_mha(q_absorbed, k_sel, k_sel, nullptr, inp_kpool->g_mask, nullptr, layer.wv_b, inp_kpool->n_sel, kq_scale, il);
+        out = build_attn_mha(q_absorbed, k_sel, k_sel, nullptr, inp_kpool->g_mask, nullptr, nullptr, layer.wv_b, inp_kpool->n_sel, kq_scale, il);
     } else {
         // the scatter selection is causal by construction: a live slot is a cell of the token's own sequence at or
         //   before its position (set_input_kpool), so it replaces the kq_mask
         cb(sel, "kq_mask_dsa", il);
 
-        out = build_attn_mha(q_absorbed, k, v, nullptr, sel, nullptr, layer.wv_b, inp_kpool->n_sel, kq_scale, il);
+        out = build_attn_mha(q_absorbed, k, v, nullptr, sel, nullptr, nullptr, layer.wv_b, inp_kpool->n_sel, kq_scale, il);
     }
     cb(out, "kqv_out", il);
 
