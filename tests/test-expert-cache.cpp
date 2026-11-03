@@ -176,7 +176,7 @@ bool test_one(ggml_backend_reg_t reg, ggml_backend_dev_t dev, ggml_backend_t bac
         ggml_backend_tensor_set(w.full, tmp.data(), 0, tmp.size());
         // the whole weight on one device: one chunk per expert
         w.cache = cache_create(dev, ggml_backend_buffer_get_base(buf_host), ggml_backend_buffer_get_size(buf_host),
-            w.host->data, tc.n_expert, tc.cap, w.host->nb[2], w.host->nb[2], w.host->nb[2], 0, 1, tc.cap);
+            w.host->data, tc.n_expert, tc.cap, w.host->nb[2], w.host->nb[2], w.host->nb[2], 0, 1, tc.cap, 0, nullptr);
         if (w.cache == nullptr) {
             printf("  could not create the cache\n");
             ok = false;
