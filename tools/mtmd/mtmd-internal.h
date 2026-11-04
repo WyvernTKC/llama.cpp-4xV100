@@ -22,3 +22,10 @@ std::vector<std::vector<const mtmd_bitmap *>> mtmd_group_mergeable_bitmaps(std::
 
 int mtmd_dsv41_separator_padding(const std::string & text, bool leading);
 bool mtmd_dsv41_is_message_boundary(const std::string & text, bool leading);
+
+struct mtmd_image_preprocessor;
+
+// mtmd_get_video_config() for a given template, without a context
+mtmd_video_config mtmd_video_config_init(mtmd_video_template tmpl, const mtmd_image_preprocessor * preproc,
+                                         int32_t src_width, int32_t src_height,
+                                         int32_t src_n_frames, float src_fps);

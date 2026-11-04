@@ -1764,6 +1764,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // The last h-row of one process() call needs the first token of the NEXT
     // call to pair with, so it's stashed here until that next call fires.
     std::vector<std::vector<float>> pending_h;   // [n_seq][n_embd]
+    std::vector<llama_pos>          pending_pos; // [n_seq] target position of pending_h, -1: unknown
 
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
@@ -1774,6 +1775,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
     std::vector<int32_t> verify_h_base;
+    std::vector<std::vector<llama_pos>> verify_h_pos; // [n_seq][kept rows] target position of each kept row
 
     // the target hidden states stay on the devices: the catch-up batches name their rows (llama_set_spec_states_device)
     bool states_dev = false;
@@ -1832,14 +1834,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
-        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
-
         // only gemma4-assistant shares the target KV; other drafts set ctx_other just to borrow tensors
         char arch[64] = {0};
         llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch, sizeof(arch));
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt && std::strcmp(arch, "gemma4-assistant") == 0;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+
+        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ is_mem_shared);
+        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
@@ -1852,6 +1854,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         this->n_max = this->params.n_max;
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        pending_pos.assign(n_seq, -1);
 
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
@@ -1860,6 +1863,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
         verify_h_base.assign(n_seq, 0);
+        verify_h_pos.assign(n_seq, {});
 
         // with a shared KV there is no catch-up batch to read the states
         if (!is_mem_shared) {
@@ -2006,20 +2010,35 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            // a target that shares its KV with the draft extracts h for the output rows only
+            if (is_mem_shared && !batch_in.tokens[i_batch_end[seq_id]].output) {
+                verify_h_rows[seq_id] = 0;
+                continue;
+            }
+
+            const bool all_rows_output = std::all_of(
+                    batch_in.tokens.begin() + i_batch_beg[seq_id],
+                    batch_in.tokens.begin() + i_batch_end[seq_id] + 1,
+                    [](const common_batch::token & token) { return token.output; });
+
             // accept() reads a row of a verify batch (short, its drafts may come from another implementation), a prompt
             //   batch needs its last row only
-            const int32_t n_keep = std::min(n_rows, std::max(params.n_max + 1, 256));
+            const int32_t n_keep = is_mem_shared && !all_rows_output ? 1 : std::min(n_rows, std::max(params.n_max + 1, 256));
             verify_h_rows[seq_id] = n_rows;
             verify_h_base[seq_id] = n_rows - n_keep;
             verify_h[seq_id].resize((size_t) n_keep * n_embd);
+            verify_h_pos[seq_id].resize(n_keep);
 
             for (int32_t i = 0; i < n_keep; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + verify_h_base[seq_id] + i);
+                const int32_t k = i_batch_beg[seq_id] + verify_h_base[seq_id] + i;
+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, k);
+                verify_h_pos[seq_id][i] = batch_in.tokens[k].pos[0];
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_keep - 1) * n_embd, row_bytes);
+            pending_pos[seq_id] = verify_h_pos[seq_id][n_keep - 1];
         }
 
         return true;
@@ -2208,6 +2227,51 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::max(std::min<int32_t>(n_accepted, n_rows - 1), verify_h_base[seq_id]) - verify_h_base[seq_id];
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+        pending_pos[seq_id] = verify_h_pos[seq_id][i_h];
+    }
+
+    // the h row of the last position in the target memory: a checkpoint made from a rollback snapshot (the server's
+    //   tail checkpoint) ends a few rows before pending_h
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+
+        const llama_pos pos = llama_memory_seq_pos_max(llama_get_memory(params.ctx_tgt), seq_id);
+
+        const float * h = nullptr;
+        if (pos >= 0 && pos == pending_pos[seq_id]) {
+            h = pending_h[seq_id].data();
+        } else if (verify_h_rows[seq_id] > 0) {
+            const auto & rows_pos = verify_h_pos[seq_id];
+            for (int32_t i = (int32_t) rows_pos.size() - 1; i >= 0; --i) {
+                if (rows_pos[i] == pos) {
+                    h = verify_h[seq_id].data() + (size_t) i * n_embd;
+                    break;
+                }
+            }
+        }
+        if (h == nullptr) {
+            return false;
+        }
+
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        data.resize(row_bytes);
+        std::memcpy(data.data(), h, row_bytes);
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        if (data.size() != row_bytes) {
+            return;
+        }
+        std::memcpy(pending_h[seq_id].data(), data.data(), row_bytes);
+        pending_pos[seq_id] = llama_memory_seq_pos_max(llama_get_memory(params.ctx_tgt), seq_id);
     }
 };
 
