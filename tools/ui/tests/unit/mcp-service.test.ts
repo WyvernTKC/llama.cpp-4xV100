@@ -346,4 +346,35 @@ describe('MCPService', () => {
 		expect(result.isError).toBe(false);
 		expect(result.content).toBe('{"accounts":[{"id":1}],"total":1}');
 	});
+
+	it('formats image content and image resource blobs as one data URI line each', async () => {
+		const connection = {
+			client: {
+				callTool: vi.fn().mockResolvedValue({
+					content: [
+						{ text: 'chart ready', type: 'text' },
+						{ data: 'iVBORw0K\nGgoAAAA=\n', mimeType: 'image/png', type: 'image' },
+						{
+							resource: { blob: 'R0lGOD lhAQ==', mimeType: 'image/gif', uri: 'file:///a.gif' },
+							type: 'resource'
+						},
+						{
+							resource: { blob: 'JVBERi0=', mimeType: 'application/pdf', uri: 'file:///a.pdf' },
+							type: 'resource'
+						}
+					]
+				})
+			},
+			requestTimeoutMs: 9000,
+			serverName: 'test-server'
+		} as unknown as MCPConnection;
+		const result = await MCPService.callTool(connection, { arguments: {}, name: 'tool' });
+
+		expect(result.content.split('\n')).toEqual([
+			'chart ready',
+			'data:image/png;base64,iVBORw0KGgoAAAA=',
+			'data:image/gif;base64,R0lGODlhAQ==',
+			'JVBERi0='
+		]);
+	});
 });

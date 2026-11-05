@@ -188,7 +188,14 @@ export {
 } from './uri-template';
 
 // Data URL utilities
-export { createBase64DataUrl } from './data-url';
+export { createBase64DataUrl, downloadDataUrl } from './data-url';
+
+// attachment:// image handles in tool arguments
+export {
+	collectAttachmentRefs,
+	formatAttachmentRefLabel,
+	resolveAttachmentRefs
+} from './attachment-refs';
 
 // Header utilities
 export { parseHeadersToArray, serializeHeaders } from './headers';

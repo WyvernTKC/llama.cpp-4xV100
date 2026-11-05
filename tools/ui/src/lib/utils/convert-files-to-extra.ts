@@ -1,6 +1,7 @@
 import { convertPDFToImage, convertPDFToText } from './pdf-processing';
 import { isSvgMimeType, svgBase64UrlToPngDataURL } from './svg-to-png';
 import { isLikelyTextFile, readFileAsText } from './text-files';
+import { uuid } from './uuid';
 import { isWebpMimeType, webpBase64UrlToPngDataURL } from './webp-to-png';
 import { SETTINGS_KEYS } from '$lib/constants';
 import { AttachmentType, FileTypeCategory, SpecialFileType } from '$lib/enums';
@@ -71,6 +72,7 @@ export async function parseFilesToMessageExtras(
 				extras.push({
 					base64Url,
 					name: file.name,
+					refId: uuid(),
 					size: file.size,
 					type: AttachmentType.IMAGE
 				});

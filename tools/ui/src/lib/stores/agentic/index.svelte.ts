@@ -69,17 +69,18 @@ import type {
 	ChatMessageToolCallTiming
 } from '$lib/types/chat';
 import type {
-	DatabaseMessage,
 	DatabaseMessageExtra,
 	DatabaseMessageExtraAudioFile,
 	DatabaseMessageExtraImageFile
 } from '$lib/types/database';
 import type { OpenAIToolDefinition } from '$lib/types/mcp';
 import {
+	collectAttachmentRefs,
 	executeBrowserInfoTool,
 	executeGetDatetimeTool,
 	getAudioInputFormat,
-	isAbortError
+	isAbortError,
+	resolveAttachmentRefs
 } from '$lib/utils';
 import { SvelteMap } from 'svelte/reactivity';
 
@@ -363,6 +364,7 @@ class AgenticStore {
 		try {
 			await this.executeAgenticLoop({
 				agenticConfig,
+				attachmentRefs: collectAttachmentRefs(messages),
 				callbacks,
 				conversationId,
 				messages: normalizedMessages,
@@ -426,15 +428,24 @@ class AgenticStore {
 		options: AgenticFlowOptions;
 		tools: ReturnType<typeof toolsStore.getEnabledToolsForLLM>;
 		agenticConfig: AgenticConfig;
+		attachmentRefs: Map<string, string>;
 		callbacks: AgenticFlowCallbacks;
 		signal?: AbortSignal;
 	}): Promise<void> {
-		const { agenticConfig, callbacks, conversationId, messages, options, signal, tools } = params;
+		const {
+			agenticConfig,
+			attachmentRefs,
+			callbacks,
+			conversationId,
+			messages,
+			options,
+			signal,
+			tools
+		} = params;
 		const {
 			createAssistantMessage,
 			createToolResultMessage,
 			onAssistantTurnComplete,
-			onAttachments,
 			onChunk,
 			onCompletionId,
 			onFlowComplete,
@@ -844,7 +855,14 @@ class AgenticStore {
 							if (executionResult.isError) toolSuccess = false;
 						} else {
 							const mcpCall: MCPToolCall = {
-								function: { arguments: toolCall.function.arguments, name: toolName },
+								function: {
+									arguments: resolveAttachmentRefs(
+										toolCall.function.arguments,
+										tools.find((tool) => tool.function.name === toolName)?.function.parameters,
+										attachmentRefs
+									),
+									name: toolName
+								},
 								id: toolCall.id
 							};
 							const executionResult = await mcpStore.executeTool(mcpCall, signal);
@@ -900,25 +918,17 @@ class AgenticStore {
 				// arrived via updateToolResultMessage. Skip the second
 				// create call - just attach any base64 attachments found in
 				// the final accumulator (rare, since chunks usually don't
-				// carry image data URIs) and emit the attachments callback.
-				let toolResultMessage: DatabaseMessage | undefined;
-
+				// carry image data URIs). Both paths store the extras once.
 				if (createdToolResultMessageId) {
-					toolResultMessage = { id: createdToolResultMessageId } as DatabaseMessage;
-
 					if (attachments.length > 0 && updateToolResultMessage) {
 						await updateToolResultMessage(createdToolResultMessageId, cleanedResult, attachments);
 					}
 				} else if (createToolResultMessage) {
-					toolResultMessage = await createToolResultMessage(
+					await createToolResultMessage(
 						toolCall.id,
 						cleanedResult,
 						attachments.length > 0 ? attachments : undefined
 					);
-				}
-
-				if (attachments.length > 0 && toolResultMessage) {
-					onAttachments?.(toolResultMessage.id, attachments);
 				}
 
 				// Build content parts for session history (including images for vision models)

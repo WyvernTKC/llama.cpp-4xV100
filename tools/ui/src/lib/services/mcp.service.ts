@@ -21,6 +21,7 @@ import type {
 	Tool
 } from '@modelcontextprotocol/sdk/types.js';
 import {
+	BASE64_WHITESPACE_REGEX,
 	CORS_PROXY,
 	CORS_PROXY_ENDPOINT,
 	DEFAULT_CLIENT_VERSION,
@@ -34,7 +35,8 @@ import {
 	MCPContentType,
 	MCPLogLevel,
 	MCPRefType,
-	MCPTransportType
+	MCPTransportType,
+	MimeTypePrefix
 } from '$lib/enums';
 import type {
 	ClientCapabilities,
@@ -74,7 +76,7 @@ interface ToolResultContentItem {
 	text?: string;
 	data?: string;
 	mimeType?: string;
-	resource?: { text?: string; blob?: string; uri?: string };
+	resource?: { text?: string; blob?: string; mimeType?: string; uri?: string };
 }
 
 interface ToolCallResult {
@@ -1129,13 +1131,18 @@ export class MCPService {
 		};
 	}
 
+	// one data URI per line, so the agentic loop can lift it out as an attachment
+	private static formatMediaDataUrl(mimeType: string, base64Data: string): string {
+		return createBase64DataUrl(mimeType, base64Data.replace(BASE64_WHITESPACE_REGEX, ''));
+	}
+
 	private static formatSingleContent(content: ToolResultContentItem): string {
 		if (content.type === MCPContentType.TEXT && content.text) {
 			return content.text;
 		}
 
 		if (content.type === MCPContentType.IMAGE && content.data) {
-			return createBase64DataUrl(content.mimeType ?? DEFAULT_IMAGE_MIME_TYPE, content.data);
+			return this.formatMediaDataUrl(content.mimeType ?? DEFAULT_IMAGE_MIME_TYPE, content.data);
 		}
 
 		if (content.type === MCPContentType.RESOURCE && content.resource) {
@@ -1143,13 +1150,17 @@ export class MCPService {
 
 			if (resource.text) return resource.text;
 
+			if (resource.blob && resource.mimeType?.startsWith(MimeTypePrefix.IMAGE)) {
+				return this.formatMediaDataUrl(resource.mimeType, resource.blob);
+			}
+
 			if (resource.blob) return resource.blob;
 
 			return JSON.stringify(resource);
 		}
 
 		if (content.data && content.mimeType) {
-			return createBase64DataUrl(content.mimeType, content.data);
+			return this.formatMediaDataUrl(content.mimeType, content.data);
 		}
 
 		return JSON.stringify(content);

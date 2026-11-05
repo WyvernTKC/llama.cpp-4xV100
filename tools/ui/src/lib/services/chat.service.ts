@@ -44,6 +44,7 @@ import type { OpenAIToolDefinition } from '$lib/types/mcp';
 import { isAbortError } from '$lib/utils/abort';
 import { ApiError } from '$lib/utils/api-fetch';
 import { getAuthHeaders, getJsonHeaders } from '$lib/utils/api-headers';
+import { formatAttachmentRefLabel } from '$lib/utils/attachment-refs';
 import { formatAttachmentText } from '$lib/utils/formatters';
 import { streamIdentity } from '$lib/utils/stream-identity';
 
@@ -215,6 +216,13 @@ export class ChatService {
 			// Caps the resolution and bakes the jpeg exif orientation in one pass,
 			// untouched images pass through as is
 			const base64Url = await capImageDataURLSize(image.base64Url, maxImageResolution);
+
+			if (image.refId) {
+				contentParts.push({
+					text: formatAttachmentRefLabel(image.refId),
+					type: ContentPartType.TEXT
+				});
+			}
 
 			contentParts.push({
 				image_url: { url: base64Url },

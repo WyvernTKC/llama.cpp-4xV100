@@ -5,10 +5,19 @@
 
 	import ToolCallBlock from './ToolCallBlock.svelte';
 	import { Loader2 } from '@lucide/svelte';
-	import { MarkdownContent, SyntaxHighlightedCode } from '$lib/components/app';
+	import {
+		DialogChatAttachmentsPreview,
+		MarkdownContent,
+		SyntaxHighlightedCode
+	} from '$lib/components/app';
 	import { MAX_HEIGHT_CODE_BLOCK } from '$lib/constants';
 	import { AttachmentType, FileTypeText, MimeTypeAudio, ToolResultKind } from '$lib/enums';
-	import type { AgenticSection, DatabaseMessageExtra, ToolResultLine } from '$lib/types';
+	import type {
+		AgenticSection,
+		DatabaseMessageExtra,
+		DatabaseMessageExtraImageFile,
+		ToolResultLine
+	} from '$lib/types';
 	import {
 		classifyToolResult,
 		formatJsonPretty,
@@ -32,6 +41,24 @@
 	const parsedLines: ToolResultLine[] = $derived(
 		section.toolResult ? parseToolResultWithMedia(section.toolResult, attachments) : []
 	);
+
+	// shown under the block, so they stay visible while it is collapsed; older
+	// chats stored each tool image twice, and the name is unique per image
+	const imageAttachments = $derived([
+		...new Map(
+			(attachments ?? [])
+				.filter((a): a is DatabaseMessageExtraImageFile => a.type === AttachmentType.IMAGE)
+				.map((a) => [a.name, a])
+		).values()
+	]);
+
+	let previewOpen = $state(false);
+	let previewIndex = $state(0);
+
+	function openPreview(index: number) {
+		previewIndex = index;
+		previewOpen = true;
+	}
 </script>
 
 <ToolCallBlock {isStreaming} meta={null} {onToggle} {open} {section} {title}>
@@ -110,26 +137,17 @@
 								{line.text}
 							</div>
 
-							{#if line.media}
-								{#if line.media.type === AttachmentType.AUDIO}
-									{@const audioMimeType = line.media.mimeType ?? MimeTypeAudio.MP3_MPEG}
-									<div class="mt-2 mb-2">
-										<audio class="w-full rounded-lg" controls>
-											<source
-												src={createBase64DataUrl(audioMimeType, line.media.base64Data)}
-												type={audioMimeType}
-											/>
-											Your browser does not support the audio element.
-										</audio>
-									</div>
-								{:else}
-									<img
-										alt={line.media.name}
-										class="mt-2 mb-2 h-auto max-w-full rounded-lg"
-										loading="lazy"
-										src={line.media.base64Url}
-									/>
-								{/if}
+							{#if line.media?.type === AttachmentType.AUDIO}
+								{@const audioMimeType = line.media.mimeType ?? MimeTypeAudio.MP3_MPEG}
+								<div class="mt-2 mb-2">
+									<audio class="w-full rounded-lg" controls>
+										<source
+											src={createBase64DataUrl(audioMimeType, line.media.base64Data)}
+											type={audioMimeType}
+										/>
+										Your browser does not support the audio element.
+									</audio>
+								</div>
 							{/if}
 						{/each}
 					</div>
@@ -140,3 +158,29 @@
 		{/if}
 	{/snippet}
 </ToolCallBlock>
+
+{#if imageAttachments.length > 0}
+	<div class="mb-2 flex flex-col items-start gap-2">
+		{#each imageAttachments as image, i (image.name)}
+			<button
+				aria-label="Open {image.name}"
+				class="block max-w-full cursor-zoom-in rounded-lg"
+				onclick={() => openPreview(i)}
+				type="button"
+			>
+				<img
+					alt={image.name}
+					class="h-auto max-h-[60vh] max-w-full rounded-lg object-contain"
+					loading="lazy"
+					src={image.base64Url}
+				/>
+			</button>
+		{/each}
+	</div>
+
+	<DialogChatAttachmentsPreview
+		bind:open={previewOpen}
+		attachments={imageAttachments}
+		previewFocusIndex={previewIndex}
+	/>
+{/if}

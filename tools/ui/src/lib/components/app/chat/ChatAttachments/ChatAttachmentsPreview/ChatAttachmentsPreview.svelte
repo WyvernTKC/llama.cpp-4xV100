@@ -9,6 +9,7 @@
 	import { modelsStore } from '$lib/stores';
 	import {
 		createBase64DataUrl,
+		downloadDataUrl,
 		formatFileSize,
 		getAttachmentDisplayItems,
 		getLanguageFromFilename,
@@ -181,6 +182,12 @@
 	function onNavigate(index: number) {
 		currentIndex = index;
 	}
+
+	let saveImage = $derived.by(() => {
+		const src = isImage ? displayPreview : undefined;
+
+		return src ? () => downloadDataUrl(src, displayName).catch(console.error) : undefined;
+	});
 </script>
 
 <div class="{className} flex flex-col text-white">
@@ -189,7 +196,7 @@
 
 		<div class="flex h-full w-full flex-col items-center justify-start overflow-auto py-4">
 			{#if currentItem}
-				<ChatAttachmentsPreviewFileInfo {displayName} {fileSize} />
+				<ChatAttachmentsPreviewFileInfo {displayName} {fileSize} onDownload={saveImage} />
 
 				<ChatAttachmentsPreviewCurrentItem
 					{activeModelId}

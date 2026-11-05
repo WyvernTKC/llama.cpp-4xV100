@@ -18,6 +18,17 @@ export const DISPLAY_NAME_SEPARATOR_REGEX = /[-_]/;
 // Regex for matching base64-encoded data URIs
 export const DATA_URI_BASE64_REGEX = /^data:([^;]+);base64,([A-Za-z0-9+/]+=*)$/;
 
+// Line breaks some servers put inside base64 payloads
+export const BASE64_WHITESPACE_REGEX = /\s+/g;
+
+// Handle the model puts in a tool argument to send a chat image: attachment://<refId>
+export const ATTACHMENT_REF_PREFIX = 'attachment://';
+export const ATTACHMENT_REF_REGEX = /^attachment:\/\/([0-9a-z-]+)$/;
+
+// Words in a tool parameter's name, title or description that pick the image encoding
+export const DATA_URI_HINT_REGEX = /data[\s_-]?ur[il]/i;
+export const BASE64_HINT_REGEX = /base64/i;
+
 // Prefix for MCP attachment filenames
 export const MCP_ATTACHMENT_NAME_PREFIX = 'mcp-attachment';
 
