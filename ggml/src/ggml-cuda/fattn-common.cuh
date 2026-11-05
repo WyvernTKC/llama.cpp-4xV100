@@ -1564,11 +1564,23 @@ void launch_fattn(
         // Stream-K splits the work before the mask scan is applied, so skipped KV tiles make the blocks uneven.
         const bool prefer_whole_tiles = GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DGX_SPARK && async_kv_preload && scan_mask;
 
-        auto should_use_stream_k = [prefer_whole_tiles](const int cc, const int ntiles_dst, const int max_blocks, const int DKQ) {
+        // Volta: under a causal mask the last Q tiles see the most KV, use whole tiles (run last to first) while n_kv <= ratio*n_q.
+        //     A sliding-window mask with ranges has the same work per tile. GGML_CUDA_FATTN_CAUSAL_RATIO=0 turns it off.
+        static const int64_t causal_ratio = [] {
+            const char * env = getenv("GGML_CUDA_FATTN_CAUSAL_RATIO");
+            return env != nullptr ? (int64_t) atoll(env) : (int64_t) 4;
+        }();
+        const bool causal_tiles = volta_mma_available(cc) && causal_ratio > 0 && !use_sparse &&
+            (scan_mask || (use_ranges && ggml_get_op_params_i32(KQV, 5) == 0)) && K->ne[1] <= causal_ratio*Q->ne[1];
+
+        auto should_use_stream_k = [prefer_whole_tiles, causal_tiles](const int cc, const int ntiles_dst, const int max_blocks, const int DKQ) {
             const int tiles_nwaves             = (ntiles_dst + max_blocks - 1) / max_blocks;
             const int tiles_efficiency_percent = 100 * ntiles_dst / (max_blocks*tiles_nwaves);
 
             if (prefer_whole_tiles && tiles_efficiency_percent >= 75) {
+                return false;
+            }
+            if (causal_tiles && tiles_nwaves >= 2) {
                 return false;
             }
             if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE) {

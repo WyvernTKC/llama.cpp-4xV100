@@ -2356,9 +2356,16 @@ static __global__ void flash_attn_ext_f16(
         KV_max = KV_max_ptr + int64_t(iter_j)*ne33*ne11;
     }
 
+    // One block per tile and the mask skips KV: run the Q tiles last to first, so the long causal tiles start first.
+    const int ntiles = iter_j*iter_z_gqa*ne12*ne03;
+    int itile = blockIdx.x;
+    if ((int) gridDim.x == ntiles && (KV_max || KV_ranges)) {
+        itile += iter_j - 1 - 2*(itile % iter_j);
+    }
+
     // kbc == k block continuous, current index in continuous ijk space.
-    int       kbc      = int64_t(blockIdx.x + 0)*(iter_k*iter_j*iter_z_gqa*ne12*ne03) / gridDim.x;
-    const int kbc_stop = int64_t(blockIdx.x + 1)*(iter_k*iter_j*iter_z_gqa*ne12*ne03) / gridDim.x;
+    int       kbc      = int64_t(itile + 0)*(iter_k*ntiles) / gridDim.x;
+    const int kbc_stop = int64_t(itile + 1)*(iter_k*ntiles) / gridDim.x;
 
     // If the seams of 2 CUDA blocks fall within an output tile their results need to be combined.
     // For this we need to track both the block that starts the tile (needs_fixup) and the block that finishes the tile (is_fixup).
