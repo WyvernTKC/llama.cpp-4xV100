@@ -194,7 +194,8 @@ export { createBase64DataUrl, downloadDataUrl } from './data-url';
 export {
 	collectAttachmentRefs,
 	formatAttachmentRefLabel,
-	resolveAttachmentRefs
+	resolveAttachmentRefs,
+	withAttachmentRefHints
 } from './attachment-refs';
 
 // Header utilities

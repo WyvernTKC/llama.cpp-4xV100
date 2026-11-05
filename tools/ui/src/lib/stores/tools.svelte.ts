@@ -32,7 +32,7 @@ import { mcpStore } from '$lib/stores/mcp/index.svelte';
 import { modelsStore } from '$lib/stores/models/index.svelte';
 import { settingsStore } from '$lib/stores/settings/index.svelte';
 import type { OpenAIToolDefinition, ToolEntry, ToolGroup } from '$lib/types';
-import { ApiError, buildSandboxToolDefinition } from '$lib/utils';
+import { ApiError, buildSandboxToolDefinition, withAttachmentRefHints } from '$lib/utils';
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
 /** Stable selection identity for a tool, shared by the disabled set and the permission store */
@@ -580,7 +580,7 @@ class ToolsStore {
 							function: {
 								description: tool.description,
 								name: tool.name,
-								parameters: this.normalizeJsonSchema(rawSchema)
+								parameters: withAttachmentRefHints(this.normalizeJsonSchema(rawSchema))
 							},
 							type: ToolCallType.FUNCTION
 						},

@@ -2,7 +2,8 @@ import { AttachmentType } from '$lib/enums';
 import {
 	collectAttachmentRefs,
 	formatAttachmentRefLabel,
-	resolveAttachmentRefs
+	resolveAttachmentRefs,
+	withAttachmentRefHints
 } from '$lib/utils/attachment-refs';
 import { describe, expect, it } from 'vitest';
 
@@ -93,5 +94,54 @@ describe('collectAttachmentRefs', () => {
 describe('formatAttachmentRefLabel', () => {
 	it('names the handle', () => {
 		expect(formatAttachmentRefLabel(REF)).toContain(handle);
+	});
+});
+
+describe('withAttachmentRefHints', () => {
+	const schema = {
+		properties: {
+			images: { description: 'Images to edit', items: { type: 'string' }, type: 'array' },
+			meta: { properties: { photo: { type: 'string' } }, type: 'object' },
+			prompt: { description: 'What to change in image 1', type: 'string' },
+			return_image: { enum: ['preview', 'full'], type: 'string' },
+			size: { description: 'Image width', type: 'integer' }
+		},
+		type: 'object'
+	};
+	const hinted = withAttachmentRefHints(schema) as {
+		properties: Record<
+			string,
+			{ description?: string; properties?: Record<string, { description?: string }> }
+		>;
+	};
+
+	it('notes the handle on string parameters that take an image', () => {
+		expect(hinted.properties.images.description).toMatch(/^Images to edit .*attachment:\/\/<id>/);
+		expect(hinted.properties.meta.properties?.photo.description).toContain('attachment://<id>');
+	});
+
+	it('leaves other parameters alone', () => {
+		expect(hinted.properties.prompt).toEqual(schema.properties.prompt);
+		expect(hinted.properties.return_image).toEqual(schema.properties.return_image);
+		expect(hinted.properties.size).toEqual(schema.properties.size);
+	});
+
+	it('does not change the encoding a handle is sent as', () => {
+		const tool = {
+			properties: {
+				image: { description: 'Image bytes', type: 'string' },
+				image_b64: { description: 'base64 image', type: 'string' }
+			},
+			type: 'object'
+		};
+		const args = { image: handle, image_b64: handle };
+
+		expect(resolveAttachmentRefs(args, withAttachmentRefHints(tool), refs)).toEqual(
+			resolveAttachmentRefs(args, tool, refs)
+		);
+		expect(resolveAttachmentRefs(args, withAttachmentRefHints(tool), refs)).toEqual({
+			image: DATA_URL,
+			image_b64: RAW
+		});
 	});
 });

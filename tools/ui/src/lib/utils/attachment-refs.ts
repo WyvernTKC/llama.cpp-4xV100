@@ -1,8 +1,10 @@
 import {
+	ATTACHMENT_REF_PARAM_HINT,
 	ATTACHMENT_REF_PREFIX,
 	ATTACHMENT_REF_REGEX,
 	BASE64_HINT_REGEX,
-	DATA_URI_HINT_REGEX
+	DATA_URI_HINT_REGEX,
+	IMAGE_PARAM_HINT_REGEX
 } from '$lib/constants';
 import { AttachmentType } from '$lib/enums';
 import type { DatabaseMessageExtra } from '$lib/types/database';
@@ -35,16 +37,63 @@ function asSchema(value: unknown): JsonSchema | undefined {
 	return value && typeof value === 'object' ? (value as JsonSchema) : undefined;
 }
 
+function hintText(schema: JsonSchema | undefined, key: string | undefined): string {
+	return [key, schema?.title, schema?.description]
+		.filter((part) => typeof part === 'string')
+		.join(' ');
+}
+
 function wantsRawBase64(schema: JsonSchema | undefined, key: string | undefined): boolean {
 	if (schema?.contentEncoding === 'base64') return true;
 
-	const hint = [key, schema?.title, schema?.description]
-		.filter((part) => typeof part === 'string')
-		.join(' ');
+	const hint = hintText(schema, key);
 
 	if (DATA_URI_HINT_REGEX.test(hint)) return false;
 
 	return BASE64_HINT_REGEX.test(hint);
+}
+
+function hasType(schema: JsonSchema | undefined, type: string): boolean {
+	const types = schema?.type;
+
+	return Array.isArray(types) ? types.includes(type) : types === type;
+}
+
+function hintProperty(key: string, property: JsonSchema): JsonSchema {
+	if (hasType(property, 'object')) return withAttachmentRefHints(property);
+
+	const takesStrings =
+		hasType(property, 'string') ||
+		(hasType(property, 'array') && hasType(asSchema(property.items), 'string'));
+	const name = [key, property.title].filter((part) => typeof part === 'string').join(' ');
+
+	if (!takesStrings || property.enum || !IMAGE_PARAM_HINT_REGEX.test(name)) return property;
+
+	const description = typeof property.description === 'string' ? `${property.description} ` : '';
+
+	return { ...property, description: description + ATTACHMENT_REF_PARAM_HINT };
+}
+
+/**
+ * Tell the model, on each string parameter that takes an image, that a chat image's
+ * attachment://<refId> handle works there. Depends on the schema only, so the tool
+ * list stays byte-identical across turns.
+ */
+export function withAttachmentRefHints(schema: JsonSchema): JsonSchema {
+	const properties = asSchema(schema.properties);
+
+	if (!properties) return schema;
+
+	return {
+		...schema,
+		properties: Object.fromEntries(
+			Object.entries(properties).map(([key, value]) => {
+				const property = asSchema(value);
+
+				return [key, property ? hintProperty(key, property) : value];
+			})
+		)
+	};
 }
 
 function resolveValue(

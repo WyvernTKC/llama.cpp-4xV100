@@ -25,6 +25,16 @@ export const BASE64_WHITESPACE_REGEX = /\s+/g;
 export const ATTACHMENT_REF_PREFIX = 'attachment://';
 export const ATTACHMENT_REF_REGEX = /^attachment:\/\/([0-9a-z-]+)$/;
 
+// Words in a tool parameter's name or title that mark it as taking an image; not the
+// description, a prompt parameter's description talks about the image too
+export const IMAGE_PARAM_HINT_REGEX = /image|photo|picture/i;
+
+// Added to such parameters, since tool docs often say to upload the image or pass a
+// server path and models then invent one. Must not say base64 or data URI, those words
+// pick the encoding the handle is sent as.
+export const ATTACHMENT_REF_PARAM_HINT =
+	'An image from this chat can be passed here as its attachment://<id> handle (shown next to the image); the client then sends the image itself.';
+
 // Words in a tool parameter's name, title or description that pick the image encoding
 export const DATA_URI_HINT_REGEX = /data[\s_-]?ur[il]/i;
 export const BASE64_HINT_REGEX = /base64/i;
