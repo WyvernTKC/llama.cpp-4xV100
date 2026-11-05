@@ -15,7 +15,9 @@
 		INITIAL_FILE_SIZE,
 		INPUT_CLASSES,
 		PROMPT_CONTENT_SEPARATOR,
-		SETTING_CONFIG_DEFAULT
+		SETTING_CONFIG_DEFAULT,
+		SPEECH_RECOGNITION_BLOCKED_ERRORS,
+		SPEECH_RECOGNITION_SILENT_ERRORS
 	} from '$lib/constants';
 	import {
 		ContentPartType,
@@ -33,6 +35,7 @@
 		modelsStore,
 		serverStore,
 		settingsStore,
+		speechStore,
 		toolsStore,
 		uiStore
 	} from '$lib/stores';
@@ -44,15 +47,20 @@
 		PromptMessage
 	} from '$lib/types';
 	import {
+		autoResizeTextarea,
 		buildMentionInsertion,
 		containsCodeSpan,
 		containsFileMentionLink,
+		createSpeechRecognition,
 		findCommandToken,
 		findMentionToken,
 		getConversationModel,
 		isIMEComposing,
 		isOffsetInCodeBlock,
+		isSpeechRecognitionSupported,
 		parseClipboardContent,
+		type SpeechRecognitionLike,
+		speechResultsToText,
 		uuid
 	} from '$lib/utils';
 	import {
@@ -61,7 +69,8 @@
 		createAudioFile,
 		isAudioRecordingSupported
 	} from '$lib/utils/browser-only';
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
+	import { toast } from 'svelte-sonner';
 
 	interface Props {
 		// Data
@@ -134,6 +143,12 @@
 	// Audio Recording State
 	let isRecording = $state(false);
 	let recordingSupported = $state(false);
+
+	// Dictation State: `dictated` marks input that came from speech, so the reply is read aloud
+	let recognition: SpeechRecognitionLike | null = null;
+	let isDictating = $state(false);
+	let dictationSupported = $state(false);
+	let dictated = false;
 
 	// Invisible anchor at the form's top edge so the mention/WD popovers
 	// float above the box.
@@ -247,9 +262,16 @@
 		queueCaretRestore();
 	});
 
+	$effect(() => {
+		if (!value.trim()) dictated = false;
+	});
+
 	onMount(() => {
 		recordingSupported = isAudioRecordingSupported();
 		audioRecorder = new AudioRecorder();
+		dictationSupported = isSpeechRecognitionSupported();
+
+		return () => recognition?.abort();
 	});
 
 	export function focus() {
@@ -262,6 +284,16 @@
 
 	export function openModelSelector() {
 		chatFormActionsRef?.openModelSelector();
+	}
+
+	/** True when speech filled the input; clears the mark and ends a running dictation. */
+	export function takeDictated(): boolean {
+		const wasDictated = dictated;
+
+		dictated = false;
+		recognition?.abort();
+
+		return wasDictated;
 	}
 
 	export function checkModelSelected(): boolean {
@@ -517,6 +549,63 @@
 		}
 	}
 
+	function handleDictateClick() {
+		if (recognition) {
+			recognition.stop();
+
+			return;
+		}
+
+		const rec = createSpeechRecognition();
+
+		if (!rec) return;
+
+		// stop a reply being read so the mic does not hear it; the tap also lets iOS speak the next reply
+		speechStore.stop();
+		speechStore.unlock();
+
+		const prefix = value.trim() ? `${value.trimEnd()} ` : '';
+
+		rec.onresult = (event) => {
+			const text = speechResultsToText(event.results);
+
+			if (!text) return;
+
+			value = prefix + text;
+			onValueChange?.(value);
+			dictated = true;
+
+			tick().then(() => {
+				const el = inputRef?.getElement();
+
+				if (el instanceof HTMLTextAreaElement) autoResizeTextarea(el);
+			});
+		};
+		rec.onerror = (event) => {
+			if (SPEECH_RECOGNITION_SILENT_ERRORS.includes(event.error)) return;
+
+			toast.error(
+				SPEECH_RECOGNITION_BLOCKED_ERRORS.includes(event.error)
+					? 'Microphone blocked. Dictation needs microphone permission and an HTTPS or localhost address.'
+					: `Dictation failed: ${event.error}`
+			);
+		};
+		rec.onend = () => {
+			if (recognition !== rec) return;
+
+			recognition = null;
+			isDictating = false;
+		};
+
+		try {
+			rec.start();
+			recognition = rec;
+			isDictating = true;
+		} catch (error) {
+			console.error('Failed to start dictation:', error);
+		}
+	}
+
 	async function handleMicClick() {
 		if (!audioRecorder || !recordingSupported) {
 			console.warn('Audio recording not supported');
@@ -635,14 +724,17 @@
 				canSend={canSubmit}
 				class="px-3"
 				{disabled}
+				{isDictating}
 				{isLoading}
 				isReasoning={chatStore.isReasoning}
 				{isRecording}
+				onDictateClick={handleDictateClick}
 				onFileUpload={handleFileUpload}
 				onMicClick={handleMicClick}
 				{onStop}
 				onSystemPromptClick={() => onSystemPromptClick?.({ files: uploadedFiles, message: value })}
 				{showAddButton}
+				showDictateButton={dictationSupported}
 				{showModelSelector}
 				{uploadedFiles}
 			/>

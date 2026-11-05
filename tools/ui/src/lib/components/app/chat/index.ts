@@ -178,6 +178,12 @@ export { default as ChatFormActionsAdd } from './ChatForm/ChatFormActions/ChatFo
 export { default as ChatFormActionRecord } from './ChatForm/ChatFormActions/ChatFormActionRecord.svelte';
 
 /**
+ * Dictation button: fills the input from the device speech recognizer
+ * (Web Speech API). The reply to a dictated message is read aloud.
+ */
+export { default as ChatFormActionDictate } from './ChatForm/ChatFormActions/ChatFormActionDictate.svelte';
+
+/**
  * Container for chat form action buttons. Arranges file attachment, audio record,
  * and submit/stop buttons in a horizontal layout. Handles conditional visibility
  * based on model capabilities and loading state.

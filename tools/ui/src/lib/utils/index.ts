@@ -286,9 +286,21 @@ export {
 	detectThinkingSupportWithReason
 } from './chat-template-thinking-detector';
 
+// Speech utilities (Web Speech API dictation and read-aloud)
+export {
+	createSpeechRecognition,
+	isSpeechRecognitionSupported,
+	isSpeechSynthesisSupported,
+	markdownToSpeechText,
+	speechResultsToText,
+	splitSpeechText,
+	type SpeechRecognitionLike
+} from './speech';
+
 // Agentic content utilities (structured section derivation)
 export {
 	deriveAgenticSections,
+	getAgenticText,
 	buildAssistantRawOutput,
 	parseToolResultWithMedia,
 	splitSearchSummaryList,

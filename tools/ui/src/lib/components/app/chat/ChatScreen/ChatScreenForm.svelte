@@ -2,8 +2,10 @@
 	import { afterNavigate } from '$app/navigation';
 	import { page } from '$app/state';
 	import { ChatForm } from '$lib/components/app';
+	import { MessageRole } from '$lib/enums';
 	import { useDraftMessages } from '$lib/hooks/use-draft-messages.svelte';
-	import { deviceStore } from '$lib/stores';
+	import { conversationsStore, deviceStore, speechStore } from '$lib/stores';
+	import { getAgenticText } from '$lib/utils';
 	import { onMount } from 'svelte';
 
 	interface Props {
@@ -62,6 +64,8 @@
 	let hasLoadingAttachments = $derived(uploadedFiles.some((f) => f.isLoading));
 	let message = $state('');
 	let previousIsLoading = $derived(isLoading);
+	// send time of the dictated message whose reply is read aloud, 0 when none
+	let speakReplySentAt = 0;
 
 	const { clearDraft } = useDraftMessages({
 		getChatId: () => chatId,
@@ -83,6 +87,9 @@
 
 		const messageToSend = message.trim();
 		const filesToSend = [...uploadedFiles];
+		const sentAt = Date.now();
+
+		if (chatFormRef?.takeDictated()) speakReplySentAt = sentAt;
 
 		message = '';
 		uploadedFiles = [];
@@ -95,7 +102,37 @@
 		if (!success) {
 			message = messageToSend;
 			uploadedFiles = filesToSend;
+
+			return;
 		}
+
+		if (speakReplySentAt === sentAt) {
+			speakReplySentAt = 0;
+			speakReply(sentAt);
+		}
+	}
+
+	// The send resolves once the reply is done. Read it only if the active
+	// chat still ends with the message sent at sentAt (the user may have left).
+	function speakReply(sentAt: number) {
+		const messages = conversationsStore.activeMessages as DatabaseMessage[];
+
+		let userIdx = messages.length - 1;
+
+		while (userIdx >= 0 && messages[userIdx].role !== MessageRole.USER) userIdx--;
+
+		if (userIdx < 0 || messages[userIdx].timestamp < sentAt) return;
+
+		const [reply, ...rest] = messages.slice(userIdx + 1);
+
+		if (reply?.role !== MessageRole.ASSISTANT) return;
+
+		speechStore.speak(reply.id, getAgenticText(reply, rest));
+	}
+
+	function handleStop() {
+		speakReplySentAt = 0;
+		onStop?.();
 	}
 
 	function handleSystemPromptClick() {
@@ -146,7 +183,7 @@
 		{disabled}
 		{isLoading}
 		onFilesAdd={handleFilesAdd}
-		{onStop}
+		onStop={handleStop}
 		onSubmit={handleSubmit}
 		onSystemPromptClick={handleSystemPromptClick}
 		onUploadedFileRemove={handleUploadedFileRemove}

@@ -1,5 +1,14 @@
 <script lang="ts">
-	import { ArrowRight, Copy, Edit, GitBranch, RefreshCw, Trash2 } from '@lucide/svelte';
+	import {
+		ArrowRight,
+		Copy,
+		Edit,
+		GitBranch,
+		RefreshCw,
+		Square,
+		Trash2,
+		Volume2
+	} from '@lucide/svelte';
 	import {
 		ActionIcon,
 		ChatMessageActionIconsBranchingControls,
@@ -17,6 +26,8 @@
 		actionsPosition: 'left' | 'right';
 		onRegenerate?: () => void;
 		onContinue?: () => void;
+		onSpeak?: () => void;
+		isSpeaking?: boolean;
 		showRawOutputSwitch?: boolean;
 		rawOutputEnabled?: boolean;
 		onRawOutputToggle?: (enabled: boolean) => void;
@@ -24,10 +35,12 @@
 
 	let {
 		actionsPosition,
+		isSpeaking = false,
 		justify,
 		onContinue,
 		onRawOutputToggle,
 		onRegenerate,
+		onSpeak,
 		rawOutputEnabled = false,
 		showRawOutputSwitch = false
 	}: Props = $props();
@@ -75,6 +88,14 @@
 			class="pointer-events-auto inset-0 flex items-center gap-1 opacity-100 transition-all duration-150"
 		>
 			<ActionIcon icon={Copy} onclick={messageActions.copy} tooltip="Copy" />
+
+			{#if onSpeak}
+				<ActionIcon
+					icon={isSpeaking ? Square : Volume2}
+					onclick={onSpeak}
+					tooltip={isSpeaking ? 'Stop reading' : 'Read aloud'}
+				/>
+			{/if}
 
 			<ActionIcon icon={Edit} onclick={editCtx.startEdit} tooltip="Edit" />
 

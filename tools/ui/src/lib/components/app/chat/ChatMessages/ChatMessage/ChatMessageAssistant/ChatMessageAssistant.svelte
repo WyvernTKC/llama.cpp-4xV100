@@ -11,9 +11,9 @@
 	import { getChatMessageEditContext } from '$lib/contexts';
 	import { MessageRole } from '$lib/enums';
 	import { useProcessingState } from '$lib/hooks/use-processing-state.svelte';
-	import { chatStore, modelsStore, serverStore, settingsStore } from '$lib/stores';
+	import { chatStore, modelsStore, serverStore, settingsStore, speechStore } from '$lib/stores';
 	import { modelLoadProgressText } from '$lib/utils';
-	import { hasAgenticContent } from '$lib/utils';
+	import { getAgenticText, hasAgenticContent } from '$lib/utils';
 
 	interface Props {
 		class?: string;
@@ -212,10 +212,14 @@
 	{#if message.timestamp && !editCtx.isEditing}
 		<ChatMessageActionIcons
 			actionsPosition="left"
+			isSpeaking={speechStore.speakingId === message.id}
 			justify="start"
 			onContinue={currentConfig.enableContinueGeneration ? onContinue : undefined}
 			onRawOutputToggle={(enabled) => (showRawOutput = enabled)}
 			{onRegenerate}
+			onSpeak={speechStore.isSupported
+				? () => speechStore.toggle(message.id, getAgenticText(message, toolMessages))
+				: undefined}
 			rawOutputEnabled={showRawOutput}
 			showRawOutputSwitch={currentConfig.showRawOutputSwitch}
 		/>

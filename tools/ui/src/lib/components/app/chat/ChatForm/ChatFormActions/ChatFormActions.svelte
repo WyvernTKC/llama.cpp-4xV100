@@ -2,6 +2,7 @@
 	import { SkipForward, Square } from '@lucide/svelte';
 	import { page } from '$app/state';
 	import {
+		ChatFormActionDictate,
 		ChatFormActionReasoning,
 		ChatFormActionRecord,
 		ChatFormActionsAdd,
@@ -22,12 +23,15 @@
 		canSend?: boolean;
 		class?: string;
 		disabled?: boolean;
+		isDictating?: boolean;
 		isLoading?: boolean;
 		isReasoning?: boolean;
 		isRecording?: boolean;
 		showAddButton?: boolean;
+		showDictateButton?: boolean;
 		showModelSelector?: boolean;
 		uploadedFiles?: ChatUploadedFile[];
+		onDictateClick?: () => void;
 		onFileUpload?: () => void;
 		onMicClick?: () => void;
 		onStop?: () => void;
@@ -38,14 +42,17 @@
 		canSend = false,
 		class: className = '',
 		disabled = false,
+		isDictating = false,
 		isLoading = false,
 		isReasoning = false,
 		isRecording = false,
+		onDictateClick,
 		onFileUpload,
 		onMicClick,
 		onStop,
 		onSystemPromptClick,
 		showAddButton = true,
+		showDictateButton = false,
 		showModelSelector = true,
 		uploadedFiles = []
 	}: Props = $props();
@@ -189,6 +196,10 @@
 				class="{ICON_CLASS_DEFAULT} stroke-muted-foreground group-hover:stroke-foreground"
 			/>
 		</Button>
+	{/if}
+
+	{#if showDictateButton}
+		<ChatFormActionDictate disabled={disabled || isRecording} {isDictating} {onDictateClick} />
 	{/if}
 
 	{#if isLoading && !canSend}

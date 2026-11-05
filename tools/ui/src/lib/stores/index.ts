@@ -61,3 +61,5 @@ export { toolsStore } from './tools.svelte';
 export { versionStore } from './version.svelte';
 
 export { deviceStore } from './device.svelte';
+
+export { speechStore } from './speech.svelte';

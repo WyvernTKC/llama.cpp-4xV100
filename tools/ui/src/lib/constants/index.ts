@@ -60,6 +60,7 @@ export * from './sandbox.constants';
 export * from './settings-keys.constants';
 export * from './settings.constants';
 export * from './special-characters.constants';
+export * from './speech.constants';
 export * from './stream.constants';
 export * from './supported-file-types.constants';
 export * from './table-html-restorer.constants';

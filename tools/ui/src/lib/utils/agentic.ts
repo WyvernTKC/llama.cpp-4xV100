@@ -1,4 +1,5 @@
 import {
+	AGENTIC_TEXT_COPY_SEPARATOR,
 	ATTACHMENT_SAVED_REGEX,
 	MARKDOWN,
 	NEWLINE,
@@ -248,6 +249,20 @@ export function deriveAgenticSections(
 	}
 
 	return sections;
+}
+
+/**
+ * Text sections of an assistant entry, across all turns of an agentic
+ * session: what the user reads, without reasoning and tool calls.
+ */
+export function getAgenticText(
+	message: DatabaseMessage,
+	toolMessages: DatabaseMessage[] = []
+): string {
+	return deriveAgenticSections(message, toolMessages, [], false)
+		.filter((section) => section.type === AgenticSectionType.TEXT)
+		.map((section) => section.content)
+		.join(AGENTIC_TEXT_COPY_SEPARATOR);
 }
 
 /**

@@ -8,12 +8,7 @@
 		ChatMessageSystem,
 		ChatMessageUser
 	} from '$lib/components/app/chat';
-	import {
-		AGENTIC_TEXT_COPY_SEPARATOR,
-		REASONING_TAGS,
-		ROUTES,
-		SYSTEM_MESSAGE_PLACEHOLDER
-	} from '$lib/constants';
+	import { REASONING_TAGS, ROUTES, SYSTEM_MESSAGE_PLACEHOLDER } from '$lib/constants';
 	import { setChatMessageActionsContext, setChatMessageEditContext } from '$lib/contexts';
 	import { AgenticSectionType, AttachmentType, MessageRole, MessageType } from '$lib/enums';
 	import { DatabaseService } from '$lib/services/database.service';
@@ -23,7 +18,7 @@
 		ChatMessageDeletionInfo,
 		DatabaseMessageExtraMcpPrompt
 	} from '$lib/types';
-	import { deriveAgenticSections } from '$lib/utils';
+	import { deriveAgenticSections, getAgenticText } from '$lib/utils';
 	import { parseFilesToMessageExtras } from '$lib/utils/browser-only';
 
 	interface Props {
@@ -249,11 +244,7 @@
 		// text sections of the whole session so the clipboard matches the visible
 		// response instead of the anchor turn.
 		if (message.role === MessageRole.ASSISTANT) {
-			const sections = deriveAgenticSections(message, toolMessages, [], false);
-			const text = sections
-				.filter((section) => section.type === AgenticSectionType.TEXT)
-				.map((section) => section.content)
-				.join(AGENTIC_TEXT_COPY_SEPARATOR);
+			const text = getAgenticText(message, toolMessages);
 
 			if (text) {
 				chatActions.copy(message, text);
