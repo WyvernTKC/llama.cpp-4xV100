@@ -151,20 +151,28 @@ export class AudioRecorder {
 	}
 }
 
-export async function convertToWav(audioBlob: Blob): Promise<Blob> {
+export async function convertToWav(
+	audioBlob: Blob,
+	options: { mono?: boolean; sampleRate?: number } = {}
+): Promise<Blob> {
+	const { mono = false, sampleRate } = options;
+
 	try {
-		if (audioBlob.type.includes('wav')) {
+		if (audioBlob.type.includes('wav') && !sampleRate && !mono) {
 			return audioBlob;
 		}
 
 		const arrayBuffer = await audioBlob.arrayBuffer();
+		// decodeAudioData resamples to the context rate
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+		const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)(
+			sampleRate ? { sampleRate } : undefined
+		);
 
 		try {
 			const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
 
-			return audioBufferToWav(audioBuffer);
+			return audioBufferToWav(audioBuffer, mono);
 		} finally {
 			audioContext.close();
 		}
@@ -175,9 +183,23 @@ export async function convertToWav(audioBlob: Blob): Promise<Blob> {
 	}
 }
 
-function audioBufferToWav(buffer: AudioBuffer): Blob {
+function mixToMono(buffer: AudioBuffer): Float32Array {
+	const mixed = new Float32Array(buffer.length);
+
+	for (let c = 0; c < buffer.numberOfChannels; c++) {
+		const data = buffer.getChannelData(c);
+
+		for (let i = 0; i < data.length; i++) {
+			mixed[i] += data[i] / buffer.numberOfChannels;
+		}
+	}
+
+	return mixed;
+}
+
+function audioBufferToWav(buffer: AudioBuffer, mono = false): Blob {
 	const length = buffer.length;
-	const numberOfChannels = buffer.numberOfChannels;
+	const numberOfChannels = mono ? 1 : buffer.numberOfChannels;
 	const sampleRate = buffer.sampleRate;
 	const bytesPerSample = 2; // 16-bit
 	const blockAlign = numberOfChannels * bytesPerSample;
@@ -209,8 +231,12 @@ function audioBufferToWav(buffer: AudioBuffer): Blob {
 	// Cache channel arrays, write PCM via Int16Array (native little-endian, matches WAV)
 	const channels: Float32Array[] = new Array(numberOfChannels);
 
-	for (let c = 0; c < numberOfChannels; c++) {
-		channels[c] = buffer.getChannelData(c);
+	if (mono) {
+		channels[0] = mixToMono(buffer);
+	} else {
+		for (let c = 0; c < numberOfChannels; c++) {
+			channels[c] = buffer.getChannelData(c);
+		}
 	}
 
 	const pcm = new Int16Array(arrayBuffer, 44, length * numberOfChannels);

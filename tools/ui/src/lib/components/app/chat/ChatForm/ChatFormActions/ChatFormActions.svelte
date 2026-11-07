@@ -27,6 +27,7 @@
 		isLoading?: boolean;
 		isReasoning?: boolean;
 		isRecording?: boolean;
+		isTranscribing?: boolean;
 		showAddButton?: boolean;
 		showDictateButton?: boolean;
 		showModelSelector?: boolean;
@@ -46,6 +47,7 @@
 		isLoading = false,
 		isReasoning = false,
 		isRecording = false,
+		isTranscribing = false,
 		onDictateClick,
 		onFileUpload,
 		onMicClick,
@@ -199,7 +201,12 @@
 	{/if}
 
 	{#if showDictateButton}
-		<ChatFormActionDictate disabled={disabled || isRecording} {isDictating} {onDictateClick} />
+		<ChatFormActionDictate
+			disabled={disabled || isRecording}
+			{isDictating}
+			{isTranscribing}
+			{onDictateClick}
+		/>
 	{/if}
 
 	{#if isLoading && !canSend}

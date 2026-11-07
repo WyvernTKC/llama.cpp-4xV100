@@ -16,8 +16,10 @@
 		INPUT_CLASSES,
 		PROMPT_CONTENT_SEPARATOR,
 		SETTING_CONFIG_DEFAULT,
+		SPEECH_MIC_BLOCKED_MESSAGE,
 		SPEECH_RECOGNITION_BLOCKED_ERRORS,
-		SPEECH_RECOGNITION_SILENT_ERRORS
+		SPEECH_RECOGNITION_SILENT_ERRORS,
+		TRANSCRIPTION_SAMPLE_RATE
 	} from '$lib/constants';
 	import {
 		ContentPartType,
@@ -28,6 +30,7 @@
 		ToolSource
 	} from '$lib/enums';
 	import { useChatFormPickers } from '$lib/hooks/use-chat-form-pickers.svelte';
+	import { TranscriptionService } from '$lib/services';
 	import {
 		chatStore,
 		conversationsStore,
@@ -146,9 +149,14 @@
 
 	// Dictation State: `dictated` marks input that came from speech, so the reply is read aloud
 	let recognition: SpeechRecognitionLike | null = null;
+	let dictationRecorder: AudioRecorder | undefined;
 	let isDictating = $state(false);
-	let dictationSupported = $state(false);
+	let isTranscribing = $state(false);
+	let speechRecognitionSupported = $state(false);
+	let mediaRecorderSupported = $state(false);
 	let dictated = false;
+	// bumped when the input is sent, so a transcript that comes back later is dropped
+	let dictationRun = 0;
 
 	// Invisible anchor at the form's top edge so the mention/WD popovers
 	// float above the box.
@@ -220,6 +228,7 @@
 	});
 
 	let isRouter = $derived(serverStore.isRouterMode);
+	let useServerDictation = $derived(Boolean(currentConfig.dictationUseServer));
 	let conversationModel = $derived(
 		getConversationModel(conversationsStore.activeMessages as DatabaseMessage[])
 	);
@@ -269,9 +278,14 @@
 	onMount(() => {
 		recordingSupported = isAudioRecordingSupported();
 		audioRecorder = new AudioRecorder();
-		dictationSupported = isSpeechRecognitionSupported();
+		speechRecognitionSupported = isSpeechRecognitionSupported();
+		mediaRecorderSupported = typeof MediaRecorder !== 'undefined';
+		dictationRecorder = new AudioRecorder();
 
-		return () => recognition?.abort();
+		return () => {
+			recognition?.abort();
+			dictationRecorder?.cancelRecording();
+		};
 	});
 
 	export function focus() {
@@ -291,7 +305,13 @@
 		const wasDictated = dictated;
 
 		dictated = false;
+		dictationRun++;
 		recognition?.abort();
+
+		if (dictationRecorder?.isRecording()) {
+			dictationRecorder.cancelRecording();
+			isDictating = false;
+		}
 
 		return wasDictated;
 	}
@@ -549,7 +569,29 @@
 		}
 	}
 
+	function dictationPrefix(): string {
+		return value.trim() ? `${value.trimEnd()} ` : '';
+	}
+
+	function setDictatedText(prefix: string, text: string) {
+		value = prefix + text;
+		onValueChange?.(value);
+		dictated = true;
+
+		tick().then(() => {
+			const el = inputRef?.getElement();
+
+			if (el instanceof HTMLTextAreaElement) autoResizeTextarea(el);
+		});
+	}
+
 	function handleDictateClick() {
+		if (useServerDictation) {
+			void handleServerDictation();
+
+			return;
+		}
+
 		if (recognition) {
 			recognition.stop();
 
@@ -564,29 +606,19 @@
 		speechStore.stop();
 		speechStore.unlock();
 
-		const prefix = value.trim() ? `${value.trimEnd()} ` : '';
+		const prefix = dictationPrefix();
 
 		rec.onresult = (event) => {
 			const text = speechResultsToText(event.results);
 
-			if (!text) return;
-
-			value = prefix + text;
-			onValueChange?.(value);
-			dictated = true;
-
-			tick().then(() => {
-				const el = inputRef?.getElement();
-
-				if (el instanceof HTMLTextAreaElement) autoResizeTextarea(el);
-			});
+			if (text) setDictatedText(prefix, text);
 		};
 		rec.onerror = (event) => {
 			if (SPEECH_RECOGNITION_SILENT_ERRORS.includes(event.error)) return;
 
 			toast.error(
 				SPEECH_RECOGNITION_BLOCKED_ERRORS.includes(event.error)
-					? 'Microphone blocked. Dictation needs microphone permission and an HTTPS or localhost address.'
+					? SPEECH_MIC_BLOCKED_MESSAGE
 					: `Dictation failed: ${event.error}`
 			);
 		};
@@ -603,6 +635,70 @@
 			isDictating = true;
 		} catch (error) {
 			console.error('Failed to start dictation:', error);
+		}
+	}
+
+	// an empty setting sends the selected model to this server in router mode, nothing otherwise
+	function getTranscriptionModel(): string | undefined {
+		const model = String(currentConfig.transcriptionModel ?? '').trim();
+
+		if (model) return model;
+
+		if (String(currentConfig.transcriptionUrl ?? '').trim() || !isRouter) return undefined;
+
+		return modelsStore.selectedModelName ?? conversationModel ?? undefined;
+	}
+
+	// tap to record, tap again to send the audio to the transcription endpoint
+	async function handleServerDictation() {
+		if (!dictationRecorder || isTranscribing) return;
+
+		if (dictationRecorder.isRecording()) {
+			const run = dictationRun;
+
+			isDictating = false;
+			isTranscribing = true;
+
+			try {
+				const audio = await dictationRecorder.stopRecording();
+				const wav = await convertToWav(audio, {
+					mono: true,
+					sampleRate: TRANSCRIPTION_SAMPLE_RATE
+				});
+				const text = await TranscriptionService.transcribe(createAudioFile(wav), {
+					language: navigator.language.split('-')[0],
+					model: getTranscriptionModel(),
+					url: String(currentConfig.transcriptionUrl ?? '')
+				});
+
+				if (run === dictationRun && text) setDictatedText(dictationPrefix(), text);
+			} catch (error) {
+				if (run === dictationRun) {
+					toast.error(
+						`Transcription failed: ${error instanceof Error ? error.message : String(error)}`
+					);
+				}
+			} finally {
+				isTranscribing = false;
+			}
+
+			return;
+		}
+
+		if (!isAudioRecordingSupported()) {
+			toast.error(SPEECH_MIC_BLOCKED_MESSAGE);
+
+			return;
+		}
+
+		speechStore.stop();
+		speechStore.unlock();
+
+		try {
+			await dictationRecorder.startRecording();
+			isDictating = true;
+		} catch (error) {
+			toast.error(error instanceof Error ? error.message : SPEECH_MIC_BLOCKED_MESSAGE);
 		}
 	}
 
@@ -728,13 +824,14 @@
 				{isLoading}
 				isReasoning={chatStore.isReasoning}
 				{isRecording}
+				{isTranscribing}
 				onDictateClick={handleDictateClick}
 				onFileUpload={handleFileUpload}
 				onMicClick={handleMicClick}
 				{onStop}
 				onSystemPromptClick={() => onSystemPromptClick?.({ files: uploadedFiles, message: value })}
 				{showAddButton}
-				showDictateButton={dictationSupported}
+				showDictateButton={useServerDictation ? mediaRecorderSupported : speechRecognitionSupported}
 				{showModelSelector}
 				{uploadedFiles}
 			/>

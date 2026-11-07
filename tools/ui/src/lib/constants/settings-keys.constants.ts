@@ -18,6 +18,7 @@ export const SETTINGS_KEYS = {
 	CUSTOM_CSS: 'customCss',
 	// PY_INTERPRETER_ENABLED: 'pyInterpreterEnabled',
 	CUSTOM_JSON: 'customJson',
+	DICTATION_USE_SERVER: 'dictationUseServer',
 	DISABLE_AUTO_SCROLL: 'disableAutoScroll',
 	// Developer
 	DISABLE_REASONING_PARSING: 'disableReasoningParsing',
@@ -79,6 +80,8 @@ export const SETTINGS_KEYS = {
 	TITLE_GENERATION_USE_LLM: 'titleGenerationUseLLM',
 	TOP_K: 'top_k',
 	TOP_P: 'top_p',
+	TRANSCRIPTION_MODEL: 'transcriptionModel',
+	TRANSCRIPTION_URL: 'transcriptionUrl',
 	TYP_P: 'typ_p',
 	// General
 	USE_HUGGING_FACE_HUB: 'useHuggingFaceHub',

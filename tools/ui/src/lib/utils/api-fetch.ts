@@ -175,7 +175,7 @@ export async function apiDelete<T>(
  * Parse error message from a failed response.
  * Tries to extract error message from JSON body, falls back to status text.
  */
-async function parseErrorMessage(response: Response): Promise<string> {
+export async function parseErrorMessage(response: Response): Promise<string> {
 	try {
 		const errorData = await response.json();
 

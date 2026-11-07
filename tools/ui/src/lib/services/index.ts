@@ -359,3 +359,11 @@ export { MigrationService } from './migration.service';
  * @see settingsStore in stores/settings/index.svelte.ts - reactive state + business logic
  */
 export { SettingsService } from './settings.service';
+
+/**
+ * **TranscriptionService** - speech to text over the OpenAI transcriptions format
+ *
+ * Posts a recording to this server's `/v1/audio/transcriptions` or to another
+ * endpoint (llama.cpp, whisper.cpp) and returns the text.
+ */
+export { TranscriptionService } from './transcription.service';

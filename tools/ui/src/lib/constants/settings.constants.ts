@@ -121,6 +121,30 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 			},
 			{
 				defaultValue: false,
+				help: 'Dictation records the audio and sends it to a transcription endpoint (OpenAI /v1/audio/transcriptions format) instead of the device speech recognizer. By default it uses this server, which needs a model with audio input. The microphone still needs an HTTPS or localhost address.',
+				key: SETTINGS_KEYS.DICTATION_USE_SERVER,
+				label: 'Transcribe dictation on a server',
+				type: SettingsFieldType.CHECKBOX
+			},
+			{
+				defaultValue: '',
+				dependsOn: SETTINGS_KEYS.DICTATION_USE_SERVER,
+				help: 'Empty uses this server. For another llama.cpp server use <code>http://host:port/v1/audio/transcriptions</code>, for a whisper.cpp server <code>http://host:port/inference</code>. Another server must allow CORS, and an HTTPS page can only call an HTTPS URL. The API key is sent to this server only.',
+				key: SETTINGS_KEYS.TRANSCRIPTION_URL,
+				label: 'Transcription URL',
+				placeholder: './v1/audio/transcriptions',
+				type: SettingsFieldType.INPUT
+			},
+			{
+				defaultValue: '',
+				dependsOn: SETTINGS_KEYS.DICTATION_USE_SERVER,
+				help: 'Model name sent with the audio. Empty sends the selected model when this server runs in router mode, and nothing otherwise. Some OpenAI-style whisper servers need a name here.',
+				key: SETTINGS_KEYS.TRANSCRIPTION_MODEL,
+				label: 'Transcription model',
+				type: SettingsFieldType.INPUT
+			},
+			{
+				defaultValue: false,
 				help: 'Enable "Continue" button for assistant messages, including reasoning models.',
 				isExperimental: true,
 				key: SETTINGS_KEYS.ENABLE_CONTINUE_GENERATION,

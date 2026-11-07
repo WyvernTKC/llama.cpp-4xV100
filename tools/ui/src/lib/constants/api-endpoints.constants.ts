@@ -19,6 +19,11 @@ export const API_SLOTS = {
 	LIST: './slots'
 };
 
+// OpenAI-style speech to text, multipart form with the audio in the file field
+export const API_AUDIO = {
+	TRANSCRIPTIONS: '/v1/audio/transcriptions'
+};
+
 export const API_TOOLS = {
 	EXECUTE: '/tools',
 	LIST: '/tools'
