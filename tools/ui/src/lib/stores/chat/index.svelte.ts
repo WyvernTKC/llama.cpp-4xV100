@@ -1077,6 +1077,10 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				extras?: DatabaseMessageExtra[],
 				toolCwd?: string
 			) => {
+				// Each result hangs off the previous message of the flow: the turn's
+				// assistant message for the first call, then the result before it. The
+				// results of parallel calls form one chain on the branch, as the legacy
+				// migration stores them; as siblings the branch walk kept only the last.
 				const msg = await DatabaseService.createMessageBranch(
 					{
 						children: [],
@@ -1090,7 +1094,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 						toolCwd,
 						type: MessageType.TEXT
 					},
-					currentMessageId
+					lastCreatedInFlow
 				);
 
 				// mirror into the active store and move the node pointer only when this

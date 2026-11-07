@@ -4,7 +4,7 @@
 
 import { MessageRole, MessageType } from '$lib/enums';
 import type { DatabaseMessage } from '$lib/types/database';
-import { buildSiblingInfoMap, findLeafNode } from '$lib/utils/branching';
+import { buildSiblingInfoMap, filterByLeafNodeId, findLeafNode } from '$lib/utils/branching';
 import { describe, expect, it } from 'vitest';
 
 function msg(id: string, parent: string | null, children: string[] = []): DatabaseMessage {
@@ -91,5 +91,79 @@ describe('buildSiblingInfoMap', () => {
 		for (const m of messages) {
 			expect(findLeafNode(messages, m.id), `leaf of ${m.id}`).toBe(leafId);
 		}
+	});
+});
+
+/** A message with a role, an optional tool call id and a timestamp for path order. */
+function node(
+	id: string,
+	parent: string | null,
+	children: string[],
+	role: MessageRole,
+	timestamp: number,
+	toolCallId?: string
+): DatabaseMessage {
+	return { ...msg(id, parent, children), role, timestamp, toolCallId } as DatabaseMessage;
+}
+
+describe('filterByLeafNodeId with parallel tool calls', () => {
+	it('keeps every result of a chained turn', () => {
+		// u1 -> a1 (two calls) -> t1 -> t2 -> a2, as new flows store them
+		const messages = [
+			node('u1', null, ['a1'], MessageRole.USER, 1),
+			node('a1', 'u1', ['t1'], MessageRole.ASSISTANT, 2),
+			node('t1', 'a1', ['t2'], MessageRole.TOOL, 3, 'call_1'),
+			node('t2', 't1', ['a2'], MessageRole.TOOL, 4, 'call_2'),
+			node('a2', 't2', [], MessageRole.ASSISTANT, 5)
+		];
+
+		expect(filterByLeafNodeId(messages, 'a2').map((m) => m.id)).toEqual([
+			'u1',
+			'a1',
+			't1',
+			't2',
+			'a2'
+		]);
+	});
+
+	it('recovers results stored as siblings under the assistant message', () => {
+		// older chats: both results hang off a1, the next turn off the last one
+		const messages = [
+			node('u1', null, ['a1'], MessageRole.USER, 1),
+			node('a1', 'u1', ['t1', 't2'], MessageRole.ASSISTANT, 2),
+			node('t1', 'a1', [], MessageRole.TOOL, 3, 'call_1'),
+			node('t2', 'a1', ['a2'], MessageRole.TOOL, 4, 'call_2'),
+			node('a2', 't2', [], MessageRole.ASSISTANT, 5)
+		];
+
+		expect(filterByLeafNodeId(messages, 'a2').map((m) => m.id)).toEqual([
+			'u1',
+			'a1',
+			't1',
+			't2',
+			'a2'
+		]);
+	});
+
+	it('leaves out user branches, branched tool results and duplicate call ids', () => {
+		const messages = [
+			node('u1', null, ['a1'], MessageRole.USER, 1),
+			node('a1', 'u1', ['t1', 'tdup', 'tb', 'u2', 't2'], MessageRole.ASSISTANT, 2),
+			node('t1', 'a1', [], MessageRole.TOOL, 3, 'call_1'),
+			node('tdup', 'a1', [], MessageRole.TOOL, 4, 'call_2'),
+			node('tb', 'a1', ['x'], MessageRole.TOOL, 5, 'call_3'),
+			node('x', 'tb', [], MessageRole.ASSISTANT, 6),
+			node('u2', 'a1', [], MessageRole.USER, 7),
+			node('t2', 'a1', ['a2'], MessageRole.TOOL, 8, 'call_2'),
+			node('a2', 't2', [], MessageRole.ASSISTANT, 9)
+		];
+
+		expect(filterByLeafNodeId(messages, 'a2').map((m) => m.id)).toEqual([
+			'u1',
+			'a1',
+			't1',
+			't2',
+			'a2'
+		]);
 	});
 });

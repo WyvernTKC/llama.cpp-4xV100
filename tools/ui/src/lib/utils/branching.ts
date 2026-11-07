@@ -30,6 +30,42 @@ export function findMessageById(
 }
 
 /**
+ * The results of an assistant message's other tool calls, stored next to the
+ * one on the path. Chats saved before tool results were chained hold the
+ * results of parallel calls as siblings under the assistant message, and the
+ * walk up the parent chain reaches only one of them. A sibling with children
+ * starts a branch of its own and stays out.
+ */
+function siblingToolResults(
+	nodeMap: ReadonlyMap<string, DatabaseMessage>,
+	assistant: DatabaseMessage,
+	onPath: DatabaseMessage
+): DatabaseMessage[] {
+	const seen = new Set<string | undefined>([onPath.toolCallId]);
+	const siblings: DatabaseMessage[] = [];
+
+	for (const childId of assistant.children) {
+		const child = nodeMap.get(childId);
+
+		if (
+			!child ||
+			child.id === onPath.id ||
+			child.role !== MessageRole.TOOL ||
+			!child.toolCallId ||
+			child.children.length > 0 ||
+			seen.has(child.toolCallId)
+		) {
+			continue;
+		}
+
+		seen.add(child.toolCallId);
+		siblings.push(child);
+	}
+
+	return siblings;
+}
+
+/**
  * Filters messages to get the conversation path from root to a specific leaf node.
  * If the leafNodeId doesn't exist, returns the path with the latest timestamp.
  *
@@ -80,7 +116,13 @@ export function filterByLeafNodeId(
 			break;
 		}
 
-		currentNode = nodeMap.get(currentNode.parent);
+		const parentNode = nodeMap.get(currentNode.parent);
+
+		if (currentNode.role === MessageRole.TOOL && parentNode?.role === MessageRole.ASSISTANT) {
+			result.push(...siblingToolResults(nodeMap, parentNode, currentNode));
+		}
+
+		currentNode = parentNode;
 	}
 
 	// Sort: system messages first, then by timestamp
