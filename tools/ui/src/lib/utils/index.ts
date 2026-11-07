@@ -192,10 +192,13 @@ export { createBase64DataUrl, downloadDataUrl } from './data-url';
 
 // attachment:// image handles in tool arguments
 export {
+	assignImageRefIds,
 	collectAttachmentRefs,
 	formatAttachmentRefLabel,
 	resolveAttachmentRefs,
-	withAttachmentRefHints
+	withAttachmentRefHints,
+	withFreshImageRefIds,
+	withToolImageHandles
 } from './attachment-refs';
 
 // Header utilities

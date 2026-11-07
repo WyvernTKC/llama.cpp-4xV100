@@ -45,6 +45,7 @@ export const SETTINGS_KEYS = {
 	MEMORIES_ENABLED: 'memoriesEnabled',
 	MENTION_SEARCH_MAX_DEPTH: 'mentionSearchMaxDepth',
 	MIN_P: 'min_p',
+	PARALLEL_TOOL_CALLS: 'parallelToolCalls',
 	// Display
 	PASTE_LONG_TEXT_TO_FILE_LEN: 'pasteLongTextToFileLen',
 	PDF_AS_IMAGE: 'pdfAsImage',

@@ -1,13 +1,16 @@
+import { uuid } from './uuid';
 import {
 	ATTACHMENT_REF_PARAM_HINT,
 	ATTACHMENT_REF_PREFIX,
 	ATTACHMENT_REF_REGEX,
+	ATTACHMENT_SAVED_REGEX,
 	BASE64_HINT_REGEX,
 	DATA_URI_HINT_REGEX,
-	IMAGE_PARAM_HINT_REGEX
+	IMAGE_PARAM_HINT_REGEX,
+	NEWLINE
 } from '$lib/constants';
 import { AttachmentType } from '$lib/enums';
-import type { DatabaseMessageExtra } from '$lib/types/database';
+import type { DatabaseMessageExtra, DatabaseMessageExtraImageFile } from '$lib/types/database';
 
 type JsonSchema = Record<string, unknown>;
 
@@ -16,7 +19,7 @@ export function formatAttachmentRefLabel(refId: string): string {
 	return `[Image ${ATTACHMENT_REF_PREFIX}${refId} - pass this handle in a tool argument to send the image]`;
 }
 
-/** Data URL of every chat image that carries a ref id, keyed by that id. */
+/** Data URL of every chat image that carries a ref id, PDF pages sent as images too, keyed by that id. */
 export function collectAttachmentRefs(messages: readonly object[]): Map<string, string> {
 	const refs = new Map<string, string>();
 
@@ -26,11 +29,133 @@ export function collectAttachmentRefs(messages: readonly object[]): Map<string, 
 		for (const extra of extras ?? []) {
 			if (extra.type === AttachmentType.IMAGE && extra.refId) {
 				refs.set(extra.refId, extra.base64Url);
+			} else if (extra.type === AttachmentType.PDF && extra.processedAsImages) {
+				extra.images?.forEach((image, i) => {
+					const refId = extra.imageRefIds?.[i];
+
+					if (refId) refs.set(refId, image);
+				});
 			}
 		}
 	}
 
 	return refs;
+}
+
+/**
+ * Gives every image on the path a ref id no earlier image on it holds: images
+ * saved before ref ids existed get one, and so does a copy of an earlier image.
+ * PDF pages sent as images count as images. Returns the new extras of each
+ * message that changed, keyed by message id; the other messages keep theirs.
+ */
+export function assignImageRefIds(
+	messages: readonly { id: string; extra?: DatabaseMessageExtra[] }[],
+	newId: () => string = uuid
+): Map<string, DatabaseMessageExtra[]> {
+	const seen = new Set<string>();
+	const changed = new Map<string, DatabaseMessageExtra[]>();
+	const claim = (refId: string | undefined): string => {
+		const id = refId && !seen.has(refId) ? refId : newId();
+
+		seen.add(id);
+
+		return id;
+	};
+
+	for (const message of messages) {
+		if (!message.extra?.length) continue;
+
+		let dirty = false;
+
+		const extra = message.extra.map((item): DatabaseMessageExtra => {
+			if (item.type === AttachmentType.IMAGE) {
+				const refId = claim(item.refId);
+
+				if (refId === item.refId) return item;
+
+				dirty = true;
+
+				return { ...item, refId };
+			}
+
+			if (item.type === AttachmentType.PDF && item.processedAsImages && item.images?.length) {
+				const imageRefIds = item.images.map((_, i) => claim(item.imageRefIds?.[i]));
+
+				if (imageRefIds.every((id, i) => id === item.imageRefIds?.[i])) return item;
+
+				dirty = true;
+
+				return { ...item, imageRefIds };
+			}
+
+			return item;
+		});
+
+		if (dirty) changed.set(message.id, extra);
+	}
+
+	return changed;
+}
+
+/** The extras with a new ref id on each image, for a copy of them in a new message. */
+export function withFreshImageRefIds<T extends DatabaseMessageExtra[] | undefined>(
+	extras: T,
+	newId: () => string = uuid
+): T {
+	if (!extras) return extras;
+
+	return extras.map((item) => {
+		if (item.type === AttachmentType.IMAGE) return { ...item, refId: newId() };
+
+		if (item.type === AttachmentType.PDF && item.processedAsImages && item.images?.length) {
+			return { ...item, imageRefIds: item.images.map(() => newId()) };
+		}
+
+		return item;
+	}) as T;
+}
+
+/**
+ * The text of a tool result as the model reads it: each image the tool returned
+ * keeps the "[Attachment saved: name]" line it was swapped for, and gets its
+ * attachment://<refId> label on that line. An image without such a line gets
+ * its label at the end. The stored text stays as is, the chat view parses it.
+ */
+export function withToolImageHandles(
+	content: string,
+	extras: readonly DatabaseMessageExtra[] | undefined
+): string {
+	const images = (extras ?? []).filter(
+		(e): e is DatabaseMessageExtraImageFile & { refId: string } =>
+			e.type === AttachmentType.IMAGE && Boolean(e.refId)
+	);
+
+	if (images.length === 0) return content;
+
+	// older chats stored each tool image twice under one name
+	const byName = new Map<string, string>();
+
+	for (const image of images) {
+		if (!byName.has(image.name)) byName.set(image.name, image.refId);
+	}
+
+	const labelled = new Set<string>();
+	const lines = content.split(NEWLINE).map((line) => {
+		const name = line.match(ATTACHMENT_SAVED_REGEX)?.[1];
+		const refId = name === undefined ? undefined : byName.get(name);
+
+		if (!name || !refId || labelled.has(name)) return line;
+
+		labelled.add(name);
+
+		return `${line} ${formatAttachmentRefLabel(refId)}`;
+	});
+
+	for (const [name, refId] of byName) {
+		if (!labelled.has(name)) lines.push(formatAttachmentRefLabel(refId));
+	}
+
+	return lines.join(NEWLINE);
 }
 
 function asSchema(value: unknown): JsonSchema | undefined {

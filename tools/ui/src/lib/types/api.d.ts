@@ -315,6 +315,8 @@ export interface ApiChatCompletionRequest {
 	return_progress?: boolean;
 	sse_ping_interval?: number;
 	tools?: ApiChatCompletionTool[];
+	// false: at most one tool call per reply, the server default follows the chat template
+	parallel_tool_calls?: boolean;
 	// Reasoning parameters
 	reasoning_format?: string;
 	reasoning_effort?: string;

@@ -156,6 +156,7 @@ export async function parseFilesToMessageExtras(
 						extras.push({
 							base64Data: base64Data,
 							content,
+							imageRefIds: images.map(() => uuid()),
 							images: images,
 							name: file.name,
 							processedAsImages: true,

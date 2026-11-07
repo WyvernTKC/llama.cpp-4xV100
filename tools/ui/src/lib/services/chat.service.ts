@@ -44,7 +44,7 @@ import type { OpenAIToolDefinition } from '$lib/types/mcp';
 import { isAbortError } from '$lib/utils/abort';
 import { ApiError } from '$lib/utils/api-fetch';
 import { getAuthHeaders, getJsonHeaders } from '$lib/utils/api-headers';
-import { formatAttachmentRefLabel } from '$lib/utils/attachment-refs';
+import { formatAttachmentRefLabel, withToolImageHandles } from '$lib/utils/attachment-refs';
 import { formatAttachmentText } from '$lib/utils/formatters';
 import { streamIdentity } from '$lib/utils/stream-identity';
 
@@ -142,7 +142,7 @@ export class ChatService {
 		// Handle tool result messages (role: 'tool')
 		if (message.role === MessageRole.TOOL && message.toolCallId) {
 			return {
-				content: message.content,
+				content: withToolImageHandles(message.content, message.extra),
 				role: MessageRole.TOOL,
 				tool_call_id: message.toolCallId
 			};
@@ -279,6 +279,15 @@ export class ChatService {
 		for (const pdfFile of pdfFiles) {
 			if (pdfFile.processedAsImages && pdfFile.images) {
 				for (let i = 0; i < pdfFile.images.length; i++) {
+					const refId = pdfFile.imageRefIds?.[i];
+
+					if (refId) {
+						contentParts.push({
+							text: formatAttachmentRefLabel(refId),
+							type: ContentPartType.TEXT
+						});
+					}
+
 					contentParts.push({
 						image_url: { url: pdfFile.images[i] },
 						type: ContentPartType.IMAGE_URL
@@ -1091,6 +1100,7 @@ export class ChatService {
 			onReasoningChunk,
 			onTimings,
 			onToolCallChunk,
+			parallelToolCalls,
 			presence_penalty,
 			reasoningEffort,
 			// Penalty parameters
@@ -1163,6 +1173,12 @@ export class ChatService {
 			stream,
 			tools: tools && tools.length > 0 ? tools : undefined
 		};
+
+		// One tool call per reply unless parallel calls are on: the grammar ends the
+		// reply after the call, so the model reads the result before it goes on
+		if (requestBody.tools && !parallelToolCalls) {
+			requestBody.parallel_tool_calls = false;
+		}
 
 		// Include model in request if provided (required in ROUTER mode)
 		if (options.model) {

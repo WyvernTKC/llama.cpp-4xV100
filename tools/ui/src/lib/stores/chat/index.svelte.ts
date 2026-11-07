@@ -49,6 +49,7 @@ import type {
 } from '$lib/types';
 import type { AgenticToolPolicy } from '$lib/types/agentic';
 import {
+	assignImageRefIds,
 	canCompactMessages,
 	compactionCut,
 	filterByLeafNodeId,
@@ -471,6 +472,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		if (currentConfig.disableReasoningParsing) apiOptions.disableReasoningParsing = true;
 
 		if (currentConfig.excludeReasoningFromContext) apiOptions.excludeReasoningFromContext = true;
+
+		if (currentConfig.parallelToolCalls) apiOptions.parallelToolCalls = true;
 
 		// an explicit reasoning choice overrides the server default, DEFAULT sends nothing:
 		// a level the chat template honors goes as is, the others as a token budget
@@ -972,7 +975,9 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 		// Every request path funnels through here, so the compaction boundary
 		// applied once covers the plain send, the agentic flow, and the
-		// pre-encode that reuses this list from the closure.
+		// pre-encode that reuses this list from the closure. The image handles
+		// go first, so they hold for images before the boundary too.
+		allMessages = await this.ensureImageRefIds(assistantMessage.convId, allMessages);
 		allMessages = sliceAtLastCompaction(allMessages);
 
 		// Mutable state for the current message being streamed
@@ -1440,6 +1445,39 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	/** The steps a compaction keeps as written, as the settings set them. */
 	private compactionPreserve(): number {
 		return Number(settingsStore.config.compactionPreservedSteps);
+	}
+
+	/**
+	 * Gives every image on the path an attachment:// handle no other image on it
+	 * holds, for images saved before handles existed and copies of an earlier
+	 * image, and stores them, so the model reads the same handles on every turn.
+	 * Returns the path with the handles.
+	 */
+	private async ensureImageRefIds(
+		convId: string,
+		path: DatabaseMessage[]
+	): Promise<DatabaseMessage[]> {
+		const changed = assignImageRefIds(path);
+
+		if (changed.size === 0) return path;
+
+		for (const [id, proxied] of changed) {
+			// the untouched extras are still the store's state proxies, which IndexedDB cannot clone
+			const extra = $state.snapshot(proxied) as DatabaseMessageExtra[];
+
+			changed.set(id, extra);
+			await DatabaseService.updateMessage(id, { extra });
+
+			if (conversationsStore.activeConversation?.id === convId) {
+				const idx = conversationsStore.findMessageIndex(id);
+
+				if (idx >= 0) conversationsStore.updateMessageAtIndex(idx, { extra });
+			}
+		}
+
+		return path.map((message) =>
+			changed.has(message.id) ? { ...message, extra: changed.get(message.id) } : message
+		);
 	}
 
 	private async generateTitleWithLLM(

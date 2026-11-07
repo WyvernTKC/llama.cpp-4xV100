@@ -33,7 +33,8 @@ import {
 	findLeafNode,
 	findMessageById,
 	isAbortError,
-	sliceAtLastCompaction
+	sliceAtLastCompaction,
+	withFreshImageRefIds
 } from '$lib/utils';
 
 /**
@@ -396,12 +397,13 @@ export class ChatMessageFlows {
 
 				if (!parentId) return;
 
+				// a copy of an image is a new image in this chat, with its own handle
 				const newMessage = await DatabaseService.createMessageBranch(
 					{
 						children: [],
 						content: newContent,
 						convId: msg.convId,
-						extra: extrasToUse,
+						extra: withFreshImageRefIds(extrasToUse),
 						model: msg.model,
 						role: msg.role,
 						timestamp: Date.now(),

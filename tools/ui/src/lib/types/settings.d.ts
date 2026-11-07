@@ -87,6 +87,8 @@ export interface SettingsChatServiceOptions {
 	disableReasoningParsing?: boolean;
 	// Strip reasoning content from context before sending
 	excludeReasoningFromContext?: boolean;
+	// Several tool calls in one reply; off sends parallel_tool_calls: false
+	parallelToolCalls?: boolean;
 	// Enable model thinking/reasoning via chat_template_kwargs
 	enableThinking?: boolean;
 	// Reasoning effort level the chat template honors, sent as reasoning_effort

@@ -152,6 +152,8 @@ export interface AgenticFlowCallbacks {
 export interface AgenticFlowOptions {
 	stream?: boolean;
 	model?: string;
+	// several tool calls in one reply, otherwise one call and the model reads its result first
+	parallelToolCalls?: boolean;
 	temperature?: number;
 	max_tokens?: number;
 	[key: string]: unknown;

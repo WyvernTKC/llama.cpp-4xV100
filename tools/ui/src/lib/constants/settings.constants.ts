@@ -414,6 +414,13 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 			},
 			{
 				defaultValue: false,
+				help: 'Let the model request several tool calls in one reply. Off, a reply ends with its first tool call and the model reads that result before it reasons further or calls the next tool.',
+				key: SETTINGS_KEYS.PARALLEL_TOOL_CALLS,
+				label: 'Parallel tool calls',
+				type: SettingsFieldType.CHECKBOX
+			},
+			{
+				defaultValue: false,
 				help: 'Let the model manage conversations: compact_conversation, get_context_usage and rename_conversation for this chat, search_conversations and read_conversation for past chats, and new_conversation to start a chat in a new tab with its first message left for you to send. A compaction the model asks for runs when its reply ends.',
 				key: SETTINGS_KEYS.CHAT_TOOLS_ENABLED,
 				label: 'Chat tools',

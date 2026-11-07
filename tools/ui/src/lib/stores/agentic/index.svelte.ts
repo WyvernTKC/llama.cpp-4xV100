@@ -93,7 +93,9 @@ import {
 	isAbortError,
 	lastContextBearingMessage,
 	normalizeConversationTitle,
-	resolveAttachmentRefs
+	resolveAttachmentRefs,
+	uuid,
+	withToolImageHandles
 } from '$lib/utils';
 import { SvelteMap } from 'svelte/reactivity';
 
@@ -793,8 +795,18 @@ class AgenticStore {
 				return;
 			}
 
-			// Normalize and save assistant turn with tool calls
-			const normalizedCalls = this.normalizeToolCalls(turnToolCalls);
+			// Normalize and save assistant turn with tool calls. Unless parallel tool
+			// calls are on, the request asks for one call per reply; a template that
+			// still yields several keeps only the first, so the model reads its result
+			// before it decides on the next call
+			let normalizedCalls = this.normalizeToolCalls(turnToolCalls);
+
+			if (!options.parallelToolCalls && normalizedCalls.length > 1) {
+				console.info(
+					`[AgenticStore] Running 1 of ${normalizedCalls.length} tool calls, parallel tool calls are off`
+				);
+				normalizedCalls = normalizedCalls.slice(0, 1);
+			}
 
 			if (normalizedCalls.length === 0) {
 				await onAssistantTurnComplete?.(
@@ -1031,6 +1043,16 @@ class AgenticStore {
 
 				const { attachments, cleanedResult } = this.extractBase64Attachments(result);
 
+				// a later call in this flow can pass these images on by their handles
+				for (const attachment of attachments) {
+					if (attachment.type === AttachmentType.IMAGE && attachment.refId) {
+						attachmentRefs.set(attachment.refId, attachment.base64Url);
+					}
+				}
+
+				// the text the model reads, as it reads it again from the stored message
+				const modelResult = withToolImageHandles(cleanedResult, attachments);
+
 				// For streaming tools the result message was created empty
 				// at the start of execution and updated in place as chunks
 				// arrived via updateToolResultMessage. Skip the second
@@ -1055,7 +1077,7 @@ class AgenticStore {
 
 				// Build content parts for session history (including images for vision models)
 				const contentParts: ApiChatMessageContentPart[] = [
-					{ text: cleanedResult, type: ContentPartType.TEXT }
+					{ text: modelResult, type: ContentPartType.TEXT }
 				];
 
 				for (const attachment of attachments) {
@@ -1088,7 +1110,7 @@ class AgenticStore {
 				}
 
 				sessionMessages.push({
-					content: contentParts.length === 1 ? cleanedResult : contentParts,
+					content: contentParts.length === 1 ? modelResult : contentParts,
 					role: MessageRole.TOOL,
 					tool_call_id: toolCall.id
 				});
@@ -1304,7 +1326,12 @@ class AgenticStore {
 			const name = this.buildAttachmentName(mimeType, attachmentIndex);
 
 			if (mimeType.startsWith(MIME_TYPE_PREFIXES.IMAGE)) {
-				attachments.push({ base64Url: trimmedLine, name, type: AttachmentType.IMAGE });
+				attachments.push({
+					base64Url: trimmedLine,
+					name,
+					refId: uuid(),
+					type: AttachmentType.IMAGE
+				});
 
 				return `[Attachment saved: ${name}]`;
 			}

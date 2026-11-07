@@ -72,6 +72,8 @@ export interface DatabaseMessageExtraPdfFile {
 	size?: number;
 	content: string;
 	images?: string[];
+	/** Ref id of each page in images, the model passes it as attachment://<refId> */
+	imageRefIds?: string[];
 	processedAsImages: boolean;
 }
 

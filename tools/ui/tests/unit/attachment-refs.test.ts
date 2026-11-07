@@ -1,9 +1,13 @@
 import { AttachmentType } from '$lib/enums';
+import type { DatabaseMessageExtra } from '$lib/types/database';
 import {
+	assignImageRefIds,
 	collectAttachmentRefs,
 	formatAttachmentRefLabel,
 	resolveAttachmentRefs,
-	withAttachmentRefHints
+	withAttachmentRefHints,
+	withFreshImageRefIds,
+	withToolImageHandles
 } from '$lib/utils/attachment-refs';
 import { describe, expect, it } from 'vitest';
 
@@ -143,5 +147,134 @@ describe('withAttachmentRefHints', () => {
 			image: DATA_URL,
 			image_b64: RAW
 		});
+	});
+});
+
+function counter(): () => string {
+	let n = 0;
+
+	return () => `new-${++n}`;
+}
+
+const image = (name: string, refId?: string): DatabaseMessageExtra => ({
+	base64Url: DATA_URL,
+	name,
+	refId,
+	type: AttachmentType.IMAGE
+});
+const pdf = (imageRefIds?: string[]): DatabaseMessageExtra => ({
+	base64Data: '',
+	content: '',
+	imageRefIds,
+	images: ['data:image/png;base64,AAAA', 'data:image/png;base64,BBBB'],
+	name: 'doc.pdf',
+	processedAsImages: true,
+	type: AttachmentType.PDF
+});
+
+describe('collectAttachmentRefs with PDF pages', () => {
+	it('maps each page ref id to its page image', () => {
+		const found = collectAttachmentRefs([{ extra: [pdf(['p1', 'p2'])] }]);
+
+		expect(found.get('p1')).toBe('data:image/png;base64,AAAA');
+		expect(found.get('p2')).toBe('data:image/png;base64,BBBB');
+	});
+});
+
+describe('assignImageRefIds', () => {
+	it('leaves a path whose images all hold distinct ids alone', () => {
+		const path = [
+			{ extra: [image('a.png', 'r1')], id: 'm1' },
+			{ extra: [pdf(['p1', 'p2'])], id: 'm2' }
+		];
+
+		expect(assignImageRefIds(path, counter()).size).toBe(0);
+	});
+
+	it('gives images without an id one', () => {
+		const changed = assignImageRefIds(
+			[{ extra: [image('a.png'), image('b.png', 'r2')], id: 'm1' }],
+			counter()
+		);
+
+		expect(changed.get('m1')).toEqual([image('a.png', 'new-1'), image('b.png', 'r2')]);
+	});
+
+	it('gives a later copy of an image a new id and keeps the first', () => {
+		const changed = assignImageRefIds(
+			[
+				{ extra: [image('a.png', 'r1')], id: 'm1' },
+				{ extra: [], id: 'm2' },
+				{ extra: [image('a.png', 'r1')], id: 'm3' }
+			],
+			counter()
+		);
+
+		expect([...changed.keys()]).toEqual(['m3']);
+		expect(changed.get('m3')).toEqual([image('a.png', 'new-1')]);
+	});
+
+	it('fills and dedupes PDF page ids', () => {
+		const changed = assignImageRefIds(
+			[
+				{ extra: [image('a.png', 'r1')], id: 'm1' },
+				{ extra: [pdf(['r1'])], id: 'm2' }
+			],
+			counter()
+		);
+
+		expect(changed.get('m2')).toEqual([pdf(['new-1', 'new-2'])]);
+	});
+});
+
+describe('withFreshImageRefIds', () => {
+	it('renews image and PDF page ids and keeps other extras', () => {
+		const text: DatabaseMessageExtra = { content: 'x', name: 'a.txt', type: AttachmentType.TEXT };
+
+		expect(
+			withFreshImageRefIds([image('a.png', 'r1'), pdf(['p1', 'p2']), text], counter())
+		).toEqual([image('a.png', 'new-1'), pdf(['new-2', 'new-3']), text]);
+		expect(withFreshImageRefIds(undefined)).toBeUndefined();
+	});
+});
+
+describe('withToolImageHandles', () => {
+	it('labels each saved image line with its handle', () => {
+		const content = 'map ready\n[Attachment saved: a.png]\n[Attachment saved: b.png]\ndone';
+
+		expect(withToolImageHandles(content, [image('a.png', 'r1'), image('b.png', 'r2')])).toBe(
+			`map ready\n[Attachment saved: a.png] ${formatAttachmentRefLabel('r1')}\n` +
+				`[Attachment saved: b.png] ${formatAttachmentRefLabel('r2')}\ndone`
+		);
+	});
+
+	it('returns text without image ids untouched', () => {
+		const content = 'x\n[Attachment saved: a.png]';
+
+		expect(withToolImageHandles(content, [image('a.png')])).toBe(content);
+		expect(withToolImageHandles(content, undefined)).toBe(content);
+	});
+
+	it('labels an image without a saved line at the end, and a doubly stored image once', () => {
+		const content = '[Attachment saved: a.png]';
+
+		expect(
+			withToolImageHandles(content, [
+				image('a.png', 'r1'),
+				image('a.png', 'r9'),
+				image('c.png', 'r3')
+			])
+		).toBe(
+			`[Attachment saved: a.png] ${formatAttachmentRefLabel('r1')}\n${formatAttachmentRefLabel('r3')}`
+		);
+	});
+
+	it('keeps the labels in place when a reminder is appended later', () => {
+		const content = '[Attachment saved: a.png]';
+		const extras = [image('a.png', 'r1')];
+
+		expect(withToolImageHandles(`${content}\n\nreminder`, extras)).toBe(
+			`${withToolImageHandles(content, extras)}\n\nreminder`
+		);
 	});
 });
