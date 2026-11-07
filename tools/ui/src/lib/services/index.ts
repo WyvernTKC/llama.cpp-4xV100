@@ -367,3 +367,15 @@ export { SettingsService } from './settings.service';
  * endpoint (llama.cpp, whisper.cpp) and returns the text.
  */
 export { TranscriptionService } from './transcription.service';
+
+/**
+ * **MemoryService** - the memories the model saves with the chat tools
+ *
+ * Its own IndexedDB database; a new chat freezes the list into its system prompt.
+ */
+export { MemoryService } from './memory.service';
+
+/**
+ * **ChatHistoryService** - search and read past conversations for the chat tools
+ */
+export { ChatHistoryService } from './chat-history.service';

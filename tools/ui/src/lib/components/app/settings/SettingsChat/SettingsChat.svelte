@@ -4,6 +4,7 @@
 		SettingsChatDesktopSidebar,
 		SettingsChatFields,
 		SettingsChatImportExportTab,
+		SettingsChatMemories,
 		SettingsChatMobileHeader,
 		SettingsChatToolsTab,
 		SettingsFooter,
@@ -181,6 +182,10 @@
 								onConfigChange={handleConfigChange}
 								onThemeChange={handleThemeChange}
 							/>
+
+							{#if currentSection.slug === SETTINGS_SECTION_SLUGS.AGENTIC}
+								<SettingsChatMemories />
+							{/if}
 
 							{#if currentSection.slug === SETTINGS_SECTION_SLUGS.GENERAL}
 								<div class="flex justify-end gap-2">

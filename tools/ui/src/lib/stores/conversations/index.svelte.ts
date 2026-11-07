@@ -13,6 +13,7 @@ import { ROUTES } from '$lib/constants';
 import { MessageRole } from '$lib/enums';
 import { ConversationTransferService } from '$lib/services/conversation-transfer.service';
 import { DatabaseService } from '$lib/services/database.service';
+import { MemoryService } from '$lib/services/memory.service';
 import { MigrationService } from '$lib/services/migration.service';
 import { RouterService } from '$lib/services/router.service';
 // direct imports between stores, not via the barrel, to avoid circular deps
@@ -298,6 +299,42 @@ class ConversationsStore implements ConversationsPreferencesHost {
 		}
 
 		return conversation.id;
+	}
+
+	/**
+	 * Creates a conversation without opening it, for the new_conversation chat
+	 * tool while a reply streams in another one: its root and system prompt are
+	 * in place, the first message waits as its input draft, and it opens as a
+	 * background tab when tabs are on.
+	 *
+	 * @param name - Title of the conversation
+	 * @param firstMessage - Draft for its input box
+	 * @returns The created conversation
+	 */
+	async createConversationInBackground(
+		name: string,
+		firstMessage?: string
+	): Promise<DatabaseConversation> {
+		const conversation = await DatabaseService.createConversation(name, {
+			...this.preferences.getToolPolicySnapshot()
+		});
+		const rootId = await DatabaseService.createRootMessage(conversation.id);
+		const systemPrompt = await this.newChatSystemPrompt();
+		const leafId = systemPrompt
+			? (await DatabaseService.createSystemMessage(conversation.id, systemPrompt, rootId)).id
+			: rootId;
+
+		await DatabaseService.updateCurrentNode(conversation.id, leafId);
+
+		const stored: DatabaseConversation = { ...conversation, currNode: leafId };
+
+		this.conversations = [stored, ...this.conversations];
+
+		if (firstMessage) draftMessagesStore.saveDraftMessage(conversation.id, firstMessage, []);
+
+		if (settingsStore.config.conversationTabs) await tabsStore.openInNewTab(conversation.id);
+
+		return stored;
 	}
 
 	/**
@@ -604,6 +641,18 @@ class ConversationsStore implements ConversationsPreferencesHost {
 				await this.applyTitleFromContent(this.activeConversation.id, newFirstUserMessage.content);
 			}
 		}
+	}
+
+	/**
+	 * The system prompt a new chat starts with: the configured one, plus the
+	 * saved memories while memories are on. The chat stores it once, so later
+	 * memories never change its prompt or the server's cache of it.
+	 */
+	async newChatSystemPrompt(): Promise<string> {
+		const configured = settingsStore.config.systemMessage?.toString().trim() ?? '';
+		const memories = settingsStore.config.memoriesEnabled ? await MemoryService.promptBlock() : '';
+
+		return [configured, memories].filter(Boolean).join('\n\n');
 	}
 
 	/**

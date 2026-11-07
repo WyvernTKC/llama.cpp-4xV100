@@ -43,11 +43,17 @@ export enum GlobSearchType {
  */
 export enum BuiltInTool {
 	BROWSER_COMPACT_CONVERSATION = 'compact_conversation',
+	BROWSER_DELETE_MEMORY = 'delete_memory',
 	BROWSER_GET_CONTEXT_USAGE = 'get_context_usage',
 	BROWSER_GET_DATETIME = 'get_datetime',
+	BROWSER_NEW_CONVERSATION = 'new_conversation',
+	BROWSER_READ_CONVERSATION = 'read_conversation',
 	BROWSER_READ_MEDIA = 'read_media',
 	BROWSER_RENAME_CONVERSATION = 'rename_conversation',
 	BROWSER_RUN_JAVASCRIPT = 'run_javascript',
+	BROWSER_SAVE_MEMORY = 'save_memory',
+	BROWSER_SEARCH_CONVERSATIONS = 'search_conversations',
+	BROWSER_SEARCH_MEMORIES = 'search_memories',
 	SERVER_EDIT_FILE = 'edit_file',
 	SERVER_EXEC_SHELL_COMMAND = 'exec_shell_command',
 	SERVER_FILE_GLOB_SEARCH = 'file_glob_search',

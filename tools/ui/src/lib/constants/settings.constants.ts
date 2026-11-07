@@ -414,7 +414,7 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 			},
 			{
 				defaultValue: false,
-				help: 'Expose compact_conversation, get_context_usage and rename_conversation to the model, so it can summarize the conversation when the context fills up and give the chat a title. A compaction the model asks for runs when its reply ends.',
+				help: 'Let the model manage conversations: compact_conversation, get_context_usage and rename_conversation for this chat, search_conversations and read_conversation for past chats, and new_conversation to start a chat in a new tab with its first message left for you to send. A compaction the model asks for runs when its reply ends.',
 				key: SETTINGS_KEYS.CHAT_TOOLS_ENABLED,
 				label: 'Chat tools',
 				type: SettingsFieldType.CHECKBOX
@@ -429,6 +429,13 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 				max: 100,
 				min: 0,
 				type: SettingsFieldType.INPUT
+			},
+			{
+				defaultValue: false,
+				help: 'Let the model save, search and delete short memories (save_memory, search_memories, delete_memory) that carry over to later chats. A new chat lists the saved memories in its system prompt, fixed for that chat. Memories stay in this browser; the list below shows and deletes them.',
+				key: SETTINGS_KEYS.MEMORIES_ENABLED,
+				label: 'Memories',
+				type: SettingsFieldType.CHECKBOX
 			},
 			{
 				defaultValue: DEFAULT_MCP_CONFIG.requestTimeoutSeconds,

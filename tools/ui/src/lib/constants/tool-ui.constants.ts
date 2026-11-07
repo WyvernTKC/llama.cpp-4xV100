@@ -8,7 +8,11 @@
 // ChatMessageToolCallBlockSearchResults for prior art).
 
 import {
+	BookmarkPlus,
+	BookmarkX,
+	BookOpen,
 	Braces,
+	Brain,
 	Clock,
 	Eye,
 	FilePen,
@@ -17,6 +21,8 @@ import {
 	FileText,
 	Gauge,
 	Info,
+	MessageSquarePlus,
+	MessagesSquare,
 	PenLine,
 	SearchCode,
 	Shrink,
@@ -31,6 +37,11 @@ export const TOOL_UI: Readonly<Record<BuiltInTool, ToolUiEntry>> = {
 		label: 'Compact conversation',
 		source: ToolSource.BROWSER
 	},
+	[BuiltInTool.BROWSER_DELETE_MEMORY]: {
+		icon: BookmarkX,
+		label: 'Delete memory',
+		source: ToolSource.BROWSER
+	},
 	[BuiltInTool.BROWSER_GET_CONTEXT_USAGE]: {
 		icon: Gauge,
 		label: 'Context usage',
@@ -39,6 +50,16 @@ export const TOOL_UI: Readonly<Record<BuiltInTool, ToolUiEntry>> = {
 	[BuiltInTool.BROWSER_GET_DATETIME]: {
 		icon: Clock,
 		label: 'Current time',
+		source: ToolSource.BROWSER
+	},
+	[BuiltInTool.BROWSER_NEW_CONVERSATION]: {
+		icon: MessageSquarePlus,
+		label: 'New conversation',
+		source: ToolSource.BROWSER
+	},
+	[BuiltInTool.BROWSER_READ_CONVERSATION]: {
+		icon: BookOpen,
+		label: 'Read conversation',
 		source: ToolSource.BROWSER
 	},
 	[BuiltInTool.BROWSER_READ_MEDIA]: { icon: Eye, label: 'Read media', source: ToolSource.BROWSER },
@@ -50,6 +71,21 @@ export const TOOL_UI: Readonly<Record<BuiltInTool, ToolUiEntry>> = {
 	[BuiltInTool.BROWSER_RUN_JAVASCRIPT]: {
 		icon: Braces,
 		label: 'Run JavaScript',
+		source: ToolSource.BROWSER
+	},
+	[BuiltInTool.BROWSER_SAVE_MEMORY]: {
+		icon: BookmarkPlus,
+		label: 'Save memory',
+		source: ToolSource.BROWSER
+	},
+	[BuiltInTool.BROWSER_SEARCH_CONVERSATIONS]: {
+		icon: MessagesSquare,
+		label: 'Search conversations',
+		source: ToolSource.BROWSER
+	},
+	[BuiltInTool.BROWSER_SEARCH_MEMORIES]: {
+		icon: Brain,
+		label: 'Search memories',
 		source: ToolSource.BROWSER
 	},
 	[BuiltInTool.SERVER_EDIT_FILE]: { icon: FilePen, label: 'Edit file', source: ToolSource.SERVER },

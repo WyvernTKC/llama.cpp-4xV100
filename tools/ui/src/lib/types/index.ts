@@ -87,6 +87,7 @@ export type {
 export type {
 	McpServerOverride,
 	DatabaseConversation,
+	DatabaseMemory,
 	DatabaseMessageExtraAudioFile,
 	DatabaseMessageExtraVideoFile,
 	DatabaseMessageExtraImageFile,

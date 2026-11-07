@@ -10,7 +10,7 @@
  * the permission/continue/steering gates owned by {@link AgenticGates}.
  */
 
-import { CHAT_TOOL_NAMES, DEFAULT_AGENTIC_CONFIG, NEWLINE } from '$lib/constants';
+import { CHAT_TOOL_NAMES, CHAT_TOOLS, DEFAULT_AGENTIC_CONFIG, NEWLINE } from '$lib/constants';
 import {
 	AUDIO_MIME_TO_EXTENSION,
 	DATA_URI_BASE64_REGEX,
@@ -30,6 +30,8 @@ import {
 	ToolCallType
 } from '$lib/enums';
 import { ChatService } from '$lib/services';
+import { ChatHistoryService } from '$lib/services/chat-history.service';
+import { MemoryService } from '$lib/services/memory.service';
 import { ReadMediaService } from '$lib/services/read-media.service';
 import { SandboxService } from '$lib/services/sandbox.service';
 import { ToolsService } from '$lib/services/tools.service';
@@ -1115,9 +1117,10 @@ class AgenticStore {
 	}
 
 	/**
-	 * Runs compact_conversation, get_context_usage or rename_conversation. A
-	 * compaction is only requested here; chatStore runs it once the flow ends,
-	 * since the loop holds the message list the model reads until then.
+	 * Runs a chat tool: compaction, context usage, rename, search and read past
+	 * conversations, new conversation, and the memory tools. A compaction is
+	 * only requested here; chatStore runs it once the flow ends, since the loop
+	 * holds the message list the model reads until then.
 	 */
 	private async executeChatTool(
 		toolName: string,
@@ -1183,6 +1186,85 @@ class AgenticStore {
 				this.chatToolRequests.set(conversationId, { ...requests, renamed: true });
 
 				return { content: `Renamed the conversation to "${title}".`, isError: false };
+			}
+
+			case BuiltInTool.BROWSER_SEARCH_CONVERSATIONS: {
+				const { hits, partial } = await ChatHistoryService.search(args.query, conversationId);
+				const note =
+					hits.length === 0
+						? 'No other conversation matches.'
+						: partial
+							? 'No conversation holds every word; these hold some of them.'
+							: undefined;
+
+				return { content: JSON.stringify({ conversations: hits, note }), isError: false };
+			}
+
+			case BuiltInTool.BROWSER_READ_CONVERSATION: {
+				const id = typeof args.conversation_id === 'string' ? args.conversation_id : '';
+				const read = await ChatHistoryService.read(id, Number(args.offset) || 0);
+
+				if (!read) return { content: `Error: no conversation with id "${id}".`, isError: true };
+
+				return { content: JSON.stringify(read), isError: false };
+			}
+
+			case BuiltInTool.BROWSER_NEW_CONVERSATION: {
+				const title = normalizeConversationTitle(args.title) || 'New chat';
+				const firstMessage =
+					typeof args.first_message === 'string' ? args.first_message.trim() : '';
+				const created = await conversationsStore.createConversationInBackground(
+					title,
+					firstMessage || undefined
+				);
+				const where = settingsStore.config.conversationTabs ? 'in a new tab' : 'in the chat list';
+
+				return {
+					content: JSON.stringify({
+						conversation_id: created.id,
+						note: firstMessage
+							? `The chat is ${where} with the first message in its input box; the user sends it.`
+							: `The chat is ${where}.`,
+						title
+					}),
+					isError: false
+				};
+			}
+
+			case BuiltInTool.BROWSER_SAVE_MEMORY: {
+				const { created, memory } = await MemoryService.save(args.content, conversationId);
+
+				return {
+					content: created ? `Saved memory ${memory.id}.` : `Already saved as memory ${memory.id}.`,
+					isError: false
+				};
+			}
+
+			case BuiltInTool.BROWSER_SEARCH_MEMORIES: {
+				const found = await MemoryService.search(
+					args.query,
+					CHAT_TOOLS.SEARCH_MEMORIES_MAX_RESULTS
+				);
+
+				return {
+					content: JSON.stringify({
+						memories: found.map((m) => ({
+							content: m.content,
+							id: m.id,
+							saved: new Date(m.updatedAt).toISOString().slice(0, 10)
+						}))
+					}),
+					isError: false
+				};
+			}
+
+			case BuiltInTool.BROWSER_DELETE_MEMORY: {
+				const id = typeof args.id === 'string' ? args.id : '';
+				const removed = await MemoryService.remove(id);
+
+				if (!removed) return { content: `Error: no single memory with id "${id}".`, isError: true };
+
+				return { content: `Deleted memory ${removed.id}: ${removed.content}`, isError: false };
 			}
 
 			default:

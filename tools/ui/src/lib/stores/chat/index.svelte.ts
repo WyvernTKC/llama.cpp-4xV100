@@ -794,8 +794,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 			if (isNewConversation) {
 				const rootId = await DatabaseService.createRootMessage(currentConv.id);
-				const currentConfig = settingsStore.config;
-				const systemPrompt = currentConfig.systemMessage?.toString().trim();
+				const systemPrompt = await conversationsStore.newChatSystemPrompt();
 
 				let sysOrRootId = rootId;
 

@@ -451,6 +451,16 @@ export class DatabaseService {
 	}
 
 	/**
+	 * Gets every message of every conversation, in no particular order. Used by
+	 * the search_conversations chat tool, which scans them all.
+	 *
+	 * @returns Array of messages
+	 */
+	static async getAllMessages(): Promise<DatabaseMessage[]> {
+		return await db[IDXDB_TABLES.messages].toArray();
+	}
+
+	/**
 	 * Gets a conversation by ID.
 	 *
 	 * @param id - Conversation ID

@@ -42,6 +42,7 @@ export const SETTINGS_KEYS = {
 	MCP_REQUEST_TIMEOUT_SECONDS: 'mcpRequestTimeoutSeconds',
 	// MCP
 	MCP_SERVERS: 'mcpServers',
+	MEMORIES_ENABLED: 'memoriesEnabled',
 	MENTION_SEARCH_MAX_DEPTH: 'mentionSearchMaxDepth',
 	MIN_P: 'min_p',
 	// Display

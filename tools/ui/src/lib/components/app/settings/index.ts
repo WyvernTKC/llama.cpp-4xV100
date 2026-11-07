@@ -79,3 +79,9 @@ export { default as SettingsChatFields } from './SettingsChat/SettingsChatFields
  * server favicons and permission management controls.
  */
 export { default as SettingsChatToolsTab } from './SettingsChat/SettingsChatToolsTab.svelte';
+
+/**
+ * **SettingsChatMemories** - the memories the model saved, listed under the
+ * Agentic settings with delete and delete-all.
+ */
+export { default as SettingsChatMemories } from './SettingsChat/SettingsChatMemories.svelte';

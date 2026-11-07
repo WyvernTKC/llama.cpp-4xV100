@@ -390,9 +390,17 @@ export {
 	appendTextToContent,
 	contextReminderText,
 	contextTokens,
+	formatMemoryPromptBlock,
 	hasContextReminder,
-	normalizeConversationTitle
+	normalizeConversationTitle,
+	normalizeMemoryContent,
+	queryTerms,
+	rankMemories,
+	renderTranscript,
+	searchConversations,
+	snippetAround
 } from './chat-tools';
+export type { ConversationSearchHit } from './chat-tools';
 
 // Sandbox tool definition
 // SANDBOX_TOOL_DEFINITION is deprecated; kept for backward compatibility.

@@ -150,3 +150,13 @@ export type ExportedConversation = {
 };
 
 export type ExportedConversations = ExportedConversation | ExportedConversation[];
+
+/** A memory the model saved with the save_memory chat tool, kept in its own IndexedDB database. */
+export interface DatabaseMemory {
+	id: string;
+	content: string;
+	createdAt: number;
+	updatedAt: number;
+	/** Conversation the memory was saved from */
+	sourceConvId?: string;
+}

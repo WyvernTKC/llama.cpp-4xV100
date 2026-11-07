@@ -12,6 +12,7 @@ import {
 	buildBrowserInfoToolDefinition,
 	buildChatToolDefinitions,
 	buildGetDatetimeToolDefinition,
+	buildMemoryToolDefinitions,
 	buildReadMediaToolDefinition,
 	DISABLED_TOOL_CATEGORIES_LOCALSTORAGE_KEY,
 	DISABLED_TOOL_KEYS_LOCALSTORAGE_KEY,
@@ -129,6 +130,8 @@ class ToolsStore {
 		}
 
 		if (settingsStore.config.chatToolsEnabled) tools.push(...buildChatToolDefinitions());
+
+		if (settingsStore.config.memoriesEnabled) tools.push(...buildMemoryToolDefinitions());
 
 		return tools;
 	}

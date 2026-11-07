@@ -1,13 +1,26 @@
-import { buildChatToolDefinitions, CHAT_TOOL_NAMES, CHAT_TOOLS, TOOL_UI } from '$lib/constants';
+import {
+	buildChatToolDefinitions,
+	buildMemoryToolDefinitions,
+	CHAT_TOOL_NAMES,
+	CHAT_TOOLS,
+	TOOL_UI
+} from '$lib/constants';
 import { BuiltInTool, ContentPartType, MessageRole, MessageType } from '$lib/enums';
-import type { DatabaseMessage } from '$lib/types';
+import type { DatabaseConversation, DatabaseMemory, DatabaseMessage } from '$lib/types';
 import {
 	appendTextToContent,
 	contextReminderText,
 	contextTokens,
 	countSteps,
+	formatMemoryPromptBlock,
 	hasContextReminder,
-	normalizeConversationTitle
+	normalizeConversationTitle,
+	normalizeMemoryContent,
+	queryTerms,
+	rankMemories,
+	renderTranscript,
+	searchConversations,
+	snippetAround
 } from '$lib/utils';
 import { describe, expect, it } from 'vitest';
 
@@ -29,10 +42,12 @@ function makeMessage(
 }
 
 describe('chat tool definitions', () => {
-	it('offers the three chat tools, each with a tool-call label', () => {
-		const names = buildChatToolDefinitions().map((t) => t.function.name);
+	it('covers every chat tool name once, each with a tool-call label', () => {
+		const names = [...buildChatToolDefinitions(), ...buildMemoryToolDefinitions()].map(
+			(t) => t.function.name
+		);
 
-		expect(names).toEqual([...CHAT_TOOL_NAMES]);
+		expect([...names].sort()).toEqual([...CHAT_TOOL_NAMES].sort());
 
 		for (const name of names) {
 			expect(TOOL_UI[name as BuiltInTool]).toBeDefined();
@@ -127,5 +142,176 @@ describe('countSteps', () => {
 		];
 
 		expect(countSteps(messages)).toBe(4);
+	});
+});
+
+function memory(id: string, content: string, updatedAt: number): DatabaseMemory {
+	return { content, createdAt: updatedAt, id, updatedAt };
+}
+
+describe('memories', () => {
+	it('keeps a memory on one line and drops non-text', () => {
+		expect(normalizeMemoryContent('  User   likes\n metric units ')).toBe(
+			'User likes metric units'
+		);
+		expect(normalizeMemoryContent(7)).toBe('');
+	});
+
+	it('lists the newest memories in the system prompt block, oldest first', () => {
+		const block = formatMemoryPromptBlock([
+			memory('a', 'first', 1),
+			memory('c', 'third', 3),
+			memory('b', 'second', 2)
+		]);
+
+		expect(block.split('\n')).toEqual([
+			CHAT_TOOLS.MEMORY_PROMPT_HEADER,
+			'- [a] first',
+			'- [b] second',
+			'- [c] third'
+		]);
+		expect(formatMemoryPromptBlock([])).toBe('');
+	});
+
+	it('caps the block at the item limit, keeping the newest', () => {
+		const many = Array.from({ length: CHAT_TOOLS.MEMORY_PROMPT_MAX_ITEMS + 5 }, (_, i) =>
+			memory(`m${i}`, `fact ${i}`, i)
+		);
+		const lines = formatMemoryPromptBlock(many).split('\n').slice(1);
+
+		expect(lines).toHaveLength(CHAT_TOOLS.MEMORY_PROMPT_MAX_ITEMS);
+		expect(lines[0]).toBe('- [m5] fact 5');
+	});
+
+	it('ranks memories by matching words, newer first among equals', () => {
+		const all = [
+			memory('a', 'User prefers metric units', 1),
+			memory('b', 'User lives in Brisbane', 2),
+			memory('c', 'Metric units for the Brisbane trip', 3)
+		];
+
+		expect(rankMemories(all, 'metric brisbane', 10).map((m) => m.id)).toEqual(['c', 'b', 'a']);
+		expect(rankMemories(all, '', 2).map((m) => m.id)).toEqual(['c', 'b']);
+		expect(rankMemories(all, 'nothing', 10)).toEqual([]);
+	});
+});
+
+describe('queryTerms and snippets', () => {
+	it('splits a query into lowercase words without punctuation', () => {
+		expect(queryTerms('  "Rome", trip!  rome ')).toEqual(['rome', 'trip']);
+		expect(queryTerms(undefined)).toEqual([]);
+	});
+
+	it('cuts a snippet around the first hit', () => {
+		const text = `${'a '.repeat(200)}needle ${'b '.repeat(200)}`;
+		const snippet = snippetAround(text, ['needle'], 60);
+
+		expect(snippet.startsWith('...')).toBe(true);
+		expect(snippet.endsWith('...')).toBe(true);
+		expect(snippet).toContain('needle');
+		expect(snippetAround('short text', ['x'], 60)).toBe('short text');
+	});
+});
+
+function conversation(id: string, name: string, lastModified: number): DatabaseConversation {
+	return { currNode: null, id, lastModified, name };
+}
+
+function chatMessage(
+	id: string,
+	convId: string,
+	role: MessageRole,
+	content: string,
+	timestamp = 0,
+	extra: Partial<DatabaseMessage> = {}
+): DatabaseMessage {
+	return {
+		children: [],
+		content,
+		convId,
+		id,
+		parent: null,
+		role,
+		timestamp,
+		type: MessageType.TEXT,
+		...extra
+	} as DatabaseMessage;
+}
+
+describe('searchConversations', () => {
+	const conversations = [
+		conversation('c1', 'Rome trip', 10),
+		conversation('c2', 'Pasta recipes', 20),
+		conversation('c3', 'Current chat', 30)
+	];
+	const messages = [
+		chatMessage('m1', 'c1', MessageRole.USER, 'Plan three days in Rome in May', 1),
+		chatMessage('m2', 'c1', MessageRole.ASSISTANT, 'Day one: the Colosseum and the Forum', 2),
+		chatMessage('m3', 'c2', MessageRole.USER, 'A carbonara like they make in Rome', 3),
+		chatMessage('m4', 'c3', MessageRole.USER, 'Rome Colosseum tickets', 4),
+		chatMessage('m5', 'c2', MessageRole.TOOL, 'Colosseum tool output', 5)
+	];
+
+	it('ranks conversations holding every word first and leaves out the current one', () => {
+		const { hits, partial } = searchConversations(conversations, messages, 'rome colosseum', {
+			excludeConvId: 'c3'
+		});
+
+		expect(partial).toBe(false);
+		expect(hits.map((h) => h.conversation_id)).toEqual(['c1']);
+		expect(hits[0].title).toBe('Rome trip');
+		expect(hits[0].snippets.length).toBeGreaterThan(0);
+	});
+
+	it('falls back to partial matches, ignoring tool results', () => {
+		const { hits, partial } = searchConversations(conversations, messages, 'carbonara colosseum', {
+			excludeConvId: 'c3'
+		});
+
+		// one word each, one matching message each: the more recent conversation first
+		expect(partial).toBe(true);
+		expect(hits.map((h) => h.conversation_id)).toEqual(['c2', 'c1']);
+	});
+
+	it('lists the most recent conversations for an empty query', () => {
+		const { hits } = searchConversations(conversations, messages, '', { excludeConvId: 'c3' });
+
+		expect(hits.map((h) => h.conversation_id)).toEqual(['c2', 'c1']);
+		expect(hits[1].snippets).toEqual(['user: Plan three days in Rome in May']);
+	});
+});
+
+describe('renderTranscript', () => {
+	const branch = [
+		chatMessage('s', 'c', MessageRole.SYSTEM, 'system prompt', 0),
+		chatMessage('u', 'c', MessageRole.USER, 'hello', 1),
+		chatMessage('a', 'c', MessageRole.ASSISTANT, '', 2, {
+			toolCalls: JSON.stringify([{ function: { arguments: '{}', name: 'get_datetime' }, id: 't' }])
+		}),
+		chatMessage('t', 'c', MessageRole.TOOL, 'x'.repeat(1000), 3),
+		chatMessage('a2', 'c', MessageRole.ASSISTANT, 'It is noon.', 4)
+	];
+
+	it('numbers the messages, names called tools and cuts long tool results', () => {
+		const read = renderTranscript(branch, 0);
+		const lines = read.transcript.split('\n');
+
+		expect(read.total_messages).toBe(4);
+		expect(read.next_offset).toBeNull();
+		expect(lines[0]).toBe('[0] user: hello');
+		expect(lines[1]).toBe('[1] assistant (called get_datetime): ');
+		expect(lines[2].endsWith('... (cut)')).toBe(true);
+		expect(lines[3]).toBe('[3] assistant: It is noon.');
+	});
+
+	it('pages by size and reads on from next_offset', () => {
+		const first = renderTranscript(branch, 0, 60);
+
+		expect(first.next_offset).not.toBeNull();
+
+		const rest = renderTranscript(branch, first.next_offset ?? 0, 10000);
+
+		expect(rest.from).toBe(first.next_offset);
+		expect(rest.transcript.endsWith('[3] assistant: It is noon.')).toBe(true);
 	});
 });
