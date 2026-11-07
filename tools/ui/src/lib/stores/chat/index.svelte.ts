@@ -83,6 +83,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	// message flows: edit, regenerate, continue, delete
 	private flows = new ChatMessageFlows(this);
 	private isEditModeActive = $state(false);
+	// compactions the model asked for while another conversation was open, run on return
+	private pendingCompactions = new Set<string>();
 	/** Reactive: queued pending messages for non-agentic streaming */
 	private pendingMessages = new SvelteMap<
 		string,
@@ -293,9 +295,18 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	 * node appended to the branch. Later requests slice the branch at that
 	 * node, so the full history stays visible and navigable while the model
 	 * context restarts from the summary.
+	 *
+	 * With `targetConvId` (a compaction the model asked for), a conversation
+	 * that is not open waits until flushPendingMessage runs it on return.
 	 */
-	async compactConversation(): Promise<void> {
+	async compactConversation(targetConvId?: string): Promise<void> {
 		const activeConv = conversationsStore.activeConversation;
+
+		if (targetConvId && activeConv?.id !== targetConvId) {
+			this.pendingCompactions.add(targetConvId);
+
+			return;
+		}
 
 		if (!activeConv) return;
 
@@ -424,6 +435,10 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		if (conversationsStore.activeConversation?.id !== convId) return;
 
 		if (this.isChatLoadingInternal(convId) || agenticStore.isRunning(convId)) return;
+
+		// a compaction the model asked for goes first, so the queued message
+		// reads the reduced context; compactConversation sends it when done
+		if (this.pendingCompactions.delete(convId)) await this.compactConversation(convId);
 
 		const pending = this.consumePendingMessage(convId);
 
@@ -1182,8 +1197,12 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 				if (serverStore.isRouterMode) modelsStore.fetchRouterModels().catch(console.error);
 
-				// Pre-encode conversation in KV cache for faster next turn
-				if (settingsStore.config.preEncodeConversation) {
+				// Pre-encode conversation in KV cache for faster next turn; a
+				// compaction the model asked for re-encodes the reduced context itself
+				if (
+					settingsStore.config.preEncodeConversation &&
+					!agenticStore.hasCompactionRequest(convId)
+				) {
 					void this.triggerPreEncode(convId, lastCreatedInFlow, effectiveModel);
 				}
 			},
@@ -1260,13 +1279,33 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			});
 
 			if (agenticResult.handled) {
-				// Generate LLM based title for new conversations after agentic flow completes
-				if (firstUserMessageContent) {
+				const chatToolRequests = agenticStore.consumeChatToolRequests(convId);
+
+				// Generate LLM based title for new conversations after agentic flow completes,
+				// unless the model already named it with rename_conversation
+				if (firstUserMessageContent && !chatToolRequests.renamed) {
 					await this.generateTitleWithLLM(firstUserMessageContent, streamedContent, convId);
 				}
 
 				// Check if there's a pending steering message to re-send
 				const pending = agenticStore.consumePendingSteeringMessage(convId);
+
+				// A compaction the model asked for runs before a steering message goes
+				// out, so that message reads the reduced context. A stopped or failed
+				// reply drops the request.
+				if (chatToolRequests.compact && !agenticResult.error && !abortController.signal.aborted) {
+					if (pending) this.pendingMessages.set(convId, pending);
+
+					await this.compactConversation(convId);
+
+					// compactConversation sends the queued message once it is done; when
+					// it had nothing to compact the message is still here
+					const left = this.consumePendingMessage(convId);
+
+					if (left) await this.sendQueuedMessage(convId, left);
+
+					return;
+				}
 
 				if (pending) {
 					await this.sendQueuedMessage(convId, pending);

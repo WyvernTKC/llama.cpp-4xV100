@@ -186,6 +186,15 @@ export interface AgenticFlowResult {
 }
 
 /**
+ * What the chat tools asked for during a flow, acted on by chatStore once the
+ * flow ends: a compaction, and a title that LLM title generation must keep.
+ */
+export interface AgenticChatToolRequests {
+	compact: boolean;
+	renamed: boolean;
+}
+
+/**
  * A user message to be injected into the agentic loop between turns.
  */
 export interface SteeringMessage {

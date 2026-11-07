@@ -15,20 +15,38 @@ import {
 	FilePlus,
 	FileSearch,
 	FileText,
+	Gauge,
 	Info,
+	PenLine,
 	SearchCode,
+	Shrink,
 	Terminal
 } from '@lucide/svelte';
 import { BuiltInTool, ToolSource } from '$lib/enums';
 import type { ToolUiEntry } from '$lib/types';
 
 export const TOOL_UI: Readonly<Record<BuiltInTool, ToolUiEntry>> = {
+	[BuiltInTool.BROWSER_COMPACT_CONVERSATION]: {
+		icon: Shrink,
+		label: 'Compact conversation',
+		source: ToolSource.BROWSER
+	},
+	[BuiltInTool.BROWSER_GET_CONTEXT_USAGE]: {
+		icon: Gauge,
+		label: 'Context usage',
+		source: ToolSource.BROWSER
+	},
 	[BuiltInTool.BROWSER_GET_DATETIME]: {
 		icon: Clock,
 		label: 'Current time',
 		source: ToolSource.BROWSER
 	},
 	[BuiltInTool.BROWSER_READ_MEDIA]: { icon: Eye, label: 'Read media', source: ToolSource.BROWSER },
+	[BuiltInTool.BROWSER_RENAME_CONVERSATION]: {
+		icon: PenLine,
+		label: 'Rename conversation',
+		source: ToolSource.BROWSER
+	},
 	[BuiltInTool.BROWSER_RUN_JAVASCRIPT]: {
 		icon: Braces,
 		label: 'Run JavaScript',

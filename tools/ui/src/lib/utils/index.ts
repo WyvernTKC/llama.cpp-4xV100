@@ -380,9 +380,19 @@ export {
 	canCompactMessages,
 	compactionCut,
 	compactionTokensBefore,
+	countSteps,
 	lastContextBearingMessage,
 	sliceAtLastCompaction
 } from './compaction';
+
+// Chat tools (compact_conversation, get_context_usage, rename_conversation)
+export {
+	appendTextToContent,
+	contextReminderText,
+	contextTokens,
+	hasContextReminder,
+	normalizeConversationTitle
+} from './chat-tools';
 
 // Sandbox tool definition
 // SANDBOX_TOOL_DEFINITION is deprecated; kept for backward compatibility.

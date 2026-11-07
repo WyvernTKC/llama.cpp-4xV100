@@ -80,6 +80,14 @@ export function sliceAtLastCompaction(messages: DatabaseMessage[]): DatabaseMess
 }
 
 /**
+ * How many steps a message list holds: user messages, and assistant messages
+ * with their tool results. The prefix and compaction nodes are no steps.
+ */
+export function countSteps(messages: DatabaseMessage[]): number {
+	return stepStarts(messages).length;
+}
+
+/**
  * Where a compaction of the list the model reads cuts it: the summary
  * request sends what comes before the cut, the very prefix the model last
  * read, so the server reuses its cache, and the preserved steps after it

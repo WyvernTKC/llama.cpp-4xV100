@@ -10,7 +10,7 @@
  * the permission/continue/steering gates owned by {@link AgenticGates}.
  */
 
-import { DEFAULT_AGENTIC_CONFIG, NEWLINE } from '$lib/constants';
+import { CHAT_TOOL_NAMES, DEFAULT_AGENTIC_CONFIG, NEWLINE } from '$lib/constants';
 import {
 	AUDIO_MIME_TO_EXTENSION,
 	DATA_URI_BASE64_REGEX,
@@ -25,6 +25,7 @@ import {
 	AttachmentType,
 	ContentPartType,
 	MessageRole,
+	MessageType,
 	MimeTypePrefix,
 	ToolCallType
 } from '$lib/enums';
@@ -37,6 +38,7 @@ import { AgenticGates } from '$lib/stores/agentic/gates.svelte';
 import { conversationsStore } from '$lib/stores/conversations/index.svelte';
 import { mcpStore } from '$lib/stores/mcp/index.svelte';
 import { modelsStore } from '$lib/stores/models/index.svelte';
+import { serverStore } from '$lib/stores/server.svelte';
 import { settingsStore } from '$lib/stores/settings/index.svelte';
 import { toolsStore } from '$lib/stores/tools.svelte';
 import type {
@@ -49,6 +51,7 @@ import type {
 	ToolExecutionResult
 } from '$lib/types';
 import type {
+	AgenticChatToolRequests,
 	AgenticFlowCallbacks,
 	AgenticFlowOptions,
 	AgenticMessage,
@@ -69,20 +72,46 @@ import type {
 	ChatMessageToolCallTiming
 } from '$lib/types/chat';
 import type {
+	DatabaseMessage,
 	DatabaseMessageExtra,
 	DatabaseMessageExtraAudioFile,
 	DatabaseMessageExtraImageFile
 } from '$lib/types/database';
 import type { OpenAIToolDefinition } from '$lib/types/mcp';
 import {
+	appendTextToContent,
 	collectAttachmentRefs,
+	contextReminderText,
+	contextTokens,
+	countSteps,
 	executeBrowserInfoTool,
 	executeGetDatetimeTool,
 	getAudioInputFormat,
+	hasContextReminder,
 	isAbortError,
+	lastContextBearingMessage,
+	normalizeConversationTitle,
 	resolveAttachmentRefs
 } from '$lib/utils';
 import { SvelteMap } from 'svelte/reactivity';
+
+/** What the chat tools know about the conversation a flow started from. */
+interface ChatToolFlowContext {
+	/** Steps the model reads when the flow starts, what a compaction counts against. */
+	baseSteps: number;
+	/** The compaction epoch: the id of the last compaction node, empty before the first. */
+	epoch: string;
+	/** Context tokens of the last request before the flow, from the stored timings. */
+	initialTokens: number;
+	/** Whether the model was already reminded of the context size in this epoch. */
+	reminded: boolean;
+}
+
+function isDatabaseMessage(
+	message: AgenticFlowParams['messages'][number]
+): message is DatabaseMessage {
+	return 'convId' in message && typeof (message as DatabaseMessage).id === 'string';
+}
 
 function createDefaultSession(): AgenticSession {
 	return {
@@ -144,8 +173,12 @@ function toAgenticMessages(messages: ApiChatMessageData[]): AgenticMessage[] {
 }
 
 class AgenticStore {
+	// what the chat tools asked for during the running flow, per conversation
+	private chatToolRequests = new Map<string, AgenticChatToolRequests>();
 	// permission, continue and steering gates the loop waits on between turns
 	private gates = new AgenticGates();
+	// compaction epoch the context reminder went out in, per conversation
+	private remindedEpochs = new Map<string, string>();
 	private sessions = new SvelteMap<string, AgenticSession>();
 
 	get isAnyRunning(): boolean {
@@ -181,8 +214,25 @@ class AgenticStore {
 		conversationsStore.onConversationsDeleted((convIds) => {
 			for (const convId of convIds) {
 				this.sessions.delete(convId);
+				this.chatToolRequests.delete(convId);
+				this.remindedEpochs.delete(convId);
 			}
 		});
+	}
+
+	/**
+	 * The chat tool requests of the flow that just ended, cleared on read.
+	 * Called by chatStore after the agentic flow exits.
+	 */
+	consumeChatToolRequests(conversationId: string): AgenticChatToolRequests {
+		const requests = this.chatToolRequests.get(conversationId) ?? {
+			compact: false,
+			renamed: false
+		};
+
+		this.chatToolRequests.delete(conversationId);
+
+		return requests;
 	}
 
 	/**
@@ -276,6 +326,11 @@ class AgenticStore {
 		return this.sessions.get(conversationId)?.totalToolCalls ?? 0;
 	}
 
+	/** Whether the running flow asked for a compaction once it ends. */
+	hasCompactionRequest(conversationId: string): boolean {
+		return this.chatToolRequests.get(conversationId)?.compact ?? false;
+	}
+
 	hasPendingSteeringMessage(conversationId: string): boolean {
 		return this.gates.hasPendingSteeringMessage(conversationId);
 	}
@@ -335,6 +390,7 @@ class AgenticStore {
 
 		// Clear any pending permissions/continue requests for this conversation when starting a new flow
 		this.gates.clear(conversationId);
+		this.chatToolRequests.delete(conversationId);
 
 		const agenticConfig = this.getConfig(settingsStore.config);
 		const tools = await this.toolsFor(toolPolicy);
@@ -366,6 +422,7 @@ class AgenticStore {
 				agenticConfig,
 				attachmentRefs: collectAttachmentRefs(messages),
 				callbacks,
+				chatTools: this.chatToolFlowContext(conversationId, messages),
 				conversationId,
 				messages: normalizedMessages,
 				options,
@@ -422,7 +479,43 @@ class AgenticStore {
 		};
 	}
 
+	/** What the chat tools know about the conversation, from the messages a flow starts with. */
+	private chatToolFlowContext(
+		conversationId: string,
+		messages: AgenticFlowParams['messages']
+	): ChatToolFlowContext {
+		const stored = messages.filter(isDatabaseMessage);
+
+		let boundary: DatabaseMessage | undefined;
+
+		for (let i = stored.length - 1; i >= 0 && !boundary; i--) {
+			if (stored[i].type === MessageType.COMPACTION) boundary = stored[i];
+		}
+
+		const epoch = boundary?.id ?? '';
+		const since = boundary?.timestamp ?? 0;
+		// the steps a compaction keeps are older than its node, so only a reminder
+		// stored after the node counts for this epoch
+		const remindedInStore = stored.some(
+			(m) =>
+				m.timestamp > since && m.type !== MessageType.COMPACTION && hasContextReminder(m.content)
+		);
+
+		return {
+			baseSteps: countSteps(stored),
+			epoch,
+			initialTokens: contextTokens(lastContextBearingMessage(stored)?.timings),
+			reminded: remindedInStore || this.remindedEpochs.get(conversationId) === epoch
+		};
+	}
+
+	/** The context size of the model a flow runs on, from its props or the server's. */
+	private contextSize(model: string): number | null {
+		return (model ? modelsStore.props.getModelContextSize(model) : null) ?? serverStore.contextSize;
+	}
+
 	private async executeAgenticLoop(params: {
+		chatTools: ChatToolFlowContext;
 		conversationId: string;
 		messages: ApiChatMessageData[];
 		options: AgenticFlowOptions;
@@ -436,6 +529,7 @@ class AgenticStore {
 			agenticConfig,
 			attachmentRefs,
 			callbacks,
+			chatTools,
 			conversationId,
 			messages,
 			options,
@@ -473,6 +567,8 @@ class AgenticStore {
 		const effectiveModel = options.model || modelsStore.models[0]?.model || '';
 
 		let turn = 0;
+		// the last tool result of the previous turn, where a context reminder is stored
+		let lastToolResult: { content: string; id: string } | null = null;
 
 		while (true) {
 			if (turn >= maxTurns) {
@@ -519,6 +615,18 @@ class AgenticStore {
 				toolsMs: 0,
 				turn: turn + 1
 			};
+
+			await this.remindContextIfFull({
+				chatTools,
+				conversationId,
+				lastToolResult,
+				model: effectiveModel,
+				sessionMessages,
+				tokens: capturedTimings ? contextTokens(capturedTimings) : chatTools.initialTokens,
+				tools,
+				updateToolResultMessage
+			});
+			lastToolResult = null;
 
 			try {
 				await ChatService.sendMessage(
@@ -846,6 +954,14 @@ class AgenticStore {
 									signal,
 									conversationsStore.activeConversation?.cwd
 								);
+							} else if (CHAT_TOOL_NAMES.includes(toolName)) {
+								executionResult = await this.executeChatTool(toolName, args, {
+									chatTools,
+									conversationId,
+									model: effectiveModel,
+									timings: capturedTimings,
+									turn
+								});
 							} else {
 								executionResult = await SandboxService.executeTool(toolName, args, signal);
 							}
@@ -923,12 +1039,16 @@ class AgenticStore {
 					if (attachments.length > 0 && updateToolResultMessage) {
 						await updateToolResultMessage(createdToolResultMessageId, cleanedResult, attachments);
 					}
+
+					lastToolResult = { content: cleanedResult, id: createdToolResultMessageId };
 				} else if (createToolResultMessage) {
-					await createToolResultMessage(
+					const created = await createToolResultMessage(
 						toolCall.id,
 						cleanedResult,
 						attachments.length > 0 ? attachments : undefined
 					);
+
+					lastToolResult = { content: cleanedResult, id: created.id };
 				}
 
 				// Build content parts for session history (including images for vision models)
@@ -991,6 +1111,82 @@ class AgenticStore {
 			}
 
 			turn++;
+		}
+	}
+
+	/**
+	 * Runs compact_conversation, get_context_usage or rename_conversation. A
+	 * compaction is only requested here; chatStore runs it once the flow ends,
+	 * since the loop holds the message list the model reads until then.
+	 */
+	private async executeChatTool(
+		toolName: string,
+		args: Record<string, unknown>,
+		ctx: {
+			chatTools: ChatToolFlowContext;
+			conversationId: string;
+			model: string;
+			timings?: ChatMessageTimings;
+			turn: number;
+		}
+	): Promise<ToolExecutionResult> {
+		const { chatTools, conversationId } = ctx;
+		const requests = this.chatToolRequests.get(conversationId) ?? {
+			compact: false,
+			renamed: false
+		};
+		const preserve = Math.max(0, Number(settingsStore.config.compactionPreservedSteps) || 0);
+		// steps once the reply ends: what the model read, this turn and the final answer
+		const stepsAtEnd = chatTools.baseSteps + ctx.turn + 2;
+		const canCompact = stepsAtEnd > preserve;
+
+		switch (toolName) {
+			case BuiltInTool.BROWSER_GET_CONTEXT_USAGE: {
+				const used = ctx.timings ? contextTokens(ctx.timings) : chatTools.initialTokens;
+				const total = this.contextSize(ctx.model);
+
+				return {
+					content: JSON.stringify({
+						compaction_available: canCompact,
+						compaction_keeps_last_steps: preserve,
+						compaction_scheduled: requests.compact,
+						context_size: total,
+						percent_used: total ? Math.round((used / total) * 100) : null,
+						used_tokens: used
+					}),
+					isError: false
+				};
+			}
+
+			case BuiltInTool.BROWSER_COMPACT_CONVERSATION: {
+				if (!canCompact) {
+					return {
+						content: `Nothing to compact yet: compaction keeps the last ${preserve} steps as written and this conversation has ${stepsAtEnd}.`,
+						isError: false
+					};
+				}
+
+				this.chatToolRequests.set(conversationId, { ...requests, compact: true });
+
+				return {
+					content: `Compaction scheduled. When this reply ends, everything before the last ${preserve} steps is replaced by a summary in your context, and the user still sees the full history. Finish your reply normally.`,
+					isError: false
+				};
+			}
+
+			case BuiltInTool.BROWSER_RENAME_CONVERSATION: {
+				const title = normalizeConversationTitle(args.title);
+
+				if (!title) return { content: 'Error: the title is empty.', isError: true };
+
+				await conversationsStore.updateConversationName(conversationId, title);
+				this.chatToolRequests.set(conversationId, { ...requests, renamed: true });
+
+				return { content: `Renamed the conversation to "${title}".`, isError: false };
+			}
+
+			default:
+				return { content: `Error: unknown chat tool ${toolName}.`, isError: true };
 		}
 	}
 
@@ -1070,6 +1266,50 @@ class AgenticStore {
 		if (trimmed === '') return {};
 
 		return JSON.parse(trimmed) as Record<string, unknown>;
+	}
+
+	/**
+	 * Tells the model once per compaction epoch that the context is filling up:
+	 * one line appended to the last message of the request. On a tool result the
+	 * line is stored too, so the next request reads the same prefix and the
+	 * server keeps its cache; a user message keeps its text as the user wrote it.
+	 */
+	private async remindContextIfFull(p: {
+		chatTools: ChatToolFlowContext;
+		conversationId: string;
+		lastToolResult: { content: string; id: string } | null;
+		model: string;
+		sessionMessages: AgenticMessage[];
+		tokens: number;
+		tools: OpenAIToolDefinition[];
+		updateToolResultMessage?: AgenticFlowCallbacks['updateToolResultMessage'];
+	}): Promise<void> {
+		const percent = Number(settingsStore.config.contextReminderPercent);
+
+		if (p.chatTools.reminded || !settingsStore.config.chatToolsEnabled || !(percent > 0)) return;
+
+		if (!p.tools.some((t) => t.function.name === BuiltInTool.BROWSER_COMPACT_CONVERSATION)) return;
+
+		const total = this.contextSize(p.model);
+
+		if (!total || p.tokens * 100 < percent * total) return;
+
+		const last = p.sessionMessages[p.sessionMessages.length - 1];
+
+		if (!last || (last.role !== MessageRole.USER && last.role !== MessageRole.TOOL)) return;
+
+		const text = contextReminderText(p.tokens, total);
+
+		last.content = appendTextToContent(last.content, text);
+		p.chatTools.reminded = true;
+		this.remindedEpochs.set(p.conversationId, p.chatTools.epoch);
+
+		if (last.role === MessageRole.TOOL && p.lastToolResult && p.updateToolResultMessage) {
+			await p.updateToolResultMessage(
+				p.lastToolResult.id,
+				appendTextToContent(p.lastToolResult.content, text) as string
+			);
+		}
 	}
 
 	/**

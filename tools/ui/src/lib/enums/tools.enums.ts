@@ -42,8 +42,11 @@ export enum GlobSearchType {
  * the UI while keeping a single wire name.
  */
 export enum BuiltInTool {
+	BROWSER_COMPACT_CONVERSATION = 'compact_conversation',
+	BROWSER_GET_CONTEXT_USAGE = 'get_context_usage',
 	BROWSER_GET_DATETIME = 'get_datetime',
 	BROWSER_READ_MEDIA = 'read_media',
+	BROWSER_RENAME_CONVERSATION = 'rename_conversation',
 	BROWSER_RUN_JAVASCRIPT = 'run_javascript',
 	SERVER_EDIT_FILE = 'edit_file',
 	SERVER_EXEC_SHELL_COMMAND = 'exec_shell_command',

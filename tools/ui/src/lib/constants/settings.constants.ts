@@ -1,4 +1,5 @@
 import { DEFAULT_AGENTIC_CONFIG } from './agentic.constants';
+import { CHAT_TOOLS } from './chat-tools';
 import { CLI_FLAGS } from './cli-flags.constants';
 import { COMPACTION } from './compaction.constants';
 import { DEFAULT_MCP_CONFIG } from './mcp.constants';
@@ -409,6 +410,24 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 				isPositiveInteger: true,
 				key: SETTINGS_KEYS.AGENTIC_MAX_TURNS,
 				label: 'Agentic turns',
+				type: SettingsFieldType.INPUT
+			},
+			{
+				defaultValue: false,
+				help: 'Expose compact_conversation, get_context_usage and rename_conversation to the model, so it can summarize the conversation when the context fills up and give the chat a title. A compaction the model asks for runs when its reply ends.',
+				key: SETTINGS_KEYS.CHAT_TOOLS_ENABLED,
+				label: 'Chat tools',
+				type: SettingsFieldType.CHECKBOX
+			},
+			{
+				defaultValue: CHAT_TOOLS.DEFAULT_REMINDER_PERCENT,
+				dependsOn: SETTINGS_KEYS.CHAT_TOOLS_ENABLED,
+				help: 'Once the context is this full, in percent, the next request tells the model once that it can compact. 0 turns the reminder off.',
+				isPositiveInteger: true,
+				key: SETTINGS_KEYS.CONTEXT_REMINDER_PERCENT,
+				label: 'Context reminder (%)',
+				max: 100,
+				min: 0,
 				type: SettingsFieldType.INPUT
 			},
 			{

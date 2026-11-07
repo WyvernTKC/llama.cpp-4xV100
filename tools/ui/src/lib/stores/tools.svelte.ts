@@ -10,6 +10,7 @@
 import { browser } from '$app/environment';
 import {
 	buildBrowserInfoToolDefinition,
+	buildChatToolDefinitions,
 	buildGetDatetimeToolDefinition,
 	buildReadMediaToolDefinition,
 	DISABLED_TOOL_CATEGORIES_LOCALSTORAGE_KEY,
@@ -126,6 +127,8 @@ class ToolsStore {
 		if (!this.hasServerTool(BuiltInTool.SERVER_GET_INFO)) {
 			tools.push(buildBrowserInfoToolDefinition());
 		}
+
+		if (settingsStore.config.chatToolsEnabled) tools.push(...buildChatToolDefinitions());
 
 		return tools;
 	}
