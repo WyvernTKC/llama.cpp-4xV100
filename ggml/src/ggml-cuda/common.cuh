@@ -2010,6 +2010,7 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    ggml_prec prec_src1 = GGML_PREC_UNDEFINED; // src1 precision requested by the fused MUL_MATs (MMQ)
     // gated delta net gate and beta instead of a GLU: dst = softplus(x*y + gdn_dt) * gdn_a, gdn_beta = sigmoid(gate*y)
     // with gdn_x (mmvq, one token): these are the rows of gdn_x into gdn_dst, after the rows of src0 and sib
     const ggml_tensor * gdn_dt = nullptr;

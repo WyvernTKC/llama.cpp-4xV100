@@ -300,7 +300,7 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_deepseek41::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }
 
 // Engram n-gram hash: each token gathers n_cols rows of this layer's table.
@@ -445,7 +445,6 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
 }
 
 ggml_tensor * llama_model_deepseek41::graph::build_inp_engram(
-        const llama_model & model,
         int il) {
     const auto & pmodel = static_cast<const llama_model_deepseek41 &>(model);
 
@@ -479,7 +478,6 @@ ggml_tensor * llama_model_deepseek41::graph::build_inp_engram(
 }
 
 ggml_tensor * llama_model_deepseek41::graph::build_engram(
-        const llama_model & model,
         ggml_tensor * x,
         ggml_tensor * emb,
         int il) const {
@@ -562,7 +560,6 @@ dsv41_rope_cfg llama_model_deepseek41::graph::rope_cfg(int il) const {
 // Undo the rotation the query carried into attention, then the grouped output projection. wo_a is
 // block diagonal over groups, each projecting only its own heads, hence a batched mul_mat.
 ggml_tensor * llama_model_deepseek41::graph::build_attention_tail(
-        const llama_model & model,
         ggml_tensor * out,
         ggml_tensor * inp_pos,
         int64_t nt,
@@ -712,7 +709,6 @@ ggml_tensor * llama_model_deepseek41::graph::build_candidate_mask(
 // Score this layer's queries against the shared index keys and keep the best compressed positions.
 // The keys were published by an earlier layer, so this only builds the query side.
 ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
-        const llama_model & model,
         llm_graph_input_dsv4 * inp_dsv4,
         const llm_graph_input_dsv4::comp_input & inp_comp,
         ggml_tensor * qr,
@@ -843,7 +839,6 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
 // Only a source layer compresses. The layers after it read the same rows, which the KV cache
 // hands them through the reuse callback, so a reader builds no compressor at all.
 ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
-        const llama_model & model,
         llm_graph_input_dsv4 * inp_dsv4,
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
@@ -890,7 +885,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
         // no compressed stream, so this layer sees only its own window
         out = build_raw_attention(inp_attn, q, kv, layer.attn_sinks, kq_scale, il);
 
-        return build_attention_tail(model, out, inp_pos, nt, il);
+        return build_attention_tail(out, inp_pos, nt, il);
     }
 
     // The plan slot follows the ratio, since a plan encodes how many tokens make a row. The rows
@@ -996,7 +991,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
     // an index source picks the positions; the layers in between reuse what it picked
     ggml_tensor * top_k = nullptr;
     if (hparams.dsv41_is_index_source(il)) {
-        top_k = build_indexer_top_k(model, inp_dsv4, inp_comp, qr, cur, inp_pos, il);
+        top_k = build_indexer_top_k(inp_dsv4, inp_comp, qr, cur, inp_pos, il);
         topk_idxs = top_k;
     } else {
         const int32_t src = hparams.dsv41_topk_source[il];
@@ -1055,11 +1050,11 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
     }
     cb(out, "attn_out_raw", il);
 
-    return build_attention_tail(model, out, inp_pos, nt, il);
+    return build_attention_tail(out, inp_pos, nt, il);
 }
 
-llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_params & params) :
-    llama_model_deepseek4::graph(params) {
+llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
+    llama_model_deepseek4::graph(params, no_build{}) {
     const auto & pmodel = static_cast<const llama_model_deepseek41 &>(model);
 
     ggml_tensor * cur;
@@ -1095,7 +1090,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
 
         // the engram sits before the block and writes straight into the stream
         if (!is_media && pmodel.engram_index(il) >= 0) {
-            inpL = build_engram(model, inpL, build_inp_engram(model, il), il);
+            inpL = build_engram(inpL, build_inp_engram(il), il);
             cb(inpL, "engram_out", il);
         }
 
@@ -1114,7 +1109,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
-        cur = build_attention_v41(model, inp_dsv4, cur, inp_pos, il);
+        cur = build_attention_v41(inp_dsv4, cur, inp_pos, il);
 
         inpL = build_hc_post(cur, residual, attn_mix.post, attn_mix.comb, il);
         cb(inpL, "hc_attn_post", il);

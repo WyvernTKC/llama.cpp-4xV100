@@ -107,6 +107,7 @@
 	let editedUploadedFiles = $state<ChatUploadedFile[]>([]);
 	let isEditing = $state(false);
 	let showDeleteDialog = $state(false);
+	let showForkDialog = $state(false);
 	let shouldBranchAfterEdit = $state(false);
 	let textareaElement: HTMLTextAreaElement | undefined = $state();
 
@@ -183,8 +184,14 @@
 		navigateToSibling: handleNavigateToSibling,
 		requestDelete: handleDelete,
 		setShowDeleteDialog: handleShowDeleteDialogChange,
+		setShowForkDialog: (show: boolean) => {
+			showForkDialog = show;
+		},
 		get showDeleteDialog() {
 			return showDeleteDialog;
+		},
+		get showForkDialog() {
+			return showForkDialog;
 		},
 		get siblingInfo() {
 			return siblingInfo;

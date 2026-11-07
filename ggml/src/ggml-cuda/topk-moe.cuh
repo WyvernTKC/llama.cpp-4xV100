@@ -218,6 +218,9 @@ static __device__ __forceinline__ void topk_moe_select(
             const int expert = i + threadIdx.x;
             selection_wt[i / WARP_SIZE] =
                 (n_experts % WARP_SIZE == 0 || expert < n_experts) ? wt[i / WARP_SIZE] + bias_v[i / WARP_SIZE] : -INFINITY;
+            if (__isnanf(selection_wt[i / WARP_SIZE])) {
+                selection_wt[i / WARP_SIZE] = -FLT_MAX;
+            }
         }
         if constexpr (grouped) {
             topk_moe_mask_groups<experts_per_thread>(selection_wt, config.n_groups, config.n_group_used, threadIdx.x);
