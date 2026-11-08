@@ -5,6 +5,7 @@
  * in settings field configurations to ensure consistency.
  */
 export const SETTINGS_KEYS = {
+	AGENT_TOOLS_ENABLED: 'agentToolsEnabled',
 	AGENTIC_MAX_TURNS: 'agenticMaxTurns',
 	ALWAYS_SHOW_SIDEBAR_ON_DESKTOP: 'alwaysShowSidebarOnDesktop',
 	ALWAYS_SHOW_TOOL_CALL_CONTENT: 'alwaysShowToolCallContent',

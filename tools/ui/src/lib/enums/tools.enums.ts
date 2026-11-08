@@ -1,3 +1,10 @@
+/** Status of a task in the list the model keeps with update_tasks. */
+export enum AgentTaskStatus {
+	COMPLETED = 'completed',
+	IN_PROGRESS = 'in_progress',
+	PENDING = 'pending'
+}
+
 export enum ToolSource {
 	BROWSER = 'browser',
 	CUSTOM = 'custom',
@@ -42,18 +49,24 @@ export enum GlobSearchType {
  * the UI while keeping a single wire name.
  */
 export enum BuiltInTool {
+	BROWSER_ASK_USER = 'ask_user',
 	BROWSER_COMPACT_CONVERSATION = 'compact_conversation',
 	BROWSER_DELETE_MEMORY = 'delete_memory',
 	BROWSER_GET_CONTEXT_USAGE = 'get_context_usage',
 	BROWSER_GET_DATETIME = 'get_datetime',
 	BROWSER_NEW_CONVERSATION = 'new_conversation',
+	BROWSER_NOTIFY = 'notify',
 	BROWSER_READ_CONVERSATION = 'read_conversation',
 	BROWSER_READ_MEDIA = 'read_media',
 	BROWSER_RENAME_CONVERSATION = 'rename_conversation',
 	BROWSER_RUN_JAVASCRIPT = 'run_javascript',
+	BROWSER_RUN_SUBAGENT = 'run_subagent',
 	BROWSER_SAVE_MEMORY = 'save_memory',
+	BROWSER_SCHEDULE_WAKEUP = 'schedule_wakeup',
 	BROWSER_SEARCH_CONVERSATIONS = 'search_conversations',
 	BROWSER_SEARCH_MEMORIES = 'search_memories',
+	BROWSER_SLEEP = 'sleep',
+	BROWSER_UPDATE_TASKS = 'update_tasks',
 	SERVER_EDIT_FILE = 'edit_file',
 	SERVER_EXEC_SHELL_COMMAND = 'exec_shell_command',
 	SERVER_FILE_GLOB_SEARCH = 'file_glob_search',

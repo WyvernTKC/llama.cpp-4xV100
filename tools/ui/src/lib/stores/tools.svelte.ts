@@ -9,6 +9,7 @@
 
 import { browser } from '$app/environment';
 import {
+	buildAgentToolDefinitions,
 	buildBrowserInfoToolDefinition,
 	buildChatToolDefinitions,
 	buildGetDatetimeToolDefinition,
@@ -132,6 +133,8 @@ class ToolsStore {
 		if (settingsStore.config.chatToolsEnabled) tools.push(...buildChatToolDefinitions());
 
 		if (settingsStore.config.memoriesEnabled) tools.push(...buildMemoryToolDefinitions());
+
+		if (settingsStore.config.agentToolsEnabled) tools.push(...buildAgentToolDefinitions());
 
 		return tools;
 	}

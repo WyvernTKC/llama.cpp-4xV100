@@ -504,6 +504,13 @@ export { default as ChatMessageAgenticContent } from './ChatMessages/ChatMessage
 export { default as ChatMessageActionCardPermissionRequest } from './ChatMessages/ChatMessageActions/ChatMessageActionCard/ChatMessageActionCardPermissionRequest.svelte';
 export { default as ChatMessageActionCard } from './ChatMessages/ChatMessageActions/ChatMessageActionCard/ChatMessageActionCard.svelte';
 export { default as ChatMessageActionCardContinueRequest } from './ChatMessages/ChatMessageActions/ChatMessageActionCard/ChatMessageActionCardContinueRequest.svelte';
+export { default as ChatMessageActionCardQuestion } from './ChatMessages/ChatMessageActions/ChatMessageActionCard/ChatMessageActionCardQuestion.svelte';
+
+/**
+ * Rows of an update_tasks task list with their status icons. Used by the
+ * update_tasks tool block and by the task strip above the input box.
+ */
+export { default as AgentTaskList } from './ChatMessages/ChatMessage/ChatMessageToolCall/AgentTaskList.svelte';
 
 /**
  * Action buttons toolbar for messages. Displays copy, edit, delete, and regenerate
@@ -713,3 +720,9 @@ export { default as ChatScreenServerError } from './ChatScreen/ChatScreenServerE
  * Renders nothing otherwise. Shown inside ChatScreen only on an active conversation route.
  */
 export { default as ChatScreenStreamResumeStatus } from './ChatScreen/ChatScreenStreamResumeStatus.svelte';
+
+/**
+ * Strip above the input box with the model's open task list and its scheduled
+ * wake-up for the open chat.
+ */
+export { default as ChatScreenAgentStatus } from './ChatScreen/ChatScreenAgentStatus.svelte';

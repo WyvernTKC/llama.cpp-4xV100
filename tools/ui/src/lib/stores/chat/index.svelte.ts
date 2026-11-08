@@ -37,8 +37,10 @@ import { modelsStore } from '$lib/stores/models/index.svelte';
 import { serverStore } from '$lib/stores/server.svelte';
 import { settingsStore } from '$lib/stores/settings/index.svelte';
 import { toolsStore } from '$lib/stores/tools.svelte';
+import { wakeupsStore } from '$lib/stores/wakeups.svelte';
 import type {
 	ApiChatMessageData,
+	BackgroundReply,
 	ChatMessageCompactionTimings,
 	ChatMessagePromptProgress,
 	ChatMessageTimings,
@@ -58,7 +60,8 @@ import {
 	getConversationModel,
 	isAbortError,
 	normalizeModelName,
-	sliceAtLastCompaction
+	sliceAtLastCompaction,
+	wakeupMessage
 } from '$lib/utils';
 import { SvelteMap } from 'svelte/reactivity';
 
@@ -173,6 +176,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 		return message;
 	}
+
 	async addSystemPrompt(draft?: { message: string; files: ChatUploadedFile[] }): Promise<void> {
 		let activeConv = conversationsStore.activeConversation;
 
@@ -248,7 +252,6 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			this.preEncodeAbortController = null;
 		}
 	}
-
 	/**
 	 * Whether the branch holds a step to summarize before the steps a
 	 * compaction preserves.
@@ -266,6 +269,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		this.clearChatStreaming(convId);
 		this.processing.setState(convId, null);
 	}
+
 	clearChatStreaming(convId: string, messageId?: string): void {
 		// session aware: a stale generation must not wipe a newer one's streaming state on the
 		// same conversation, that would drop the frozen stop identity and stop the wrong session
@@ -281,7 +285,6 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		this.isEditModeActive = false;
 		this.addFilesHandler = null;
 	}
-
 	clearPendingEditMessageId(): void {
 		this.pendingEditMessageId = null;
 	}
@@ -350,6 +353,10 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		const pending = this.consumePendingMessage(convId);
 
 		if (pending) await this.sendQueuedMessage(convId, pending);
+	}
+
+	constructor() {
+		wakeupsStore.initialize((convId, note) => this.sendWakeup(convId, note));
 	}
 
 	consumePendingMessage(
@@ -752,10 +759,111 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		}
 	}
 
+	/**
+	 * Sends `content` as a user message in a conversation that need not be on
+	 * screen, under that conversation's own tool policy, and resolves once
+	 * its reply has ended with the text of the final answer. Null when the
+	 * conversation is busy or gone. A stop through `signal` stops its reply.
+	 */
+	async sendInBackground(
+		convId: string,
+		content: string,
+		signal?: AbortSignal
+	): Promise<BackgroundReply | null> {
+		if (this.isBusy(convId) || signal?.aborted) return null;
+
+		const conversation = await DatabaseService.getConversation(convId);
+
+		if (!conversation) return null;
+
+		const onAbort = () => void this.stopGenerationForChat(convId);
+
+		signal?.addEventListener('abort', onAbort, { once: true });
+
+		try {
+			if (conversationsStore.activeConversation?.id === convId) {
+				await this.sendMessage(content);
+			} else {
+				const all = await DatabaseService.getConversationMessages(convId);
+				const path = [...filterByLeafNodeId(all, conversation.currNode, false)];
+				const userMessage = await DatabaseService.createMessageBranch(
+					{
+						children: [],
+						content,
+						convId,
+						role: MessageRole.USER,
+						timestamp: Date.now(),
+						toolCalls: '',
+						type: MessageType.TEXT
+					},
+					conversation.currNode
+				);
+				const assistantMessage = await DatabaseService.createMessageBranch(
+					{
+						children: [],
+						content: '',
+						convId,
+						model: null,
+						role: MessageRole.ASSISTANT,
+						timestamp: Date.now(),
+						toolCalls: '',
+						type: MessageType.TEXT
+					},
+					userMessage.id
+				);
+
+				await DatabaseService.updateCurrentNode(convId, assistantMessage.id);
+				conversationsStore.updateConversationTimestamp(convId);
+				this.setChatLoading(convId, true);
+				this.clearChatStreaming(convId);
+
+				const controller = this.getOrCreateAbortController(convId);
+
+				try {
+					await this.streamChatCompletion([...path, userMessage], assistantMessage);
+				} finally {
+					// the stream marks the conversation it serves as the processing one
+					this.processing.setActiveConversation(conversationsStore.activeConversation?.id ?? null);
+				}
+
+				if (controller.signal.aborted) return this.backgroundReply(convId, true);
+			}
+		} catch (error) {
+			this.setChatLoading(convId, false);
+
+			if (isAbortError(error)) return this.backgroundReply(convId, true);
+
+			return {
+				answer: '',
+				error: error instanceof Error ? error.message : String(error),
+				stopped: false
+			};
+		} finally {
+			signal?.removeEventListener('abort', onAbort);
+		}
+
+		return this.backgroundReply(convId, Boolean(signal?.aborted));
+	}
 	async sendMessage(content: string, extras?: DatabaseMessageExtra[]): Promise<void> {
 		if (!content.trim() && (!extras || extras.length === 0)) return;
 
 		const activeConv = conversationsStore.activeConversation;
+
+		// A message typed while an ask_user question waits answers it. One with
+		// attachments answers that a message follows and goes out as one once
+		// the flow has read the answer.
+		if (activeConv && agenticStore.getPendingQuestion(activeConv.id)) {
+			const hasExtras = Boolean(extras && extras.length > 0);
+
+			if (hasExtras) agenticStore.injectSteeringMessage(activeConv.id, content, extras);
+
+			agenticStore.resolveQuestion(
+				activeConv.id,
+				hasExtras ? 'The user answered with a message that has attachments; it follows.' : content
+			);
+
+			return;
+		}
 
 		// If agentic loop is running, inject as a steering message instead of starting a new flow
 		if (activeConv && agenticStore.isRunning(activeConv.id)) {
@@ -878,6 +986,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			});
 		}
 	}
+
 	setChatLoading(convId: string, loading: boolean): void {
 		if (loading) {
 			this.activity.markLocal(convId);
@@ -1242,6 +1351,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 				conversationsStore.updateMessageAtIndex(idx, { timings: intermediateTimings });
 			},
+			sendInBackground: (targetConvId: string, content: string, signal?: AbortSignal) =>
+				this.sendInBackground(targetConvId, content, signal),
 			updateToolResultMessage: async (
 				messageId: string,
 				content: string,
@@ -1270,7 +1381,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				await DatabaseService.updateMessage(messageId, updates);
 			}
 		};
-		const toolPolicy = this.toolPolicy();
+		const toolPolicy = this.toolPolicyFor(convId);
 
 		{
 			const agenticResult = await agenticStore.runAgenticFlow({
@@ -1442,6 +1553,20 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		}
 	}
 
+	/** The final answer of a conversation's last reply, read back from its current node. */
+	private async backgroundReply(convId: string, stopped: boolean): Promise<BackgroundReply> {
+		const conversation = await DatabaseService.getConversation(convId);
+		const all = conversation ? await DatabaseService.getConversationMessages(convId) : [];
+		const leaf = all.find((m) => m.id === conversation?.currNode);
+		const error = agenticStore.getLastError(convId)?.message;
+
+		return {
+			answer: leaf?.role === MessageRole.ASSISTANT ? leaf.content.trim() : '',
+			error,
+			stopped
+		};
+	}
+
 	/** The steps a compaction keeps as written, as the settings set them. */
 	private compactionPreserve(): number {
 		return Number(settingsStore.config.compactionPreservedSteps);
@@ -1532,6 +1657,11 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		return this.chatStreamingStates.get(convId);
 	}
 
+	/** Whether a conversation has a reply, flow or local pipe running. */
+	private isBusy(convId: string): boolean {
+		return this.isChatLoadingInternal(convId) || agenticStore.isRunning(convId);
+	}
+
 	/**
 	 * Pre-encodes the branch ending at the leaf as the next turn reads it: the
 	 * stored path cut at its last compaction, with the tools, message shaping
@@ -1548,7 +1678,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		const branchPath = [...filterByLeafNodeId(allMessages, leafId, false)];
 		const request = await agenticStore.requestFor(
 			await ChatService.normalizeMessagesForApi(sliceAtLastCompaction(branchPath)),
-			this.toolPolicy()
+			this.toolPolicyFor(convId)
 		);
 
 		return ChatService.preEncode(
@@ -1655,6 +1785,22 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	}
 
 	/**
+	 * Sends a due wake-up into its conversation; false while the chat is busy,
+	 * so the wake-up tries again later. The reply runs on its own.
+	 */
+	private async sendWakeup(convId: string, note: string): Promise<boolean> {
+		if (this.isBusy(convId)) return false;
+
+		if (!(await DatabaseService.getConversation(convId))) return true;
+
+		this.sendInBackground(convId, wakeupMessage(note)).catch((error: unknown) =>
+			console.error('[ChatStore] Wake-up failed:', error)
+		);
+
+		return true;
+	}
+
+	/**
 	 * Streams a fresh summary of `source` into the compaction node and re-stamps
 	 * the reduced context afterwards. `rollback` restores the row when nothing
 	 * usable came back, so an empty or aborted summary never replaces what the
@@ -1714,7 +1860,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			// reuses the prefix it cached and only the instruction is new.
 			const request = await agenticStore.requestFor(
 				await ChatService.normalizeMessagesForApi(source.slice(0, cut)),
-				this.toolPolicy()
+				this.toolPolicyFor(convId)
 			);
 			const configValue = settingsStore.config;
 			const compactionPrompt =
@@ -1813,10 +1959,23 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	}
 
 	/** The tool policy of the active conversation, the one its requests run under. */
-	private toolPolicy(): AgenticToolPolicy {
+	/**
+	 * The tool policy a request of `convId` runs under: the live preferences
+	 * when it is on screen, else the policy stored on its row.
+	 */
+	private toolPolicyFor(convId: string): AgenticToolPolicy {
+		if (conversationsStore.activeConversation?.id === convId) {
+			return {
+				disabledToolCategories: conversationsStore.preferences.getDisabledToolCategories(),
+				disabledTools: conversationsStore.preferences.getDisabledTools()
+			};
+		}
+
+		const row = conversationsStore.conversations.find((c) => c.id === convId);
+
 		return {
-			disabledToolCategories: conversationsStore.preferences.getDisabledToolCategories(),
-			disabledTools: conversationsStore.preferences.getDisabledTools()
+			disabledToolCategories: [...(row?.disabledToolCategories ?? [])],
+			disabledTools: [...(row?.disabledTools ?? [])]
 		};
 	}
 

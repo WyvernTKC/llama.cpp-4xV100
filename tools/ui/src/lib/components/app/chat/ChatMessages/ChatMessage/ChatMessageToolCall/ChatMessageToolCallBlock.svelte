@@ -1,4 +1,5 @@
 <script lang="ts">
+	import ChatMessageToolCallBlockAskUser from './ChatMessageToolCallBlockAskUser.svelte';
 	import ChatMessageToolCallBlockDefault from './ChatMessageToolCallBlockDefault.svelte';
 	import ChatMessageToolCallBlockEditFile from './ChatMessageToolCallBlockEditFile.svelte';
 	import ChatMessageToolCallBlockExecShellCommand from './ChatMessageToolCallBlockExecShellCommand.svelte';
@@ -10,6 +11,8 @@
 	import ChatMessageToolCallBlockReadMedia from './ChatMessageToolCallBlockReadMedia.svelte';
 	import ChatMessageToolCallBlockRunJavascript from './ChatMessageToolCallBlockRunJavascript.svelte';
 	import ChatMessageToolCallBlockSearchResults from './ChatMessageToolCallBlockSearchResults.svelte';
+	import ChatMessageToolCallBlockSubagent from './ChatMessageToolCallBlockSubagent.svelte';
+	import ChatMessageToolCallBlockTasks from './ChatMessageToolCallBlockTasks.svelte';
 	import ChatMessageToolCallBlockWriteFile from './ChatMessageToolCallBlockWriteFile.svelte';
 	import { BuiltInTool } from '$lib/enums';
 	import type { AgenticSection, DatabaseMessageExtra } from '$lib/types';
@@ -47,6 +50,12 @@
 
 {#if isSearchCall}
 	<ChatMessageToolCallBlockSearchResults {isStreaming} {onToggle} {open} {section} />
+{:else if section.toolName === BuiltInTool.BROWSER_RUN_SUBAGENT}
+	<ChatMessageToolCallBlockSubagent {isStreaming} {onToggle} {open} {section} />
+{:else if section.toolName === BuiltInTool.BROWSER_UPDATE_TASKS}
+	<ChatMessageToolCallBlockTasks {isStreaming} {onToggle} {open} {section} />
+{:else if section.toolName === BuiltInTool.BROWSER_ASK_USER}
+	<ChatMessageToolCallBlockAskUser {isStreaming} {section} />
 {:else if section.toolName === BuiltInTool.BROWSER_GET_DATETIME}
 	<ChatMessageToolCallBlockGetDatetime {isStreaming} {section} />
 {:else if section.toolName === BuiltInTool.SERVER_GET_INFO}

@@ -228,6 +228,8 @@ export type {
 	AgenticFlowOptions,
 	AgenticFlowParams,
 	AgenticFlowResult,
+	BackgroundReply,
+	PendingQuestion,
 	SteeringMessage,
 	AgenticSection,
 	ToolResultLine,

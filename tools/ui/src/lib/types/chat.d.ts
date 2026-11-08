@@ -1,3 +1,4 @@
+import type { BackgroundReply } from './agentic';
 import type { ApiChatCompletionToolCall } from './api';
 import type { DatabaseMessage, DatabaseMessageExtra } from './database';
 import type {
@@ -165,6 +166,11 @@ export interface ChatStreamCallbacks {
 	onFlowComplete?: (timings?: ChatMessageTimings) => void;
 	onError?: (error: Error) => void;
 	onTurnComplete?: (intermediateTimings: ChatMessageTimings) => void;
+	sendInBackground?: (
+		conversationId: string,
+		content: string,
+		signal?: AbortSignal
+	) => Promise<BackgroundReply | null>;
 }
 
 /**

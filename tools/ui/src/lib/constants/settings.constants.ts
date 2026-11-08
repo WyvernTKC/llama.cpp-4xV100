@@ -421,7 +421,7 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 			},
 			{
 				defaultValue: false,
-				help: 'Let the model manage conversations: compact_conversation, get_context_usage and rename_conversation for this chat, search_conversations and read_conversation for past chats, and new_conversation to start a chat in a new tab with its first message left for you to send. A compaction the model asks for runs when its reply ends.',
+				help: 'Let the model manage conversations: compact_conversation, get_context_usage and rename_conversation for this chat, search_conversations and read_conversation for past chats, and new_conversation to start a chat in a new tab that answers its first message on its own. A compaction the model asks for runs when its reply ends.',
 				key: SETTINGS_KEYS.CHAT_TOOLS_ENABLED,
 				label: 'Chat tools',
 				type: SettingsFieldType.CHECKBOX
@@ -442,6 +442,13 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 				help: 'Let the model save, search and delete short memories (save_memory, search_memories, delete_memory) that carry over to later chats. A new chat lists the saved memories in its system prompt, fixed for that chat. Memories stay in this browser; the list below shows and deletes them.',
 				key: SETTINGS_KEYS.MEMORIES_ENABLED,
 				label: 'Memories',
+				type: SettingsFieldType.CHECKBOX
+			},
+			{
+				defaultValue: false,
+				help: 'Let the model pace and split up longer work: sleep to wait, ask_user to ask you with options, update_tasks for a task list above the input, notify for a browser notification, schedule_wakeup to continue the chat after some minutes while the page is open, and run_subagent to hand a task to a sub-agent in a chat of its own and get back only its answer.',
+				key: SETTINGS_KEYS.AGENT_TOOLS_ENABLED,
+				label: 'Agent tools',
 				type: SettingsFieldType.CHECKBOX
 			},
 			{

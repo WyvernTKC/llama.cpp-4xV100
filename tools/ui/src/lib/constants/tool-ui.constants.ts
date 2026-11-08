@@ -8,9 +8,12 @@
 // ChatMessageToolCallBlockSearchResults for prior art).
 
 import {
+	AlarmClock,
+	Bell,
 	BookmarkPlus,
 	BookmarkX,
 	BookOpen,
+	Bot,
 	Braces,
 	Brain,
 	Clock,
@@ -20,7 +23,10 @@ import {
 	FileSearch,
 	FileText,
 	Gauge,
+	Hourglass,
 	Info,
+	ListChecks,
+	MessageCircleQuestionMark,
 	MessageSquarePlus,
 	MessagesSquare,
 	PenLine,
@@ -32,6 +38,11 @@ import { BuiltInTool, ToolSource } from '$lib/enums';
 import type { ToolUiEntry } from '$lib/types';
 
 export const TOOL_UI: Readonly<Record<BuiltInTool, ToolUiEntry>> = {
+	[BuiltInTool.BROWSER_ASK_USER]: {
+		icon: MessageCircleQuestionMark,
+		label: 'Ask user',
+		source: ToolSource.BROWSER
+	},
 	[BuiltInTool.BROWSER_COMPACT_CONVERSATION]: {
 		icon: Shrink,
 		label: 'Compact conversation',
@@ -57,6 +68,7 @@ export const TOOL_UI: Readonly<Record<BuiltInTool, ToolUiEntry>> = {
 		label: 'New conversation',
 		source: ToolSource.BROWSER
 	},
+	[BuiltInTool.BROWSER_NOTIFY]: { icon: Bell, label: 'Notify', source: ToolSource.BROWSER },
 	[BuiltInTool.BROWSER_READ_CONVERSATION]: {
 		icon: BookOpen,
 		label: 'Read conversation',
@@ -73,9 +85,15 @@ export const TOOL_UI: Readonly<Record<BuiltInTool, ToolUiEntry>> = {
 		label: 'Run JavaScript',
 		source: ToolSource.BROWSER
 	},
+	[BuiltInTool.BROWSER_RUN_SUBAGENT]: { icon: Bot, label: 'Sub-agent', source: ToolSource.BROWSER },
 	[BuiltInTool.BROWSER_SAVE_MEMORY]: {
 		icon: BookmarkPlus,
 		label: 'Save memory',
+		source: ToolSource.BROWSER
+	},
+	[BuiltInTool.BROWSER_SCHEDULE_WAKEUP]: {
+		icon: AlarmClock,
+		label: 'Schedule wake-up',
 		source: ToolSource.BROWSER
 	},
 	[BuiltInTool.BROWSER_SEARCH_CONVERSATIONS]: {
@@ -86,6 +104,12 @@ export const TOOL_UI: Readonly<Record<BuiltInTool, ToolUiEntry>> = {
 	[BuiltInTool.BROWSER_SEARCH_MEMORIES]: {
 		icon: Brain,
 		label: 'Search memories',
+		source: ToolSource.BROWSER
+	},
+	[BuiltInTool.BROWSER_SLEEP]: { icon: Hourglass, label: 'Sleep', source: ToolSource.BROWSER },
+	[BuiltInTool.BROWSER_UPDATE_TASKS]: {
+		icon: ListChecks,
+		label: 'Task list',
 		source: ToolSource.BROWSER
 	},
 	[BuiltInTool.SERVER_EDIT_FILE]: { icon: FilePen, label: 'Edit file', source: ToolSource.SERVER },

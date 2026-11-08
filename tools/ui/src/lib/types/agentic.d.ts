@@ -144,6 +144,33 @@ export interface AgenticFlowCallbacks {
 	onTimings?: (timings?: ChatMessageTimings, promptProgress?: ChatMessagePromptProgress) => void;
 	/** An agentic turn (LLM + tool execution) completed - intermediate timing update */
 	onTurnComplete?: (intermediateTimings: ChatMessageTimings) => void;
+	/**
+	 * Send a user message in another conversation and wait until its reply
+	 * ends; null when that conversation is busy or gone. Used by the
+	 * sub-agent and new-chat tools, which run their work as chats of their own.
+	 */
+	sendInBackground?: (
+		conversationId: string,
+		content: string,
+		signal?: AbortSignal
+	) => Promise<BackgroundReply | null>;
+}
+
+/** How a message sent with sendInBackground was answered. */
+export interface BackgroundReply {
+	/** Text of the final assistant message, empty when there was none. */
+	answer: string;
+	/** Error message when the reply failed. */
+	error?: string;
+	/** Whether the reply was stopped before it ended. */
+	stopped: boolean;
+}
+
+/** An ask_user question waiting for the user's answer. */
+export interface PendingQuestion {
+	options: string[];
+	question: string;
+	toolCallId: string;
 }
 
 /**

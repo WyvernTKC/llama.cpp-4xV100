@@ -110,6 +110,7 @@ export {
 export { KeyboardKey } from './keyboard.enums';
 
 export {
+	AgentTaskStatus,
 	BuiltInTool,
 	GlobSearchType,
 	ToolSource,

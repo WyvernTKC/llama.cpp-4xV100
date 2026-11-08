@@ -116,10 +116,10 @@ export function buildChatToolDefinitions(): OpenAIToolDefinition[] {
 		),
 		tool(
 			BuiltInTool.BROWSER_NEW_CONVERSATION,
-			'Starts a new conversation in a new tab, for example to move a separate topic out of this one. The first message is left in its input box for the user to review and send; nothing is sent by this call.',
+			'Starts a new conversation in a new tab, for example to move a separate topic out of this one, and sends its first message there right away. The new chat answers on its own while this one goes on; it cannot see this conversation, so the first message must say everything it needs.',
 			{
 				first_message: {
-					description: 'The message to put in the new chat, written as the user would send it',
+					description: 'The first message of the new chat, written as the user would send it',
 					type: JsonSchemaType.STRING
 				},
 				title: { description: 'Title of the new chat, a few words', type: JsonSchemaType.STRING }

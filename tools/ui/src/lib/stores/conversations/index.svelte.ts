@@ -10,7 +10,7 @@
 import { browser } from '$app/environment';
 import { goto } from '$app/navigation';
 import { ROUTES } from '$lib/constants';
-import { MessageRole } from '$lib/enums';
+import { MessageRole, type ToolSource } from '$lib/enums';
 import { ConversationTransferService } from '$lib/services/conversation-transfer.service';
 import { DatabaseService } from '$lib/services/database.service';
 import { MemoryService } from '$lib/services/memory.service';
@@ -302,21 +302,26 @@ class ConversationsStore implements ConversationsPreferencesHost {
 	}
 
 	/**
-	 * Creates a conversation without opening it, for the new_conversation chat
-	 * tool while a reply streams in another one: its root and system prompt are
-	 * in place, the first message waits as its input draft, and it opens as a
-	 * background tab when tabs are on.
+	 * Creates a conversation without opening it, for the new_conversation and
+	 * run_subagent tools while a reply streams in another one: its root and system prompt are
+	 * in place, an optional first message waits as its input draft, and it
+	 * opens as a background tab when tabs are on.
 	 *
 	 * @param name - Title of the conversation
-	 * @param firstMessage - Draft for its input box
+	 * @param options - Input draft and tool policy of the chat
 	 * @returns The created conversation
 	 */
 	async createConversationInBackground(
 		name: string,
-		firstMessage?: string
+		options: {
+			/** Left in the input box for the user to send. */
+			draft?: string;
+			/** Tool policy of the chat, the global defaults when unset. */
+			policy?: { disabledTools?: string[]; disabledToolCategories?: ToolSource[] };
+		} = {}
 	): Promise<DatabaseConversation> {
 		const conversation = await DatabaseService.createConversation(name, {
-			...this.preferences.getToolPolicySnapshot()
+			...(options.policy ?? this.preferences.getToolPolicySnapshot())
 		});
 		const rootId = await DatabaseService.createRootMessage(conversation.id);
 		const systemPrompt = await this.newChatSystemPrompt();
@@ -330,7 +335,7 @@ class ConversationsStore implements ConversationsPreferencesHost {
 
 		this.conversations = [stored, ...this.conversations];
 
-		if (firstMessage) draftMessagesStore.saveDraftMessage(conversation.id, firstMessage, []);
+		if (options.draft) draftMessagesStore.saveDraftMessage(conversation.id, options.draft, []);
 
 		if (settingsStore.config.conversationTabs) await tabsStore.openInNewTab(conversation.id);
 

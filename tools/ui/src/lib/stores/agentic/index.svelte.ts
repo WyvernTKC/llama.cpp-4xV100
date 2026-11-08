@@ -10,7 +10,15 @@
  * the permission/continue/steering gates owned by {@link AgenticGates}.
  */
 
-import { CHAT_TOOL_NAMES, CHAT_TOOLS, DEFAULT_AGENTIC_CONFIG, NEWLINE } from '$lib/constants';
+import {
+	AGENT_TOOL_NAMES,
+	AGENT_TOOLS,
+	CHAT_TOOL_NAMES,
+	CHAT_TOOLS,
+	DEFAULT_AGENTIC_CONFIG,
+	NEWLINE,
+	SUBAGENT_DISABLED_TOOLS
+} from '$lib/constants';
 import {
 	AUDIO_MIME_TO_EXTENSION,
 	DATA_URI_BASE64_REGEX,
@@ -32,6 +40,7 @@ import {
 import { ChatService } from '$lib/services';
 import { ChatHistoryService } from '$lib/services/chat-history.service';
 import { MemoryService } from '$lib/services/memory.service';
+import { NotificationService } from '$lib/services/notification.service';
 import { ReadMediaService } from '$lib/services/read-media.service';
 import { SandboxService } from '$lib/services/sandbox.service';
 import { ToolsService } from '$lib/services/tools.service';
@@ -43,12 +52,14 @@ import { modelsStore } from '$lib/stores/models/index.svelte';
 import { serverStore } from '$lib/stores/server.svelte';
 import { settingsStore } from '$lib/stores/settings/index.svelte';
 import { toolsStore } from '$lib/stores/tools.svelte';
+import { wakeupsStore } from '$lib/stores/wakeups.svelte';
 import type {
 	AgenticConfig,
 	AgenticFlowParams,
 	AgenticFlowResult,
 	AgenticSession,
 	MCPToolCall,
+	PendingQuestion,
 	SettingsConfigType,
 	ToolExecutionResult
 } from '$lib/types';
@@ -82,18 +93,26 @@ import type {
 import type { OpenAIToolDefinition } from '$lib/types/mcp';
 import {
 	appendTextToContent,
+	clampToolNumber,
 	collectAttachmentRefs,
 	contextReminderText,
 	contextTokens,
 	countSteps,
+	describeTaskList,
 	executeBrowserInfoTool,
 	executeGetDatetimeTool,
 	getAudioInputFormat,
 	hasContextReminder,
 	isAbortError,
 	lastContextBearingMessage,
+	normalizeAskArgs,
 	normalizeConversationTitle,
+	normalizeNotifyArgs,
+	normalizeTaskList,
 	resolveAttachmentRefs,
+	subagentPrompt,
+	subagentTitle,
+	truncateSubagentAnswer,
 	uuid,
 	withToolImageHandles
 } from '$lib/utils';
@@ -184,6 +203,8 @@ class AgenticStore {
 	// compaction epoch the context reminder went out in, per conversation
 	private remindedEpochs = new Map<string, string>();
 	private sessions = new SvelteMap<string, AgenticSession>();
+	// the chat each run_subagent call runs in, by tool call id, for its block
+	private subagentChats = new SvelteMap<string, string>();
 
 	get isAnyRunning(): boolean {
 		for (const session of this.sessions.values()) {
@@ -303,6 +324,11 @@ class AgenticStore {
 		return this.gates.getPendingPermissionRequest(conversationId);
 	}
 
+	/** The ask_user question the conversation waits on. */
+	getPendingQuestion(conversationId: string): PendingQuestion | null {
+		return this.gates.getPendingQuestion(conversationId);
+	}
+
 	getPendingSteeringMessageContent(conversationId: string): string | null {
 		return this.gates.getPendingSteeringMessageContent(conversationId);
 	}
@@ -324,6 +350,11 @@ class AgenticStore {
 
 	getStreamingToolCall(conversationId: string): { name: string; arguments: string } | null {
 		return this.sessions.get(conversationId)?.streamingToolCall ?? null;
+	}
+
+	/** The chat a run_subagent call runs in, while it runs and after. */
+	getSubagentConversation(toolCallId: string): string | null {
+		return this.subagentChats.get(toolCallId) ?? null;
 	}
 
 	getTotalToolCalls(conversationId: string): number {
@@ -381,6 +412,11 @@ class AgenticStore {
 		this.gates.resolvePermission(conversationId, decision);
 	}
 
+	/** Answer the open ask_user question of a conversation; false when there is none. */
+	resolveQuestion(conversationId: string, answer: string): boolean {
+		return this.gates.resolveQuestion(conversationId, answer);
+	}
+
 	async runAgenticFlow(params: AgenticFlowParams): Promise<AgenticFlowResult> {
 		const {
 			callbacks,
@@ -431,6 +467,7 @@ class AgenticStore {
 				messages: normalizedMessages,
 				options,
 				signal,
+				toolPolicy,
 				tools
 			});
 
@@ -524,6 +561,7 @@ class AgenticStore {
 		messages: ApiChatMessageData[];
 		options: AgenticFlowOptions;
 		tools: ReturnType<typeof toolsStore.getEnabledToolsForLLM>;
+		toolPolicy?: AgenticToolPolicy;
 		agenticConfig: AgenticConfig;
 		attachmentRefs: Map<string, string>;
 		callbacks: AgenticFlowCallbacks;
@@ -538,6 +576,7 @@ class AgenticStore {
 			messages,
 			options,
 			signal,
+			toolPolicy,
 			tools
 		} = params;
 		const {
@@ -973,8 +1012,17 @@ class AgenticStore {
 									chatTools,
 									conversationId,
 									model: effectiveModel,
+									sendInBackground: callbacks.sendInBackground,
 									timings: capturedTimings,
 									turn
+								});
+							} else if (AGENT_TOOL_NAMES.includes(toolName)) {
+								executionResult = await this.executeAgentTool(toolName, args, {
+									conversationId,
+									sendInBackground: callbacks.sendInBackground,
+									signal,
+									toolCallId: toolCall.id,
+									toolPolicy
 								});
 							} else {
 								executionResult = await SandboxService.executeTool(toolName, args, signal);
@@ -1139,6 +1187,126 @@ class AgenticStore {
 	}
 
 	/**
+	 * Runs an agent tool: sleep, ask_user, update_tasks, notify,
+	 * schedule_wakeup and run_subagent. A stop through `signal` while one
+	 * waits throws an abort, which ends the flow like any stopped tool.
+	 */
+	private async executeAgentTool(
+		toolName: string,
+		args: Record<string, unknown>,
+		ctx: {
+			conversationId: string;
+			sendInBackground?: AgenticFlowCallbacks['sendInBackground'];
+			signal?: AbortSignal;
+			toolCallId: string;
+			toolPolicy?: AgenticToolPolicy;
+		}
+	): Promise<ToolExecutionResult> {
+		const { conversationId, signal } = ctx;
+
+		switch (toolName) {
+			case BuiltInTool.BROWSER_SLEEP: {
+				const seconds = clampToolNumber(args.seconds, AGENT_TOOLS.SLEEP_MAX_SECONDS);
+				const { slept, woken } = await this.sleep(conversationId, seconds, signal);
+
+				return {
+					content: woken
+						? `Woke up after ${slept} of ${seconds} seconds: the user sent a message.`
+						: `Waited ${slept} seconds.`,
+					isError: false
+				};
+			}
+
+			case BuiltInTool.BROWSER_ASK_USER: {
+				const ask = normalizeAskArgs(args);
+
+				if (!ask) {
+					return {
+						content: 'Error: ask_user needs a question and at least two different options.',
+						isError: true
+					};
+				}
+
+				const answer = await this.gates.requestAnswer(
+					conversationId,
+					{ ...ask, toolCallId: ctx.toolCallId },
+					signal
+				);
+
+				if (signal?.aborted) throw new DOMException('Stopped', 'AbortError');
+
+				if (answer === null) {
+					return { content: 'The question was closed without an answer.', isError: false };
+				}
+
+				return { content: JSON.stringify({ answer }), isError: false };
+			}
+
+			case BuiltInTool.BROWSER_UPDATE_TASKS: {
+				const tasks = normalizeTaskList(args);
+
+				if (!tasks) {
+					return {
+						content: 'Error: update_tasks needs tasks, a list of { content, status }.',
+						isError: true
+					};
+				}
+
+				return { content: describeTaskList(tasks), isError: false };
+			}
+
+			case BuiltInTool.BROWSER_NOTIFY: {
+				const notice = normalizeNotifyArgs(args);
+
+				if (!notice) return { content: 'Error: the message is empty.', isError: true };
+
+				const shown = await NotificationService.show(notice.title, notice.message);
+
+				return {
+					content:
+						shown === 'system'
+							? 'Notification shown.'
+							: 'Shown inside the page: this browser does not allow system notifications here.',
+					isError: false
+				};
+			}
+
+			case BuiltInTool.BROWSER_SCHEDULE_WAKEUP: {
+				const minutes = clampToolNumber(args.minutes, AGENT_TOOLS.WAKEUP_MAX_MINUTES);
+				const note = typeof args.note === 'string' ? args.note.trim() : '';
+
+				if (minutes === 0) {
+					return {
+						content: wakeupsStore.cancel(conversationId)
+							? 'Wake-up cancelled.'
+							: 'There was no wake-up to cancel.',
+						isError: false
+					};
+				}
+
+				if (!note) return { content: 'Error: the note is empty.', isError: true };
+
+				const wakeup = wakeupsStore.schedule(conversationId, minutes, note);
+				const at = new Date(wakeup.dueAt).toLocaleTimeString([], {
+					hour: '2-digit',
+					minute: '2-digit'
+				});
+
+				return {
+					content: `Wake-up scheduled for ${at}, in ${Math.round(minutes * 10) / 10} minutes. It replaces any earlier one and fires only while the page is open.`,
+					isError: false
+				};
+			}
+
+			case BuiltInTool.BROWSER_RUN_SUBAGENT:
+				return this.runSubagent(args, ctx);
+
+			default:
+				return { content: `Error: unknown agent tool ${toolName}.`, isError: true };
+		}
+	}
+
+	/**
 	 * Runs a chat tool: compaction, context usage, rename, search and read past
 	 * conversations, new conversation, and the memory tools. A compaction is
 	 * only requested here; chatStore runs it once the flow ends, since the loop
@@ -1151,6 +1319,7 @@ class AgenticStore {
 			chatTools: ChatToolFlowContext;
 			conversationId: string;
 			model: string;
+			sendInBackground?: AgenticFlowCallbacks['sendInBackground'];
 			timings?: ChatMessageTimings;
 			turn: number;
 		}
@@ -1235,17 +1404,23 @@ class AgenticStore {
 				const title = normalizeConversationTitle(args.title) || 'New chat';
 				const firstMessage =
 					typeof args.first_message === 'string' ? args.first_message.trim() : '';
-				const created = await conversationsStore.createConversationInBackground(
-					title,
-					firstMessage || undefined
-				);
+				const created = await conversationsStore.createConversationInBackground(title);
 				const where = settingsStore.config.conversationTabs ? 'in a new tab' : 'in the chat list';
+
+				// the new chat answers on its own while this flow goes on
+				if (firstMessage && ctx.sendInBackground) {
+					ctx
+						.sendInBackground(created.id, firstMessage)
+						.catch((error: unknown) =>
+							console.error('[AgenticStore] The new conversation failed to start:', error)
+						);
+				}
 
 				return {
 					content: JSON.stringify({
 						conversation_id: created.id,
 						note: firstMessage
-							? `The chat is ${where} with the first message in its input box; the user sends it.`
+							? `The chat is ${where} and answers its first message on its own.`
 							: `The chat is ${where}.`,
 						title
 					}),
@@ -1417,6 +1592,112 @@ class AgenticStore {
 			await p.updateToolResultMessage(
 				p.lastToolResult.id,
 				appendTextToContent(p.lastToolResult.content, text) as string
+			);
+		}
+	}
+
+	/**
+	 * Hands a task to a sub-agent: a chat of its own, under this flow's tool
+	 * policy minus the tools a sub-agent does not get, that answers the task
+	 * while this flow waits. Only its final answer comes back.
+	 */
+	private async runSubagent(
+		args: Record<string, unknown>,
+		ctx: {
+			conversationId: string;
+			sendInBackground?: AgenticFlowCallbacks['sendInBackground'];
+			signal?: AbortSignal;
+			toolCallId: string;
+			toolPolicy?: AgenticToolPolicy;
+		}
+	): Promise<ToolExecutionResult> {
+		const task = typeof args.task === 'string' ? args.task.trim() : '';
+
+		if (!task) return { content: 'Error: the task is empty.', isError: true };
+
+		if (!ctx.sendInBackground) {
+			return { content: 'Error: sub-agents cannot run from here.', isError: true };
+		}
+
+		const title = subagentTitle(args.title, task);
+		const disabledTools = [...(ctx.toolPolicy?.disabledTools ?? toolsStore.disabledTools)];
+
+		for (const name of SUBAGENT_DISABLED_TOOLS) {
+			const key = toolsStore.getPermissionKey(name) ?? `${ToolSource.BROWSER}:${name}`;
+
+			if (!disabledTools.includes(key)) disabledTools.push(key);
+		}
+
+		const chat = await conversationsStore.createConversationInBackground(title, {
+			policy: {
+				disabledToolCategories: [
+					...(ctx.toolPolicy?.disabledToolCategories ?? toolsStore.disabledToolCategories)
+				],
+				disabledTools
+			}
+		});
+
+		this.subagentChats.set(ctx.toolCallId, chat.id);
+
+		const reply = await ctx.sendInBackground(chat.id, subagentPrompt(task), ctx.signal);
+
+		if (ctx.signal?.aborted) throw new DOMException('Stopped', 'AbortError');
+
+		if (!reply) {
+			return {
+				content: JSON.stringify({
+					conversation_id: chat.id,
+					error: 'The sub-agent did not start.'
+				}),
+				isError: true
+			};
+		}
+
+		const note = reply.error
+			? `The sub-agent failed: ${reply.error}`
+			: reply.stopped
+				? 'The sub-agent was stopped before it finished.'
+				: !reply.answer
+					? 'The sub-agent ended without an answer.'
+					: undefined;
+
+		return {
+			content: JSON.stringify({
+				answer: reply.answer ? truncateSubagentAnswer(reply.answer) : null,
+				conversation_id: chat.id,
+				note,
+				title
+			}),
+			isError: Boolean(reply.error)
+		};
+	}
+
+	/**
+	 * Waits up to `seconds`, ending early once the user queues a message.
+	 * Throws an abort when the flow stops meanwhile.
+	 */
+	private async sleep(
+		conversationId: string,
+		seconds: number,
+		signal?: AbortSignal
+	): Promise<{ slept: number; woken: boolean }> {
+		const start = performance.now();
+		const end = start + seconds * 1000;
+		const elapsed = () => Math.round((performance.now() - start) / 1000);
+
+		while (true) {
+			if (signal?.aborted) throw new DOMException('Stopped', 'AbortError');
+
+			if (this.gates.hasPendingSteeringMessage(conversationId)) {
+				return { slept: elapsed(), woken: true };
+			}
+
+			const left = end - performance.now();
+
+			if (left <= 0) return { slept: elapsed(), woken: false };
+
+			await new Promise((resolve) =>
+				setTimeout(resolve, Math.min(left, AGENT_TOOLS.SLEEP_POLL_MS))
 			);
 		}
 	}

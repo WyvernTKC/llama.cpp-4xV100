@@ -4,6 +4,7 @@
 	import {
 		ChatMessageActionCardContinueRequest,
 		ChatMessageActionCardPermissionRequest,
+		ChatMessageActionCardQuestion,
 		ChatMessageStatistics,
 		MarkdownContent
 	} from '$lib/components/app';
@@ -67,6 +68,14 @@
 	function handlePermission(decision: ToolPermissionDecision) {
 		dismissedPermission = pendingPermission;
 		agenticStore.resolvePermission(message.convId, decision);
+	}
+
+	const pendingQuestion = $derived(
+		isStreaming ? agenticStore.getPendingQuestion(message.convId) : null
+	);
+
+	function handleAnswer(answer: string) {
+		agenticStore.resolveQuestion(message.convId, answer);
 	}
 
 	const pendingContinue = $derived(
@@ -238,6 +247,14 @@
 			onDecision={handlePermission}
 			serverLabel={visiblePermission.serverLabel}
 			toolName={visiblePermission.toolName}
+		/>
+	{/if}
+
+	{#if pendingQuestion}
+		<ChatMessageActionCardQuestion
+			onAnswer={handleAnswer}
+			options={pendingQuestion.options}
+			question={pendingQuestion.question}
 		/>
 	{/if}
 

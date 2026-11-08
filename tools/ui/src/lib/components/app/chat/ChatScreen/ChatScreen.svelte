@@ -6,6 +6,7 @@
 	import { page } from '$app/state';
 	import {
 		ChatMessages,
+		ChatScreenAgentStatus,
 		ChatScreenDragOverlay,
 		ChatScreenForm,
 		ChatScreenServerError,
@@ -277,6 +278,8 @@
 
 			{#if page.params.id}
 				<ChatScreenStreamResumeStatus />
+
+				<ChatScreenAgentStatus />
 			{/if}
 
 			<div class="pointer-events-none flex flex-col gap-6 items-center w-full">

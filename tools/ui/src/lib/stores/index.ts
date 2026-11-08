@@ -57,6 +57,9 @@ export { permissionsStore } from './permissions.svelte';
 // TOOLS
 export { toolsStore } from './tools.svelte';
 
+// WAKE-UPS (schedule_wakeup timers)
+export { wakeupsStore } from './wakeups.svelte';
+
 // ENVIRONMENT / META
 export { versionStore } from './version.svelte';
 

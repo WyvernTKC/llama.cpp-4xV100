@@ -405,6 +405,22 @@ export {
 } from './chat-tools';
 export type { ConversationSearchHit } from './chat-tools';
 
+// Agent tools (sleep, ask_user, update_tasks, notify, schedule_wakeup, run_subagent)
+export {
+	clampToolNumber,
+	describeTaskList,
+	latestTaskList,
+	normalizeAskArgs,
+	normalizeNotifyArgs,
+	normalizeTaskList,
+	subagentPrompt,
+	subagentTitle,
+	taskProgress,
+	truncateSubagentAnswer,
+	wakeupMessage
+} from './agent-tools';
+export type { AgentTask, AgentTaskProgress } from './agent-tools';
+
 // Sandbox tool definition
 // SANDBOX_TOOL_DEFINITION is deprecated; kept for backward compatibility.
 export { buildSandboxToolDefinition, SANDBOX_TOOL_DEFINITION } from './sandbox-tool';

@@ -2,16 +2,17 @@
  * AgenticGates - User interaction gates for the agentic loop
  *
  * Owns the state the loop waits on between turns: tool permission requests,
- * turn-limit continue prompts and queued steering messages. The loop awaits
- * requestPermission/requestContinue; the UI resolves them through
- * resolvePermission/resolveContinue. Owned by agenticStore, no host coupling.
+ * turn-limit continue prompts, ask_user questions and queued steering
+ * messages. The loop awaits requestPermission/requestContinue/requestAnswer;
+ * the UI resolves them through resolvePermission/resolveContinue/
+ * resolveQuestion. Owned by agenticStore, no host coupling.
  */
 
 import { ToolPermissionDecision } from '$lib/enums';
 // direct imports between stores, not via the barrel, to avoid circular deps
 import { permissionsStore } from '$lib/stores/permissions.svelte';
 import { toolsStore } from '$lib/stores/tools.svelte';
-import type { DatabaseMessageExtra, SteeringMessage } from '$lib/types';
+import type { DatabaseMessageExtra, PendingQuestion, SteeringMessage } from '$lib/types';
 import { SvelteMap } from 'svelte/reactivity';
 
 export class AgenticGates {
@@ -25,8 +26,13 @@ export class AgenticGates {
 		string,
 		{ toolName: string; serverLabel: string } | null
 	>();
+	/** Reactive: the ask_user question a conversation waits on */
+	private pendingQuestions = new SvelteMap<string, PendingQuestion>();
+
 	/** Resolve functions for pending permission Promises; nothing derives from this map */
 	private permissionResolvers = new SvelteMap<string, (decision: ToolPermissionDecision) => void>();
+	/** Resolve functions for pending questions, null for a stopped one; nothing derives from this map */
+	private questionResolvers = new SvelteMap<string, (answer: string | null) => void>();
 
 	/** Reactive: queued steering messages to inject between turns */
 	private steeringMessages = new SvelteMap<string, SteeringMessage>();
@@ -40,6 +46,7 @@ export class AgenticGates {
 		this.pendingContinueRequests.set(conversationId, false);
 		this.continueResolvers.delete(conversationId);
 		this.steeringMessages.delete(conversationId);
+		this.questionResolvers.get(conversationId)?.(null);
 	}
 
 	/**
@@ -73,6 +80,10 @@ export class AgenticGates {
 		return this.pendingPermissions.get(conversationId) ?? null;
 	}
 
+	getPendingQuestion(conversationId: string): PendingQuestion | null {
+		return this.pendingQuestions.get(conversationId) ?? null;
+	}
+
 	getPendingSteeringMessageContent(conversationId: string): string | null {
 		return this.steeringMessages.get(conversationId)?.content ?? null;
 	}
@@ -95,6 +106,35 @@ export class AgenticGates {
 		extras?: DatabaseMessageExtra[]
 	): void {
 		this.steeringMessages.set(conversationId, { content, extras });
+	}
+
+	/**
+	 * Show an ask_user question and wait for the answer: a picked option or
+	 * text the user typed. Null when the flow stops before an answer.
+	 */
+	async requestAnswer(
+		conversationId: string,
+		question: PendingQuestion,
+		signal?: AbortSignal
+	): Promise<string | null> {
+		// a question still open from an earlier flow can never be answered now
+		this.questionResolvers.get(conversationId)?.(null);
+
+		if (signal?.aborted) return null;
+
+		return new Promise<string | null>((resolve) => {
+			const onAbort = () => this.questionResolvers.get(conversationId)?.(null);
+
+			this.pendingQuestions.set(conversationId, question);
+			this.questionResolvers.set(conversationId, (answer) => {
+				this.questionResolvers.delete(conversationId);
+				this.pendingQuestions.delete(conversationId);
+				signal?.removeEventListener('abort', onAbort);
+				resolve(answer);
+			});
+
+			signal?.addEventListener('abort', onAbort, { once: true });
+		});
 	}
 
 	async requestContinue(conversationId: string, signal?: AbortSignal): Promise<boolean> {
@@ -204,5 +244,16 @@ export class AgenticGates {
 			this.permissionResolvers.delete(conversationId);
 			resolver(decision);
 		}
+	}
+
+	/** Answer the open ask_user question; false when there is none. */
+	resolveQuestion(conversationId: string, answer: string): boolean {
+		const resolver = this.questionResolvers.get(conversationId);
+
+		if (!resolver) return false;
+
+		resolver(answer);
+
+		return true;
 	}
 }
