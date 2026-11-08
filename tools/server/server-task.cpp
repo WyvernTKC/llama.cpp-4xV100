@@ -1882,7 +1882,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         *replaced = false;
     }
 
-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+    int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
     float f_sim_best  = float(lcp_best) / tokens_new.size();
@@ -1908,6 +1908,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
+            lcp_best    = lcp_cur;
 
             it_best = it;
         }
@@ -1958,6 +1959,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
 
         SRV_TRC(" - restored prompt state: %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+        SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_RESTORE__\n");
+
+        // the whole cached prompt is a prefix of the new one
+        if (lcp_best == (int) it_best->prompt.tokens.size()) {
+            SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
+        }
 
         prompt = std::move(it_best->prompt);
 
