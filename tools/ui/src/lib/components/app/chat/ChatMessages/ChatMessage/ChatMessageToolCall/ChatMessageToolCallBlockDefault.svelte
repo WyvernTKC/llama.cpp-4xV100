@@ -12,6 +12,7 @@
 	} from '$lib/components/app';
 	import { MAX_HEIGHT_CODE_BLOCK } from '$lib/constants';
 	import { AttachmentType, FileTypeText, MimeTypeAudio, ToolResultKind } from '$lib/enums';
+	import { agenticStore } from '$lib/stores';
 	import type {
 		AgenticSection,
 		DatabaseMessageExtra,
@@ -51,6 +52,15 @@
 				.map((a) => [a.name, a])
 		).values()
 	]);
+
+	const progress = $derived(
+		section.toolCallId ? agenticStore.getToolCallProgress(section.toolCallId) : null
+	);
+	const progressPercent = $derived(
+		progress?.total
+			? Math.round(Math.min(Math.max(progress.progress / progress.total, 0), 1) * 100)
+			: null
+	);
 
 	let previewOpen = $state(false);
 	let previewIndex = $state(0);
@@ -158,6 +168,35 @@
 		{/if}
 	{/snippet}
 </ToolCallBlock>
+
+{#if progress}
+	<div class="mb-2 flex w-full max-w-sm flex-col gap-1.5">
+		<div class="flex items-baseline gap-2 text-xs text-muted-foreground">
+			<span class="min-w-0 flex-1 break-words">{progress.message ?? ''}</span>
+
+			{#if progressPercent !== null}
+				<span class="shrink-0 tabular-nums">{progressPercent}%</span>
+			{/if}
+		</div>
+
+		{#if progressPercent !== null}
+			<div class="h-1 w-full overflow-hidden rounded-full bg-muted">
+				<div
+					class="h-full bg-primary transition-[width] duration-200 ease-out"
+					style="width: {progressPercent}%"
+				></div>
+			</div>
+		{/if}
+
+		{#if progress.previewUrl}
+			<img
+				alt="Preview of the result so far"
+				class="h-auto w-full rounded-lg"
+				src={progress.previewUrl}
+			/>
+		{/if}
+	</div>
+{/if}
 
 {#if imageAttachments.length > 0}
 	<div class="mb-2 flex flex-col items-start gap-2">

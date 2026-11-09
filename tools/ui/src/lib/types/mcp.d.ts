@@ -11,6 +11,7 @@ import type {
 	Tool,
 	Transport
 } from '@modelcontextprotocol/sdk';
+import type { Progress } from '@modelcontextprotocol/sdk/types.js';
 import type { ColorMode } from '$lib/enums';
 import type { HealthCheckStatus, MCPConnectionPhase, MCPLogLevel } from '$lib/enums/mcp.enums';
 import type { ToolSource } from '$lib/enums/tools.enums';
@@ -307,6 +308,18 @@ export interface MCPProgressState {
 	message?: string;
 	startTime: Date;
 	lastUpdate: Date;
+}
+
+/** Params of a progress notification as the MCP SDK passes them to `onprogress` */
+export type MCPProgressNotification = Progress & { _meta?: Record<string, unknown> };
+
+/** What a running MCP tool call last reported in its progress notifications */
+export interface MCPToolCallProgress {
+	progress: number;
+	total?: number;
+	message?: string;
+	/** Data URL of the latest preview image, kept until a newer one arrives */
+	previewUrl?: string;
 }
 
 /**

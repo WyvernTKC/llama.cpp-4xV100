@@ -59,6 +59,7 @@ import type {
 	AgenticFlowResult,
 	AgenticSession,
 	MCPToolCall,
+	MCPToolCallProgress,
 	PendingQuestion,
 	SettingsConfigType,
 	ToolExecutionResult
@@ -109,6 +110,7 @@ import {
 	normalizeConversationTitle,
 	normalizeNotifyArgs,
 	normalizeTaskList,
+	parseMcpToolCallProgress,
 	resolveAttachmentRefs,
 	subagentPrompt,
 	subagentTitle,
@@ -205,6 +207,8 @@ class AgenticStore {
 	private sessions = new SvelteMap<string, AgenticSession>();
 	// the chat each run_subagent call runs in, by tool call id, for its block
 	private subagentChats = new SvelteMap<string, string>();
+	// what each running MCP tool call last reported, by tool call id, for its block
+	private toolCallProgress = new SvelteMap<string, MCPToolCallProgress>();
 
 	get isAnyRunning(): boolean {
 		for (const session of this.sessions.values()) {
@@ -355,6 +359,11 @@ class AgenticStore {
 	/** The chat a run_subagent call runs in, while it runs and after. */
 	getSubagentConversation(toolCallId: string): string | null {
 		return this.subagentChats.get(toolCallId) ?? null;
+	}
+
+	/** The last progress a running MCP tool call reported, null when none. */
+	getToolCallProgress(toolCallId: string): MCPToolCallProgress | null {
+		return this.toolCallProgress.get(toolCallId) ?? null;
 	}
 
 	getTotalToolCalls(conversationId: string): number {
@@ -1043,9 +1052,19 @@ class AgenticStore {
 								},
 								id: toolCall.id
 							};
-							const executionResult = await mcpStore.executeTool(mcpCall, signal);
 
-							result = executionResult.content;
+							try {
+								const executionResult = await mcpStore.executeTool(mcpCall, signal, (progress) => {
+									this.toolCallProgress.set(
+										toolCall.id,
+										parseMcpToolCallProgress(progress, this.toolCallProgress.get(toolCall.id))
+									);
+								});
+
+								result = executionResult.content;
+							} finally {
+								this.toolCallProgress.delete(toolCall.id);
+							}
 						}
 					} catch (error) {
 						if (isAbortError(error)) {

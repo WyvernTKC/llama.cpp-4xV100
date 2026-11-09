@@ -1,3 +1,4 @@
+import { createBase64DataUrl } from './data-url';
 import { extractRootDomain } from './url';
 import {
 	AlertTriangle,
@@ -10,6 +11,7 @@ import {
 	XCircle
 } from '@lucide/svelte';
 import {
+	BASE64_WHITESPACE_REGEX,
 	CODE_FILE_EXTENSION_REGEX,
 	DEFAULT_RESOURCE_FILENAME,
 	DISPLAY_NAME_SEPARATOR_REGEX,
@@ -17,6 +19,9 @@ import {
 	FILE_EXTENSION_REGEX,
 	IMAGE_FILE_EXTENSION_REGEX,
 	MCP_ALLOWED_ICON_MIME_TYPES,
+	MCP_PROGRESS_META_KEY,
+	MCP_PROGRESS_PREVIEW_MAX_BASE64_CHARS,
+	MCP_PROGRESS_PREVIEW_MIME_TYPES,
 	MCP_SERVER_ID_PREFIX,
 	MCP_SSE,
 	MIME_TYPE_PREFIXES,
@@ -37,11 +42,13 @@ import {
 } from '$lib/enums';
 import type {
 	HealthCheckState,
+	MCPProgressNotification,
 	MCPResourceContent,
 	MCPResourceIcon,
 	MCPResourceInfo,
 	MCPServerDisplayInfo,
-	MCPServerSettingsEntry
+	MCPServerSettingsEntry,
+	MCPToolCallProgress
 } from '$lib/types';
 import type { MimeTypeUnion } from '$lib/types/common';
 import type { Component } from 'svelte';
@@ -461,4 +468,36 @@ export function getMcpServerLabel(
 	const position = twins.findIndex((s) => s.id === server.id);
 
 	return position < 0 ? label : `${label} (${position + 1})`;
+}
+
+function parseMcpProgressPreview(meta: Record<string, unknown> | undefined): string | undefined {
+	const state = meta?.[MCP_PROGRESS_META_KEY] as
+		| { preview?: { data?: unknown; mime_type?: unknown } }
+		| undefined;
+	const preview = state?.preview;
+
+	if (typeof preview?.data !== 'string' || typeof preview.mime_type !== 'string') return undefined;
+
+	if (!MCP_PROGRESS_PREVIEW_MIME_TYPES.has(preview.mime_type)) return undefined;
+
+	if (preview.data.length > MCP_PROGRESS_PREVIEW_MAX_BASE64_CHARS) return undefined;
+
+	return createBase64DataUrl(preview.mime_type, preview.data.replace(BASE64_WHITESPACE_REGEX, ''));
+}
+
+/**
+ * Folds an MCP progress notification into the live state of its tool call.
+ * Servers send a preview only when it changes, so a notification without one
+ * keeps the previous preview.
+ */
+export function parseMcpToolCallProgress(
+	notification: MCPProgressNotification,
+	previous?: MCPToolCallProgress | null
+): MCPToolCallProgress {
+	return {
+		message: notification.message,
+		previewUrl: parseMcpProgressPreview(notification._meta) ?? previous?.previewUrl,
+		progress: notification.progress,
+		total: notification.total
+	};
 }

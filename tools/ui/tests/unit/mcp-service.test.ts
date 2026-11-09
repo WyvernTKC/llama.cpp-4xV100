@@ -330,6 +330,28 @@ describe('MCPService', () => {
 		).toHaveLength(0);
 	});
 
+	it('asks for progress and lets progress reset the request timeout', async () => {
+		const callTool = vi.fn().mockResolvedValue({ content: [{ text: 'done', type: 'text' }] });
+		const connection = {
+			client: { callTool },
+			requestTimeoutMs: 9000,
+			serverName: 'test-server'
+		} as unknown as MCPConnection;
+		const onProgress = vi.fn();
+
+		await MCPService.callTool(connection, { arguments: {}, name: 'tool' }, undefined, onProgress);
+
+		expect(callTool).toHaveBeenCalledWith(
+			{ arguments: {}, name: 'tool' },
+			undefined,
+			expect.objectContaining({
+				onprogress: onProgress,
+				resetTimeoutOnProgress: true,
+				timeout: 9000
+			})
+		);
+	});
+
 	it('falls back to structuredContent when content array is empty', async () => {
 		const connection = {
 			client: {

@@ -36,6 +36,22 @@ export const DEFAULT_MCP_CONFIG = {
 
 export const MCP_SERVER_ID_PREFIX = 'LlamaUI-MCP-Server';
 
+/**
+ * Progress notification `_meta` key under which the stable-diffusion.cpp server
+ * sends its job state and a live preview of the image being made.
+ */
+export const MCP_PROGRESS_META_KEY = 'sdcpp/progress';
+
+/** Largest progress preview the UI shows, in base64 characters */
+export const MCP_PROGRESS_PREVIEW_MAX_BASE64_CHARS = 1_000_000;
+
+/** Raster image types a progress preview may use */
+export const MCP_PROGRESS_PREVIEW_MIME_TYPES = new Set<string>([
+	MimeTypeImage.PNG,
+	MimeTypeImage.JPEG,
+	MimeTypeImage.WEBP
+]);
+
 /** Backoff policy for reconnecting to a dropped MCP server. */
 export const MCP_RECONNECT = {
 	/** Per-attempt timeout for a single reconnection attempt before giving up and backing off. */

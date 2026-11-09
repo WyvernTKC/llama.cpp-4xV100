@@ -26,6 +26,7 @@ import type {
 	HealthCheckState,
 	MCPClientConfig,
 	MCPConnection,
+	MCPProgressNotification,
 	MCPPromptInfo,
 	MCPResourceAttachment,
 	MCPResourceContent,
@@ -338,18 +339,24 @@ class MCPStore implements McpHealthHost {
 		return this.initialize(signature, mcpConfig!);
 	}
 
-	async executeTool(toolCall: MCPToolCall, signal?: AbortSignal): Promise<ToolExecutionResult> {
+	async executeTool(
+		toolCall: MCPToolCall,
+		signal?: AbortSignal,
+		onProgress?: (progress: MCPProgressNotification) => void
+	): Promise<ToolExecutionResult> {
 		return this.executeToolByName(
 			toolCall.function.name,
 			this.parseToolArguments(toolCall.function.arguments),
-			signal
+			signal,
+			onProgress
 		);
 	}
 
 	async executeToolByName(
 		toolName: string,
 		args: Record<string, unknown>,
-		signal?: AbortSignal
+		signal?: AbortSignal,
+		onProgress?: (progress: MCPProgressNotification) => void
 	): Promise<ToolExecutionResult> {
 		const serverName = this.toolsIndex.get(toolName);
 
@@ -360,7 +367,12 @@ class MCPStore implements McpHealthHost {
 		if (!connection) throw new Error(`Server "${serverName}" is not connected`);
 
 		try {
-			return await MCPService.callTool(connection, { arguments: args, name: toolName }, signal);
+			return await MCPService.callTool(
+				connection,
+				{ arguments: args, name: toolName },
+				signal,
+				onProgress
+			);
 		} catch (error) {
 			if (MCPService.isSessionExpiredError(error)) {
 				await this.reconnectServer(serverName);
@@ -369,7 +381,12 @@ class MCPStore implements McpHealthHost {
 
 				if (!newConnection) throw new Error(`Failed to reconnect to "${serverName}"`);
 
-				return MCPService.callTool(newConnection, { arguments: args, name: toolName }, signal);
+				return MCPService.callTool(
+					newConnection,
+					{ arguments: args, name: toolName },
+					signal,
+					onProgress
+				);
 			}
 
 			throw error;

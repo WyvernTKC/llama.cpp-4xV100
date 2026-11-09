@@ -175,7 +175,8 @@ export {
 	downloadResourceContent,
 	getMcpIconUrl,
 	getMcpServerFaviconFallback,
-	getMcpServerLabel
+	getMcpServerLabel,
+	parseMcpToolCallProgress
 } from './mcp';
 
 // URI Template utilities
