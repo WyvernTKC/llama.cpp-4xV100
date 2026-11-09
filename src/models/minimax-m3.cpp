@@ -391,6 +391,7 @@ llama_model_minimax_m3::graph::graph(const llm_graph_params & params) : llm_grap
                     ggml_tensor * iq4 = ggml_reshape_4d(ctx0, iq, n_idx_dim, Hd, 1, ns);
                     ggml_tensor * sc  = ggml_mul_mat(ctx0,
                             ggml_reshape_4d(ctx0, ikp, n_idx_dim, n_ps, 1, ns), iq4);
+                    // the reference computes the indexer scores in F32: https://github.com/huggingface/transformers/blob/0f53828e83f2212060233d2ea552cc76617b8712/src/transformers/models/minimax_m3_vl/modeling_minimax_m3_vl.py#L562
                     ggml_prec_set_acc(sc, GGML_PREC_F32);
                     // unmapped positions come out -inf, so they can never rank into the top-k
                     sc = ggml_add_inplace(ctx0, sc,

@@ -1387,6 +1387,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemm_noshuffle_q8_0_q8_1_dp4a_ila_a8_bin = nullptr;
     cl_kernel kernel_gemv_noshuffle_q8_0_f32;
     cl_kernel kernel_gemv_noshuffle_q8_0_f32_splitk;  // split-K across WGs (small-M decode)
+    cl_kernel kernel_gemv_noshuffle_q8_0_f32_mc;      // multi-column (N 2..4) verify GEMV
     cl_kernel kernel_gemm_noshuffle_q1_0_f32;
     cl_kernel kernel_gemv_noshuffle_q1_0_f32;
     cl_kernel kernel_gemv_noshuffle_q1_0_f32_nsg1 = nullptr;
@@ -6334,6 +6335,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q8_0_f32 = clCreateKernel(prog, "kernel_gemv_noshuffle_q8_0_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q8_0_f32_splitk = clCreateKernel(prog, "kernel_gemv_noshuffle_q8_0_f32_splitk", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemv_noshuffle_q8_0_f32_mc = clCreateKernel(prog, "kernel_gemv_noshuffle_q8_0_f32_mc", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -11117,6 +11119,13 @@ inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, c
         threshold_ne0 = 128;
         threshold_ne1 = 128;
     }
+    // K floor 256 on X2E: the gemma-4 E2B/E4B MTP drafters' weights are all K = 256.
+    // Default on for X2E, GGML_OPENCL_K_FLOOR_256=0/1 forces it.
+    static const char * k_floor_256_env = getenv("GGML_OPENCL_K_FLOOR_256");
+    const bool k_floor_256 = k_floor_256_env ? atoi(k_floor_256_env) != 0 : backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E;
+    if (k_floor_256 && threshold_ne0 > 256) {
+        threshold_ne0 = 256;
+    }
     bool threashold_ok = tensor->ne[0] >= threshold_ne0 && tensor->ne[1] >= threshold_ne1 &&
             tensor->ne[2] == 1 && tensor->ne[3] == 1;
 
@@ -11496,6 +11505,13 @@ static bool use_fa_bin_kernels_prefill(const ggml_backend_opencl_context * backe
     const int n_q = q->ne[1];
     const int dk = q->ne[0];
     const int dv = v->ne[0];
+
+    // do not choose bin FA kernels to avoid repacking the KV cache for small
+    // verify batches on X2
+    if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E && is_mixed &&
+        (dk == 256 || dk == 512) && n_q <= 4) {
+        return false;
+    }
 
     constexpr bool prefill_only = true;
 
@@ -12005,7 +12021,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             return false;
         case GGML_OP_MUL_MAT_ID:
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-            if (ggml_get_op_params_i32(op, 3) == GGML_PREC_F32 &&
+            if ((ggml_get_op_params_i32(op, 3) == GGML_PREC_BF16 || ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) &&
                 use_adreno_moe_kernels(backend_ctx, op->src[0])) {
                 return false;
             }
@@ -26197,7 +26213,13 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
     int N = ne1;
     int K = ne00;
 
-    if (ne1 == 1) {
+    // Multi-column verify GEMV for ne1 2..4, reuses the ne1 == 1 image setup.
+    // Default on for X2E, GGML_OPENCL_Q8_0_MC=0/1 forces it.
+    static const char * q8_mc_env = getenv("GGML_OPENCL_Q8_0_MC");
+    const bool q8_mc = q8_mc_env ? atoi(q8_mc_env) != 0 : backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E;
+    const bool use_q8_mc = q8_mc && ne1 >= 2 && ne1 <= 4;
+
+    if (ne1 == 1 || use_q8_mc) {
         cl_mem q_img = nullptr;
         cl_mem b_sub_buf = nullptr;
         cl_mem b_img = nullptr;
@@ -26222,6 +26244,30 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
         img_desc.image_width = K * N / 4;
         img_desc.buffer = b_sub_buf;
         CL_CHECK((b_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
+
+        if (use_q8_mc) {
+            kernel = backend_ctx->kernel_gemv_noshuffle_q8_0_f32_mc;
+
+            CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &q_img));
+            CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem),   &extra0_q8_0->d));
+            CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &b_img));
+            CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int),      &ne00));
+            CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int),      &ne01));
+            CL_CHECK(clSetKernelArg(kernel, 7, sizeof(int),      &ne1));
+
+            size_t wavesize = backend_ctx->adreno_wave_size;
+            size_t local_work_size[]  = { wavesize, 4, 1 };
+            size_t global_work_size[] = { CEIL_DIV(M, wavesize)*wavesize, 4, 1 };
+
+            backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+
+            CL_CHECK(clReleaseMemObject(q_img));
+            CL_CHECK(clReleaseMemObject(b_img));
+            CL_CHECK(clReleaseMemObject(b_sub_buf));
+            return;
+        }
 
         // Split-K for small-M decode GEMVs. The base kernel puts one output row
         // per lane and splits K only inside one workgroup, so M is the sole source
@@ -34173,6 +34219,23 @@ static void moe_router_reoerder(ggml_backend_t backend, const ggml_tensor * src,
     CL_CHECK(clReleaseMemObject(emap_buf));
 }
 
+// Use the per-token MoE GEMV instead of the tiled expert GEMM for small batches.
+// The GEMV costs one weight pass per token, the GEMM pads every expert to a
+// 32-token tile, so the GEMV wins while tokens rarely share an expert.
+// Default on for X2E up to 4 tokens while 2 * tokens * used < experts.
+// GGML_OPENCL_MOE_GEMV_MAX_TOK overrides with a plain token limit (1 = decode only).
+static bool use_adreno_moe_gemv_small_batch(const ggml_backend_opencl_context * backend_ctx, int n_tokens, int n_used, int n_expert) {
+    if (n_tokens <= 1) {
+        return true;
+    }
+    static const char * env = getenv("GGML_OPENCL_MOE_GEMV_MAX_TOK");
+    if (env) {
+        return n_tokens <= std::max(1, atoi(env));
+    }
+    return backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E && n_tokens <= 4 &&
+           2 * (int64_t) n_tokens * n_used < (int64_t) n_expert;
+}
+
 static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -34302,7 +34365,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                 size_t local_size[3] = {64, 2, 1};
                 size_t global_size[3] = {64, 2, 1};
 
-                if (ne12 == 1) { // for gemv
+                if (use_adreno_moe_gemv_small_batch(backend_ctx, ne12, ne20, ne02)) { // for gemv
                     kernel = backend_ctx->kernel_gemv_moe_q4_0_f32_ns;
 
                     cl_mem src1_sub_buffer, buf_src1_image, buf_src2;
@@ -34310,14 +34373,14 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // create a sub_buffer for src2
                     cl_buffer_region region;
                     region.origin = offset2;
-                    region.size = ne20 * ne21 * sizeof(int);
+                    region.size = (size_t) nb21 * (ne21 - 1) + ne20 * sizeof(int);
                     buf_src2 = clCreateSubBuffer(extra2->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
                     CL_CHECK(status);
 
                     // set thread grid
                     global_size[0] = static_cast<size_t>(((ne01 + 63) / 64) * 64);
                     global_size[1] = 4;
-                    global_size[2] = static_cast<size_t>(ne20);
+                    global_size[2] = static_cast<size_t>(ne20 * ne12);
                     local_size[1] = 4;
 
                     // create a sub_buffer for src1
@@ -34334,6 +34397,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Set kernel args
                     int arg_idx = 0;
+                    const int ids_stride = (int) (nb21 / sizeof(int));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0_q4_0->q));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0_q4_0->d));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &buf_src1_image));
@@ -34343,6 +34407,8 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne00));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne01));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne11));
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne20));
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ids_stride));
 
                     // launch kernel
                     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
@@ -34611,7 +34677,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                 size_t local_size[3] = {64, 2, 1};
                 size_t global_size[3] = {64, 2, 1};
 
-                if (ne12 == 1) { // for gemv
+                if (use_adreno_moe_gemv_small_batch(backend_ctx, ne12, ne20, ne02)) { // for gemv
                     kernel = backend_ctx->kernel_gemv_moe_q4_1_f32_ns;
 
                     cl_mem src1_sub_buffer, buf_src1_image, buf_src2;
@@ -34619,14 +34685,14 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // create a sub_buffer for src2
                     cl_buffer_region region;
                     region.origin = offset2;
-                    region.size = ne20 * ne21 * sizeof(int);
+                    region.size = (size_t) nb21 * (ne21 - 1) + ne20 * sizeof(int);
                     buf_src2 = clCreateSubBuffer(extra2->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
                     CL_CHECK(status);
 
                     // set thread grid
                     global_size[0] = static_cast<size_t>(((ne01 + 63) / 64) * 64);
                     global_size[1] = 4;
-                    global_size[2] = static_cast<size_t>(ne20);
+                    global_size[2] = static_cast<size_t>(ne20 * ne12);
                     local_size[1] = 4;
 
                     // create a sub_buffer for src1
@@ -34643,6 +34709,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Set kernel args
                     int arg_idx = 0;
+                    const int ids_stride = (int) (nb21 / sizeof(int));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0_q4_1->q));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0_q4_1->d));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0_q4_1->m));
@@ -34653,6 +34720,8 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne00));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne01));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne11));
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne20));
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ids_stride));
 
                     // launch kernel
                     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
@@ -34797,7 +34866,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                 size_t local_size[3] = {64, 2, 1};
                 size_t global_size[3] = {64, 2, 1};
 
-                if (ne12 == 1) { // for gemv
+                if (use_adreno_moe_gemv_small_batch(backend_ctx, ne12, ne20, ne02)) { // for gemv
                     kernel = backend_ctx->kernel_gemv_moe_q5_0_f32_ns;
 
                     cl_mem src1_sub_buffer, buf_src1_image, buf_src2;
@@ -34805,14 +34874,14 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // create a sub_buffer for src2
                     cl_buffer_region region;
                     region.origin = offset2;
-                    region.size = ne20 * ne21 * sizeof(int);
+                    region.size = (size_t) nb21 * (ne21 - 1) + ne20 * sizeof(int);
                     buf_src2 = clCreateSubBuffer(extra2->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
                     CL_CHECK(status);
 
                     // set thread grid
                     global_size[0] = static_cast<size_t>(((ne01 + 63) / 64) * 64);
                     global_size[1] = 4;
-                    global_size[2] = static_cast<size_t>(ne20);
+                    global_size[2] = static_cast<size_t>(ne20 * ne12);
                     local_size[1] = 4;
 
                     // create a sub_buffer for src1
@@ -34829,6 +34898,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Set kernel args
                     int arg_idx = 0;
+                    const int ids_stride = (int) (nb21 / sizeof(int));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0_q5_0->qs));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0_q5_0->qh));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0_q5_0->d));
@@ -34839,6 +34909,8 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne00));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne01));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne11));
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne20));
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ids_stride));
 
                     // launch kernel
                     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
@@ -35050,7 +35122,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                 size_t local_size[3] = {64, 2, 1};
                 size_t global_size[3] = {64, 2, 1};
 
-                if (ne12 == 1) { // for gemv
+                if (use_adreno_moe_gemv_small_batch(backend_ctx, ne12, ne20, ne02)) { // for gemv
                     kernel = backend_ctx->kernel_gemv_moe_q5_1_f32_ns;
 
                     cl_mem src1_sub_buffer, buf_src1_image, buf_src2;
@@ -35058,14 +35130,14 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // create a sub_buffer for src2
                     cl_buffer_region region;
                     region.origin = offset2;
-                    region.size = ne20 * ne21 * sizeof(int);
+                    region.size = (size_t) nb21 * (ne21 - 1) + ne20 * sizeof(int);
                     buf_src2 = clCreateSubBuffer(extra2->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
                     CL_CHECK(status);
 
                     // set thread grid
                     global_size[0] = static_cast<size_t>(((ne01 + 63) / 64) * 64);
                     global_size[1] = 4;
-                    global_size[2] = static_cast<size_t>(ne20);
+                    global_size[2] = static_cast<size_t>(ne20 * ne12);
                     local_size[1] = 4;
 
                     // create a sub_buffer for src1
@@ -35082,6 +35154,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Set kernel args
                     int arg_idx = 0;
+                    const int ids_stride = (int) (nb21 / sizeof(int));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0_q5_1->qs));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0_q5_1->qh));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0_q5_1->d));
@@ -35093,6 +35166,8 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne00));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne01));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne11));
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne20));
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ids_stride));
 
                     // launch kernel
                     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
@@ -35482,7 +35557,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                 size_t local_size[3] = {64, 2, 1};
                 size_t global_size[3] = {64, 2, 1};
 
-                if (ne12 == 1) { // for gemv
+                if (use_adreno_moe_gemv_small_batch(backend_ctx, ne12, ne20, ne02)) { // for gemv
                     kernel = backend_ctx->kernel_gemv_moe_q4_k_f32_ns;
 
                     // Weight-as-texture MoE decode GEMV
@@ -35502,14 +35577,14 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // create a sub_buffer for src2
                     cl_buffer_region region;
                     region.origin = offset2;
-                    region.size = ne20 * ne21 * sizeof(int);
+                    region.size = (size_t) nb21 * (ne21 - 1) + ne20 * sizeof(int);
                     buf_src2 = clCreateSubBuffer(extra2->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
                     CL_CHECK(status);
 
                     // set thread grid
                     global_size[0] = static_cast<size_t>(((ne01 + 63) / 64) * 64);
                     global_size[1] = 4;
-                    global_size[2] = static_cast<size_t>(ne20);
+                    global_size[2] = static_cast<size_t>(ne20 * ne12);
                     local_size[1] = 4;
 
                     // create a sub_buffer for src1
@@ -35526,6 +35601,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Set kernel args
                     int arg_idx = 0;
+                    const int ids_stride = (int) (nb21 / sizeof(int));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    use_moe_decode_wimg ? &extra0_q4_K->q_img : &extra0_q4_K->q));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0_q4_K->d));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0_q4_K->dm));
@@ -35537,6 +35613,8 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne00));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne01));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne11));
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne20));
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ids_stride));
 
                     // launch kernel
                     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
@@ -35752,7 +35830,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                 size_t local_size[3] = {64, 2, 1};
                 size_t global_size[3] = {64, 2, 1};
 
-                if (ne12 == 1) { // for gemv
+                if (use_adreno_moe_gemv_small_batch(backend_ctx, ne12, ne20, ne02)) { // for gemv
                     kernel = backend_ctx->kernel_gemv_moe_q5_k_f32_ns;
 
                     cl_mem src1_sub_buffer, buf_src1_image, buf_src2;
@@ -35760,14 +35838,14 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // create a sub_buffer for src2
                     cl_buffer_region region;
                     region.origin = offset2;
-                    region.size = ne20 * ne21 * sizeof(int);
+                    region.size = (size_t) nb21 * (ne21 - 1) + ne20 * sizeof(int);
                     buf_src2 = clCreateSubBuffer(extra2->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
                     CL_CHECK(status);
 
                     // set thread grid
                     global_size[0] = static_cast<size_t>(((ne01 + 63) / 64) * 64);
                     global_size[1] = 4;
-                    global_size[2] = static_cast<size_t>(ne20);
+                    global_size[2] = static_cast<size_t>(ne20 * ne12);
                     local_size[1] = 4;
 
                     // create a sub_buffer for src1
@@ -35784,6 +35862,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Set kernel args
                     int arg_idx = 0;
+                    const int ids_stride = (int) (nb21 / sizeof(int));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0_q5_K->q));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0_q5_K->qh));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0_q5_K->d));
@@ -35796,6 +35875,8 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne00));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne01));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne11));
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne20));
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ids_stride));
 
                     // launch kernel
                     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
@@ -36009,7 +36090,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                 size_t local_size[3] = {64, 2, 1};
                 size_t global_size[3] = {64, 2, 1};
 
-                if (ne12 == 1) { // for gemv
+                if (use_adreno_moe_gemv_small_batch(backend_ctx, ne12, ne20, ne02)) { // for gemv
                     kernel = backend_ctx->kernel_gemv_moe_q6_k_f32_ns;
 
                     cl_mem src1_sub_buffer, buf_src1_image, buf_src2;
@@ -36017,14 +36098,14 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     // create a sub_buffer for src2
                     cl_buffer_region region;
                     region.origin = offset2;
-                    region.size = ne20 * ne21 * sizeof(int);
+                    region.size = (size_t) nb21 * (ne21 - 1) + ne20 * sizeof(int);
                     buf_src2 = clCreateSubBuffer(extra2->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &status);
                     CL_CHECK(status);
 
                     // set thread grid
                     global_size[0] = static_cast<size_t>(((ne01 + 63) / 64) * 64);
                     global_size[1] = 4;
-                    global_size[2] = static_cast<size_t>(ne20);
+                    global_size[2] = static_cast<size_t>(ne20 * ne12);
                     local_size[1] = 4;
 
                     // create a sub_buffer for src1
@@ -36041,6 +36122,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 
                     // Set kernel args
                     int arg_idx = 0;
+                    const int ids_stride = (int) (nb21 / sizeof(int));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0_q6_K->ql));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0_q6_K->qh));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),    &extra0_q6_K->s));
@@ -36052,6 +36134,8 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne00));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne01));
                     CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne11));
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ne20));
+                    CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),       &ids_stride));
 
                     // launch kernel
                     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
