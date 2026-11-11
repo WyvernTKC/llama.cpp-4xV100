@@ -25,11 +25,13 @@
 	import { fade } from 'svelte/transition';
 	interface Props {
 		initialSection?: string;
+		/** Where the phone's section tabs pin, see SettingsChatMobileHeader */
+		mobileHeaderClass?: string;
 		onSectionChange?: (section: SettingsSectionTitle) => void;
 		onClose?: () => void;
 	}
 
-	let { initialSection, onClose, onSectionChange }: Props = $props();
+	let { initialSection, mobileHeaderClass, onClose, onSectionChange }: Props = $props();
 
 	let activeSlug = $derived(initialSection ?? 'general');
 
@@ -162,6 +164,7 @@
 
 		<SettingsChatMobileHeader
 			bind:this={mobileHeader}
+			class={mobileHeaderClass}
 			isActive={(section: SettingsSection) => section.slug === activeSlug}
 			onSectionChange={handleSectionChange}
 			sections={SETTINGS_CHAT_SECTIONS}

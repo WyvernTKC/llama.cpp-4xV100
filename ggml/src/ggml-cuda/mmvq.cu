@@ -2894,9 +2894,9 @@ static void ggml_cuda_mul_mat_vec_q_impl(
         GGML_ASSERT(ids && src1_rot == 0 && ne12 == 1 && ne13 == 1);
         const size_t row_q8_1 = ne10_padded * sizeof(block_q8_1)/QK8_1;
         char * buf = src1_q8_1_rot.alloc(nbytes_src1_q8_1 + row_q8_1);
-        quantize_row_q8_1_cuda(src1_d, nullptr, buf, src0->type, ne10, src1->nb[1] / ts_src1, src1->nb[2] / ts_src1,
+        quantize_row_q8_1_cuda(src1_d, buf, ne10, src1->nb[1] / ts_src1, src1->nb[2] / ts_src1,
             src1->nb[3] / ts_src1, ne10_padded, ne11, ne12, ne13, stream);
-        quantize_row_q8_1_cuda((const float *) sib_y_row->data, nullptr, buf + nbytes_src1_q8_1, src0->type, ne10,
+        quantize_row_q8_1_cuda((const float *) sib_y_row->data, buf + nbytes_src1_q8_1, ne10,
             ne10, ne10, ne10, ne10_padded, 1, 1, 1, stream);
         src1_q8_1 = buf;
     } else if (src1_rot != 0) {
@@ -2909,7 +2909,7 @@ static void ggml_cuda_mul_mat_vec_q_impl(
             src1_rot, stream);
         src1_q8_1 = src1_q8_1_rot.get();
     } else {
-        // quantize_row_q8_1_cuda ignores src0->type, so the result only depends on src1 and the padded
+        // quantize_row_q8_1_cuda does not take src0, so the result only depends on src1 and the padded
         // width: reuse it when a later matmul reads the same input, e.g. the q/k/v projections. A view of
         // the same rows of the same tensor reads the same bytes, e.g. the MUL_MAT_ID reshape of a norm
         // that the shared expert reads as it is.
@@ -2939,7 +2939,7 @@ static void ggml_cuda_mul_mat_vec_q_impl(
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
-            quantize_row_q8_1_cuda(src1_d, nullptr, cached.buf->get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+            quantize_row_q8_1_cuda(src1_d, cached.buf->get(), ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         }
 
         src1_q8_1 = cached.buf->get();

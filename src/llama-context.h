@@ -357,8 +357,22 @@ private:
 
     llm_graph_cb graph_get_cb() const;
 
-    // create a new backend scheduler for a graph of the specified size and register the callbacks below
-    void sched_new(size_t max_nodes, bool parallel);
+    // parameters defining the backend scheduler instance
+    struct sched_params {
+        size_t max_nodes  = 0;
+        bool   parallel   = false;
+        bool   op_offload = false;
+
+        // a scheduler can serve any graph of up to max_nodes nodes
+        bool can_reuse(const sched_params & other) const {
+            return parallel   == other.parallel
+                && op_offload == other.op_offload
+                && max_nodes  <= other.max_nodes;
+        }
+    };
+
+    // create a new backend scheduler with the given parameters, unless the current one can be reused
+    void sched_new(const sched_params & params);
 
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
@@ -465,6 +479,8 @@ private:
 
     // the scheduler of the graph being built or last computed: sched, or the one of a graph slot
     ggml_backend_sched_t sched_cur = nullptr;
+
+    sched_params sched_params_cur;
 
     bool sched_need_reserve = true;
 

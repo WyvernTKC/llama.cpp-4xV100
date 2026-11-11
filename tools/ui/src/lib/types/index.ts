@@ -47,6 +47,7 @@ export type {
 	HfModelGguf,
 	HfModelInfo,
 	HfModelSearchParams,
+	HfMmprojEncoders,
 	HfModelSibling,
 	HfModelSiblingRef
 } from './huggingface';
@@ -201,6 +202,9 @@ export type {
 	MCPServerResources
 } from './mcp';
 
+// Group types
+export type { Group } from './groups';
+
 // Search result types
 export type { SearchResult } from './search';
 
@@ -213,9 +217,6 @@ export type {
 	GlobSearchChildOptions,
 	GlobSearchChildResult
 } from './glob';
-
-// ChatFormInputRich token types (chat form)
-export type { ChatFormInputRichToken } from './chat-form-input-rich';
 
 // Agentic types
 export type {
