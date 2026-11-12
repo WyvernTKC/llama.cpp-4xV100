@@ -130,6 +130,25 @@ describe('withAttachmentRefHints', () => {
 		expect(hinted.properties.size).toEqual(schema.properties.size);
 	});
 
+	it('notes the handle on the start and end frames of a video tool', () => {
+		const video = withAttachmentRefHints({
+			properties: {
+				first_frame: { description: 'Image the video starts from', type: 'string' },
+				frame: { description: 'Which frame: "first", "last" or a number', type: 'string' },
+				last_frame: { type: 'string' },
+				video_frames: { type: 'integer' }
+			},
+			type: 'object'
+		}) as { properties: Record<string, { description?: string }> };
+
+		expect(video.properties.first_frame.description).toMatch(
+			/^Image the video starts from .*attachment:\/\/<id>/
+		);
+		expect(video.properties.last_frame.description).toContain('attachment://<id>');
+		expect(video.properties.frame.description).not.toContain('attachment://');
+		expect(video.properties.video_frames.description).toBeUndefined();
+	});
+
 	it('does not change the encoding a handle is sent as', () => {
 		const tool = {
 			properties: {

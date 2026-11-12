@@ -26,8 +26,10 @@ export const ATTACHMENT_REF_PREFIX = 'attachment://';
 export const ATTACHMENT_REF_REGEX = /^attachment:\/\/([0-9a-z-]+)$/;
 
 // Words in a tool parameter's name or title that mark it as taking an image; not the
-// description, a prompt parameter's description talks about the image too
-export const IMAGE_PARAM_HINT_REGEX = /image|photo|picture/i;
+// description, a prompt parameter's description talks about the image too. Video tools
+// take their images as first_frame / last_frame; a bare "frame" is often a frame number.
+export const IMAGE_PARAM_HINT_REGEX =
+	/image|photo|picture|(?:first|last|start|end|init|key)[\s_-]?frame/i;
 
 // Added to such parameters, since tool docs often say to upload the image or pass a
 // server path and models then invent one. Must not say base64 or data URI, those words
