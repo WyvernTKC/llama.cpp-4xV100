@@ -10,6 +10,19 @@ export function createBase64DataUrl(mimeType: string, base64Data: string): strin
 }
 
 /**
+ * Reads a blob as base64, without the data URL prefix.
+ */
+export function readBlobAsBase64(blob: Blob): Promise<string> {
+	return new Promise((resolve, reject) => {
+		const reader = new FileReader();
+
+		reader.onload = () => resolve((reader.result as string).split(',')[1] ?? '');
+		reader.onerror = () => reject(reader.error);
+		reader.readAsDataURL(blob);
+	});
+}
+
+/**
  * Saves a data URL as a file. The bytes go through a blob URL, which every
  * browser downloads regardless of size.
  *

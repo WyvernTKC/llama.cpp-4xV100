@@ -1,6 +1,6 @@
 import { Globe, Radio, Zap } from '@lucide/svelte';
 import { MCPTransportType } from '$lib/enums';
-import { MimeTypeImage } from '$lib/enums/files.enums';
+import { MimeTypeImage, MimeTypeVideo } from '$lib/enums/files.enums';
 import type { ClientCapabilities, Implementation } from '$lib/types';
 import type { Component } from 'svelte';
 
@@ -51,6 +51,24 @@ export const MCP_PROGRESS_PREVIEW_MIME_TYPES = new Set<string>([
 	MimeTypeImage.JPEG,
 	MimeTypeImage.WEBP
 ]);
+
+/** Video files a tool result can link (by file extension) for the UI to download and play */
+export const MCP_TOOL_VIDEO_EXTENSION_TO_MIME: Record<string, string> = {
+	m4v: MimeTypeVideo.MP4,
+	mp4: MimeTypeVideo.MP4,
+	ogv: MimeTypeVideo.OGG,
+	webm: MimeTypeVideo.WEBM
+};
+
+/** Most linked videos the UI downloads from one tool result */
+export const MCP_TOOL_VIDEO_MAX_COUNT = 4;
+
+/** Largest linked video the UI downloads, in bytes */
+export const MCP_TOOL_VIDEO_MAX_BYTES = 64 * 1024 * 1024;
+
+/** http(s) URLs in tool result text: ends at whitespace, quotes or brackets, never on punctuation */
+export const MCP_TOOL_RESULT_URL_REGEX =
+	/https?:\/\/[^\s"'`<>()[\]{}\\]*[^\s"'`<>()[\]{}\\.,;:!?]/gi;
 
 /** Backoff policy for reconnecting to a dropped MCP server. */
 export const MCP_RECONNECT = {

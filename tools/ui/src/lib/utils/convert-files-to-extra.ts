@@ -1,3 +1,4 @@
+import { readBlobAsBase64 } from './data-url';
 import { convertPDFToImage, convertPDFToText } from './pdf-processing';
 import { isSvgMimeType, svgBase64UrlToPngDataURL } from './svg-to-png';
 import { isLikelyTextFile, readFileAsText } from './text-files';
@@ -10,24 +11,6 @@ import { settingsStore } from '$lib/stores/settings/index.svelte';
 import type { ChatUploadedFile, DatabaseMessageExtra, FileProcessingResult } from '$lib/types';
 import { getFileTypeCategory } from '$lib/utils';
 import { toast } from 'svelte-sonner';
-
-function readFileAsBase64(file: File): Promise<string> {
-	return new Promise((resolve, reject) => {
-		const reader = new FileReader();
-
-		reader.onload = () => {
-			// Extract base64 data without the data URL prefix
-			const dataUrl = reader.result as string;
-			const base64 = dataUrl.split(',')[1];
-
-			resolve(base64);
-		};
-
-		reader.onerror = () => reject(reader.error);
-
-		reader.readAsDataURL(file);
-	});
-}
 
 export async function parseFilesToMessageExtras(
 	files: ChatUploadedFile[],
@@ -80,7 +63,7 @@ export async function parseFilesToMessageExtras(
 		} else if (getFileTypeCategory(file.type) === FileTypeCategory.AUDIO) {
 			// Process audio files (MP3 and WAV)
 			try {
-				const base64Data = await readFileAsBase64(file.file);
+				const base64Data = await readBlobAsBase64(file.file);
 
 				extras.push({
 					base64Data: base64Data,
@@ -95,7 +78,7 @@ export async function parseFilesToMessageExtras(
 		} else if (getFileTypeCategory(file.type) === FileTypeCategory.VIDEO) {
 			// Process video files (MP4, etc)
 			try {
-				const base64Data = await readFileAsBase64(file.file);
+				const base64Data = await readBlobAsBase64(file.file);
 
 				extras.push({
 					base64Data: base64Data,
@@ -110,7 +93,7 @@ export async function parseFilesToMessageExtras(
 		} else if (getFileTypeCategory(file.type) === FileTypeCategory.PDF) {
 			try {
 				// Always get base64 data for preview functionality
-				const base64Data = await readFileAsBase64(file.file);
+				const base64Data = await readBlobAsBase64(file.file);
 				const currentConfig = settingsStore.config;
 				// Use per-model vision check for router mode
 				const hasVisionSupport = activeModelId

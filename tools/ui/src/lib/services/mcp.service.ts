@@ -28,15 +28,19 @@ import {
 	DEFAULT_IMAGE_MIME_TYPE,
 	DEFAULT_MCP_CONFIG,
 	HEADERS,
-	NEWLINE
+	MCP_TOOL_VIDEO_MAX_BYTES,
+	NEWLINE,
+	PATH_SEPARATOR
 } from '$lib/constants';
 import {
+	AttachmentType,
 	MCPConnectionPhase,
 	MCPContentType,
 	MCPLogLevel,
 	MCPRefType,
 	MCPTransportType,
-	MimeTypePrefix
+	MimeTypePrefix,
+	MimeTypeVideo
 } from '$lib/enums';
 import type {
 	ClientCapabilities,
@@ -55,6 +59,7 @@ import type {
 	ToolCallParams,
 	ToolExecutionResult
 } from '$lib/types';
+import type { DatabaseMessageExtraVideoFile } from '$lib/types/database';
 import {
 	buildProxiedHeaders,
 	buildProxiedUrl,
@@ -62,10 +67,12 @@ import {
 	extractJsonRpcMethods,
 	formatDiagnosticErrorMessage,
 	getAuthHeaders,
+	getMcpToolVideoMimeType,
 	getRequestBody,
 	getRequestMethod,
 	getRequestUrl,
 	isAbortError,
+	readBlobAsBase64,
 	type RequestBodySummary,
 	sanitizeHeaders,
 	summarizeRequestBody,
@@ -627,6 +634,69 @@ export class MCPService {
 	}
 
 	/**
+	 * Download a video file that a tool result links on its server. It goes the
+	 * same route as the MCP requests: the CORS proxy and the configured headers.
+	 *
+	 * @throws {Error} On an HTTP error or a file larger than MCP_TOOL_VIDEO_MAX_BYTES
+	 */
+	static async fetchToolVideo(
+		config: MCPServerConfig,
+		url: string,
+		signal?: AbortSignal
+	): Promise<DatabaseMessageExtraVideoFile> {
+		const target = new URL(url);
+		const useProxy = config.useProxy ?? false;
+		const headers = useProxy
+			? { ...getAuthHeaders(), ...buildProxiedHeaders(config.headers ?? {}) }
+			: (config.headers ?? {});
+		const response = await fetch(useProxy ? buildProxiedUrl(target.href) : target, {
+			credentials: config.credentials,
+			headers,
+			signal
+		});
+
+		if (!response.ok || !response.body) {
+			throw new Error(`HTTP ${response.status} for ${target.href}`);
+		}
+
+		const reader = response.body.getReader();
+		const chunks: Uint8Array<ArrayBuffer>[] = [];
+
+		let size = 0;
+
+		for (;;) {
+			const { done, value } = await reader.read();
+
+			if (done) break;
+
+			size += value.byteLength;
+
+			if (size > MCP_TOOL_VIDEO_MAX_BYTES) {
+				await reader.cancel();
+
+				throw new Error(`${target.href} is larger than ${MCP_TOOL_VIDEO_MAX_BYTES} bytes`);
+			}
+
+			chunks.push(value);
+		}
+
+		const contentType = (response.headers.get(HEADERS.CONTENT_TYPE) ?? '')
+			.split(';')[0]
+			.trim()
+			.toLowerCase();
+
+		return {
+			base64Data: await readBlobAsBase64(new Blob(chunks)),
+			mimeType: contentType.startsWith(MimeTypePrefix.VIDEO)
+				? contentType
+				: (getMcpToolVideoMimeType(target) ?? MimeTypeVideo.WEBM),
+			name: target.pathname.split(PATH_SEPARATOR).pop() || target.host,
+			size,
+			type: AttachmentType.VIDEO
+		};
+	}
+
+	/**
 	 * Get a specific prompt with arguments.
 	 * Unlike list operations, this throws on failure since the caller explicitly
 	 * requested a specific prompt and needs to handle the error.
@@ -1159,7 +1229,11 @@ export class MCPService {
 
 			if (resource.text) return resource.text;
 
-			if (resource.blob && resource.mimeType?.startsWith(MimeTypePrefix.IMAGE)) {
+			if (
+				resource.blob &&
+				(resource.mimeType?.startsWith(MimeTypePrefix.IMAGE) ||
+					resource.mimeType?.startsWith(MimeTypePrefix.VIDEO))
+			) {
 				return this.formatMediaDataUrl(resource.mimeType, resource.blob);
 			}
 

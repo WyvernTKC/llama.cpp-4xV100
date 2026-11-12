@@ -24,6 +24,9 @@ import {
 	MCP_PROGRESS_PREVIEW_MIME_TYPES,
 	MCP_SERVER_ID_PREFIX,
 	MCP_SSE,
+	MCP_TOOL_RESULT_URL_REGEX,
+	MCP_TOOL_VIDEO_EXTENSION_TO_MIME,
+	MCP_TOOL_VIDEO_MAX_COUNT,
 	MIME_TYPE_PREFIXES,
 	MIME_TYPE_SUBSTRINGS,
 	PATH_SEPARATOR,
@@ -500,4 +503,46 @@ export function parseMcpToolCallProgress(
 		progress: notification.progress,
 		total: notification.total
 	};
+}
+
+/** Video MIME type of a URL by its file extension, or undefined for a non-video URL */
+export function getMcpToolVideoMimeType(url: URL): string | undefined {
+	const extension = url.pathname.match(FILE_EXTENSION_REGEX)?.[0].slice(1).toLowerCase();
+
+	return extension ? MCP_TOOL_VIDEO_EXTENSION_TO_MIME[extension] : undefined;
+}
+
+/**
+ * Video files a tool result links on the MCP server that returned it, such as
+ * sd-server's http://host:port/mcp/images/<id>.webm. Links to other origins are
+ * left alone, so a tool result cannot make the UI download from any host.
+ */
+export function findMcpToolResultVideoUrls(result: string, serverUrl: string): string[] {
+	let serverOrigin: string;
+
+	try {
+		serverOrigin = new URL(serverUrl).origin;
+	} catch {
+		return [];
+	}
+
+	const urls = new Set<string>();
+
+	for (const candidate of result.match(MCP_TOOL_RESULT_URL_REGEX) ?? []) {
+		let url: URL;
+
+		try {
+			url = new URL(candidate);
+		} catch {
+			continue;
+		}
+
+		if (url.origin !== serverOrigin || !getMcpToolVideoMimeType(url)) continue;
+
+		urls.add(url.href);
+
+		if (urls.size >= MCP_TOOL_VIDEO_MAX_COUNT) break;
+	}
+
+	return [...urls];
 }

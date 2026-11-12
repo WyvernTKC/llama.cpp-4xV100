@@ -17,6 +17,7 @@
 		AgenticSection,
 		DatabaseMessageExtra,
 		DatabaseMessageExtraImageFile,
+		DatabaseMessageExtraVideoFile,
 		ToolResultLine
 	} from '$lib/types';
 	import {
@@ -49,6 +50,14 @@
 		...new Map(
 			(attachments ?? [])
 				.filter((a): a is DatabaseMessageExtraImageFile => a.type === AttachmentType.IMAGE)
+				.map((a) => [a.name, a])
+		).values()
+	]);
+
+	const videoAttachments = $derived([
+		...new Map(
+			(attachments ?? [])
+				.filter((a): a is DatabaseMessageExtraVideoFile => a.type === AttachmentType.VIDEO)
 				.map((a) => [a.name, a])
 		).values()
 	]);
@@ -195,6 +204,22 @@
 				src={progress.previewUrl}
 			/>
 		{/if}
+	</div>
+{/if}
+
+{#if videoAttachments.length > 0}
+	<div class="mb-2 flex flex-col items-start gap-2">
+		{#each videoAttachments as video (video.name)}
+			<video
+				aria-label={video.name}
+				class="h-auto max-h-[60vh] max-w-full rounded-lg"
+				controls
+				preload="metadata"
+				src={createBase64DataUrl(video.mimeType, video.base64Data)}
+			>
+				<track kind="captions" src="" />
+			</video>
+		{/each}
 	</div>
 {/if}
 

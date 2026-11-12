@@ -166,7 +166,8 @@ export enum FileExtensionText {
 export enum MimeTypePrefix {
 	AUDIO = 'audio/',
 	IMAGE = 'image/',
-	TEXT = 'text'
+	TEXT = 'text',
+	VIDEO = 'video/'
 }
 
 export enum MimeTypeIncludes {

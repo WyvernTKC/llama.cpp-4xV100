@@ -1,4 +1,4 @@
-import { MimeTypeAudio, MimeTypeImage } from '$lib/enums';
+import { MimeTypeAudio, MimeTypeImage, MimeTypeVideo } from '$lib/enums';
 
 // File extension patterns for resource type detection
 export const IMAGE_FILE_EXTENSION_REGEX = /\.(png|jpg|jpeg|gif|svg|webp)$/i;
@@ -51,6 +51,9 @@ export const DEFAULT_IMAGE_EXTENSION = 'img';
 // Default file extension for unknown audio types
 export const DEFAULT_AUDIO_EXTENSION = 'mp3';
 
+// Default file extension for unknown video types
+export const DEFAULT_VIDEO_EXTENSION = 'webm';
+
 // Default filename for resource content downloads
 export const DEFAULT_RESOURCE_FILENAME = 'resource.txt';
 
@@ -91,4 +94,14 @@ export const AUDIO_MIME_TO_EXTENSION: Record<string, string> = {
 	[MimeTypeAudio.X_PN_WAV]: 'wav',
 	[MimeTypeAudio.X_WAV]: 'wav',
 	[MimeTypeAudio.X_WAVE]: 'wav'
+} as const;
+
+/**
+ * Mapping from video MIME types to file extensions.
+ * Used for generating attachment filenames from MIME types.
+ */
+export const VIDEO_MIME_TO_EXTENSION: Record<string, string> = {
+	[MimeTypeVideo.MP4]: 'mp4',
+	[MimeTypeVideo.OGG]: 'ogv',
+	[MimeTypeVideo.WEBM]: 'webm'
 } as const;

@@ -24,9 +24,11 @@ import {
 	DATA_URI_BASE64_REGEX,
 	DEFAULT_AUDIO_EXTENSION,
 	DEFAULT_IMAGE_EXTENSION,
+	DEFAULT_VIDEO_EXTENSION,
 	IMAGE_MIME_TO_EXTENSION,
 	MCP_ATTACHMENT_NAME_PREFIX,
-	MIME_TYPE_PREFIXES
+	MIME_TYPE_PREFIXES,
+	VIDEO_MIME_TO_EXTENSION
 } from '$lib/constants';
 import { BuiltInTool, ToolPermissionDecision, ToolSource } from '$lib/enums';
 import {
@@ -89,7 +91,8 @@ import type {
 	DatabaseMessage,
 	DatabaseMessageExtra,
 	DatabaseMessageExtraAudioFile,
-	DatabaseMessageExtraImageFile
+	DatabaseMessageExtraImageFile,
+	DatabaseMessageExtraVideoFile
 } from '$lib/types/database';
 import type { OpenAIToolDefinition } from '$lib/types/mcp';
 import {
@@ -506,9 +509,13 @@ class AgenticStore {
 	}
 
 	private buildAttachmentName(mimeType: string, index: number): string {
-		const extension = mimeType.startsWith(MimeTypePrefix.AUDIO)
-			? (AUDIO_MIME_TO_EXTENSION[mimeType] ?? DEFAULT_AUDIO_EXTENSION)
-			: (IMAGE_MIME_TO_EXTENSION[mimeType] ?? DEFAULT_IMAGE_EXTENSION);
+		let extension = IMAGE_MIME_TO_EXTENSION[mimeType] ?? DEFAULT_IMAGE_EXTENSION;
+
+		if (mimeType.startsWith(MimeTypePrefix.AUDIO)) {
+			extension = AUDIO_MIME_TO_EXTENSION[mimeType] ?? DEFAULT_AUDIO_EXTENSION;
+		} else if (mimeType.startsWith(MimeTypePrefix.VIDEO)) {
+			extension = VIDEO_MIME_TO_EXTENSION[mimeType] ?? DEFAULT_VIDEO_EXTENSION;
+		}
 
 		return `${MCP_ATTACHMENT_NAME_PREFIX}-${Date.now()}-${index}.${extension}`;
 	}
@@ -945,6 +952,7 @@ class AgenticStore {
 				let result = '';
 				let toolSuccess = true;
 				let createdToolResultMessageId: string | null = null;
+				let linkedVideos: DatabaseMessageExtraVideoFile[] = [];
 
 				// Streaming tools (currently only exec_shell_command): mark
 				// the session so the matching renderer can switch to live mode.
@@ -1065,6 +1073,9 @@ class AgenticStore {
 							} finally {
 								this.toolCallProgress.delete(toolCall.id);
 							}
+
+							// shown in the chat only: the model keeps reading the links
+							linkedVideos = await mcpStore.fetchToolResultVideos(toolName, result, signal);
 						}
 					} catch (error) {
 						if (isAbortError(error)) {
@@ -1109,6 +1120,8 @@ class AgenticStore {
 				}
 
 				const { attachments, cleanedResult } = this.extractBase64Attachments(result);
+
+				attachments.push(...linkedVideos);
 
 				// a later call in this flow can pass these images on by their handles
 				for (const attachment of attachments) {
@@ -1537,6 +1550,17 @@ class AgenticStore {
 					mimeType,
 					name,
 					type: AttachmentType.AUDIO
+				});
+
+				return `[Attachment saved: ${name}]`;
+			}
+
+			if (mimeType.startsWith(MimeTypePrefix.VIDEO)) {
+				attachments.push({
+					base64Data,
+					mimeType,
+					name,
+					type: AttachmentType.VIDEO
 				});
 
 				return `[Attachment saved: ${name}]`;

@@ -181,7 +181,9 @@ export {
 	getMcpIconUrl,
 	getMcpServerFaviconFallback,
 	getMcpServerLabel,
-	parseMcpToolCallProgress
+	parseMcpToolCallProgress,
+	getMcpToolVideoMimeType,
+	findMcpToolResultVideoUrls
 } from './mcp';
 
 // URI Template utilities
@@ -194,7 +196,7 @@ export {
 } from './uri-template';
 
 // Data URL utilities
-export { createBase64DataUrl, downloadDataUrl } from './data-url';
+export { createBase64DataUrl, downloadDataUrl, readBlobAsBase64 } from './data-url';
 
 // attachment:// image handles in tool arguments
 export {

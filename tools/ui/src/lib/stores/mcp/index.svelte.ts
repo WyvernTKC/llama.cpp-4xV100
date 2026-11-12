@@ -38,14 +38,19 @@ import type {
 	Tool,
 	ToolExecutionResult
 } from '$lib/types';
-import type { DatabaseMessageExtraMcpResource } from '$lib/types/database';
+import type {
+	DatabaseMessageExtraMcpResource,
+	DatabaseMessageExtraVideoFile
+} from '$lib/types/database';
 import type { SettingsConfigType } from '$lib/types/settings';
 import {
 	buildProxiedIconUrl,
 	detectMcpTransportFromUrl,
+	findMcpToolResultVideoUrls,
 	getMcpIconUrl,
 	getMcpServerFaviconFallback,
 	getMcpServerLabel,
+	isAbortError,
 	parseMcpServerSettings,
 	uuid
 } from '$lib/utils';
@@ -470,6 +475,35 @@ class MCPStore implements McpHealthHost {
 			mcpResourceStore.setServerError(serverName, message);
 			console.error(`[MCPStore][${serverName}] Failed to fetch resources:`, error);
 		}
+	}
+
+	/**
+	 * Download the video files a tool result links on the tool's own server, so
+	 * the chat keeps and plays them. A failed download drops only that video.
+	 */
+	async fetchToolResultVideos(
+		toolName: string,
+		result: string,
+		signal?: AbortSignal
+	): Promise<DatabaseMessageExtraVideoFile[]> {
+		const serverName = this.toolsIndex.get(toolName);
+		const config = serverName ? this.serverConfigs.get(serverName) : undefined;
+
+		if (!config) return [];
+
+		const videos: DatabaseMessageExtraVideoFile[] = [];
+
+		for (const url of findMcpToolResultVideoUrls(result, config.url)) {
+			try {
+				videos.push(await MCPService.fetchToolVideo(config, url, signal));
+			} catch (error) {
+				if (isAbortError(error)) throw error;
+
+				console.warn(`[MCPStore] Failed to download video ${url}:`, error);
+			}
+		}
+
+		return videos;
 	}
 
 	/**
