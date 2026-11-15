@@ -42,7 +42,7 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int64_t nb32, const int64_t nb33);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -192,6 +192,34 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_bf16(
             ggml_cuda_mad(sum, ggml_cuda_cast<float2>(tmp[k_KQ_1]), __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]));
 #else
             ggml_cuda_mad(sum, ggml_cuda_cast<float2>(tmp[k_KQ_1]), ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
+#endif // V_DOT2_F32_F16_AVAILABLE
+        }
+    }
+
+    return sum;
+}
+
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f8_e4m3(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const uint8_t * K_f8 = (const uint8_t *) K_c;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D; k_KQ_0 += nthreads*4) {
+        uint8_t tmp[4];
+        ggml_cuda_memcpy_1<sizeof(tmp)>(tmp, K_f8 + k_KQ_0 + (threadIdx.x % nthreads)*4);
+#pragma unroll
+        for (int k_KQ_1 = 0; k_KQ_1 < 4; ++k_KQ_1) {
+            const float k = ggml_cuda_f8_e4m3_to_fp32(tmp[k_KQ_1]);
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            sum += k * __half2float(((const half *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
+#else
+            sum += k * ((const float *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
 #endif // V_DOT2_F32_F16_AVAILABLE
         }
     }
@@ -472,6 +500,19 @@ static __device__ __forceinline__ void dequantize_V_bf16(const void * __restrict
 }
 
 template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_f8_e4m3(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    static_assert(ne == 2 || ne == 4, "bad ne");
+    static_assert(std::is_same_v<T, half> || std::is_same_v<T, float>, "unsupported type");
+    ggml_fp8_e4m3_t tmp[ne];
+    ggml_cuda_memcpy_1<sizeof(tmp)>(tmp, (const ggml_fp8_e4m3_t *) vx + i0);
+
+#pragma unroll
+    for (int l = 0; l < ne; ++l) {
+        ((T *) dst)[l] = ggml_cuda_cast<T>(tmp[l]);
+    }
+}
+
+template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_q4_0 * x = (const block_q4_0 *) vx;
 
@@ -713,6 +754,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_F8_E4M3) {
+        return vec_dot_fattn_vec_KQ_f8_e4m3<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -735,6 +778,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q8_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
+    } else if constexpr (type_V == GGML_TYPE_F8_E4M3) {
+        return dequantize_V_f8_e4m3<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;
@@ -1463,12 +1508,13 @@ void launch_fattn(
     //     window instead of the cache. LLAMA_KQ_RANGES=0 leaves them out of the graph. They are in cells, so not
     //     for the mask columns of kv_rows.
     const ggml_tensor * ranges = KQV->src[6];
-    const bool use_ranges = ranges != nullptr && !kv_rows && mask != nullptr && !use_sparse &&
+    const bool use_ranges = ranges != nullptr && !kv_rows && mask != nullptr && mask->ne[2] == 1 && !use_sparse &&
         K->ne[1] % FATTN_KQ_STRIDE == 0 && ranges->ne[1] == mask->ne[1] && ranges->ne[3] == mask->ne[3];
     const int * KV_ranges_dev = use_ranges ? (const int *) ranges->data : nullptr;
     const int32_t n_visible_max = use_ranges && !stream_k ? ggml_get_op_params_i32(KQV, 5) : 0;
 
-    const bool scan_mask = !use_ranges && !use_sparse && mask && n_kv_cols % FATTN_KQ_STRIDE == 0 &&
+    // a mask with a head dimension differs per head, the scans read the rows of head 0 only
+    const bool scan_mask = !use_ranges && !use_sparse && mask && mask->ne[2] == 1 && n_kv_cols % FATTN_KQ_STRIDE == 0 &&
         (Q->ne[1] >= 1024 || Q->ne[3] > 1 || scan_range || kv_rows);
     if (scan_mask && !stream_k) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);

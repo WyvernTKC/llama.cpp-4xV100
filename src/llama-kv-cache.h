@@ -261,6 +261,7 @@ public:
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_kq_ranges (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, int64_t n_kv) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
 
     // the inputs of a mask built by ggml_kq_mask: per stream the position of each cell its sequence sees (-1 for the
     //   others), and the positions of the tokens. With kv_rows: per slice, the column of rows[c]
@@ -491,6 +492,7 @@ public:
     void set_input_kq_ranges (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, int64_t n_kv) const;
     void set_input_kq_pos    (ggml_tensor * dst_kv, ggml_tensor * dst_q, const llama_ubatch * ubatch, const ggml_tensor * rows = nullptr) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
 
     // the rows of a mask built by ggml_kq_mask_prefix, I32 [n_desc, n_tokens/n_stream, 1, n_stream]
     bool can_kq_prefix      (const llama_ubatch & ubatch, int64_t n_desc, bool causal_attn) const;

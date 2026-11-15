@@ -1619,6 +1619,8 @@ private:
         }
 
         mtmd_cap = mtmd_helper_get_capabilities(model_tgt, mctx);
+        // the helper only knows about the built-in video decoder
+        mtmd_cap.video = mtmd_cap.video || (mtmd_cap.vision && init_opt.video_params.decoder != nullptr);
 
         if (!llama_memory_can_shift(llama_get_memory(ctx_tgt))) {
             if (params_base.ctx_shift) {
@@ -1691,7 +1693,8 @@ private:
             const auto & types = params_base.speculative.types;
             const bool spec_ok = std::none_of(types.begin(), types.end(), [](common_speculative_type t) {
                 return t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
-                       t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+                       t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2 ||
+                       t == COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR;
             });
             ckpt_tail_snap = (env == nullptr || atoi(env) != 0) && spec_ok && llama_n_rs_seq(ctx_tgt) >= 4 &&
                 llama_memory_seq_rs_view(llama_get_memory(ctx_tgt), 0, 0);
@@ -1964,6 +1967,7 @@ private:
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
                 /* media_path            */ params_base.media_path,
+                /* media_allow_private   */ params_base.media_allow_private_urls,
                 /* force_pure_content    */ params_base.force_pure_content_parser
             };
 
@@ -5811,12 +5815,19 @@ server_context_meta server_context::get_meta() const {
 // may have bypass_sleep = true if the task does not use ctx_server
 struct server_res_generator : server_res_spipe {
     server_response_reader rd;
+    server_queue * queue_awake = nullptr; // set while this response keeps the server awake
     server_res_generator(server_queue & queue_tasks, server_response & queue_results, int sleep_idle_seconds, bool bypass_sleep = false)
             : rd(queue_tasks, queue_results, HTTP_POLLING_SECONDS) {
         // fast path in case sleeping is disabled
         bypass_sleep |= sleep_idle_seconds < 0;
         if (!bypass_sleep) {
             queue_tasks.wait_until_no_sleep();
+            queue_awake = &queue_tasks;
+        }
+    }
+    ~server_res_generator() {
+        if (queue_awake) {
+            queue_awake->release_inflight();
         }
     }
     void ok(const json & response_data) {
@@ -5831,6 +5842,10 @@ struct server_res_generator : server_res_spipe {
 
 void server_context::set_state_callback(server_state_callback_t callback) {
     impl->callback_state = std::move(callback);
+}
+
+void server_context::set_video_decoder(const mtmd_helper_video_decoder * decoder) {
+    impl->init_opt.video_params.decoder = decoder;
 }
 
 //
@@ -7458,7 +7473,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_rerank_impl(const se
         auto add_image = [&](const std::string & url) {
             // marker is appended by format_prompt_rerank, one per decoded file
             try {
-                handle_media(out_files, url, params.media_path);
+                handle_media(out_files, url, params.media_path, params.media_allow_private_urls);
             } catch (const std::runtime_error & e) {
                 throw std::invalid_argument(e.what());
             }

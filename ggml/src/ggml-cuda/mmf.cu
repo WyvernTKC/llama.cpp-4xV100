@@ -300,7 +300,7 @@ bool ggml_cuda_should_fuse_mul_mat_f_glu(const ggml_tensor * ffn_up, const ggml_
     }
 
     // only where the two matrices would each go to mmf
-    if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ncols_dst)) {
+    if (ggml_cuda_should_use_mmvf(src0, cc, warp_size, ncols_dst)) {
         return false;
     }
     return ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ncols_dst, /*mul_mat_id =*/ false);

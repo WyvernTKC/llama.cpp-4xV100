@@ -55,6 +55,7 @@ export enum MCPContentType {
  */
 export enum JsonSchemaType {
 	ARRAY = 'array',
+	BOOLEAN = 'boolean',
 	NUMBER = 'number',
 	OBJECT = 'object',
 	STRING = 'string'

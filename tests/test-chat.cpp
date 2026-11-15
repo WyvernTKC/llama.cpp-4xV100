@@ -2214,6 +2214,21 @@ static void test_lfm2_parser(const std::string & template_path, bool detailed_de
         .expect(simple_assist_msg("", "", "empty_args", "{}"))
         .run();
 
+    // undeclared names stay tool calls instead of being forced onto a declared tool
+    tst.test("<|tool_call_start|>[reseat_sim_card()]<|tool_call_end|>")
+        .tools({ special_function_tool })
+        .expect(simple_assist_msg("", "", "reseat_sim_card", "{}"))
+        .run();
+
+    tst.test("<|tool_call_start|>[set_sim_lock(mode='pin', force=True)]<|tool_call_end|>")
+        .tools({ special_function_tool })
+        .expect_tool_calls({ { "set_sim_lock", R"({"mode": "pin", "force": true})", "" } })
+        .run();
+
+    tst.test("<|tool_call_start|>[special_function(arg1=1)]<|tool_call_end|>")
+        .tools({ special_function_tool })
+        .expect(message_assist_call)
+        .run();
 }
 
 static void test_template_output_peg_parsers(bool detailed_debug) {
@@ -2734,6 +2749,16 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect(message_assist_call_thoughts)
             .run();
 
+        // Reasoning is not closed, the tool call starts inside it
+        tst.test(
+               "[THINK]I'm\nthinking"
+               R"([TOOL_CALLS]special_function[ARGS]{"arg1":1})")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .tools({ special_function_tool })
+            .expect(message_assist_call_thoughts)
+            .run();
+
         tst.test(R"([TOOL_CALLS]special_function[ARGS]{"arg1": 1})"
                  R"([TOOL_CALLS]special_function_with_opt[ARGS]{"arg1": 1, "arg2": 2})")
             .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
@@ -2769,20 +2794,6 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .json_schema(invoice_schema)
             .expect_reasoning("I need to output the invoice details in JSON")
             .expect_content(R"({"amount": 123.45, "date": "2025-12-03"})")
-            .run();
-
-        // fake tool call marker in reasoning
-        tst.test(
-               "[THINK]Let me think about [TOOL_CALLS]special_function[ARGS]{\"arg1\":1} and more[/THINK]"
-               R"([TOOL_CALLS]special_function[ARGS]{"arg1": 1})")
-            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
-            .enable_thinking(true)
-            .tools({ special_function_tool })
-            .expect_reasoning("Let me think about [TOOL_CALLS]special_function[ARGS]{\"arg1\":1} and more")
-            .expect_tool_calls({
-                { "special_function", R"({"arg1": 1})", {} },
-            })
-            .expect_reconstruction()
             .run();
 
         // Continuation tests
@@ -3178,6 +3189,17 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             })
             .run();
 
+        // Tool call after reasoning, the model did not close the thought channel (#32231)
+        tst.test(
+                "<|channel>thought\nI'm\nthinking<|tool_call>call:get_time{city:<|\"|>Paris<|\"|>}<tool_call|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ get_time_tool })
+            .expect_reasoning("I'm\nthinking")
+            .expect_tool_calls({
+                { "get_time", R"({"city": "Paris"})", {} },
+            })
+            .run();
+
         // Parallel tool calls
         tst.test(
                 "<|tool_call>call:get_time{city:<|\"|>London<|\"|>}<tool_call|>"
@@ -3265,6 +3287,61 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                 "<|tool_call>call:amount{orig:1.5e10}<tool_call|>")
             .tools({ amount_tool })
             .expect(message_with_tool_calls("amount", R"({"orig": 1.5e10})"))
+            .run();
+
+        // The argument grammar follows the shape of the parameter schema: keys in
+        // alphabetical order, optional keys skipped in place, nested objects and arrays
+        // shaped the same way, any other value accepted as written.
+        common_chat_tool shape_tool{
+            /* .name = */ "shape",
+            /* .description = */ "Schema-shaped arguments",
+            /* .parameters = */ R"({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "oldText": {"type": "string"},
+                                "newText": {"type": "string"}
+                            },
+                            "required": ["oldText", "newText"]
+                        }
+                    },
+                    "mode": {"type": "string", "enum": ["fast", "safe"]},
+                    "count": {"type": "integer"},
+                    "headers": {
+                        "type": "object",
+                        "properties": {
+                            "content-type": {"type": "string"},
+                            "accept:lang": {"type": "string"}
+                        }
+                    },
+                    "options": {"type": "object"}
+                },
+                "required": ["path", "edits"]
+            })",
+        };
+
+        tst.test(
+                "<|tool_call>call:shape{edits:[{newText:<|\"|>b<|\"|>,oldText:<|\"|>a<|\"|>}],path:<|\"|>f.c<|\"|>}<tool_call|>")
+            .tools({ shape_tool })
+            .expect(message_with_tool_calls("shape", R"({"edits":[{"newText":"b","oldText":"a"}],"path":"f.c"})"))
+            .run();
+
+        // Optional keys in place, quoted keys that are not identifiers
+        tst.test(
+                "<|tool_call>call:shape{count:3,edits:[],headers:{<|\"|>accept:lang<|\"|>:<|\"|>en<|\"|>,'content-type':<|\"|>text<|\"|>},mode:<|\"|>fast<|\"|>,options:{b:1,a:[true]},path:<|\"|>f<|\"|>}<tool_call|>")
+            .tools({ shape_tool })
+            .expect(message_with_tool_calls("shape", R"({"count":3,"edits":[],"headers":{"accept:lang":"en","content-type":"text"},"mode":"fast","options":{"b":1,"a":[true]},"path":"f"})"))
+            .run();
+
+        tst.test(
+                "<|tool_call>call:shape{edits:[],headers:{\"content-type\":<|\"|>text<|\"|>},path:<|\"|>f<|\"|>}<tool_call|>")
+            .tools({ shape_tool })
+            .expect(message_with_tool_calls("shape", R"({"edits":[],"headers":{"content-type":"text"},"path":"f"})"))
             .run();
 
         // Edge cases
@@ -5285,6 +5362,25 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .chat_template_kwargs({ { "tool_call_format", R"("xml_typed")" } })
             .expect(message_assist_call_thoughts)
             .expect_reconstruction()
+            .run();
+
+        tst.test("I'm\nthinking</ifm|think>Hello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .chat_template_kwargs({ { "reasoning_effort", R"("low")" } })
+            .expect(message_assist_thoughts)
+            .run();
+
+        tst.test(
+               "I'm\nthinking</ifm|think><ifm|tool_calls>\n"
+               "<ifm|tool_call>special_function\n"
+               "<ifm|arg_key>arg1</ifm|arg_key>\n"
+               "<ifm|arg_value>1</ifm|arg_value>\n"
+               "</ifm|tool_call>\n"
+               "</ifm|tool_calls>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .chat_template_kwargs({ { "reasoning_effort", R"("medium")" } })
+            .expect(message_assist_call_thoughts)
             .run();
 
         tst.test(

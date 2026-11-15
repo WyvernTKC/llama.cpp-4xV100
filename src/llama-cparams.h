@@ -39,9 +39,6 @@ struct llama_cparams {
     bool offload_kqv;
     bool flash_attn;
     bool auto_fa;
-    bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
-    bool fused_gdn_ch;       // use fused gated delta net (chunked)
-    bool auto_fgdn;
     bool fused_lid;          // use fused lightning indexer
     bool auto_flid;
     bool fused_dsv4_hc_pre;
@@ -55,7 +52,6 @@ struct llama_cparams {
     bool fused_kv_rows;      // unified cache: attend to the cells of each sequence only (ggml_flash_attn_ext_rows)
     bool auto_fkvr;
     bool no_perf;
-    bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;

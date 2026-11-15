@@ -148,7 +148,6 @@ struct llama_context {
     // see llama_set_spec_states_device
     bool set_spec_states_device(llama_context & dft);
     void set_causal_attn(bool value);
-    void set_warmup(bool value);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -321,7 +320,7 @@ private:
     //
 
 public:
-    uint32_t graph_max_nodes(uint32_t n_tokens) const;
+    uint32_t graph_max_nodes() const;
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;

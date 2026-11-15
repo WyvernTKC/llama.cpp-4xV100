@@ -96,6 +96,11 @@ export const TOOL_UI: Readonly<Record<BuiltInTool, ToolUiEntry>> = {
 		label: 'Schedule wake-up',
 		source: ToolSource.BROWSER
 	},
+	[BuiltInTool.BROWSER_SEARCH_CHATS]: {
+		icon: MessagesSquare,
+		label: 'Search chats',
+		source: ToolSource.BROWSER
+	},
 	[BuiltInTool.BROWSER_SEARCH_CONVERSATIONS]: {
 		icon: MessagesSquare,
 		label: 'Search conversations',

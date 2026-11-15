@@ -113,6 +113,8 @@ export {
 	AgentTaskStatus,
 	BuiltInTool,
 	GlobSearchType,
+	SearchChatsMessageSelection,
+	SearchChatsOrder,
 	ToolSource,
 	ToolPermissionDecision,
 	ToolResponseField

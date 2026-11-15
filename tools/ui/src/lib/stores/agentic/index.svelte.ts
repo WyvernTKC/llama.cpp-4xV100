@@ -45,6 +45,7 @@ import { MemoryService } from '$lib/services/memory.service';
 import { NotificationService } from '$lib/services/notification.service';
 import { ReadMediaService } from '$lib/services/read-media.service';
 import { SandboxService } from '$lib/services/sandbox.service';
+import { SearchChatsService } from '$lib/services/search-chats.service';
 import { ToolsService } from '$lib/services/tools.service';
 // direct imports between stores, not via the barrel, to avoid circular deps
 import { AgenticGates } from '$lib/stores/agentic/gates.svelte';
@@ -1014,6 +1015,8 @@ class AgenticStore {
 								executionResult = executeGetDatetimeTool();
 							} else if (toolName === BuiltInTool.SERVER_GET_INFO) {
 								executionResult = executeBrowserInfoTool();
+							} else if (toolName === BuiltInTool.BROWSER_SEARCH_CHATS) {
+								executionResult = await SearchChatsService.executeTool(args, conversationId);
 							} else if (toolName === BuiltInTool.BROWSER_READ_MEDIA) {
 								executionResult = await ReadMediaService.executeTool(
 									args,
