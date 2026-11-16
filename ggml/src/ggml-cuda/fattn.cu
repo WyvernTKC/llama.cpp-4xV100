@@ -3,6 +3,7 @@
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
+#include "fattn-volta-nomask.cuh"
 #include "fattn.cuh"
 
 #if !defined(GGML_USE_MUSA)
@@ -621,6 +622,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE    =   0,
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
+    BEST_FATTN_KERNEL_VOLTA_NOMASK = 300,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
 };
 
@@ -797,6 +799,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     if (volta_mma_available(cc)) {
+        if (ggml_cuda_fattn_volta_nomask_applies(cc, ggml_cuda_info().devices[device].nsm, dst)) {
+            return BEST_FATTN_KERNEL_VOLTA_NOMASK;
+        }
         // A sparse launch gathers ncols1_eff*n_kv_max keys where the tile kernel reads the whole cache, so
         //   it wins for a single token too - without this DeepSeek-V4 token generation stays dense at every
         //   depth. A tile narrower than its own width still pays for the index rows, so the break-even
@@ -909,6 +914,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
             need_f16_V = V->type == GGML_TYPE_F32 || f16_fallback;
         } break;
+        case BEST_FATTN_KERNEL_VOLTA_NOMASK:
         case BEST_FATTN_KERNEL_NONE:
             break;
     }
@@ -929,6 +935,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_VEC:
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_VOLTA_NOMASK:
+            ggml_cuda_flash_attn_ext_volta_nomask(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
