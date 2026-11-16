@@ -1450,6 +1450,8 @@ private:
         if (has_mmproj) {
             mparams.use_gpu          = params_base.mmproj_use_gpu;
             mparams.device           = params_base.mmproj_device;
+            mparams.devices          = params_base.mmproj_devices.data();
+            mparams.n_devices        = params_base.mmproj_devices.size();
             mparams.print_timings    = false;
             mparams.n_threads        = params_base.cpuparams.n_threads;
             mparams.flash_attn_type  = params_base.flash_attn_type;

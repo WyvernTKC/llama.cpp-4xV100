@@ -32,6 +32,9 @@ struct mtmd_subctx_params {
 // the device the weights and the graphs are placed on, nullptr means CPU
 ggml_backend_dev_t mtmd_select_device(bool use_gpu, ggml_backend_dev_t device);
 
+// a meta device that splits the vision encoder of fname over devs (tensor parallel), nullptr if the model does not support it
+ggml_backend_dev_t mtmd_split_device(const char * fname, const ggml_backend_dev_t * devs, size_t n_devs);
+
 // shared by the subcontexts, not thread-safe
 struct mtmd_backends {
     ggml_backend_t backend     = nullptr; // backend_cpu if no accelerator

@@ -157,6 +157,8 @@ struct mtmd_cli_context {
         mtmd_context_params mparams = mtmd_context_params_default();
         mparams.use_gpu          = params.mmproj_use_gpu;
         mparams.device           = params.mmproj_device;
+        mparams.devices          = params.mmproj_devices.data();
+        mparams.n_devices        = params.mmproj_devices.size();
         mparams.print_timings    = true;
         mparams.n_threads        = params.cpuparams.n_threads;
         mparams.flash_attn_type  = params.flash_attn_type;

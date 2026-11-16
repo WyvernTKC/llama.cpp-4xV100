@@ -2622,8 +2622,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         // note: "-mmdev" must sort after "--rpc" in the preset map, else RPC devices are not registered yet
         {"-mmdev", "--mmproj-device"}, "DEVICE",
         "device to use for multimodal projector (none = don't offload, default: follows --device)\n"
+        "a comma-separated list splits the vision encoder over these devices (qwen3vl only)\n"
         "use --list-devices to see a list of available devices",
         [](common_params & params, const std::string & value) {
+            params.mmproj_devices.clear();
             if (value == "none") {
                 params.mmproj_use_gpu = false;
                 params.mmproj_device  = nullptr;
@@ -2631,11 +2633,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             auto devices = parse_device_list(value);
             // parse_device_list pushes nullptr at back so devices is length 2 for single device.
-            if (devices.size() > 2) {
-                throw std::invalid_argument("only one device may be specified for mmproj");
-            }
             params.mmproj_use_gpu = true;
             params.mmproj_device  = devices.front();
+            if (devices.size() > 2) {
+                params.mmproj_devices.assign(devices.begin(), devices.end() - 1);
+            }
         }
     ).set_examples(mmproj_examples).set_env("MTMD_BACKEND_DEVICE")); // no LLAMA_ARG_ prefix for backward compatibility reason
     add_opt(common_arg(

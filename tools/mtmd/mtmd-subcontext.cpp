@@ -63,6 +63,120 @@ ggml_backend_dev_t mtmd_select_device(bool use_gpu, ggml_backend_dev_t device) {
     return dev ? dev : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
 }
 
+struct mtmd_split_userdata {
+    int n_devices;
+    int n_head;
+};
+
+// even split of ne in multiples of gran, segment repeated nr times (the q, k and v parts of a fused qkv)
+static ggml_backend_meta_split_state mtmd_split_even(ggml_backend_meta_split_axis axis, int64_t ne, uint32_t nr, int n_devices, int64_t gran) {
+    ggml_backend_meta_split_state ss = {};
+    ss.axis       = axis;
+    ss.n_segments = 1;
+    ss.nr[0]      = nr;
+    const int64_t units = ne / gran;
+    int64_t low = 0;
+    for (int j = 0; j < n_devices; ++j) {
+        const int64_t high = j + 1 == n_devices ? ne : units * (j + 1) / n_devices * gran;
+        ss.ne[j] = high - low;
+        low = high;
+    }
+    return ss;
+}
+
+// Vision blocks: whole heads of the fused qkv and the matching rows of attn_out, columns of ffn_up and the matching
+// rows of ffn_down (8 at a time, 16-byte aligned F16 rows). Everything else is mirrored.
+static ggml_backend_meta_split_state mtmd_split_state(const ggml_tensor * tensor, void * userdata) {
+    const mtmd_split_userdata * ud = (const mtmd_split_userdata *) userdata;
+    std::string name = tensor->name;
+    // ggml_backend_sched names its input copies "<backend>#<name>#<copy>"
+    const size_t first = name.find('#');
+    const size_t last  = name.rfind('#');
+    if (first != std::string::npos && first != last) {
+        name = name.substr(first + 1, last - first - 1);
+    }
+    auto ends_with = [&](const char * suffix) {
+        const size_t n = strlen(suffix);
+        return name.size() >= n && name.compare(name.size() - n, n, suffix) == 0;
+    };
+    const ggml_backend_meta_split_state mirrored = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+    if (name.rfind("v.blk.", 0) != 0) {
+        return mirrored;
+    }
+    const int n_dev = ud->n_devices;
+    if (ends_with(".attn_qkv.weight")) {
+        const int64_t n = tensor->ne[1] / 3;
+        return mtmd_split_even(GGML_BACKEND_SPLIT_AXIS_1, n, 3, n_dev, n / ud->n_head);
+    }
+    if (ends_with(".attn_qkv.bias")) {
+        const int64_t n = tensor->ne[0] / 3;
+        return mtmd_split_even(GGML_BACKEND_SPLIT_AXIS_0, n, 3, n_dev, n / ud->n_head);
+    }
+    if (ends_with(".attn_out.weight")) {
+        return mtmd_split_even(GGML_BACKEND_SPLIT_AXIS_0, tensor->ne[0], 1, n_dev, tensor->ne[0] / ud->n_head);
+    }
+    if (ends_with(".ffn_up.weight")) {
+        return mtmd_split_even(GGML_BACKEND_SPLIT_AXIS_1, tensor->ne[1], 1, n_dev, 8);
+    }
+    if (ends_with(".ffn_up.bias") || ends_with(".ffn_down.weight")) {
+        return mtmd_split_even(GGML_BACKEND_SPLIT_AXIS_0, tensor->ne[0], 1, n_dev, 8);
+    }
+    return mirrored;
+}
+
+ggml_backend_dev_t mtmd_split_device(const char * fname, const ggml_backend_dev_t * devs, size_t n_devs) {
+    gguf_init_params params = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    gguf_context * ctx = gguf_init_from_file(fname, params);
+    if (ctx == nullptr) {
+        return nullptr;
+    }
+    auto get_str = [&](const char * key) -> std::string {
+        const int64_t i = gguf_find_key(ctx, key);
+        return i >= 0 && gguf_get_kv_type(ctx, i) == GGUF_TYPE_STRING ? gguf_get_val_str(ctx, i) : "";
+    };
+    auto get_bool = [&](const char * key) {
+        const int64_t i = gguf_find_key(ctx, key);
+        return i >= 0 && gguf_get_kv_type(ctx, i) == GGUF_TYPE_BOOL && gguf_get_val_bool(ctx, i);
+    };
+    std::string proj = get_str(KEY_PROJ_TYPE);
+    if (proj.empty()) {
+        proj = get_str(KEY_VISION_PROJ_TYPE);
+    }
+    int64_t n_head = 0;
+    {
+        const int64_t i = gguf_find_key(ctx, mtmd_format(KEY_N_HEAD, "vision").c_str());
+        if (i >= 0 && gguf_get_kv_type(ctx, i) == GGUF_TYPE_UINT32) {
+            n_head = gguf_get_val_u32(ctx, i);
+        }
+    }
+    const char * why = nullptr;
+    if (projector_type_from_string(proj) != PROJECTOR_TYPE_QWEN3VL) {
+        why = "only the qwen3vl_merger encoder has split rules";
+    } else if (get_bool(KEY_HAS_AUDIO_ENC) || get_bool(KEY_HAS_GEN_AUDIO_ENC)) {
+        why = "the mmproj has an audio encoder";
+    } else if (n_devs > GGML_BACKEND_META_MAX_DEVICES || n_head < (int64_t) n_devs) {
+        why = "too many devices for the number of heads";
+    }
+    // the rows of a quantized weight could not be split in whole blocks at the head and ffn boundaries
+    for (int64_t i = 0; why == nullptr && i < gguf_get_n_tensors(ctx); ++i) {
+        const std::string name = gguf_get_tensor_name(ctx, i);
+        const ggml_type type = gguf_get_tensor_type(ctx, i);
+        if (name.rfind("v.blk.", 0) == 0 && type != GGML_TYPE_F32 && type != GGML_TYPE_F16 && type != GGML_TYPE_BF16) {
+            why = "the vision blocks have quantized weights";
+        }
+    }
+    gguf_free(ctx);
+    if (why != nullptr) {
+        LOG_WRN("%s: the vision encoder stays on one device: %s\n", __func__, why);
+        return nullptr;
+    }
+    LOG_INF("%s: splitting the vision encoder over %zu devices\n", __func__, n_devs);
+    // never freed: the meta device is cached for the process and keeps this pointer
+    auto * ud = new mtmd_split_userdata { (int) n_devs, (int) n_head };
+    std::vector<ggml_backend_dev_t> dev_list(devs, devs + n_devs);
+    return ggml_backend_meta_device(dev_list.data(), dev_list.size(), mtmd_split_state, ud);
+}
+
 mtmd_backends::mtmd_backends(ggml_backend_dev_t device, int n_threads, int max_nodes,
                              ggml_backend_sched_eval_callback cb_eval, void * cb_eval_user_data) {
     threadpool = mtmd_threadpool_init(n_threads);

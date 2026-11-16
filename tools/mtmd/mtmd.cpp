@@ -584,6 +584,8 @@ mtmd_context_params mtmd_context_params_default() {
     mtmd_context_params params {
         /* use_gpu           */ true,
         /* device            */ nullptr,
+        /* devices           */ nullptr,
+        /* n_devices         */ 0,
         /* print_timings     */ true,
         /* n_threads         */ 4,
         /* image_marker      */ nullptr,
@@ -711,6 +713,13 @@ struct mtmd_context {
         }
 
         ggml_backend_dev_t device = mtmd_select_device(ctx_params.use_gpu, ctx_params.device);
+        // no_alloc only measures memory: stay on one device, a split would set up the comms of all of them
+        if (!no_alloc && ctx_params.use_gpu && ctx_params.n_devices > 1) {
+            ggml_backend_dev_t split = mtmd_split_device(mmproj_fname, ctx_params.devices, ctx_params.n_devices);
+            if (split != nullptr) {
+                device = split;
+            }
+        }
 
         mtmd_model_params model_params;
         model_params.image_min_tokens            = ctx_params.image_min_tokens;
