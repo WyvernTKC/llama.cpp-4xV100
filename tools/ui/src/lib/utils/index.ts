@@ -204,6 +204,7 @@ export {
 	assignImageRefIds,
 	collectAttachmentRefs,
 	formatAttachmentRefLabel,
+	formatToolImageRefLabel,
 	resolveAttachmentRefs,
 	withAttachmentRefHints,
 	withFreshImageRefIds,

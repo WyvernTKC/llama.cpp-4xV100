@@ -19,6 +19,15 @@ export function formatAttachmentRefLabel(refId: string): string {
 	return `[Image ${ATTACHMENT_REF_PREFIX}${refId} - pass this handle in a tool argument to send the image]`;
 }
 
+/**
+ * Label of an image a tool returned. Templates that render tool results in a
+ * user turn (Qwen) make an image there look like a new upload when it carries
+ * the upload label, and the model reruns the user's last request on it.
+ */
+export function formatToolImageRefLabel(refId: string): string {
+	return `[Image ${ATTACHMENT_REF_PREFIX}${refId} - returned by this tool call, not sent by the user; pass this handle in a tool argument to send the image]`;
+}
+
 /** Data URL of every chat image that carries a ref id, PDF pages sent as images too, keyed by that id. */
 export function collectAttachmentRefs(messages: readonly object[]): Map<string, string> {
 	const refs = new Map<string, string>();
@@ -118,7 +127,7 @@ export function withFreshImageRefIds<T extends DatabaseMessageExtra[] | undefine
 /**
  * The text of a tool result as the model reads it: each image the tool returned
  * keeps the "[Attachment saved: name]" line it was swapped for, and gets its
- * attachment://<refId> label on that line. An image without such a line gets
+ * attachment://<refId> label on that line, worded as tool output. An image without such a line gets
  * its label at the end. The stored text stays as is, the chat view parses it.
  */
 export function withToolImageHandles(
@@ -148,11 +157,11 @@ export function withToolImageHandles(
 
 		labelled.add(name);
 
-		return `${line} ${formatAttachmentRefLabel(refId)}`;
+		return `${line} ${formatToolImageRefLabel(refId)}`;
 	});
 
 	for (const [name, refId] of byName) {
-		if (!labelled.has(name)) lines.push(formatAttachmentRefLabel(refId));
+		if (!labelled.has(name)) lines.push(formatToolImageRefLabel(refId));
 	}
 
 	return lines.join(NEWLINE);

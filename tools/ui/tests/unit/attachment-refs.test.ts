@@ -4,6 +4,7 @@ import {
 	assignImageRefIds,
 	collectAttachmentRefs,
 	formatAttachmentRefLabel,
+	formatToolImageRefLabel,
 	resolveAttachmentRefs,
 	withAttachmentRefHints,
 	withFreshImageRefIds,
@@ -98,6 +99,16 @@ describe('collectAttachmentRefs', () => {
 describe('formatAttachmentRefLabel', () => {
 	it('names the handle', () => {
 		expect(formatAttachmentRefLabel(REF)).toContain(handle);
+	});
+});
+
+describe('formatToolImageRefLabel', () => {
+	it('names the handle and marks the image as tool output, not an upload', () => {
+		const label = formatToolImageRefLabel(REF);
+
+		expect(label).toContain(handle);
+		expect(label).toContain('returned by this tool call, not sent by the user');
+		expect(label).not.toBe(formatAttachmentRefLabel(REF));
 	});
 });
 
@@ -262,8 +273,8 @@ describe('withToolImageHandles', () => {
 		const content = 'map ready\n[Attachment saved: a.png]\n[Attachment saved: b.png]\ndone';
 
 		expect(withToolImageHandles(content, [image('a.png', 'r1'), image('b.png', 'r2')])).toBe(
-			`map ready\n[Attachment saved: a.png] ${formatAttachmentRefLabel('r1')}\n` +
-				`[Attachment saved: b.png] ${formatAttachmentRefLabel('r2')}\ndone`
+			`map ready\n[Attachment saved: a.png] ${formatToolImageRefLabel('r1')}\n` +
+				`[Attachment saved: b.png] ${formatToolImageRefLabel('r2')}\ndone`
 		);
 	});
 
@@ -284,7 +295,7 @@ describe('withToolImageHandles', () => {
 				image('c.png', 'r3')
 			])
 		).toBe(
-			`[Attachment saved: a.png] ${formatAttachmentRefLabel('r1')}\n${formatAttachmentRefLabel('r3')}`
+			`[Attachment saved: a.png] ${formatToolImageRefLabel('r1')}\n${formatToolImageRefLabel('r3')}`
 		);
 	});
 
