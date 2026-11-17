@@ -35,6 +35,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <random>
 #include <regex>
 #include <set>
@@ -12163,6 +12164,132 @@ struct test_leaky_relu : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT, one decode token with one mask per q head made of 64-cell pages (page-sparse decode)
+// every row keeps page 0, n_pages random pages and a last page cut off part-way, like the recent window
+struct test_flash_attn_ext_pages : public test_case {
+    const int64_t   hs;
+    const int64_t   nh;      // KV heads
+    const int64_t   gqa;     // q heads per KV head
+    const int64_t   kv;
+    const int64_t   n_pages;
+    const ggml_type type_KV;
+    const bool      shared;  // the q heads of a KV head share their pages
+    const bool      list;    // one causal mask row for all heads and the pages as a chunk list (ggml_flash_attn_ext_set_chunk_list)
+
+    std::string vars() override {
+        return VARS_TO_STR8(hs, nh, gqa, kv, n_pages, type_KV, shared, list);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * 2 * nh*gqa * (n_pages + 2)*64 * hs;
+    }
+
+    test_flash_attn_ext_pages(int64_t hs = 128, int64_t nh = 8, int64_t gqa = 4, int64_t kv = 8192, int64_t n_pages = 16,
+                              ggml_type type_KV = GGML_TYPE_F16, bool shared = true, bool list = false)
+        : hs(hs), nh(nh), gqa(gqa), kv(kv), n_pages(n_pages), type_KV(type_KV), shared(shared), list(list) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, 1, nh*gqa, 1);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, 1);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, 1);
+        ggml_set_name(v, "v");
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, 1, list ? 1 : nh*gqa, 1);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_n_kv_max(out, int32_t(64*(n_pages + 2)));
+        ggml_flash_attn_ext_set_mask_chunked(out, true);
+        if (list) {
+            ggml_tensor * cl = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, kv/32 + 1, nh*gqa, 1);
+            ggml_set_name(cl, "cl");
+            ggml_flash_attn_ext_set_chunk_list(out, cl);
+        }
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (list && strcmp(t->name, "m") == 0) {
+                // causal: the last page is cut off part-way, finite values vary
+                std::vector<float> f(kv, -INFINITY);
+                for (int64_t c = 0; c < kv - 64 + 21; ++c) {
+                    f[c] = -0.03125f * float(1 + c % 7);
+                }
+                std::vector<ggml_fp16_t> h(f.size());
+                ggml_fp32_to_fp16_row(f.data(), h.data(), h.size());
+                ggml_backend_tensor_set(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
+                continue;
+            }
+            if (strcmp(t->name, "cl") == 0) {
+                // page 0, n_pages random pages and both chunks of the last page (its second chunk is all -inf), ascending
+                const int64_t n_page = kv/64;
+                std::mt19937 gen(0x9A6E);
+                std::vector<int32_t> rows(t->ne[0]*t->ne[1], -1);
+                std::vector<int64_t> order(n_page - 2);
+                std::iota(order.begin(), order.end(), 1);
+                for (int64_t r = 0; r < nh*gqa; ++r) {
+                    int32_t * row = rows.data() + r*t->ne[0];
+                    if (shared && r % gqa != 0) {
+                        std::copy(row - t->ne[0], row, row);
+                        continue;
+                    }
+                    std::shuffle(order.begin(), order.end(), gen);
+                    std::vector<int64_t> pages(order.begin(), order.begin() + n_pages);
+                    pages.push_back(0);
+                    pages.push_back(n_page - 1);
+                    std::sort(pages.begin(), pages.end());
+                    row[0] = 0;
+                    for (int64_t p : pages) {
+                        row[1 + row[0]++] = int32_t(2*p);
+                        row[1 + row[0]++] = int32_t(2*p + 1);
+                    }
+                }
+                ggml_backend_tensor_set(t, rows.data(), 0, rows.size()*sizeof(int32_t));
+                continue;
+            }
+            if (strcmp(t->name, "m") != 0) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            const int64_t n_page = kv/64;
+            std::mt19937 gen(0x9A6E);
+            std::vector<float> f(kv*nh*gqa, -INFINITY);
+            std::vector<int64_t> order(n_page - 2);
+            std::iota(order.begin(), order.end(), 1);
+            for (int64_t r = 0; r < nh*gqa; ++r) {
+                float * row = f.data() + r*kv;
+                if (shared && r % gqa != 0) {
+                    std::copy(row - kv, row, row);
+                    continue;
+                }
+                std::shuffle(order.begin(), order.end(), gen);
+                auto keep = [&](int64_t page, int64_t n) {
+                    for (int64_t j = 0; j < n; ++j) {
+                        row[page*64 + j] = -0.03125f * float(1 + (page + j + r) % 7);
+                    }
+                };
+                keep(0, 64);
+                for (int64_t i = 0; i < n_pages; ++i) {
+                    keep(order[i], 64);
+                }
+                keep(n_page - 1, 1 + (r*13) % 64);
+            }
+            std::vector<ggml_fp16_t> h(f.size());
+            ggml_fp32_to_fp16_row(f.data(), h.data(), h.size());
+            ggml_backend_tensor_set(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
+        }
+    }
+};
+
 // GGML_OP_FLASH_ATTN_EXT
 struct test_flash_attn_ext : public test_case {
     const int64_t hsk; // K head size
@@ -13116,6 +13243,281 @@ struct test_lightning_indexer : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "m") == 0) {
                 init_tensor_kq_mask(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_PAGE_TOP_K
+struct test_page_top_k : public test_case {
+    const ggml_type type;
+    const int64_t d;
+    const int64_t n_kv_h;
+    const int64_t n_gqa;
+    const int64_t n_page;
+    const int64_t n_top;
+    const int64_t n_masked; // masked pages: page 0 and the last n_masked - 1
+    const float   mval;     // their mask value: -inf, or -1e30 as llama-graph sets it
+    const bool    chunks;   // ggml_page_top_k_chunks with the extra chunks of extra_chunks()
+
+    ggml_tensor * qkv_t = nullptr;
+    ggml_tensor * ps_t  = nullptr;
+    ggml_tensor * pm_t  = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR9(type, d, n_kv_h, n_gqa, n_page, n_top, n_masked, mval, chunks);
+    }
+
+    // page 0, single chunks of three pages that may or may not be picked, the masked last pages as a window, -1 padding
+    std::vector<int32_t> extra_chunks() const {
+        std::set<int32_t> e = {0, 1, 10, 35, (int32_t) (2*(n_page/2) + 1), (int32_t) (2*(n_page - 2)), (int32_t) (2*(n_page - 2) + 1),
+            (int32_t) (2*(n_page - 1))};
+        std::vector<int32_t> v;
+        for (int32_t c : e) {
+            if (c < 2*n_page) {
+                v.push_back(c);
+            }
+        }
+        v.push_back(-1);
+        v.push_back(-1);
+        return v;
+    }
+
+    // the pages of a result row: the picks, or the pages of a chunk list with both chunks listed and not both extra
+    // (n_masked >= 3 and n_top <= the unmasked pages: page 0 and the window pages are never picked).
+    // A chunk list must equal the list rebuilt from its pages. Returns false on a malformed row.
+    bool row_pages(const float * row, std::set<int32_t> & pages) const {
+        pages.clear();
+        if (!chunks) {
+            for (int64_t i = 0; i < n_top; ++i) {
+                pages.insert((int32_t) row[i]);
+            }
+            return (int64_t) pages.size() == n_top && *pages.begin() >= 0 && *pages.rbegin() < n_page;
+        }
+        const int32_t n = (int32_t) row[0];
+        if (n < 0 || n > 2*n_page) {
+            return false;
+        }
+        std::vector<int32_t> list(n);
+        for (int32_t i = 0; i < n; ++i) {
+            list[i] = (int32_t) row[1 + i];
+            if (list[i] < 0 || list[i] >= 2*n_page || (i > 0 && list[i] <= list[i - 1])) {
+                return false;
+            }
+        }
+        std::set<int32_t> ex;
+        for (int32_t c : extra_chunks()) {
+            if (c >= 0) {
+                ex.insert(c);
+            }
+        }
+        const std::set<int32_t> ls(list.begin(), list.end());
+        for (int32_t c : list) {
+            if (c % 2 == 0 && ls.count(c + 1) && !(ex.count(c) && ex.count(c + 1))) {
+                pages.insert(c/2);
+            }
+        }
+        std::set<int32_t> rebuilt;
+        for (int32_t p : pages) {
+            rebuilt.insert(2*p);
+            rebuilt.insert(2*p + 1);
+        }
+        for (int32_t c : ex) {
+            if (!pages.count(c/2)) {
+                rebuilt.insert(c);
+            }
+        }
+        return (int64_t) pages.size() == n_top && rebuilt == ls;
+    }
+
+    double max_err() override {
+        return 0.0;
+    }
+
+    // no atomics on the result: every run on a backend gives the same bytes
+    bool deterministic(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        return true;
+    }
+
+    // err below compares the output only, not the q and stats views
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    // The backends round the scores differently (summation order, exp/log), so two pages whose group scores
+    // are within rounding of the cut may swap. Each row must hold n_top distinct pages, the rows of a group
+    // must be equal, and a page in one result but not the other must lie within 1e-4 of the cut of the
+    // group scores computed here in double precision.
+    double err(const float * a, const float * b, size_t n) override {
+        const int64_t n_head = n_kv_h*n_gqa;
+        const int64_t n_row  = chunks ? 2*n_page + 1 : n_top;
+        GGML_ASSERT(n == (size_t) (n_row*n_head));
+
+        std::vector<float> qkv(ggml_nelements(qkv_t));
+        ggml_backend_tensor_get(qkv_t, qkv.data(), 0, ggml_nbytes(qkv_t));
+        std::vector<float> pm(n_page);
+        ggml_backend_tensor_get(pm_t, pm.data(), 0, ggml_nbytes(pm_t));
+        std::vector<float> ps(ggml_nelements(ps_t));
+        if (type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> h(ps.size());
+            ggml_backend_tensor_get(ps_t, h.data(), 0, ggml_nbytes(ps_t));
+            for (size_t i = 0; i < h.size(); ++i) {
+                ps[i] = ggml_fp16_to_fp32(h[i]);
+            }
+        } else {
+            ggml_backend_tensor_get(ps_t, ps.data(), 0, ggml_nbytes(ps_t));
+        }
+
+        const double scale = 1.0/sqrt((double) d);
+        double diff = 0.0;
+        std::vector<double> g(n_page), s(n_page);
+        for (int64_t k = 0; k < n_kv_h; ++k) {
+            std::fill(g.begin(), g.end(), -INFINITY);
+            for (int64_t h = k*n_gqa; h < (k + 1)*n_gqa; ++h) {
+                double m = -INFINITY;
+                for (int64_t p = 0; p < n_page; ++p) {
+                    const float * st = ps.data() + (p*n_kv_h + k)*4*d + 2*d;
+                    double acc = 0.0;
+                    for (int64_t j = 0; j < d; ++j) {
+                        const double x = scale*qkv[h*(d + 2) + j];
+                        acc += x > 0.0 ? x*st[j] : x*st[d + j];
+                    }
+                    s[p] = acc + pm[p];
+                    m = std::max(m, s[p]);
+                }
+                double lse = 0.0;
+                if (m > -INFINITY) {
+                    double sum = 0.0;
+                    for (int64_t p = 0; p < n_page; ++p) {
+                        sum += exp(s[p] - m);
+                    }
+                    lse = m + log(sum);
+                }
+                for (int64_t p = 0; p < n_page; ++p) {
+                    g[p] = std::max(g[p], s[p] - lse);
+                }
+            }
+            std::vector<double> sorted(g);
+            std::nth_element(sorted.begin(), sorted.begin() + (n_top - 1), sorted.end(), std::greater<double>());
+            const double cut = sorted[n_top - 1];
+
+            std::set<int32_t> ref_a, ref_b;
+            for (int64_t h = k*n_gqa; h < (k + 1)*n_gqa; ++h) {
+                std::set<int32_t> sa, sb;
+                if (!row_pages(a + h*n_row, sa) || !row_pages(b + h*n_row, sb)) {
+                    diff += 1;
+                    continue;
+                }
+                if (h == k*n_gqa) {
+                    ref_a = sa;
+                    ref_b = sb;
+                } else if (sa != ref_a || sb != ref_b) {
+                    diff += 1;
+                }
+            }
+            for (int32_t p : ref_a) {
+                if (!ref_b.count(p) && !(fabs(g[p] - cut) <= 1e-4*(1.0 + fabs(cut)))) {
+                    diff += 1;
+                }
+            }
+            for (int32_t p : ref_b) {
+                if (!ref_a.count(p) && !(fabs(g[p] - cut) <= 1e-4*(1.0 + fabs(cut)))) {
+                    diff += 1;
+                }
+            }
+        }
+        return diff;
+    }
+
+    test_page_top_k(ggml_type type = GGML_TYPE_F16, int64_t d = 128, int64_t n_kv_h = 4, int64_t n_gqa = 8, int64_t n_page = 2048,
+            int64_t n_top = 430, int64_t n_masked = 3, float mval = -INFINITY, bool chunks = false)
+        : type(type), d(d), n_kv_h(n_kv_h), n_gqa(n_gqa), n_page(n_page), n_top(n_top), n_masked(n_masked), mval(mval), chunks(chunks) {
+        GGML_ASSERT(!chunks || (n_masked >= 3 && n_top <= n_page - n_masked && n_page >= 40));
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // q rows with a stride of d + 2 floats; stats is the max/min half of the cached statistics [mean, var, max, min]
+        qkv_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (d + 2)*n_kv_h*n_gqa);
+        ggml_set_name(qkv_t, "qkv");
+        ggml_tensor * q = ggml_view_2d(ctx, qkv_t, d, n_kv_h*n_gqa, (d + 2)*sizeof(float), 0);
+
+        ps_t = ggml_new_tensor_3d(ctx, type, 4*d, n_kv_h, n_page);
+        ggml_set_name(ps_t, "ps");
+        const size_t ts = ggml_type_size(type);
+        ggml_tensor * stats = ggml_view_3d(ctx, ps_t, 2*d, n_page, n_kv_h, 4*d*n_kv_h*ts, 4*d*ts, 2*d*ts);
+
+        pm_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_page);
+        ggml_set_name(pm_t, "pmask");
+
+        ggml_tensor * out;
+        if (chunks) {
+            ggml_tensor * ex = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, extra_chunks().size());
+            ggml_set_name(ex, "extra");
+            out = ggml_page_top_k_chunks(ctx, q, stats, pm_t, ex, n_top, 1.0f/sqrtf((float) d));
+        } else {
+            out = ggml_page_top_k(ctx, q, stats, pm_t, n_top, 1.0f/sqrtf((float) d));
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "pmask") == 0) {
+                std::vector<float> m(n_page, 0.0f);
+                for (int64_t p = 0; p < n_masked; ++p) {
+                    m[p == 0 ? 0 : n_page - p] = mval;
+                }
+                ggml_backend_tensor_set(t, m.data(), 0, n_page*sizeof(float));
+            } else if (strcmp(t->name, "extra") == 0) {
+                const std::vector<int32_t> e = extra_chunks();
+                ggml_backend_tensor_set(t, e.data(), 0, e.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "qkv") == 0) {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else {
+                init_tensor_uniform(t, -2.0f, 2.0f);
+            }
+        }
+    }
+};
+
+// GGML_OP_PAGE_STATS
+struct test_page_stats : public test_case {
+    const ggml_type type_k;
+    const ggml_type type_ps;
+    const int64_t   d;
+    const int64_t   n_kv_h;
+    const int64_t   n_page;
+    const std::vector<int32_t> upd;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_k, type_ps, d, n_kv_h, n_page, upd.size());
+    }
+
+    test_page_stats(ggml_type type_k = GGML_TYPE_Q8_0, ggml_type type_ps = GGML_TYPE_F16, int64_t d = 128, int64_t n_kv_h = 4,
+            int64_t n_page = 64, std::vector<int32_t> upd = {62, 63})
+        : type_k(type_k), type_ps(type_ps), d(d), n_kv_h(n_kv_h), n_page(n_page), upd(upd) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * k = ggml_new_tensor_3d(ctx, type_k, d, n_kv_h, 64*n_page);
+        ggml_set_name(k, "k");
+        ggml_tensor * ps = ggml_new_tensor_3d(ctx, type_ps, 4*d, n_kv_h, n_page);
+        ggml_set_name(ps, "ps");
+        ggml_tensor * u = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, upd.size());
+        ggml_set_name(u, "upd");
+        ggml_tensor * out = ggml_page_stats(ctx, k, ps, u);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "upd") == 0) {
+                ggml_backend_tensor_set(t, upd.data(), 0, upd.size()*sizeof(int32_t));
             } else {
                 init_tensor_uniform(t);
             }
@@ -14160,6 +14562,38 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 1, true, true)); // Qwen4-Exp decode
 
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_page_top_k(type));
+        test_cases.emplace_back(new test_page_top_k(type, 128, 8, 4, 2048, 430, 3));
+        test_cases.emplace_back(new test_page_top_k(type, 64, 2, 16, 1001, 1, 0));
+        test_cases.emplace_back(new test_page_top_k(type, 256, 1, 1, 777, 777, 5));
+        test_cases.emplace_back(new test_page_top_k(type, 128, 4, 8, 4096, 4000, 200));
+        test_cases.emplace_back(new test_page_top_k(type, 128, 2, 6, 8192, 2000, 1));
+        test_cases.emplace_back(new test_page_top_k(type, 96, 3, 2, 37, 10, 30));
+        // groups larger than one pass of the score kernel, MQA, group scores in global memory, wide heads
+        test_cases.emplace_back(new test_page_top_k(type, 128, 2, 24, 2048, 430, 3));
+        test_cases.emplace_back(new test_page_top_k(type, 128, 1, 64, 1500, 300, 2));
+        test_cases.emplace_back(new test_page_top_k(type, 128, 2, 8, 12000, 3000, 4));
+        test_cases.emplace_back(new test_page_top_k(type, 64, 1, 40, 10300, 100, 1));
+        test_cases.emplace_back(new test_page_top_k(type, 512, 2, 4, 1024, 200, 3));
+        // the -1e30 mask of llama-graph, including more picks than unmasked pages
+        test_cases.emplace_back(new test_page_top_k(type, 128, 4, 8, 2048, 430, 3, -1e30f));
+        test_cases.emplace_back(new test_page_top_k(type, 128, 2, 4, 256, 250, 20, -1e30f));
+        // the page statistics refresh of decode (two pages, one repeated as llama-graph pads) and of a batch
+        for (ggml_type type_k : {GGML_TYPE_Q8_0, GGML_TYPE_F16, GGML_TYPE_F32}) {
+            test_cases.emplace_back(new test_page_stats(type_k, type, 128, 4, 64, {62, 63}));
+            test_cases.emplace_back(new test_page_stats(type_k, type, 128, 8, 64, {63, 63}));
+            test_cases.emplace_back(new test_page_stats(type_k, type, 64, 2, 40, {0, 7, 8, 9, 39, 39}));
+            test_cases.emplace_back(new test_page_stats(type_k, type, 256, 1, 16, {3}));
+        }
+        // chunk lists for flash attention: the MoE and 8B shapes, odd page counts, global group scores, MQA
+        test_cases.emplace_back(new test_page_top_k(type, 128, 4, 8, 2048, 430, 3, -1e30f, true));
+        test_cases.emplace_back(new test_page_top_k(type, 128, 8, 4, 1980, 430, 3, -1e30f, true));
+        test_cases.emplace_back(new test_page_top_k(type, 128, 4, 8, 2036, 2000, 3, -1e30f, true));
+        test_cases.emplace_back(new test_page_top_k(type, 128, 2, 8, 12000, 3000, 4, -INFINITY, true));
+        test_cases.emplace_back(new test_page_top_k(type, 64, 1, 40, 41, 1, 3, -INFINITY, true));
+    }
+
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         // blocks with extra cells and scores (k-pool)
         test_cases.emplace_back(new test_top_k_mask(type));
         test_cases.emplace_back(new test_top_k_mask(type, 1001, 4, 70, 16, 3, true, 7));
@@ -14168,6 +14602,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k_mask(type, 4096, 4, 1024, 512, 3, true, 1));
         test_cases.emplace_back(new test_top_k_mask(type, 4096, 4, 1024, 512, 3, true, 64, 1, 2));
         test_cases.emplace_back(new test_top_k_mask(type, 8192, 128, 64, 16, 0, false, 64, 4, 1, true)); // MiniMax-M3 MSA prefill
+        test_cases.emplace_back(new test_top_k_mask(type, 1001, 4, 70, 16, 3, true, 512));
         // cells without scores (DSA)
         test_cases.emplace_back(new test_top_k_mask(type, 256, 0, 0, 16, 0, false, 32));
         test_cases.emplace_back(new test_top_k_mask(type, 1001, 0, 0, 64, 0, false, 7, 1, 3));
@@ -17255,6 +17690,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // page-sparse decode: one mask per q head, pages shared by the group or not
+    for (int64_t gqa : {1, 3, 4}) {
+        for (int64_t kv : {4096, 32768}) {
+            for (int64_t n_pages : {7, 32}) {
+                for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+                    for (bool shared : {true, false}) {
+                        for (bool list : {false, true}) {
+                            test_cases.emplace_back(new test_flash_attn_ext_pages(128, 8, gqa, kv, n_pages, type_KV, shared, list));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // sparse mask with large batch size
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
@@ -18622,6 +19072,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                     }
                 }
             }
+        }
+    }
+
+    // page-sparse decode at 128k: Llama-3.2-3B (gqa 3) and Llama-3.1-8B (gqa 4) attention, about 21% of the cells
+    for (int64_t gqa : {3, 4}) {
+        for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_flash_attn_ext_pages(128, 8, gqa, 131072, 430, type_KV, true));
+            test_cases.emplace_back(new test_flash_attn_ext_pages(128, 8, gqa, 131072, 430, type_KV, true, true));
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {gqa, 1}, 131072, 1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
         }
     }
 

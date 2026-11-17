@@ -3057,7 +3057,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_DSV4_HC_COMB:
             case GGML_OP_DSV4_HC_PRE:
-            case GGML_OP_DSV4_HC_POST: {
+            case GGML_OP_DSV4_HC_POST:
+            case GGML_OP_PAGE_TOP_K:
+            case GGML_OP_PAGE_STATS: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             // the picks (src1) split along a dim that the mask broadcasts, everything else replicated: each device masks

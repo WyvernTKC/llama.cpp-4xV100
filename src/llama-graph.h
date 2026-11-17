@@ -402,6 +402,10 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
+    // page-sparse decode (LLAMA_SPARSE_DECODE): its inputs, and whether the graph was built for the current settings
+    void set_input_sparse(const llama_ubatch * ubatch);
+    bool can_reuse_sparse() const;
+
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
 
@@ -409,6 +413,19 @@ public:
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
     llm_attn_mask self_attn_mask;
+
+
+    // page-sparse decode (LLAMA_SPARSE_DECODE): eligible pages, page member cells, sink + window cells
+    ggml_tensor * sp_page_mask = nullptr; // F32 [n_page]
+    ggml_tensor * sp_blocks    = nullptr; // I32 [64, n_page]
+    ggml_tensor * sp_extra     = nullptr; // I32 [64 + 128, n_batch/n_stream, n_head, 1]
+    ggml_tensor * sp_chunks_ex = nullptr; // I32 [8] FUSED=3: the 32-cell chunks of page 0 and the window, ascending, -1 padded
+    ggml_tensor * sp_upd       = nullptr; // I32 [n_batch/64 + 2] pages whose statistics are refreshed
+    ggml_tensor * sp_upd64     = nullptr; // I64 same
+    int64_t       sp_checked   = -1; // cache size whose mask was last checked cell by cell
+    int           sp_budget    = 0;
+    int           sp_score     = 0;
+    int           sp_fused     = 1;
 
     // note: assumes v_rot^2 == I
     std::vector<ggml_tensor *> self_k_rot;
@@ -1344,7 +1361,8 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * chunk_list = nullptr) const; // I32 [n_kv/32 + 1, n_head_q, n_stream], see ggml_flash_attn_ext_set_chunk_list
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
@@ -1414,6 +1432,24 @@ struct llm_graph_context {
             ggml_tensor * top_k, // [n_indexer_top_k, n_tokens]
                   float   kq_scale,
                     int   il) const;
+
+    // page-sparse decode (LLAMA_SPARSE_DECODE): the sparse mask and the FA n_kv_max
+    std::pair<ggml_tensor *, int64_t> build_sparse_pages(
+            llm_graph_input_attn_kv * inp,
+                    ggml_tensor * q,
+                    ggml_tensor * k,
+                    ggml_tensor * kq_mask,
+                    ggml_tensor * ps,
+                          float   kq_scale,
+                            int   il,
+                    ggml_tensor ** chunk_list) const;
+
+    // refresh the cached statistics of the pages in inp->sp_upd from the K cache, returns the updated statistics
+    ggml_tensor * build_page_stats(
+            llm_graph_input_attn_kv * inp,
+                    ggml_tensor * k,
+                    ggml_tensor * ps,
+                            int   il) const;
 
     // ggml_top_k_mask with top_k viewed in the row layout of kq_mask, see ggml.h
     ggml_tensor * build_fused_top_k_mask(

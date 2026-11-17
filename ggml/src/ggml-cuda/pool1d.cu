@@ -49,6 +49,34 @@ static __global__ void pool1d_nchw_kernel(
     o_ptr[cur_ow] = res;
 }
 
+// a window covering the whole row gives one output per row: reduce it with a block instead of one thread
+static __global__ void pool1d_row_kernel(const int iw, const float * src, float * dst, const enum ggml_op_pool op) {
+    const bool is_max = op == GGML_OP_POOL_MAX;
+    const float * row = src + (int64_t) blockIdx.x*iw;
+
+    float res = is_max ? -FLT_MAX : 0.0f;
+    for (int i = threadIdx.x; i < iw; i += blockDim.x) {
+        const float cur = row[i];
+        res = is_max ? max(res, cur) : res + cur;
+    }
+    res = is_max ? warp_reduce_max(res) : warp_reduce_sum(res);
+
+    __shared__ float buf[WARP_SIZE];
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    if (lane == 0) {
+        buf[warp] = res;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        res = lane < (int) (blockDim.x/WARP_SIZE) ? buf[lane] : (is_max ? -FLT_MAX : 0.0f);
+        res = is_max ? warp_reduce_max(res) : warp_reduce_sum(res);
+        if (lane == 0) {
+            dst[blockIdx.x] = is_max ? res : res/iw;
+        }
+    }
+}
+
 static void pool1d_nchw_kernel_f32_f32_cuda(
         const int iw, const int ow,
         const int kw, const int sw, const int pw,
@@ -78,6 +106,11 @@ void ggml_cuda_op_pool1d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t IW = src0->ne[0];
     const int64_t OW = dst->ne[0];
     const int64_t nr = ggml_nrows(src0);
+
+    if (OW == 1 && p0 == 0 && k0 >= IW && (op == GGML_OP_POOL_MAX || op == GGML_OP_POOL_AVG)) {
+        pool1d_row_kernel<<<nr, 256, 0, stream>>>(IW, src0_d, dst_d, op);
+        return;
+    }
 
     const int parallel_elements = (int)(nr * OW);
 

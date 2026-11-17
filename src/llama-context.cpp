@@ -482,6 +482,16 @@ llama_context::llama_context(
         }
     }
 
+    // page-sparse decode is only implemented and tested on CUDA, with all layers and the KV cache on the GPU
+    if (const char * e = getenv("LLAMA_SPARSE_DECODE"); e && atoi(e) > 0 && !hparams.vocab_only) {
+        const bool all_cuda = !model.devices.empty() && std::all_of(model.devices.begin(), model.devices.end(), [](const llama_device & d) {
+            return strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(d.dev)), "CUDA") == 0;
+        });
+        if (!all_cuda || !cparams.offload_kqv || model.n_gpu_layers() <= model.hparams.n_layer_all) {
+            throw std::runtime_error("LLAMA_SPARSE_DECODE needs all layers and the KV cache on CUDA devices (CUDA build, -ngl 99, KV offload on)");
+        }
+    }
+
     if (!hparams.vocab_only) {
         // GPU backends
         for (const auto & dev : model.devices) {
@@ -2988,6 +2998,10 @@ uint32_t llama_context::graph_max_nodes() const {
         res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
         for (const auto & lora : model.loras) {
             res += lora->get_n_nodes();
+        }
+        // page-sparse decode adds the page statistics and the page selection to every attention layer
+        if (getenv("LLAMA_SPARSE_DECODE")) {
+            res += 128u*model.hparams.n_layer();
         }
     }
 

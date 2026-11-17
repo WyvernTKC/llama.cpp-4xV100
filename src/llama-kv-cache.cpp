@@ -116,7 +116,7 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((2u*(1 + n_stream) + 1)*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -246,9 +246,18 @@ llama_kv_cache::llama_kv_cache(
             v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
         }
 
+        // page-sparse decode (LLAMA_SPARSE_DECODE) keeps per-page K statistics, f16 unless LLAMA_SPARSE_DECODE_STATS=f32
+        ggml_tensor * ps = nullptr;
+        if (getenv("LLAMA_SPARSE_DECODE") && has_k && n_stream == 1 && kv_size % 64 == 0) {
+            const char * e = getenv("LLAMA_SPARSE_DECODE_STATS");
+            const ggml_type type_ps = e && strcmp(e, "f32") == 0 ? GGML_TYPE_F32 : GGML_TYPE_F16;
+            ps = ggml_new_tensor_3d(ctx, type_ps, 4*hparams.n_embd_head_k(il), hparams.n_head_kv(il), kv_size/64);
+            ggml_format_name(ps, "cache_%sps_l%d", name_tag, il);
+        }
+
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, model.layers[il].k_cache_s, model.layers[il].v_cache_s, k_stream, v_stream, });
+        layers.push_back({ il, k, v, model.layers[il].k_cache_s, model.layers[il].v_cache_s, k_stream, v_stream, nullptr, nullptr, ps });
     }
 
     if (reuse) {
@@ -1485,6 +1494,10 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(k->type, n_embd_k_gqa),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+}
+
+ggml_tensor * llama_kv_cache::get_ps(int32_t il) const {
+    return layers[map_layer_ids.at(il)].ps;
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -3765,6 +3778,10 @@ ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) cons
     ggml_tensor * k = kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
     add_graph_root(k, 2);
     return k;
+}
+
+ggml_tensor * llama_kv_cache_context::get_ps(int32_t il) const {
+    return kv->get_ps(il);
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {

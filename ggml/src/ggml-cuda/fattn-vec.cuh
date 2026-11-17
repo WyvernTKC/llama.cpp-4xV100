@@ -16,7 +16,8 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+// paged: KV_max holds, per (sequence, q head), the count and the list of visible 32-cell chunks (page-sparse decode)
+template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool paged = false> // D == head size
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
@@ -165,7 +166,7 @@ static __global__ void flash_attn_ext_vec(
     int k_hole_hi = 0;
     if (KV_ranges) {
         ggml_cuda_fattn_tile_range(KV_ranges, sequence % ne33, ic0, ncols, ne31, ne11, k_VKQ_max, k_hole_lo, k_hole_hi);
-    } else if (KV_max) {
+    } else if (KV_max && !paged) { // paged: KV_max holds the chunk lists
         const int i_KV = sequence*gridDim.x + blockIdx.x;
         const int n_KV = ne03*gridDim.x;
         k_VKQ_max = KV_max[i_KV];
@@ -294,24 +295,35 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
     }
 
-    K     += blockIdx.y*nthreads * nb11;
-    V     += blockIdx.y*nthreads * nb21;
-    maskh += blockIdx.y*nthreads;
-    for (int k_VKQ_0 = blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
-             // Increment pointers after each loop:
-             K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
+    static_assert(!paged || (nthreads == nwarps*WARP_SIZE && WARP_SIZE == FATTN_PAGED_CHUNK), "paged mode needs one chunk per warp");
 
-        if (k_VKQ_0 >= k_hole_lo && k_VKQ_0 < k_hole_hi) {
-            const int     stride = gridDim.y*nthreads;
-            const int64_t n_skip = (k_hole_hi - k_VKQ_0 + stride - 1) / stride;
-            k_VKQ_0 += n_skip*stride;
-            K       += n_skip*stride*nb11;
-            V       += n_skip*stride*nb21;
-            maskh   += n_skip*stride;
+    // paged: one row [n, chunks...] of ne11/FATTN_PAGED_CHUNK + 1 ints per (sequence, q head)
+    const int * chunk_row    = paged ? KV_max + int64_t(sequence*ne02 + head)*(ne11/FATTN_PAGED_CHUNK + 1) : nullptr;
+    const int   n_chunks_vis = paged ? chunk_row[0] : 0;
+    const int * chunks       = paged ? chunk_row + 1 : nullptr;
+    const char * K_base     = K;
+    const char * V_base     = V;
+    const half * maskh_base = maskh;
+    for (int it = blockIdx.y; paged ? it*nwarps < n_chunks_vis : it*nthreads < k_VKQ_max; it += gridDim.y) {
+        // pointers are set so that key i_KQ of this warp maps to its chunk; chunks past the list are padded with -inf
+        int   k_VKQ_0 = it*nthreads;
+        float KQ_pad  = 0.0f;
+        if constexpr (paged) {
+            const int ci = it*nwarps + threadIdx.y;
+            KQ_pad  = ci < n_chunks_vis ? 0.0f : -INFINITY;
+            k_VKQ_0 = (ci < n_chunks_vis ? chunks[ci] : 0)*FATTN_PAGED_CHUNK - threadIdx.y*WARP_SIZE;
+        } else if (k_VKQ_0 >= k_hole_lo && k_VKQ_0 < k_hole_hi) {
+            const int stride = gridDim.y*nthreads;
+            const int n_skip = (k_hole_hi - k_VKQ_0 + stride - 1) / stride;
+            it      += n_skip*gridDim.y;
+            k_VKQ_0  = it*nthreads;
             if (k_VKQ_0 >= k_VKQ_max) {
                 break;
             }
         }
+        K     = K_base     + int64_t(k_VKQ_0)*nb11;
+        V     = V_base     + int64_t(k_VKQ_0)*nb21;
+        maskh = maskh_base + k_VKQ_0;
 
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
@@ -337,6 +349,9 @@ static __global__ void flash_attn_ext_vec(
 
                 if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
                     sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
+                }
+                if constexpr (paged) {
+                    sum += KQ_pad;
                 }
 
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
@@ -595,12 +610,23 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
     const int nwarps   = nthreads / WARP_SIZE;
     fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap>;
+    bool paged = false;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if constexpr (cols_per_block == 1 && !use_logit_softcap) {
+        const ggml_tensor * mask = dst->src[3];
+        paged = mask && ggml_get_op_params_i32(dst, 6) == FATTN_PAGED_CHUNK && ggml_get_op_params_i32(dst, 4) > 0 &&
+            dst->src[0]->ne[1] == 1 && dst->src[1]->ne[1] % FATTN_PAGED_CHUNK == 0;
+        if (paged) {
+            fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, true>;
+        }
+    }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
     // a block takes nthreads KV cells per step, so the KV length allows that many parallel blocks, not one per D cells:
     //   gemma4 (D 256, a 1024-cell window) had 3-4 blocks per head at decode
-    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, nthreads, need_f16_K, need_f16_V, false, false);
+    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, nthreads, need_f16_K, need_f16_V, false, false, WARP_SIZE, false, paged);
 }
 
 template <int D, ggml_type type_K, ggml_type type_V>
