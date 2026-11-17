@@ -946,8 +946,8 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 //   LLAMA_SPARSE_DECODE=<B>             single-token decode attends to about B cells: page 0, the recent window
 //                                       and the top (B - 80)/64 pages of 64 cells per KV head
 //   LLAMA_SPARSE_DECODE_MIN_CTX=<n>     only caches of at least n cells use it (default 32768, below it dense is faster)
-//   LLAMA_SPARSE_DECODE_SCORE=quest|mv  page score (default quest)
-//   LLAMA_SPARSE_DECODE_FUSED=0|1|2     quest with cached statistics: 1 (default) selects with ggml_page_top_k, 0 with the unfused
+//   LLAMA_SPARSE_DECODE_SCORE=quest|mv  page score (default quest; mean also exists, always unfused)
+//   LLAMA_SPARSE_DECODE_FUSED=0|1|2|3   quest or mv with cached statistics: 1 (default) selects with ggml_page_top_k, 0 with the unfused
 //                                       chain of ops, 2 with ggml_page_top_k and also computes the unfused picks as sp_picks_ref (debug),
 //                                       3 with ggml_page_top_k_chunks: flash attention gathers the listed chunks, no per-head mask
 static int llama_sparse_pages_budget() {
@@ -4071,8 +4071,11 @@ std::pair<ggml_tensor *, int64_t> llm_graph_context::build_sparse_pages(
     const int64_t n_page = n_kv/64;
     const int64_t n_top  = std::min<int64_t>(n_page, (inp->sp_budget - 80)/64);
 
-    // quest with cached statistics: scores, log-softmax, group max and top-k in one op
-    const int fused = ps && inp->sp_score == 1 ? inp->sp_fused : 0;
+    // quest or mv with cached statistics: scores, log-softmax, group max and top-k in one op, which reads
+    // its half of the cached [mean, var, max, min]: [max, min] for quest, [mean, var] for mv
+    const int fused = ps && inp->sp_score != 2 ? inp->sp_fused : 0;
+    const int64_t         st_off   = inp->sp_score == 1 ? 2*d : 0;
+    const ggml_page_score st_score = inp->sp_score == 1 ? GGML_PAGE_SCORE_QUEST : GGML_PAGE_SCORE_MV;
 
     if (!inp->sp_page_mask && fused == 3) {
         inp->sp_page_mask = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_page);
@@ -4101,10 +4104,11 @@ std::pair<ggml_tensor *, int64_t> llm_graph_context::build_sparse_pages(
     // with the causal mask shared by all heads: no per-head mask is built or scanned
     if (fused == 3) {
         const size_t  ts    = ggml_element_size(ps);
-        ggml_tensor * stats = ggml_view_3d(ctx0, ps, 2*d, n_page, n_kv_h, 4*d*n_kv_h*ts, 4*d*ts, 2*d*ts);
+        ggml_tensor * stats = ggml_view_3d(ctx0, ps, 2*d, n_page, n_kv_h, 4*d*n_kv_h*ts, 4*d*ts, st_off*ts);
         ggml_tensor * q2    = ggml_view_2d(ctx0, q, d, n_head, q->nb[1], 0);
 
         ggml_tensor * list = ggml_page_top_k_chunks(ctx0, q2, stats, inp->sp_page_mask, inp->sp_chunks_ex, n_top, kq_scale);
+        ggml_page_top_k_set_score(list, st_score);
         cb(list, "sp_chunks", il);
 
         *chunk_list = ggml_reshape_3d(ctx0, list, list->ne[0], n_head, 1);
@@ -4113,10 +4117,11 @@ std::pair<ggml_tensor *, int64_t> llm_graph_context::build_sparse_pages(
 
     auto fused_mask = [&]() -> std::pair<ggml_tensor *, int64_t> {
         const size_t  ts    = ggml_element_size(ps);
-        ggml_tensor * stats = ggml_view_3d(ctx0, ps, 2*d, n_page, n_kv_h, 4*d*n_kv_h*ts, 4*d*ts, 2*d*ts);
+        ggml_tensor * stats = ggml_view_3d(ctx0, ps, 2*d, n_page, n_kv_h, 4*d*n_kv_h*ts, 4*d*ts, st_off*ts);
         ggml_tensor * q2    = ggml_view_2d(ctx0, q, d, n_head, q->nb[1], 0);
 
         ggml_tensor * picks = ggml_page_top_k(ctx0, q2, stats, inp->sp_page_mask, n_top, kq_scale); // [n_top, n_head]
+        ggml_page_top_k_set_score(picks, st_score);
         cb(picks, "sp_picks", il);
 
         picks = ggml_reshape_4d(ctx0, picks, n_top, 1, n_head, 1);

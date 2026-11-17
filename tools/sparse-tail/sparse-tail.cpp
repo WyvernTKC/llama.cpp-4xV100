@@ -370,6 +370,13 @@ int main(int argc, char ** argv) {
             if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch)) { fprintf(stderr, "prefill failed\n"); return 1; }
         }
         fprintf(stderr, "trial %zu: prefill %d tokens in %.1f s\n", t, Pt, (ggml_time_us() - t0)/1e6);
+        // recurrent / hybrid memories cannot drop the answer tokens of the previous config: restore the prompt state
+        const bool restore = llama_model_is_recurrent(model) || llama_model_is_hybrid(model);
+        std::vector<uint8_t> state;
+        if (restore) {
+            state.resize(llama_state_seq_get_size(ctx, 0));
+            state.resize(llama_state_seq_get_data(ctx, state.data(), state.size(), 0));
+        }
 
         for (const auto & c : configs) {
             if (c.budget > 0) {
@@ -381,7 +388,16 @@ int main(int argc, char ** argv) {
             } else {
                 unsetenv("LLAMA_SPARSE_DECODE");
             }
-            llama_memory_seq_rm(mem, 0, Pt, -1);
+            if (restore) {
+                llama_memory_seq_rm(mem, 0, -1, -1);
+                if (llama_state_seq_set_data(ctx, state.data(), state.size(), 0) != state.size()) {
+                    fprintf(stderr, "state restore failed\n");
+                    return 1;
+                }
+            } else if (!llama_memory_seq_rm(mem, 0, Pt, -1)) {
+                fprintf(stderr, "seq_rm failed\n");
+                return 1;
+            }
 
             int correct = 1;
             double logp = 0.0;
@@ -400,6 +416,9 @@ int main(int argc, char ** argv) {
                     if (lq[v] > lq[am]) am = v;
                 }
                 const int32_t target = tr.ids[pos + 1];
+                if (getenv("SPARSE_TAIL_VERBOSE")) {
+                    fprintf(stderr, "  %s s%d target %d lp %.3f argmax %d lp %.3f\n", c.name.c_str(), s, target, lq[target], am, lq[am]);
+                }
                 correct &= am == target;
                 logp += lq[target];
                 if (c.budget > 0) {
@@ -414,6 +433,7 @@ int main(int argc, char ** argv) {
             fprintf(out, "{\"trial\": %zu, \"task\": %d, \"book\": %d, \"depth_pct\": %d, \"len\": %d, \"config\": \"%s\", \"correct\": %d, \"logp\": %.6f, \"reads\": %.1f}\n",
                     t, tr.task, tr.book, tr.depth, L, c.name.c_str(), correct, logp, reads/tr.n_ans);
             fflush(out);
+            fprintf(stderr, "trial %zu task %d depth %d %-14s correct=%d logp=%.3f\n", t, tr.task, tr.depth, c.name.c_str(), correct, logp);
         }
     }
 

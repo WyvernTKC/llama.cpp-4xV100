@@ -2605,7 +2605,7 @@ extern "C" {
             struct ggml_tensor  * blocks,
             struct ggml_tensor  * extra);
 
-    // page selection of page-sparse decode (quest score), one token
+    // page selection of page-sparse decode (quest score unless ggml_page_top_k_set_score below), one token
     //
     // q:     [d, n_head]            f32, head h belongs to the KV head h / (n_head / n_kv_h)
     // stats: [2d, n_page, n_kv_h]   f16 or f32, the per-channel max (first d) and min (last d) of the keys of each page
@@ -2635,6 +2635,19 @@ extern "C" {
             struct ggml_tensor  * extra,
             int                   n_top,
             float                 scale);
+
+    // the page score of ggml_page_top_k(_chunks), QUEST by default; stats holds two [d] rows per page and KV head:
+    //   GGML_PAGE_SCORE_QUEST: [max, min],  s[h, p] = sum_j max(qs_j, 0)*max[j, p] + min(qs_j, 0)*min[j, p] + pmask[p]
+    //   GGML_PAGE_SCORE_MV:    [mean, var], s[h, p] = sum_j qs_j*mean[j, p] + qs_j^2*var[j, p]/2 + pmask[p]
+    // with qs = scale*q of head h
+    enum ggml_page_score {
+        GGML_PAGE_SCORE_QUEST = 0,
+        GGML_PAGE_SCORE_MV    = 1,
+    };
+
+    GGML_API void ggml_page_top_k_set_score(
+            struct ggml_tensor  * a,
+            enum ggml_page_score  score);
 
     // refresh the cached statistics of pages of 64 cells (page-sparse decode), in place
     //

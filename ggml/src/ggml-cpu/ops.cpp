@@ -11884,6 +11884,7 @@ void ggml_compute_forward_page_top_k(
     const int64_t n_gqa  = n_head/n_kv_h;
     const int64_t n_top  = ggml_get_op_params_i32(dst, 1);
     const bool    chunks = ggml_get_op_params_i32(dst, 2) != 0;
+    const bool    mv     = ggml_get_op_params_i32(dst, 3) == GGML_PAGE_SCORE_MV;
 
     const float * pm = (const float *) pmask->data;
 
@@ -11921,8 +11922,14 @@ void ggml_compute_forward_page_top_k(
             float m = -INFINITY;
             for (int64_t p = 0; p < n_page; ++p) {
                 float acc = 0.0f;
-                for (int64_t j = 0; j < d; ++j) {
-                    acc += qs[j] > 0.0f ? qs[j]*stat(j, p, k) : qs[j]*stat(d + j, p, k);
+                if (mv) {
+                    for (int64_t j = 0; j < d; ++j) {
+                        acc += qs[j]*stat(j, p, k) + 0.5f*qs[j]*qs[j]*stat(d + j, p, k);
+                    }
+                } else {
+                    for (int64_t j = 0; j < d; ++j) {
+                        acc += qs[j] > 0.0f ? qs[j]*stat(j, p, k) : qs[j]*stat(d + j, p, k);
+                    }
                 }
                 s[p] = acc + pm[p];
                 m = std::max(m, s[p]);

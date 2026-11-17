@@ -13261,13 +13261,14 @@ struct test_page_top_k : public test_case {
     const int64_t n_masked; // masked pages: page 0 and the last n_masked - 1
     const float   mval;     // their mask value: -inf, or -1e30 as llama-graph sets it
     const bool    chunks;   // ggml_page_top_k_chunks with the extra chunks of extra_chunks()
+    const bool    mv;       // GGML_PAGE_SCORE_MV on the [mean, var] half of the statistics, else quest on [max, min]
 
     ggml_tensor * qkv_t = nullptr;
     ggml_tensor * ps_t  = nullptr;
     ggml_tensor * pm_t  = nullptr;
 
     std::string vars() override {
-        return VARS_TO_STR9(type, d, n_kv_h, n_gqa, n_page, n_top, n_masked, mval, chunks);
+        return VARS_TO_STR10(type, d, n_kv_h, n_gqa, n_page, n_top, n_masked, mval, chunks, mv);
     }
 
     // page 0, single chunks of three pages that may or may not be picked, the masked last pages as a window, -1 padding
@@ -13379,11 +13380,11 @@ struct test_page_top_k : public test_case {
             for (int64_t h = k*n_gqa; h < (k + 1)*n_gqa; ++h) {
                 double m = -INFINITY;
                 for (int64_t p = 0; p < n_page; ++p) {
-                    const float * st = ps.data() + (p*n_kv_h + k)*4*d + 2*d;
+                    const float * st = ps.data() + (p*n_kv_h + k)*4*d + (mv ? 0 : 2*d);
                     double acc = 0.0;
                     for (int64_t j = 0; j < d; ++j) {
                         const double x = scale*qkv[h*(d + 2) + j];
-                        acc += x > 0.0 ? x*st[j] : x*st[d + j];
+                        acc += mv ? x*st[j] + 0.5*x*x*st[d + j] : (x > 0.0 ? x*st[j] : x*st[d + j]);
                     }
                     s[p] = acc + pm[p];
                     m = std::max(m, s[p]);
@@ -13433,13 +13434,14 @@ struct test_page_top_k : public test_case {
     }
 
     test_page_top_k(ggml_type type = GGML_TYPE_F16, int64_t d = 128, int64_t n_kv_h = 4, int64_t n_gqa = 8, int64_t n_page = 2048,
-            int64_t n_top = 430, int64_t n_masked = 3, float mval = -INFINITY, bool chunks = false)
-        : type(type), d(d), n_kv_h(n_kv_h), n_gqa(n_gqa), n_page(n_page), n_top(n_top), n_masked(n_masked), mval(mval), chunks(chunks) {
+            int64_t n_top = 430, int64_t n_masked = 3, float mval = -INFINITY, bool chunks = false, bool mv = false)
+        : type(type), d(d), n_kv_h(n_kv_h), n_gqa(n_gqa), n_page(n_page), n_top(n_top), n_masked(n_masked), mval(mval), chunks(chunks), mv(mv) {
         GGML_ASSERT(!chunks || (n_masked >= 3 && n_top <= n_page - n_masked && n_page >= 40));
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        // q rows with a stride of d + 2 floats; stats is the max/min half of the cached statistics [mean, var, max, min]
+        // q rows with a stride of d + 2 floats; stats is the max/min (quest) or mean/var (mv) half of the cached
+        // statistics [mean, var, max, min]
         qkv_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (d + 2)*n_kv_h*n_gqa);
         ggml_set_name(qkv_t, "qkv");
         ggml_tensor * q = ggml_view_2d(ctx, qkv_t, d, n_kv_h*n_gqa, (d + 2)*sizeof(float), 0);
@@ -13447,7 +13449,7 @@ struct test_page_top_k : public test_case {
         ps_t = ggml_new_tensor_3d(ctx, type, 4*d, n_kv_h, n_page);
         ggml_set_name(ps_t, "ps");
         const size_t ts = ggml_type_size(type);
-        ggml_tensor * stats = ggml_view_3d(ctx, ps_t, 2*d, n_page, n_kv_h, 4*d*n_kv_h*ts, 4*d*ts, 2*d*ts);
+        ggml_tensor * stats = ggml_view_3d(ctx, ps_t, 2*d, n_page, n_kv_h, 4*d*n_kv_h*ts, 4*d*ts, (mv ? 0 : 2*d)*ts);
 
         pm_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_page);
         ggml_set_name(pm_t, "pmask");
@@ -13459,6 +13461,9 @@ struct test_page_top_k : public test_case {
             out = ggml_page_top_k_chunks(ctx, q, stats, pm_t, ex, n_top, 1.0f/sqrtf((float) d));
         } else {
             out = ggml_page_top_k(ctx, q, stats, pm_t, n_top, 1.0f/sqrtf((float) d));
+        }
+        if (mv) {
+            ggml_page_top_k_set_score(out, GGML_PAGE_SCORE_MV);
         }
         ggml_set_name(out, "out");
 
@@ -14591,6 +14596,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_page_top_k(type, 128, 4, 8, 2036, 2000, 3, -1e30f, true));
         test_cases.emplace_back(new test_page_top_k(type, 128, 2, 8, 12000, 3000, 4, -INFINITY, true));
         test_cases.emplace_back(new test_page_top_k(type, 64, 1, 40, 41, 1, 3, -INFINITY, true));
+        // mv score: picks and chunk lists, the Ornith shape (D 256, 2 KV heads of 8) at 128k, groups over one pass, MQA
+        test_cases.emplace_back(new test_page_top_k(type, 128, 4, 8, 2048, 430, 3, -1e30f, false, true));
+        test_cases.emplace_back(new test_page_top_k(type, 256, 2, 8, 2048, 127, 3, -1e30f, false, true));
+        test_cases.emplace_back(new test_page_top_k(type, 256, 2, 8, 2048, 127, 3, -1e30f, true, true));
+        test_cases.emplace_back(new test_page_top_k(type, 128, 2, 24, 2048, 430, 3, -1e30f, true, true));
+        test_cases.emplace_back(new test_page_top_k(type, 128, 2, 8, 12000, 3000, 4, -INFINITY, true, true));
+        test_cases.emplace_back(new test_page_top_k(type, 64, 1, 40, 41, 1, 3, -INFINITY, true, true));
     }
 
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {

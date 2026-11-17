@@ -29,7 +29,8 @@ __device__ __forceinline__ float2 page_top_k_load2<float>(const float * x) {
 }
 
 // sc[k, g, p] = sum_j max(qs[j], 0)*max[j, p] + min(qs[j], 0)*min[j, p] + pmask[p], qs = scale*q of head k*n_gqa + g
-template <typename TS>
+// mv:           sum_j qs[j]*mean[j, p] + qs[j]^2*var[j, p]/2 + pmask[p] (stats rows [mean, var] instead of [max, min])
+template <typename TS, bool mv>
 static __global__ void page_top_k_score_kernel(
         const float * q, const TS * stats, const float * pmask, float * sc, float2 * part,
         const int d, const int n_gqa, const int n_page,
@@ -67,14 +68,18 @@ static __global__ void page_top_k_score_kernel(
             }
 
             for (int j = 2*lane; j < d; j += 2*WARP_SIZE) {
-                const float2 mx = page_top_k_load2(st + j);
-                const float2 mn = page_top_k_load2(st + d + j);
+                const float2 s0 = page_top_k_load2(st + j);     // max, or mean
+                const float2 s1 = page_top_k_load2(st + d + j); // min, or var
 #pragma unroll
                 for (int g = 0; g < PAGE_TOP_K_GQA_CHUNK; ++g) {
                     if (g < ng) {
                         const float a = qs[g*d + j];
                         const float b = qs[g*d + j + 1];
-                        acc[g] += (a > 0.0f ? a*mx.x : a*mn.x) + (b > 0.0f ? b*mx.y : b*mn.y);
+                        if constexpr (mv) {
+                            acc[g] += a*(s0.x + 0.5f*a*s1.x) + b*(s0.y + 0.5f*b*s1.y);
+                        } else {
+                            acc[g] += (a > 0.0f ? a*s0.x : a*s1.x) + (b > 0.0f ? b*s0.y : b*s1.y);
+                        }
                     }
                 }
             }
@@ -414,6 +419,7 @@ static void page_top_k_cuda(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const int n_gqa  = n_head/n_kv_h;
     const int  n_top  = ggml_get_op_params_i32(dst, 1);
     const bool chunks = ggml_get_op_params_i32(dst, 2) != 0;
+    const bool mv     = ggml_get_op_params_i32(dst, 3) == GGML_PAGE_SCORE_MV;
     const ggml_tensor * extra = chunks ? dst->src[3] : nullptr;
 
     const bool gs_smem = PAGE_TOP_K_LSE_PAD(n_gqa) + n_page <= PAGE_TOP_K_SMEM_FLOATS;
@@ -427,7 +433,8 @@ static void page_top_k_cuda(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const dim3 score_grid(n_bx, n_kv_h, 1);
     const ggml_cuda_kernel_launch_params score_params(score_grid, dim3(PAGE_TOP_K_SCORE_WARPS*WARP_SIZE, 1, 1),
             (size_t) std::min(n_gqa, PAGE_TOP_K_GQA_CHUNK)*d*sizeof(float), ctx.stream());
-    ggml_cuda_kernel_launch(page_top_k_score_kernel<TS>, score_params,
+    auto * score_kernel = mv ? &page_top_k_score_kernel<TS, true> : &page_top_k_score_kernel<TS, false>;
+    ggml_cuda_kernel_launch(score_kernel, score_params,
             (const float *) q->data, (const TS *) stats->data, (const float *) pmask->data, sc.get(), part.get(),
             d, n_gqa, n_page, (int64_t) (q->nb[1]/sizeof(float)), (int64_t) (stats->nb[1]/sizeof(TS)), (int64_t) (stats->nb[2]/sizeof(TS)),
             scale);

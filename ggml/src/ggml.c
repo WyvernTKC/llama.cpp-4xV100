@@ -6784,6 +6784,7 @@ struct ggml_tensor * ggml_page_top_k(
     ggml_set_op_params_f32(result, 0, scale);
     ggml_set_op_params_i32(result, 1, n_top);
     ggml_set_op_params_i32(result, 2, 0);
+    ggml_set_op_params_i32(result, 3, GGML_PAGE_SCORE_QUEST);
 
     result->op     = GGML_OP_PAGE_TOP_K;
     result->src[0] = q;
@@ -6809,6 +6810,7 @@ struct ggml_tensor * ggml_page_top_k_chunks(
     ggml_set_op_params_f32(result, 0, scale);
     ggml_set_op_params_i32(result, 1, n_top);
     ggml_set_op_params_i32(result, 2, 1);
+    ggml_set_op_params_i32(result, 3, GGML_PAGE_SCORE_QUEST);
 
     result->op     = GGML_OP_PAGE_TOP_K;
     result->src[0] = q;
@@ -6817,6 +6819,14 @@ struct ggml_tensor * ggml_page_top_k_chunks(
     result->src[3] = extra;
 
     return result;
+}
+
+void ggml_page_top_k_set_score(
+        struct ggml_tensor  * a,
+        enum ggml_page_score  score) {
+    GGML_ASSERT(a->op == GGML_OP_PAGE_TOP_K);
+    GGML_ASSERT(score == GGML_PAGE_SCORE_QUEST || score == GGML_PAGE_SCORE_MV);
+    ggml_set_op_params_i32(a, 3, (int32_t) score);
 }
 
 // ggml_page_stats
