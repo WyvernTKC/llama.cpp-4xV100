@@ -450,6 +450,10 @@ void llama_kv_cache::clear(bool data) {
         v_heads[s] = 0;
     }
 
+    // an empty cache: every page gets its statistics again as it fills
+    sp_ordered = n_stream == 1;
+    sp_dirty   = false;
+
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
@@ -570,6 +574,8 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
             }
         }
 
+        sparse_rescan();
+
         return;
     }
 
@@ -617,6 +623,8 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 
     v_heads[s1] = v_heads[s0];
 
+    sparse_rescan();
+
     //for (uint32_t s = 0; s < n_stream; ++s) {
     //    LLAMA_LOG_WARN("%s: seq %d: min = %d, max = %d\n", __func__, s, v_cells[s].seq_pos_min(s), v_cells[s].seq_pos_max(s));
     //}
@@ -647,6 +655,8 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     if (new_head != cells.size() && new_head < head) {
         head = new_head;
     }
+
+    sparse_rescan();
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
@@ -697,6 +707,10 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     // If we freed up a slot, set head to it so searching can start there.
     // Otherwise we just start the next search from the beginning.
     head = new_head != cells.size() ? new_head : 0;
+
+    // the keys are rotated by the K-shift: page statistics of every page again
+    sp_dirty = true;
+    sparse_rescan();
 }
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
@@ -736,6 +750,52 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
             cells.pos_div(i, d);
         }
     }
+
+    sp_dirty = true;
+    sparse_rescan();
+}
+
+void llama_kv_cache::sparse_rescan() {
+    sp_ordered = n_stream == 1;
+    if (!sp_ordered) {
+        return;
+    }
+    const auto & cells = v_cells[0];
+    llama_pos last = -1;
+    const uint32_t i_end = cells.used_max_p1();
+    for (uint32_t i = cells.used_min(); i < i_end && sp_ordered; ++i) {
+        if (cells.is_empty(i)) {
+            continue;
+        }
+        const llama_pos p = cells.pos_get(i);
+        sp_ordered = cells.seq_count(i) == 1 && cells.seq_has(i, 0) && p >= last;
+        last = p;
+    }
+    // no graph keeps the page statistics of an unordered cache
+    sp_dirty = sp_dirty || !sp_ordered;
+}
+
+void llama_kv_cache::sparse_track(const slot_info & sinfo, const llama_ubatch & ubatch) {
+    if (!sp_ordered) {
+        return;
+    }
+    if (n_stream != 1 || sinfo.n_stream() != 1 || ubatch.n_tokens != sinfo.size()) {
+        sp_ordered = false;
+        sp_dirty   = true;
+        return;
+    }
+    // the ubatch extends sequence 0 behind its last cell, in position order (equal positions: an M-RoPE image)
+    const auto & cells = v_cells[sinfo.strm[0]];
+    uint32_t  next = cells.used_max_p1();
+    llama_pos last = next > 0 ? cells.pos_get(next - 1) : -1;
+    for (uint32_t i = 0; i < ubatch.n_tokens && sp_ordered; ++i) {
+        const uint32_t idx = sinfo.idxs[0][i];
+        sp_ordered = idx >= next && ubatch.n_seq_id[i] == 1 && ubatch.seq_id[i][0] == 0 && ubatch.pos[i] >= last;
+        next = idx + 1;
+        last = ubatch.pos[i];
+    }
+    // no graph keeps the page statistics of an unordered cache
+    sp_dirty = sp_dirty || !sp_ordered;
 }
 
 llama_pos llama_kv_cache::seq_pos_min(llama_seq_id seq_id) const {
@@ -1498,6 +1558,10 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
 ggml_tensor * llama_kv_cache::get_ps(int32_t il) const {
     return layers[map_layer_ids.at(il)].ps;
+}
+
+bool llama_kv_cache::sparse_has_stats() const {
+    return std::any_of(layers.begin(), layers.end(), [](const kv_layer & l) { return l.ps != nullptr; });
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -3014,6 +3078,10 @@ const slot_info_vec_t *   sinfos_in) {
             (*sinfos_out)[s] = sinfo;
         }
     }
+
+    // the restored cells were not seen by the graphs that keep the page statistics
+    sp_dirty = true;
+    sparse_rescan();
 }
 
 void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const {
@@ -3707,6 +3775,8 @@ bool llama_kv_cache_context::apply() {
         return true;
     }
 
+    // here and not in apply_ubatch, which prepare() also calls to try the placement
+    kv->sparse_track(sinfos[i_cur], ubatches[i_cur]);
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv_used = kv->get_n_kv(sinfos[i_cur], ubatches[i_cur].n_tokens);
     n_kv      = kv->get_n_kv_graph(ubatches[i_cur].n_tokens, n_kv_used);
@@ -3782,6 +3852,32 @@ ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) cons
 
 ggml_tensor * llama_kv_cache_context::get_ps(int32_t il) const {
     return kv->get_ps(il);
+}
+
+bool llama_kv_cache_context::sparse_has_stats() const {
+    return kv->sparse_has_stats();
+}
+
+bool llama_kv_cache_context::sparse_ordered() const {
+    return kv->sparse_ordered();
+}
+
+bool llama_kv_cache_context::sparse_dirty() const {
+    return kv->sparse_dirty();
+}
+
+void llama_kv_cache_context::sparse_refreshed() const {
+    kv->sparse_set_dirty(false);
+}
+
+void llama_kv_cache_context::sparse_stale() const {
+    kv->sparse_set_dirty(true);
+}
+
+std::pair<uint32_t, uint32_t> llama_kv_cache_context::sparse_cells() const {
+    const auto & idxs = sinfos[i_cur].idxs[0];
+    GGML_ASSERT(!idxs.empty());
+    return { *std::min_element(idxs.begin(), idxs.end()), *std::max_element(idxs.begin(), idxs.end()) + 1 };
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {

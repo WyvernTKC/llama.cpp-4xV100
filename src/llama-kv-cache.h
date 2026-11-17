@@ -224,6 +224,16 @@ public:
     // page statistics of layer il, nullptr when not allocated
     ggml_tensor * get_ps(int32_t il) const;
 
+    // page-sparse decode indexes pages by cell, so it needs the used cells to hold sequence 0 alone in position order
+    //   (appended by ubatches, removed from the tail); sparse_track checks a ubatch before it is applied, the other
+    //   changes rescan. dirty: the page statistics no longer match the keys (a state read, a shift), every page has
+    //   to be refreshed before a page is picked again
+    bool sparse_has_stats() const;
+    bool sparse_ordered() const { return sp_ordered; }
+    bool sparse_dirty()   const { return sp_dirty; }
+    void sparse_set_dirty(bool dirty) { sp_dirty = dirty; }
+    void sparse_track(const slot_info & sinfo, const llama_ubatch & ubatch);
+
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
@@ -317,6 +327,11 @@ private:
 
     bool     graph_reshape = false;
     uint32_t n_kv_cur      = 0;
+
+    // page-sparse decode, see sparse_ordered()
+    bool sp_ordered = true;
+    bool sp_dirty   = false;
+    void sparse_rescan();
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
@@ -474,6 +489,16 @@ public:
 
     // page statistics of layer il, nullptr when not allocated
     ggml_tensor * get_ps(int32_t il) const;
+
+    // page-sparse decode, see llama_kv_cache::sparse_ordered(); refreshed/stale: the graph being set up refreshes
+    //   every page / could not refresh the pages of its cells
+    bool sparse_has_stats() const;
+    bool sparse_ordered() const;
+    bool sparse_dirty() const;
+    void sparse_refreshed() const;
+    void sparse_stale() const;
+    // the first cell of the current ubatch and one past its last
+    std::pair<uint32_t, uint32_t> sparse_cells() const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory

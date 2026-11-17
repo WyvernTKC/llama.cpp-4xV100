@@ -3320,6 +3320,14 @@ int ggml_backend_sched_reshape(ggml_backend_sched_t sched, int n, struct ggml_te
                 }
                 readers.push_back(node);
             } break;
+            case GGML_OP_PAGE_STATS: {
+                // refreshes the pages it is given from the k view in place: its output (the statistics cache) keeps its
+                //   shape, the pages lie inside the n_kv of the ubatch
+                if (node->src[0] == nullptr || !fresh.count(node->src[0]) || fresh.count(node->src[1])) {
+                    return 0;
+                }
+                readers.push_back(node);
+            } break;
             default:
                 return 0;
         }

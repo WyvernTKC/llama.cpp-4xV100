@@ -1558,7 +1558,10 @@ void launch_fattn(
         const int n_lists  = Q->ne[2]*Q->ne[3];
         const int n_chunks = K->ne[1]/FATTN_PAGED_CHUNK;
         if (chunk_list) {
-            GGML_ASSERT(chunk_list->ne[0] == n_chunks + 1 && chunk_list->ne[1] == Q->ne[2] && chunk_list->ne[2] == Q->ne[3]);
+            // a graph shrunk in place to the n_kv of the ubatch (ggml_backend_sched_reshape) keeps the lists it was built
+            //   with: rows of more chunks than the cache view has, whose entries lie inside it
+            GGML_ASSERT(chunk_list->ne[0] >= n_chunks + 1 && chunk_list->ne[1] == Q->ne[2] && chunk_list->ne[2] == Q->ne[3]);
+            GGML_ASSERT(ggml_is_contiguous(chunk_list));
         } else {
             KV_max.alloc(size_t(n_lists)*(n_chunks + 1));
 
@@ -1834,7 +1837,8 @@ void launch_fattn(
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
-        K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
+        // paged: ne11 is only the row length of the chunk lists (ncols1 == 1, the mask is read on row 0)
+        K->ne[0], chunk_list ? (int64_t) (chunk_list->ne[0] - 1)*FATTN_PAGED_CHUNK : n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0

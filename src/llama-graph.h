@@ -403,8 +403,9 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     // page-sparse decode (LLAMA_SPARSE_DECODE): its inputs, and whether the graph was built for the current settings
+    //   and the state of the cache of mctx_new
     void set_input_sparse(const llama_ubatch * ubatch);
-    bool can_reuse_sparse() const;
+    bool can_reuse_sparse(const llama_kv_cache_context * mctx_new) const;
 
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
@@ -422,10 +423,11 @@ public:
     ggml_tensor * sp_chunks_ex = nullptr; // I32 [8] FUSED=3: the 32-cell chunks of page 0 and the window, ascending, -1 padded
     ggml_tensor * sp_upd       = nullptr; // I32 [n_batch/64 + 2] pages whose statistics are refreshed
     ggml_tensor * sp_upd64     = nullptr; // I64 same
-    int64_t       sp_checked   = -1; // cache size whose mask was last checked cell by cell
     int           sp_budget    = 0;
     int           sp_score     = 0;
-    int           sp_fused     = 1;
+    int           sp_fused     = 3;
+    bool          sp_ordered   = false; // built for a cache with page statistics and its cells in order
+    bool          sp_full      = false; // sp_upd lists every page (the statistics were stale)
 
     // note: assumes v_rot^2 == I
     std::vector<ggml_tensor *> self_k_rot;

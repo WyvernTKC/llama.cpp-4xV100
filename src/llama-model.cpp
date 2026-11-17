@@ -451,6 +451,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_qkv_bias        ("blk\\.\\d*\\.attn_qkv.bias");
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
     static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
+    static const std::regex pattern_ps_cache        ("cache_ps_l\\d*"); // page statistics [4*d, n_head_kv, n_page] of page-sparse decode
     static const std::regex pattern_idx_cache       ("cache_idx_(k|v|p|r|c)_l\\d*");
     static const std::regex pattern_dsv4_state      ("dsv4_(csa|hca|lid)_state_(kv|score)_l\\d*");
     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
@@ -746,6 +747,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         //   hparams to split by and are small, so replicate them
         if (tensor_name.compare(0, 4, "blk.") == 0 && std::stoul(tensor_name.substr(4)) >= hparams.n_layer_all) {
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, 0, 0};
+        }
+        // page statistics of page-sparse decode [4*d, n_head_kv, n_page] go with the K cache: split by kv head where
+        //   it is split by head, mirrored where it is mirrored
+        if (std::regex_match(tensor_name, pattern_ps_cache)) {
+            if (is_dsv4 || is_glm5_next || hparams.is_mla() || in_mqa_layer()) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
         }
         if (is_dsv4) {
             if (std::regex_match(tensor_name, pattern_kv_cache) ||
@@ -1546,6 +1555,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
 
             const int64_t granularity_kv = granularity_q / n_gqa;
+            // page statistics: one row per kv head, the same heads as the K cache
+            if (std::regex_match(tensor_name, pattern_ps_cache)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {granularity_kv / hparams.n_embd_head_k(il)};
+            }
             // MiniMax-M3 indexer queries: one head per kv head, so the same heads as attn_k
             if (std::regex_match(tensor_name, pattern_idx_q_weight)) {
                 GGML_ASSERT(segments.size() == 1);

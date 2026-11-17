@@ -123,6 +123,10 @@ int main(int argc, char ** argv) {
     std::string gen_path;
     std::map<std::string, std::string> save_paths;
     ggml_type type_kv = GGML_TYPE_F16;
+    llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER;
+    // after saving a book's prefix state, prefill the next book over it: the restores then load a state whose page
+    //   statistics the cache does not hold (they must be recomputed, as after a prompt cache hit in the server)
+    bool restore_other = false;
     int T       = 8192;
     int n_books = 1;
     int n_tail  = 256;
@@ -143,6 +147,7 @@ int main(int argc, char ** argv) {
         else if (a == "--dump-configs") { dump_cfgs = next(); }
         else if (a == "--ref-logits") { ref_path = next(); }
         else if (a == "--ret") { ret_path = next(); }
+        else if (a == "--restore-other") { restore_other = true; }
         else if (a == "--gen") { gen_path = next(); }
         else if (a == "--kv-type") {
             const std::string t = next();
@@ -151,6 +156,13 @@ int main(int argc, char ** argv) {
             else { fprintf(stderr, "unsupported --kv-type %s\n", t.c_str()); return 1; }
         }
         else if (a == "--save-logits") { auto p = split(next(), '='); save_paths[p[0]] = p[1]; }
+        else if (a == "-sm") {
+            const std::string m = next();
+            if (m == "layer") split_mode = LLAMA_SPLIT_MODE_LAYER;
+            else if (m == "tensor") split_mode = LLAMA_SPLIT_MODE_TENSOR;
+            else if (m == "none") split_mode = LLAMA_SPLIT_MODE_NONE;
+            else { fprintf(stderr, "unsupported -sm %s\n", m.c_str()); return 1; }
+        }
         else { fprintf(stderr, "unknown arg %s\n", a.c_str()); return 1; }
     }
 
@@ -251,7 +263,8 @@ int main(int argc, char ** argv) {
     llama_backend_init();
 
     llama_model_params mp = llama_model_default_params();
-    mp.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;
+    mp.load_mode  = LLAMA_LOAD_MODE_DIRECT_IO;
+    mp.split_mode = split_mode;
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mp);
     if (!model) { fprintf(stderr, "failed to load model\n"); return 1; }
     const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -462,6 +475,21 @@ int main(int argc, char ** argv) {
             state.resize(llama_state_seq_get_size(ctx, 0));
             state.resize(llama_state_seq_get_data(ctx, state.data(), state.size(), 0));
             fprintf(stderr, "book %d: saved the prefix state, %.1f MiB\n", b, state.size()/1048576.0);
+        }
+        if (restore && restore_other && n_books > 1) {
+            const int32_t * other = all.data() + (size_t) ((b + 1) % n_books)*book_len;
+            llama_memory_clear(mem, true);
+            for (int i = 0; i < P; i += cp.n_batch) {
+                const int n = std::min<int>(cp.n_batch, P - i);
+                llama_batch_ext_clear(batch);
+                for (int j = 0; j < n; ++j) {
+                    const int32_t idx = llama_batch_ext_add_token(batch, 0, other[i + j]);
+                    const llama_pos pos = i + j;
+                    llama_batch_ext_set_pos(batch, idx, &pos);
+                }
+                if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch)) { fprintf(stderr, "prefill failed\n"); return 1; }
+            }
+            fprintf(stderr, "book %d: prefilled book %d over it\n", b, (b + 1) % n_books);
         }
         if (fref) {
             for (int s = 0; s < n_tail; ++s) {

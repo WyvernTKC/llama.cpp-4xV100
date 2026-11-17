@@ -946,10 +946,12 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 //   LLAMA_SPARSE_DECODE=<B>             single-token decode attends to about B cells: page 0, the recent window
 //                                       and the top (B - 80)/64 pages of 64 cells per KV head
 //   LLAMA_SPARSE_DECODE_MIN_CTX=<n>     only caches of at least n cells use it (default 32768, below it dense is faster)
-//   LLAMA_SPARSE_DECODE_SCORE=quest|mv  page score (default quest; mean also exists, always unfused)
-//   LLAMA_SPARSE_DECODE_FUSED=0|1|2|3   quest or mv with cached statistics: 1 (default) selects with ggml_page_top_k, 0 with the unfused
-//                                       chain of ops, 2 with ggml_page_top_k and also computes the unfused picks as sp_picks_ref (debug),
-//                                       3 with ggml_page_top_k_chunks: flash attention gathers the listed chunks, no per-head mask
+//   LLAMA_SPARSE_DECODE_SCORE=mv|quest  page score (default mv; mean also exists, always unfused)
+//   LLAMA_SPARSE_DECODE_FUSED=0|1|2|3   quest or mv with cached statistics: 3 (default) with ggml_page_top_k_chunks, flash attention
+//                                       gathers the listed chunks, no per-head mask; 1 selects with ggml_page_top_k and masks per head,
+//                                       0 with the unfused chain of ops, 2 as 1 and also computes the unfused picks as sp_picks_ref (debug)
+// Pages are runs of 64 cells, so the cache has to keep its cells in order: one sequence appended by ubatches (see
+//   llama_kv_cache::sparse_ordered), else decode is dense. Under -sm tensor only FUSED=3 with mv or quest has split rules.
 static int llama_sparse_pages_budget() {
     const char * e = getenv("LLAMA_SPARSE_DECODE");
     const int b = e ? atoi(e) : 0;
@@ -964,18 +966,18 @@ static int64_t llama_sparse_pages_min_ctx() {
 
 static int llama_sparse_pages_fused() {
     const char * e = getenv("LLAMA_SPARSE_DECODE_FUSED");
-    const int f = e ? atoi(e) : 1;
+    const int f = e ? atoi(e) : 3;
     GGML_ASSERT(f >= 0 && f <= 3 && "LLAMA_SPARSE_DECODE_FUSED must be 0, 1, 2 or 3");
     return f;
 }
 
 static int llama_sparse_pages_score() {
     const char * e = getenv("LLAMA_SPARSE_DECODE_SCORE");
-    if (!e || strcmp(e, "quest") == 0) {
-        return 1;
-    }
-    if (strcmp(e, "mv") == 0) {
+    if (!e || strcmp(e, "mv") == 0) {
         return 0;
+    }
+    if (strcmp(e, "quest") == 0) {
+        return 1;
     }
     if (strcmp(e, "mean") == 0) {
         return 2;
@@ -983,22 +985,14 @@ static int llama_sparse_pages_score() {
     GGML_ABORT("LLAMA_SPARSE_DECODE_SCORE must be mv, quest or mean");
 }
 
-// the page rule indexes cells by position: cell c of the first mask row must be visible exactly when c <= pos.
-// Checked cell by cell when the cache size changes, else at the edges and around pos (the scan cost about 0.1 ms per token).
-static void llama_sparse_check_mask(const ggml_tensor * mask, int64_t pos, int64_t & checked) {
-    const ggml_fp16_t * m    = (const ggml_fp16_t *) mask->data;
-    const int64_t       n_kv = mask->ne[0];
-    auto ok = [&](int64_t c) { return c < 0 || c >= n_kv || (ggml_fp16_to_fp32(m[c]) != -INFINITY) == (c <= pos); };
-    bool good = ok(0) && ok(pos - 1) && ok(pos) && ok(pos + 1) && ok(n_kv - 1);
-    if (good && checked != n_kv) {
-        for (int64_t c = 0; c < n_kv && good; ++c) {
-            good = ok(c);
-        }
-        checked = n_kv;
-    }
-    if (!good) {
-        GGML_ABORT("LLAMA_SPARSE_DECODE needs one sequence whose cell index equals its position");
-    }
+// the cache keeps page statistics and its cells in order: pages can be refreshed and picked
+static bool llama_sparse_ordered(const llama_kv_cache_context * mctx) {
+    return mctx->sparse_has_stats() && mctx->sparse_ordered();
+}
+
+// the statistics no longer match the keys (a state read, a shift): the graph refreshes every page
+static bool llama_sparse_full_refresh(const llama_kv_cache_context * mctx) {
+    return llama_sparse_ordered(mctx) && mctx->sparse_dirty();
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
@@ -1019,25 +1013,32 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
 
 // page-sparse decode inputs; also called by the hybrid memory inputs, which fill the mask themselves
 void llm_graph_input_attn_kv::set_input_sparse(const llama_ubatch * ubatch) {
+    // pages are indexed by cell (graphs with these inputs exist only while the cache keeps its cells in order)
     if (sp_upd && sp_upd->buffer) {
-        // pages completed by this ubatch, and the page that becomes eligible at its last position
-        const int64_t c0 = ubatch->pos[0];
-        const int64_t c1 = ubatch->pos[ubatch->n_tokens - 1] + 1;
-        GGML_ASSERT(c1 - c0 == ubatch->n_tokens);
-        // a long ubatch may build its mask on the device from the positions (ggml_kq_mask): nothing to check on the host
-        if (self_attn_mask.raw->buffer && ggml_backend_buffer_is_host(self_attn_mask.raw->buffer)) {
-            GGML_ASSERT(self_attn_mask.raw->type == GGML_TYPE_F16);
-            llama_sparse_check_mask(self_attn_mask.raw, c0, sp_checked);
-        }
+        const int64_t n_upd = sp_upd->ne[0];
         std::vector<int32_t> pages;
-        for (int64_t p = std::max<int64_t>(0, (c0 + 63)/64 - 1); 64*p + 63 < c1; ++p) {
-            if (64*p + 63 >= c0) {
+        if (sp_full) {
+            // every page up to the last cell of this ubatch (the graph may be built for more cells than are used)
+            const int64_t n_used = std::min<int64_t>(n_upd, ((int64_t) mctx->sparse_cells().second + 63)/64);
+            for (int64_t p = 0; p < n_used; ++p) {
                 pages.push_back((int32_t) p);
             }
+            mctx->sparse_refreshed();
+        } else {
+            // pages completed by this ubatch, and the page that becomes eligible at its last cell
+            const auto [c0, c1] = mctx->sparse_cells();
+            for (int64_t p = std::max<int64_t>(0, ((int64_t) c0 + 63)/64 - 1); 64*p + 63 < c1; ++p) {
+                if (64*p + 63 >= c0) {
+                    pages.push_back((int32_t) p);
+                }
+            }
+            pages.push_back((int32_t) std::max<int64_t>(0, ((int64_t) c1 - 1 - 63)/64 - 1));
+            if ((int64_t) pages.size() > n_upd) {
+                // cells spread wider than the ubatch: the next graph refreshes them all
+                mctx->sparse_stale();
+                pages.resize(n_upd);
+            }
         }
-        pages.push_back((int32_t) std::max<int64_t>(0, (c1 - 1 - 63)/64 - 1));
-        const int64_t n_upd = sp_upd->ne[0];
-        GGML_ASSERT((int64_t) pages.size() <= n_upd);
         pages.resize(n_upd, pages.back());
         std::vector<int64_t> pages64(pages.begin(), pages.end());
         ggml_backend_tensor_set(sp_upd,   pages.data(),   0, ggml_nbytes(sp_upd));
@@ -1048,17 +1049,8 @@ void llm_graph_input_attn_kv::set_input_sparse(const llama_ubatch * ubatch) {
 
     if (sp_page_mask && sp_page_mask->buffer) {
         GGML_ASSERT(ubatch->n_tokens == 1);
-        const int64_t pos  = ubatch->pos[0];
-        const int64_t n_kv = self_attn_mask.raw->ne[0];
-
-        // the page rule indexes cells by position: check that cell c is visible exactly when c <= pos
-        // TODO: this tree uploads the mask from a staging copy, so the mask is not always in a host buffer; the check
-        //       is skipped then (one sequence filled from an empty cache keeps cell == pos)
-        GGML_ASSERT(self_attn_mask.raw->type == GGML_TYPE_F16);
-        if (ggml_backend_buffer_is_host(self_attn_mask.raw->buffer)) {
-            llama_sparse_check_mask(self_attn_mask.raw, pos, sp_checked);
-        }
-        GGML_UNUSED(n_kv);
+        // the cell of the token: everything after it is empty, everything before it older
+        const int64_t pos = mctx->sparse_cells().first;
 
         const int64_t n_page  = sp_page_mask->ne[0];
         const int64_t win_blk = std::max<int64_t>(0, (pos - 63)/64);
@@ -1107,8 +1099,9 @@ void llm_graph_input_attn_kv::set_input_sparse(const llama_ubatch * ubatch) {
     }
 }
 
-bool llm_graph_input_attn_kv::can_reuse_sparse() const {
-    return sp_budget == llama_sparse_pages_budget() && sp_score == llama_sparse_pages_score() && sp_fused == llama_sparse_pages_fused();
+bool llm_graph_input_attn_kv::can_reuse_sparse(const llama_kv_cache_context * mctx_new) const {
+    return sp_budget == llama_sparse_pages_budget() && sp_score == llama_sparse_pages_score() && sp_fused == llama_sparse_pages_fused() &&
+        sp_ordered == llama_sparse_ordered(mctx_new) && sp_full == llama_sparse_full_refresh(mctx_new);
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -1127,7 +1120,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
         res &= can_reuse_attn_mask(self_attn_mask, mctx, params.ubatch, params.cparams);
     }
 
-    res &= can_reuse_sparse();
+    res &= can_reuse_sparse(mctx);
 
     return res;
 }
@@ -1700,7 +1693,10 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_attn_mask_any(inp_attn->self_attn_mask, mctx->get_attn(), inp_attn->hparams, params, /*with_rows =*/ true);
 
-    res &= inp_attn->can_reuse_sparse();
+    // the sparse inputs read the cells of the current ubatch through it
+    inp_attn->mctx = mctx->get_attn();
+
+    res &= inp_attn->can_reuse_sparse(mctx->get_attn());
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -3870,17 +3866,24 @@ ggml_tensor * llm_graph_context::build_attn(
     int64_t       n_kv_max   = 0;
     ggml_tensor * chunk_list = nullptr;
 
-    inp->sp_budget = llama_sparse_pages_budget();
-    inp->sp_score  = llama_sparse_pages_score();
-    inp->sp_fused  = llama_sparse_pages_fused();
+    inp->sp_budget  = llama_sparse_pages_budget();
+    inp->sp_score   = llama_sparse_pages_score();
+    inp->sp_fused   = llama_sparse_pages_fused();
+    inp->sp_ordered = llama_sparse_ordered(mctx_cur);
+    inp->sp_full    = llama_sparse_full_refresh(mctx_cur);
 
+    // -sm tensor: only the fused page ops (and the paged flash attention) have split rules
+    const bool k_paged  = k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0;
+    const bool sp_split = !cparams.split_tensor || (inp->sp_fused == 3 && inp->sp_score != 2 && k_paged);
+
+    // the page statistics follow the cache only while its cells are in order (else it is marked to refresh them all)
     ggml_tensor * ps = nullptr;
-    if (mctx_cur->get_ps(il) && !cparams.training && k->ne[3] == 1 && k->ne[2] % 64 == 0) {
+    if (inp->sp_ordered && sp_split && !cparams.training && k->ne[3] == 1 && k->ne[2] % 64 == 0) {
         ps = build_page_stats(inp, k, mctx_cur->get_ps(il), il);
     }
 
     // page-sparse decode: one token, flash attention, f16 mask, one stream, cache length a multiple of the page size
-    if (inp->sp_budget > 0 && !kv_rows && cparams.flash_attn && !cparams.training && q->ne[2] == 1 && mask->type == GGML_TYPE_F16 &&
+    if (inp->sp_budget > 0 && ps && !kv_rows && cparams.flash_attn && !cparams.training && q->ne[2] == 1 && mask->type == GGML_TYPE_F16 &&
             k->ne[3] == 1 && k->ne[2] % 64 == 0 && k->ne[2] >= llama_sparse_pages_min_ctx()) {
         std::tie(mask, n_kv_max) = build_sparse_pages(inp, q, k, mask, ps, kq_scale, il, &chunk_list);
     }
@@ -4012,11 +4015,14 @@ ggml_tensor * llm_graph_context::build_page_stats(
     const int64_t n_kv   = k->ne[2];
 
     if (!inp->sp_upd) {
-        inp->sp_upd = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens/64 + 2);
+        // after a state read or a shift every page of the cache, else the pages the ubatch completes
+        const int64_t n_upd_max = inp->sp_full ? n_kv/64 : n_tokens/64 + 2;
+
+        inp->sp_upd = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_upd_max);
         ggml_set_input(inp->sp_upd);
         ggml_set_name(inp->sp_upd, "sp_upd");
 
-        inp->sp_upd64 = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tokens/64 + 2);
+        inp->sp_upd64 = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_upd_max);
         ggml_set_input(inp->sp_upd64);
         ggml_set_name(inp->sp_upd64, "sp_upd64");
     }
