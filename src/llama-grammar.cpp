@@ -597,6 +597,8 @@ size_t llama_grammar_trigger_pattern::find(const std::string & input, size_t fro
         if (std::regex_match(input, match, regex)) {
             return find_start_pos(match);
         }
+        // some regex implementations match ^/$ at line breaks
+        return std::string::npos;
     }
 
     if (first_known) {

@@ -25,6 +25,12 @@ void llama_model_minimax_m3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,    hparams.indexer_block_size);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS,  hparams.indexer_local_blocks);
 
+    // BC for MiniMax-M3 GGUFs without indexer_types metadata: leading dense layers have no indexer
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        hparams.is_indexer_full_impl[il] = il >= hparams.n_layer_dense_lead;
+    }
+    ml.get_key_or_arr(LLM_KV_ATTENTION_INDEXER_TYPES, hparams.is_indexer_full_impl, hparams.n_layer(), false);
+
     msa_p = {
         /*.blk          =*/ (int) hparams.indexer_block_size,
         /*.topk_blocks  =*/ (int) hparams.indexer_top_k,
@@ -83,14 +89,18 @@ void llama_model_minimax_m3::load_arch_tensors(llama_model_loader &) {
         }
 
         // indexer: a layer is sparse (MSA) iff it has one. M3 keeps its leading dense layers on full
-        // attention and ships no indexer there, M3.1 (sparse_attention_freq all 1) has one in every layer
-        const int idx_flags = i < (int) hparams.n_layer_dense_lead ? TENSOR_NOT_REQUIRED : 0;
+        // attention and ships no indexer there, M3.1 (sparse_attention_freq all 1) has one in every layer.
+        // indexer.types (#32301) only says which layers must have one: the M3.1 GGUFs converted before it carry
+        // no such key, so the default (leading dense layers without) would reject their 12 leading indexer tensors
+        const int idx_flags = hparams.is_indexer_full(i) ? 0 : TENSOR_NOT_REQUIRED;
         layer.index_q_proj = create_tensor(tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", i), {n_embd, hparams.indexer_n_head * hparams.indexer_head_size}, idx_flags);
         layer.index_k_proj = create_tensor(tn(LLM_TENSOR_INDEXER_K_PROJ, "weight", i), {n_embd, hparams.indexer_head_size}, idx_flags);
         layer.index_q_norm = create_tensor(tn(LLM_TENSOR_INDEXER_Q_NORM, "weight", i), {hparams.indexer_head_size}, idx_flags);
         layer.index_k_norm = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM, "weight", i), {hparams.indexer_head_size}, idx_flags);
         GGML_ASSERT((layer.index_q_proj && layer.index_k_proj && layer.index_q_norm && layer.index_k_norm) ||
                     (!layer.index_q_proj && !layer.index_k_proj && !layer.index_q_norm && !layer.index_k_norm));
+        // the tensors decide: keep is_indexer_full in step with them for the saver and any upstream reader
+        hparams.is_indexer_full_impl[i] = layer.index_q_proj != nullptr;
     }
 }
 
@@ -296,7 +306,11 @@ llama_model_minimax_m3::graph::graph(const llm_graph_params & params) : llm_grap
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    const bool extract_last = (size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer];
+
     for (int il = 0; il < n_layer; ++il) {
+        res->t_layer_inp[il] = inpL;
+
         ggml_tensor * inpSA = inpL;
 
         // self-attention
@@ -538,7 +552,7 @@ llama_model_minimax_m3::graph::graph(const llm_graph_params & params) : llm_grap
             }
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_layer - 1 && inp_out_ids && !extract_last) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -596,6 +610,13 @@ llama_model_minimax_m3::graph::graph(const llm_graph_params & params) : llm_grap
 
         // input for next layer
         inpL = cur;
+    }
+
+    if (extract_last) {
+        res->t_layer_inp[n_layer] = inpL;
+        if (inp_out_ids) {
+            inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
+        }
     }
 
     cur = inpL;

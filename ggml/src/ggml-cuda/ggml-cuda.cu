@@ -3044,7 +3044,8 @@ static bool ggml_cuda_glu_with_f16_copy(ggml_backend_cuda_context & ctx, const g
 //   down at 1/8 tokens 123/711 -> 7.7/203 us). GGML_CUDA_NO_MMID_MMVF=1 restores that on Volta.
 static bool ggml_cuda_mul_mat_id_use_mmvf(const ggml_tensor * src0, const int64_t ne2, const int cc) {
     if (GGML_CUDA_CC_IS_AMD(cc)) {
-        return true;
+        // MMVF reads src0 in pairs of values, so it needs an even number of columns (#32385)
+        return src0->ne[0] % 2 == 0;
     }
     static const bool disabled = getenv("GGML_CUDA_NO_MMID_MMVF") != nullptr;
     const bool is_volta = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA && cc < GGML_CUDA_CC_TURING;
