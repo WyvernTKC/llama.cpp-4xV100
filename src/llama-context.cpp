@@ -353,6 +353,7 @@ llama_context::llama_context(
     // not under -sm tensor: the indexer may score a slice of the tokens per device, ggml_top_k_mask needs them all
     cparams.fused_top_k_mask = model.split_mode() != LLAMA_SPLIT_MODE_TENSOR;
     cparams.auto_ftkm        = cparams.fused_top_k_mask && hparams.indexer_top_k > 0;
+    cparams.split_tensor     = model.split_mode() == LLAMA_SPLIT_MODE_TENSOR;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -479,6 +480,21 @@ llama_context::llama_context(
         gf_res_reserve = std::make_unique<llm_graph_result>(max_nodes);
         for (auto & res : gf_res_prev) {
             res = std::make_unique<llm_graph_result>(max_nodes);
+        }
+    }
+
+    // page-sparse decode is only implemented and tested on CUDA, with all layers and the KV cache on the GPU
+    if (const char * e = getenv("LLAMA_SPARSE_DECODE"); e && atoi(e) > 0 && !hparams.vocab_only) {
+        const bool all_cuda = !model.devices.empty() && std::all_of(model.devices.begin(), model.devices.end(), [&](const llama_device & d) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(d.dev);
+            // the meta device of -sm tensor has no registry of its own, it splits over the GPUs
+            if (reg == nullptr) {
+                return model.split_mode() == LLAMA_SPLIT_MODE_TENSOR;
+            }
+            return strcmp(ggml_backend_reg_name(reg), "CUDA") == 0;
+        });
+        if (!all_cuda || !cparams.offload_kqv || model.n_gpu_layers() <= model.hparams.n_layer_all) {
+            throw std::runtime_error("LLAMA_SPARSE_DECODE needs all layers and the KV cache on CUDA devices (CUDA build, -ngl 99, KV offload on)");
         }
     }
 
@@ -2988,6 +3004,10 @@ uint32_t llama_context::graph_max_nodes() const {
         res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
         for (const auto & lora : model.loras) {
             res += lora->get_n_nodes();
+        }
+        // page-sparse decode adds the page statistics and the page selection to every attention layer
+        if (getenv("LLAMA_SPARSE_DECODE")) {
+            res += 128u*model.hparams.n_layer();
         }
     }
 

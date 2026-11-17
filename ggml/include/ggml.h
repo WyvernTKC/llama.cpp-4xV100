@@ -415,6 +415,8 @@ extern "C" {
         GGML_OP_GET_ROWS_MEAN,
         GGML_OP_KQ_MASK,
         GGML_OP_TOP_K_MASK,
+        GGML_OP_PAGE_TOP_K,
+        GGML_OP_PAGE_STATS,
 
         GGML_OP_UNARY,
 
@@ -2329,11 +2331,23 @@ extern "C" {
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
 
+    // Promise that, in every mask row, each 32-aligned chunk of 32 cells with a finite entry has a finite first entry.
+    // With n_kv_max > 0, backends may then gather whole chunks instead of single cells.
+    GGML_API void ggml_flash_attn_ext_set_mask_chunked(
+            struct ggml_tensor * a,
+            bool                 chunked);
+
     // Use finite mask entries as a sparse K/V set. Set 0 to disable.
     // n_kv_max must bound the number of finite entries in every mask row.
     GGML_API void ggml_flash_attn_ext_set_n_kv_max(
             struct ggml_tensor * a,
             int32_t              n_kv_max);
+
+    // Attend only to the cells of listed chunks of 32 cells; the mask still applies to them. Needs n_kv_max >= 32*n of every row.
+    // list: [n_kv/32 + 1, n_head, n_seq] i32, row = [n, c_0 < c_1 < ... < c_{n-1}] (n_head, n_seq as in q)
+    GGML_API void ggml_flash_attn_ext_set_chunk_list(
+            struct ggml_tensor * a,
+            struct ggml_tensor * list);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
@@ -2590,6 +2604,63 @@ extern "C" {
             struct ggml_tensor  * score,
             struct ggml_tensor  * blocks,
             struct ggml_tensor  * extra);
+
+    // page selection of page-sparse decode (quest score unless ggml_page_top_k_set_score below), one token
+    //
+    // q:     [d, n_head]            f32, head h belongs to the KV head h / (n_head / n_kv_h)
+    // stats: [2d, n_page, n_kv_h]   f16 or f32, the per-channel max (first d) and min (last d) of the keys of each page
+    // pmask: [n_page]               f32, added to every page score (0, or -inf or a large negative value to drop a page)
+    // res:   [n_top, n_head]        i32
+    //
+    // s[h, p]  = sum_j max(scale*q[j, h], 0)*max[j, p] + min(scale*q[j, h], 0)*min[j, p] + pmask[p]
+    // g[k, p]  = max over the heads h of KV head k of (s[h, p] - logsumexp_p s[h, p])
+    // res[:, h] = the n_top pages with the largest g[k, p] of the KV head k of h, ascending; ties go to the lower page
+    //
+    GGML_API struct ggml_tensor * ggml_page_top_k(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * stats,
+            struct ggml_tensor  * pmask,
+            int                   n_top,
+            float                 scale);
+
+    // as ggml_page_top_k, but the result is a chunk list for ggml_flash_attn_ext_set_chunk_list (pages of 64 cells, chunks of 32):
+    // extra: [n_extra] i32, ascending chunk ids kept in every row, -1 entries are skipped, at most 256
+    // res:   [2*n_page + 1, n_head] i32, row h = [n, the ascending union of the chunks 2p, 2p + 1 of the picks p of h and of extra]
+    GGML_API struct ggml_tensor * ggml_page_top_k_chunks(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * stats,
+            struct ggml_tensor  * pmask,
+            struct ggml_tensor  * extra,
+            int                   n_top,
+            float                 scale);
+
+    // the page score of ggml_page_top_k(_chunks), QUEST by default; stats holds two [d] rows per page and KV head:
+    //   GGML_PAGE_SCORE_QUEST: [max, min],  s[h, p] = sum_j max(qs_j, 0)*max[j, p] + min(qs_j, 0)*min[j, p] + pmask[p]
+    //   GGML_PAGE_SCORE_MV:    [mean, var], s[h, p] = sum_j qs_j*mean[j, p] + qs_j^2*var[j, p]/2 + pmask[p]
+    // with qs = scale*q of head h
+    enum ggml_page_score {
+        GGML_PAGE_SCORE_QUEST = 0,
+        GGML_PAGE_SCORE_MV    = 1,
+    };
+
+    GGML_API void ggml_page_top_k_set_score(
+            struct ggml_tensor  * a,
+            enum ggml_page_score  score);
+
+    // refresh the cached statistics of pages of 64 cells (page-sparse decode), in place
+    //
+    // k:   [d, n_kv_h, n_kv]      f32, f16 or q8_0, the K cache
+    // ps:  [4d, n_kv_h, n_page]   f32 or f16, per page and KV head the per-channel [mean, var, max, min] over the page's cells
+    // upd: [n_upd]                i32, the pages to refresh, repeats allowed
+    // res: ps
+    //
+    GGML_API struct ggml_tensor * ggml_page_stats(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * ps,
+            struct ggml_tensor  * upd);
 
     // custom operators
 

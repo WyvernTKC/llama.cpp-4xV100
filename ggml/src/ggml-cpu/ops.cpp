@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <numeric>
 
 // ggml_compute_forward_dup
 
@@ -8983,6 +8984,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
     const ggml_tensor * kv_rows = dst->src[5];
+    const ggml_tensor * chunk_list = dst->src[7];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -9087,6 +9089,11 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         const int32_t * rows = kv_rows ? (const int32_t *) ((const char *) kv_rows->data + iq3*kv_rows->nb[1]) : nullptr;
 
+        // the listed chunks of this head, ascending
+        const int32_t * cl   = chunk_list ? (const int32_t *) ((const char *) chunk_list->data + iq2*chunk_list->nb[1] + iq3*chunk_list->nb[2]) : nullptr;
+        const int32_t * cl_b = cl ? cl + 1 : nullptr;
+        const int32_t * cl_e = cl ? cl + 1 + cl[0] : nullptr;
+
         // online softmax / attention
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
@@ -9094,6 +9101,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
+                continue;
+            }
+            if (cl && !std::binary_search(cl_b, cl_e, (int32_t) (ic/32))) {
                 continue;
             }
 
@@ -9667,7 +9677,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref &&
+        bool use_tiled = !use_ref && !dst->src[7] &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&
@@ -11852,6 +11862,182 @@ void ggml_compute_forward_top_k_mask(
             for (int64_t j = 0; j < n_extra; ++j) {
                 keep(*(const int32_t *) (extra_row + j*extra->nb[0]));
             }
+        }
+    }
+}
+
+// ggml_compute_forward_page_top_k
+
+void ggml_compute_forward_page_top_k(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * stats = dst->src[1];
+    const ggml_tensor * pmask = dst->src[2];
+
+    const float scale = ggml_get_op_params_f32(dst, 0);
+
+    const int64_t d      = q->ne[0];
+    const int64_t n_head = q->ne[1];
+    const int64_t n_page = stats->ne[1];
+    const int64_t n_kv_h = stats->ne[2];
+    const int64_t n_gqa  = n_head/n_kv_h;
+    const int64_t n_top  = ggml_get_op_params_i32(dst, 1);
+    const bool    chunks = ggml_get_op_params_i32(dst, 2) != 0;
+    const bool    mv     = ggml_get_op_params_i32(dst, 3) == GGML_PAGE_SCORE_MV;
+
+    const float * pm = (const float *) pmask->data;
+
+    // chunk lists: the extra chunks, ascending, -1 skipped
+    std::vector<int32_t> extra;
+    if (chunks) {
+        const ggml_tensor * ex = dst->src[3];
+        for (int64_t i = 0; i < ggml_nelements(ex); ++i) {
+            const int32_t c = ((const int32_t *) ex->data)[i];
+            if (c >= 0) {
+                GGML_ASSERT((extra.empty() || c > extra.back()) && c < 2*n_page);
+                extra.push_back(c);
+            }
+        }
+    }
+    std::vector<int32_t> list;
+
+    auto stat = [&](int64_t j, int64_t p, int64_t k) {
+        const char * x = (const char *) stats->data + j*stats->nb[0] + p*stats->nb[1] + k*stats->nb[2];
+        return stats->type == GGML_TYPE_F16 ? GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) x) : *(const float *) x;
+    };
+
+    std::vector<float>   s(n_page);
+    std::vector<float>   g(n_page);
+    std::vector<float>   qs(d);
+    std::vector<int32_t> idx(n_page);
+
+    for (int64_t k = params->ith; k < n_kv_h; k += params->nth) {
+        std::fill(g.begin(), g.end(), -INFINITY);
+        for (int64_t h = k*n_gqa; h < (k + 1)*n_gqa; ++h) {
+            const float * qh = (const float *) ((const char *) q->data + h*q->nb[1]);
+            for (int64_t j = 0; j < d; ++j) {
+                qs[j] = scale*qh[j];
+            }
+            float m = -INFINITY;
+            for (int64_t p = 0; p < n_page; ++p) {
+                float acc = 0.0f;
+                if (mv) {
+                    for (int64_t j = 0; j < d; ++j) {
+                        acc += qs[j]*stat(j, p, k) + 0.5f*qs[j]*qs[j]*stat(d + j, p, k);
+                    }
+                } else {
+                    for (int64_t j = 0; j < d; ++j) {
+                        acc += qs[j] > 0.0f ? qs[j]*stat(j, p, k) : qs[j]*stat(d + j, p, k);
+                    }
+                }
+                s[p] = acc + pm[p];
+                m = std::max(m, s[p]);
+            }
+            float lse = 0.0f;
+            if (m > -INFINITY) {
+                double sum = 0.0;
+                for (int64_t p = 0; p < n_page; ++p) {
+                    sum += expf(s[p] - m);
+                }
+                lse = m + (float) log(sum);
+            }
+            for (int64_t p = 0; p < n_page; ++p) {
+                g[p] = std::max(g[p], s[p] - lse);
+            }
+        }
+
+        std::iota(idx.begin(), idx.end(), 0);
+        std::partial_sort(idx.begin(), idx.begin() + n_top, idx.end(), [&](int32_t a, int32_t b) {
+            return g[a] > g[b] || (g[a] == g[b] && a < b);
+        });
+        std::sort(idx.begin(), idx.begin() + n_top);
+        if (chunks) {
+            list.clear();
+            for (int64_t i = 0; i < n_top; ++i) {
+                list.push_back(2*idx[i]);
+                list.push_back(2*idx[i] + 1);
+            }
+            for (const int32_t c : extra) {
+                if (!std::binary_search(idx.begin(), idx.begin() + n_top, c/2)) {
+                    list.push_back(c);
+                }
+            }
+            std::sort(list.begin(), list.end());
+        }
+        for (int64_t h = k*n_gqa; h < (k + 1)*n_gqa; ++h) {
+            int32_t * out = (int32_t *) ((char *) dst->data + h*dst->nb[1]);
+            if (chunks) {
+                out[0] = (int32_t) list.size();
+                std::copy(list.begin(), list.end(), out + 1);
+                std::fill(out + 1 + list.size(), out + dst->ne[0], -1);
+                continue;
+            }
+            for (int64_t i = 0; i < n_top; ++i) {
+                out[i] = idx[i];
+            }
+        }
+    }
+}
+
+// ggml_compute_forward_page_stats
+
+void ggml_compute_forward_page_stats(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * k   = dst->src[0];
+    const ggml_tensor * upd = dst->src[2];
+
+    const int64_t d      = k->ne[0];
+    const int64_t n_kv_h = k->ne[1];
+    const int64_t n_upd  = ggml_nelements(upd);
+    const int64_t n_page = k->ne[2]/64;
+
+    ggml_to_float_t const to_float = ggml_get_type_traits(k->type)->to_float;
+
+    std::vector<float> x(64*d);
+    std::vector<float> st(4*d);
+
+    for (int64_t i = params->ith; i < n_upd*n_kv_h; i += params->nth) {
+        const int64_t p = ((const int32_t *) upd->data)[i/n_kv_h];
+        const int64_t h = i % n_kv_h;
+        GGML_ASSERT(p >= 0 && p < n_page);
+        for (int64_t c = 0; c < 64; ++c) {
+            const char * row = (const char *) k->data + h*k->nb[1] + (64*p + c)*k->nb[2];
+            if (k->type == GGML_TYPE_F32) { // no to_float for f32 in the type traits
+                memcpy(x.data() + c*d, row, d*sizeof(float));
+            } else {
+                to_float(row, x.data() + c*d, d);
+            }
+        }
+        for (int64_t j = 0; j < d; ++j) {
+            float sum = 0.0f;
+            float mx  = -INFINITY;
+            float mn  =  INFINITY;
+            for (int64_t c = 0; c < 64; ++c) {
+                const float v = x[c*d + j];
+                sum += v;
+                mx = std::max(mx, v);
+                mn = std::min(mn, v);
+            }
+            const float mu = sum/64.0f;
+            float var = 0.0f;
+            for (int64_t c = 0; c < 64; ++c) {
+                const float e = x[c*d + j] - mu;
+                var += e*e;
+            }
+            st[j] = mu;
+            st[d + j] = var/64.0f;
+            st[2*d + j] = mx;
+            st[3*d + j] = mn;
+        }
+        char * out = (char *) dst->data + h*dst->nb[1] + p*dst->nb[2];
+        if (dst->type == GGML_TYPE_F16) {
+            for (int64_t j = 0; j < 4*d; ++j) {
+                ((ggml_fp16_t *) out)[j] = GGML_CPU_FP32_TO_FP16(st[j]);
+            }
+        } else {
+            memcpy(out, st.data(), 4*d*sizeof(float));
         }
     }
 }

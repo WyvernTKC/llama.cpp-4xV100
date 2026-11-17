@@ -416,7 +416,7 @@ static bool ggml_cuda_fattn_volta_nomask_applies(const int cc, const int nsm, co
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
-    if (dst->src[3] || dst->src[4] || dst->src[5] || dst->src[6]) {
+    if (dst->src[3] || dst->src[4] || dst->src[5] || dst->src[6] || dst->src[7]) {
         return false;
     }
     float max_bias      = 0.0f;

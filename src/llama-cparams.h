@@ -51,6 +51,7 @@ struct llama_cparams {
     bool auto_ftkm;
     bool fused_kv_rows;      // unified cache: attend to the cells of each sequence only (ggml_flash_attn_ext_rows)
     bool auto_fkvr;
+    bool split_tensor;       // -sm tensor: page-sparse decode only through the ops that have split rules (FUSED=3)
     bool no_perf;
     bool op_offload;
     bool kv_unified;

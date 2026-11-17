@@ -2123,12 +2123,12 @@ static ggml_backend_meta_gathered_weight * ggml_backend_meta_warm_source(ggml_ba
     return gw;
 }
 
-// Flash attention with q split by head over mirrored k/v: the kv heads that the q heads of device j belong to.
-//   Returns false when they do not spread evenly over those kv heads, the op takes one gqa ratio from the
-//   shapes it gets and cannot express that.
-static bool ggml_backend_meta_fattn_kv_heads(const struct ggml_tensor * fattn, const struct ggml_backend_meta_split_state & ss_q,
+// q split by head over mirrored kv heads (flash attention, page selection): the kv heads that the q heads of device
+//   j belong to. Returns false when they do not spread evenly over those kv heads, the ops take one gqa ratio from
+//   the shapes they get and cannot express that.
+static bool ggml_backend_meta_q_kv_heads(int64_t n_head, int64_t n_head_kv, const struct ggml_backend_meta_split_state & ss_q,
         size_t n_bufs, size_t j, int64_t & kv_head_0, int64_t & n_kv_heads) {
-    const int64_t n_gqa = fattn->src[0]->ne[2] / fattn->src[1]->ne[2];
+    const int64_t n_gqa = n_head / n_head_kv;
     int64_t q0 = 0;
     int64_t nq = 0;
     for (size_t jj = 0; jj <= j; jj++) {
@@ -2153,6 +2153,12 @@ static bool ggml_backend_meta_fattn_kv_heads(const struct ggml_tensor * fattn, c
         }
     }
     return true;
+}
+
+// flash attention: q [d, n_tokens, n_head], k [d, n_kv, n_head_kv]
+static bool ggml_backend_meta_fattn_kv_heads(const struct ggml_tensor * fattn, const struct ggml_backend_meta_split_state & ss_q,
+        size_t n_bufs, size_t j, int64_t & kv_head_0, int64_t & n_kv_heads) {
+    return ggml_backend_meta_q_kv_heads(fattn->src[0]->ne[2], fattn->src[1]->ne[2], ss_q, n_bufs, j, kv_head_0, n_kv_heads);
 }
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
@@ -2631,6 +2637,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || mask_split);
         // the KV ranges of the mask rows (ggml_flash_attn_ext_set_kv_ranges) go with the mask
         GGML_ASSERT(tensor->src[6] == nullptr || (src_ss[6].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && !mask_split));
+        // the chunk lists of page-sparse decode (ggml_flash_attn_ext_set_chunk_list), one row per q head: split like q
+        //   (dim 1 of the list is the head, dim 2 of q), the ratio check below holds them to the same heads
+        GGML_ASSERT(tensor->src[7] == nullptr ||
+            (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[7].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) ||
+            (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 && src_ss[7].axis == GGML_BACKEND_SPLIT_AXIS_1));
         // the cell rows of a unified cache (ggml_flash_attn_ext_rows) are not used under -sm tensor (auto_fkvr)
         GGML_ASSERT(tensor->src[5] == nullptr);
 
@@ -3060,6 +3071,43 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_DSV4_HC_POST: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
+            // page statistics, refreshed in place: k [d, n_kv_h, n_kv] and ps [4d, n_kv_h, n_page] split by kv head
+            //   (dim 1) or both mirrored, the page list replicated
+            case GGML_OP_PAGE_STATS: {
+                GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                const bool split  = src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1;
+                const bool mirror = src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+                if (!split && !mirror) {
+                    GGML_ABORT("%s: page statistics need k and ps split by kv head or both mirrored (axes %d, %d)",
+                        tensor->name, int(src_ss[0].axis), int(src_ss[1].axis));
+                }
+                split_state = src_ss[1];
+            } break;
+            // page selection: q [d, n_head] split by head (dim 1), the stats view [2d, n_page, n_kv_h] split by kv head
+            //   (dim 2), or mirrored and cut to the kv heads of the device's q heads by
+            //   ggml_backend_meta_buffer_init_tensor_impl; the page mask and the extra chunks replicated. One row per q head.
+            case GGML_OP_PAGE_TOP_K: {
+                GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                    GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                    split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+                } else {
+                    GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1);
+                    GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2 || src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                    if (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && tensor->src[1]->ne[2] > 1) {
+                        for (size_t j = 0; j < n_bufs; j++) {
+                            int64_t kv_head_0, n_kv_heads;
+                            if (!ggml_backend_meta_q_kv_heads(tensor->src[0]->ne[1], tensor->src[1]->ne[2], src_ss[0], n_bufs, j,
+                                    kv_head_0, n_kv_heads)) {
+                                GGML_ABORT("%s: the q heads of device %zu do not map onto whole kv heads of the mirrored %s",
+                                    tensor->name, j, tensor->src[1]->name);
+                            }
+                        }
+                    }
+                    split_state = {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+                }
+            } break;
             // the picks (src1) split along a dim that the mask broadcasts, everything else replicated: each device masks
             //   for its own picks (MiniMax-M3 MSA prefill, split by indexer head)
             case GGML_OP_TOP_K_MASK: {
@@ -3437,6 +3485,27 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                         kv_slice->buffer = kv->buffer;
                         t_ij->src[i] = kv_slice;
                     }
+                }
+            }
+        }
+
+        // Page selection with q split by head over mirrored page statistics: likewise only the kv heads of this
+        //   device's q heads, the op takes the gqa ratio from q and the stats view [2d, n_page, n_kv_h].
+        if (tensor->op == GGML_OP_PAGE_TOP_K && tensor->src[1]->ne[2] > 1 &&
+                ggml_backend_buffer_is_meta(tensor->src[0]->buffer) && ggml_backend_buffer_is_meta(tensor->src[1]->buffer)) {
+            const ggml_backend_meta_split_state ss_q  = ggml_backend_meta_get_split_state(tensor->src[0], /*assume_sync =*/ true);
+            const ggml_backend_meta_split_state ss_st = ggml_backend_meta_get_split_state(tensor->src[1], /*assume_sync =*/ true);
+            if (ss_q.axis == GGML_BACKEND_SPLIT_AXIS_1 && ss_st.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                int64_t kv_head_0, n_kv_heads;
+                const bool ok = ggml_backend_meta_q_kv_heads(tensor->src[0]->ne[1], tensor->src[1]->ne[2], ss_q, n_simple_bufs, j,
+                    kv_head_0, n_kv_heads);
+                GGML_ASSERT(ok);
+                ggml_tensor * st = t_ij->src[1];
+                if (st != nullptr && n_kv_heads > 0 && n_kv_heads < tensor->src[1]->ne[2]) {
+                    ggml_tensor * st_slice = ggml_view_4d(simple_ctx, st, st->ne[0], st->ne[1], n_kv_heads, st->ne[3],
+                        st->nb[1], st->nb[2], st->nb[3], kv_head_0*st->nb[2]);
+                    st_slice->buffer = st->buffer;
+                    t_ij->src[1] = st_slice;
                 }
             }
         }
