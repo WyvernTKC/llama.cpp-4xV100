@@ -16,6 +16,7 @@
 	import type {
 		AgenticSection,
 		DatabaseMessageExtra,
+		DatabaseMessageExtraAudioFile,
 		DatabaseMessageExtraImageFile,
 		DatabaseMessageExtraVideoFile,
 		ToolResultLine
@@ -58,6 +59,15 @@
 		...new Map(
 			(attachments ?? [])
 				.filter((a): a is DatabaseMessageExtraVideoFile => a.type === AttachmentType.VIDEO)
+				.map((a) => [a.name, a])
+		).values()
+	]);
+
+	// audio a tool returns (a music server's song) plays under the block too
+	const audioAttachments = $derived([
+		...new Map(
+			(attachments ?? [])
+				.filter((a): a is DatabaseMessageExtraAudioFile => a.type === AttachmentType.AUDIO)
 				.map((a) => [a.name, a])
 		).values()
 	]);
@@ -155,19 +165,6 @@
 							<div class="font-mono text-[11px] leading-relaxed whitespace-pre-wrap">
 								{line.text}
 							</div>
-
-							{#if line.media?.type === AttachmentType.AUDIO}
-								{@const audioMimeType = line.media.mimeType ?? MimeTypeAudio.MP3_MPEG}
-								<div class="mt-2 mb-2">
-									<audio class="w-full rounded-lg" controls>
-										<source
-											src={createBase64DataUrl(audioMimeType, line.media.base64Data)}
-											type={audioMimeType}
-										/>
-										Your browser does not support the audio element.
-									</audio>
-								</div>
-							{/if}
 						{/each}
 					</div>
 				{/if}
@@ -219,6 +216,20 @@
 			>
 				<track kind="captions" src="" />
 			</video>
+		{/each}
+	</div>
+{/if}
+
+{#if audioAttachments.length > 0}
+	<div class="mb-2 flex w-full max-w-xl flex-col gap-2">
+		{#each audioAttachments as audio (audio.name)}
+			<audio
+				aria-label={audio.name}
+				class="w-full"
+				controls
+				preload="metadata"
+				src={createBase64DataUrl(audio.mimeType || MimeTypeAudio.MP3_MPEG, audio.base64Data)}
+			></audio>
 		{/each}
 	</div>
 {/if}
