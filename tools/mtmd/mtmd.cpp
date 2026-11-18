@@ -3608,10 +3608,11 @@ static int32_t mtmd_gen_wav_music3(mtmd_context * ctx, mtmd_gen_state * state, c
     }
     const std::vector<float> noise_ov(x.begin(), x.begin() + n_ov * n_lc);
 
-    // batch 0 is conditioned, batch 1 has a zero condition
-    std::vector<float> dit_in(2 * n_lat * n_in, 0.0f);
+    // DiT input rows [latent, zeros, condition]; batch 0 is conditioned, batch 1 has a zero condition
+    // the graph adds the latent of each step to these rows, which stay on the device for the whole window
+    std::vector<float> dit_static(2 * n_lat * n_in, 0.0f);
     for (size_t i = 0; i < n_lat; i++) {
-        std::copy(cond.begin() + i * n_cond, cond.begin() + (i + 1) * n_cond, dit_in.begin() + i * n_in + 2 * n_lc);
+        std::copy(cond.begin() + i * n_cond, cond.begin() + (i + 1) * n_cond, dit_static.begin() + i * n_in + 2 * n_lc);
     }
 
     // FlowMatchEulerDiscreteScheduler with invert_sigmas: t = 1 - linspace(1, 1 / n, n), then 1
@@ -3628,17 +3629,14 @@ static int32_t mtmd_gen_wav_music3(mtmd_context * ctx, mtmd_gen_state * state, c
         for (size_t j = 0; j < n_ov * n_lc; j++) {
             x[j] = (1.0f - (1.0f - 1e-6f) * t) * noise_ov[j] + t * prev_lat[j];
         }
-        for (size_t b = 0; b < 2; b++) {
-            for (size_t r = 0; r < n_lat; r++) {
-                std::copy(x.begin() + r * n_lc, x.begin() + (r + 1) * n_lc, dit_in.begin() + (b * n_lat + r) * n_in);
-            }
-        }
         mtmd_subctx_encode_params params;
-        params.gen_process = MTMD_SUBCTX_GEN_PROCESS_FLOW_STEP;
-        params.flow_t      = t;
-        params.cfg_scale   = g::dit_cfg;
-        params.out_feats   = &vel;
-        if (!music3_encode(ctx, state, params, dit_in) || vel.size() != x.size()) {
+        params.gen_process  = MTMD_SUBCTX_GEN_PROCESS_FLOW_STEP;
+        params.flow_t       = t;
+        params.cfg_scale    = g::dit_cfg;
+        params.out_feats    = &vel;
+        params.feats_static = &dit_static;
+        params.flow_reuse   = i > 0; // nothing else runs on the subcontext between the steps
+        if (!music3_encode(ctx, state, params, x) || vel.size() != x.size()) {
             LOG_ERR("%s: encode failed (flow step %d)\n", __func__, i);
             return 1;
         }

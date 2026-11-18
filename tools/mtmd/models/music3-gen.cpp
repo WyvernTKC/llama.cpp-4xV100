@@ -133,9 +133,19 @@ ggml_cgraph * mtmd_graph_music3_gen::build_dit() {
     const int64_t n_pos   = n_rows + 1;
     const int64_t B       = 2;
 
-    ggml_tensor * inp = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_in, n_rows, B);
-    ggml_set_name(inp, "inp_feats");
-    ggml_set_input(inp);
+    // only the latent changes from one step of a window to the next: the rest, [zeros, zeros, condition], is an input
+    //   that is also an output, so the allocator never frees it and a reused graph keeps it (see encode()); adding
+    //   the zero-padded latent rebuilds the rows exactly
+    ggml_tensor * inp_static = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_in, n_rows, B);
+    ggml_set_name(inp_static, "inp_static");
+    ggml_set_input(inp_static);
+    ggml_set_output(inp_static);
+
+    ggml_tensor * inp_lat = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_latent, n_rows);
+    ggml_set_name(inp_lat, "inp_feats");
+    ggml_set_input(inp_lat);
+
+    ggml_tensor * inp = ggml_add(ctx0, inp_static, ggml_pad(ctx0, inp_lat, (int) (n_in - n_latent), 0, 0, 0));
 
     ggml_tensor * inp_t = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
     ggml_set_name(inp_t, "inp_t");

@@ -4592,22 +4592,26 @@ struct test_norm_mul_add : public test_case {
 
     bool run_whole_graph() override { return true; }
 
+    const bool row_wb; // weight and bias one row each, the layer norm the CUDA backend fuses
+
     std::string vars() override {
-        return VARS_TO_STR4(type, ne, eps, broadcast);
+        return VARS_TO_STR5(type, ne, eps, broadcast, row_wb);
     }
 
     test_norm_mul_add(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {128, 2, 1, 1},
             float eps = 1e-5f,
-            bool broadcast = false)
-        : type(type), ne(ne), eps(eps), broadcast(broadcast) {}
+            bool broadcast = false,
+            bool row_wb = false)
+        : type(type), ne(ne), eps(eps), broadcast(broadcast), row_wb(row_wb) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         std::array<int64_t, 4> broadcast_dims = {ne[0], ne[1] * 2, ne[2] * 2, ne[3] * 2};
+        const std::array<int64_t, 4> row = {ne[0], 1, 1, 1};
 
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, broadcast ? broadcast_dims.data() : ne.data());
-        ggml_tensor * w = ggml_new_tensor(ctx, type, 4, ne.data());
-        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor(ctx, type, 4, row_wb ? row.data() : ne.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, row_wb ? row.data() : ne.data());
         ggml_set_param(a); ggml_set_param(w); ggml_set_param(b);
         ggml_set_name(a, "a"); ggml_set_name(w, "w"); ggml_set_name(b, "b");
 
@@ -15709,9 +15713,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_BF16, { n, 5, 4, 3 }, eps, true, false, false, false, false, GGML_TYPE_F32, GGML_TYPE_BF16));
             test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
             test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
+            test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false, true));
             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
         }
+    }
+    // layer norm with a weight and a bias row from 1024 columns: norm_f32<1024> with the MUL and ADD in its write loop
+    for (uint32_t n : { 1024, 2048, 2304, 5376 }) {
+        test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { n, 7, 3, 1 }, 1e-5f, false, true));
     }
     // every columns-per-thread count of both block sizes, gemma-4-31B (5376), its MoE sibling (2816) and Muse-Glimmer
     //   (6656), and a row past the register path, which stays apart; one row runs over several blocks

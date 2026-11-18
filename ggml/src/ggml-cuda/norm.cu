@@ -7,10 +7,13 @@
 
 GGML_CUDA_SPIN_SETTER(norm)
 
-template <int block_size>
+// with do_mul_add, also the MUL by a weight row w and the ADD of a bias row b of a layer norm, each rounded as the op
+//   apart (see norm_mul_add_f32 for rows narrower than 1024)
+template <int block_size, bool do_mul_add = false>
 static __global__ void norm_f32(
         const float * x, float * dst, const int ncols, const int nchannels, const int nsamples,
-        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps) {
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps,
+        const float * w = nullptr, const float * b = nullptr) {
     const int nrows = gridDim.x;
     const int row   = blockIdx.x;
     const int tid   = threadIdx.x;
@@ -41,7 +44,12 @@ static __global__ void norm_f32(
             const float inv_std = rsqrtf(var + eps);
 
             for (int col = tid; col < ncols; col += block_size) {
-                dstc[col] = (xc[col] - mean) * inv_std;
+                const float v = (xc[col] - mean) * inv_std;
+                if constexpr (do_mul_add) {
+                    dstc[col] = __fadd_rn(__fmul_rn(v, w[col]), b[col]);
+                } else {
+                    dstc[col] = v;
+                }
             }
 
             if constexpr (block_size > WARP_SIZE) {
@@ -1892,9 +1900,10 @@ bool ggml_cuda_should_fuse_norm_mul_add(const ggml_tensor * norm, const ggml_ten
             return false;
         }
     }
-    // one warp per row, weight and bias one row each; dst may sit exactly on x, not partly
+    // one warp per row (a block of 1024 from 1024 columns, like norm_f32), weight and bias one row each; dst may sit
+    //   exactly on x, not partly
     const int64_t ncols = norm->ne[0];
-    return ncols < 1024 && x->nb[0] == sizeof(float) && ggml_is_contiguous(w) && ggml_is_contiguous(b) &&
+    return x->nb[0] == sizeof(float) && ggml_is_contiguous(w) && ggml_is_contiguous(b) &&
         w->ne[0] == ncols && ggml_nrows(w) == 1 && b->ne[0] == ncols && ggml_nrows(b) == 1 &&
         ggml_are_same_shape(norm, mul) && ggml_are_same_shape(norm, add) && ggml_is_contiguous(add) &&
         ggml_cuda_same_or_disjoint(add, x) && (add->data != x->data || ggml_is_contiguous(x)) &&
@@ -1913,9 +1922,16 @@ void ggml_cuda_op_norm_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * no
 
     const size_t ts0 = ggml_type_size(x->type);
     const dim3 blocks_num(norm->ne[1], MIN(norm->ne[2], UINT16_MAX), MIN(norm->ne[3], UINT16_MAX));
-    norm_mul_add_f32<<<blocks_num, WARP_SIZE, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data,
-        (const float *) b->data, (float *) add->data, (int) norm->ne[0], (int) norm->ne[2], (int) norm->ne[3],
-        x->nb[1] / ts0, x->nb[2] / ts0, x->nb[3] / ts0, eps);
+    if (norm->ne[0] < 1024) {
+        norm_mul_add_f32<<<blocks_num, WARP_SIZE, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data,
+            (const float *) b->data, (float *) add->data, (int) norm->ne[0], (int) norm->ne[2], (int) norm->ne[3],
+            x->nb[1] / ts0, x->nb[2] / ts0, x->nb[3] / ts0, eps);
+    } else {
+        // the same reduction as norm_f32_cuda, so the result does not change with the fusion
+        norm_f32<1024, true><<<blocks_num, 1024, 32 * sizeof(float2), ctx.stream()>>>((const float *) x->data,
+            (float *) add->data, (int) norm->ne[0], (int) norm->ne[2], (int) norm->ne[3],
+            x->nb[1] / ts0, x->nb[2] / ts0, x->nb[3] / ts0, eps, (const float *) w->data, (const float *) b->data);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

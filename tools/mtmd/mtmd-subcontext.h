@@ -134,6 +134,10 @@ struct mtmd_subctx_encode_params {
     float   temp = 0.0f;                      // sampling temperature, noise scale for flow-matching decoders
     float   cfg_scale = 1.0f;                 // classifier-free guidance, 1.0 = off
     float   flow_t = 0.0f;                    // FLOW_STEP: flow-matching time, 0 = noise
+    // FLOW_STEP: the part of the input that is the same in every step of a window, uploaded when the graph is built
+    const std::vector<float> * feats_static = nullptr;
+    // FLOW_STEP: the previous call ran a step of the same window, its graph and the static input can be reused
+    bool flow_reuse = false;
     bool * out_is_eos = nullptr;
 
     // TOKENIZE: speech embedding rows of the produced codes
@@ -171,6 +175,10 @@ struct mtmd_subcontext {
     bool debug_output_embeddings = false;
 
     bool support_batch = false;
+
+    // the last FLOW_STEP graph, still allocated: nothing has used the scheduler since (see encode())
+    ggml_cgraph * flow_gf      = nullptr;
+    size_t        flow_n_feats = 0;
 
     // model and backends must outlive the subcontext
     mtmd_subcontext(const mtmd_model & model, mtmd_backends & backends, const mtmd_subctx_params & params);

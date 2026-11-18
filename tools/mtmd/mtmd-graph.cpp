@@ -1055,9 +1055,7 @@ std::unique_ptr<mtmd_graph> mtmd_get_graph_builder(mtmd_subcontext * ctx, const 
                 const auto gen_process = params ? params->gen_process : MTMD_SUBCTX_GEN_PROCESS_GEN_CODE;
                 // row size of the input of each process; the reserve pass builds GEN_CODE with one row
                 size_t n_col = (size_t) ctx->model.hparams.n_embd;
-                if (gen_process == MTMD_SUBCTX_GEN_PROCESS_FLOW_STEP) {
-                    n_col = 2 * (size_t) ctx->model.music3.pre_w->ne[0];
-                } else if (gen_process == MTMD_SUBCTX_GEN_PROCESS_GEN_WAV) {
+                if (gen_process == MTMD_SUBCTX_GEN_PROCESS_FLOW_STEP || gen_process == MTMD_SUBCTX_GEN_PROCESS_GEN_WAV) {
                     n_col = g::n_latent;
                 }
                 int n_rows = 1;

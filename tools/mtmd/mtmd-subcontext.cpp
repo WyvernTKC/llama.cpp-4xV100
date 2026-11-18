@@ -338,6 +338,7 @@ mtmd_image_f32_batch mtmd_subcontext::get_dummy_batch() const {
 
 void mtmd_subcontext::warmup(const mtmd_image_f32_batch & batch) {
     support_info_graph info;
+    flow_gf = nullptr; // reserving reuses the graph memory
 
     if (flash_attn_type == MTMD_FLASH_ATTN_TYPE_AUTO) {
         // try to enable flash attention to see if it's supported
@@ -715,17 +716,34 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
         }
     }
 
+    // minimax_music3: the flow steps of a window run the same DiT graph back to back, so the graph stays built and
+    //   allocated (the scheduler computes an allocated graph again as is) and only the inputs that change are set;
+    //   any other graph built here replaces it
+    const bool flow_step  = params->gen_process == MTMD_SUBCTX_GEN_PROCESS_FLOW_STEP;
+    const bool flow_reuse = flow_step && params->flow_reuse && flow_gf != nullptr && params->feats != nullptr &&
+                            params->feats->size() == flow_n_feats;
+
     // build the inference graph
-    ggml_backend_sched_reset(backends.sched.get());
-    ggml_cgraph * gf = mtmd_get_graph_builder(this, imgs, params)->build();
+    ggml_cgraph * gf = flow_gf;
+    if (!flow_reuse) {
+        flow_gf = nullptr;
+        ggml_backend_sched_reset(backends.sched.get());
+        gf = mtmd_get_graph_builder(this, imgs, params)->build();
+    }
 
     // the last node is the embedding tensor, code2wav has no out_embd
     // read it before scheduling: backends may reorder the nodes of graphs with several outputs (Metal)
     ggml_tensor * embeddings = params->out_embd ? ggml_graph_node(gf, -1) : nullptr;
 
-    if (!ggml_backend_sched_alloc_graph(backends.sched.get(), gf)) {
-        LOG_ERR("%s: failed to allocate compute graph\n", __func__);
-        return false;
+    if (!flow_reuse) {
+        if (!ggml_backend_sched_alloc_graph(backends.sched.get(), gf)) {
+            LOG_ERR("%s: failed to allocate compute graph\n", __func__);
+            return false;
+        }
+        if (flow_step && model.proj_type == PROJECTOR_TYPE_MINIMAX_MUSIC3_GEN) {
+            flow_gf      = gf;
+            flow_n_feats = params->feats->size();
+        }
     }
 
     // set inputs
@@ -1705,6 +1723,15 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
                     set_input_i32("inp_idx", idx);
                 } else if (params->gen_process == MTMD_SUBCTX_GEN_PROCESS_FLOW_STEP) {
                     set_input_f32("inp_t", { params->flow_t });
+                    // the static part is an output of the graph, so it is never overwritten while the graph is reused
+                    if (!flow_reuse) {
+                        if (params->feats_static == nullptr) {
+                            LOG_ERR("%s: the flow step needs its static input\n", __func__);
+                            flow_gf = nullptr;
+                            return false;
+                        }
+                        set_input_f32("inp_static", *params->feats_static);
+                    }
                 }
             } break;
         case PROJECTOR_TYPE_GEMMA4V:
