@@ -16,6 +16,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <random>
 #include <stdexcept>
 #include <vector>
@@ -64,10 +65,23 @@ ggml_backend_dev_t mtmd_select_device(bool use_gpu, ggml_backend_dev_t device) {
 }
 
 // a group of transformer blocks the meta device splits by head: every tensor whose name starts with prefix
+// blck_o and blck_ffn: lcm of the block sizes of the attn_out and ffn_down weights, which are split along their rows
+// (axis 0) and so need the device boundaries in whole quantization blocks; 1 for F32/F16/BF16
 struct mtmd_split_group {
     std::string prefix;
     int64_t     n_head;
+    int64_t     blck_o   = 1;
+    int64_t     blck_ffn = 1;
 };
+
+// split granularity of the heads (in elements: whole heads, whole attn_out blocks) and of the FFN (8 F16 values = 16 bytes,
+// whole ffn_down blocks)
+static int64_t mtmd_split_head_gran(const mtmd_split_group & g, int64_t n_embd) {
+    return std::lcm(n_embd / g.n_head, g.blck_o);
+}
+static int64_t mtmd_split_ffn_gran(const mtmd_split_group & g) {
+    return std::lcm((int64_t) 8, g.blck_ffn);
+}
 
 struct mtmd_split_userdata {
     int n_devices;
@@ -91,7 +105,8 @@ static ggml_backend_meta_split_state mtmd_split_even(ggml_backend_meta_split_axi
 }
 
 // Split blocks: whole heads of the q, k and v projections (fused or not) and the matching rows of attn_out, columns of
-// ffn_up and ffn_gate and the matching rows of ffn_down (8 at a time, 16-byte aligned F16 rows). Everything else is mirrored.
+// ffn_up and ffn_gate and the matching rows of ffn_down (8 at a time, 16-byte aligned F16 rows). Quantized attn_out and
+// ffn_down round the boundaries up to whole blocks (see mtmd_split_head_gran). Everything else is mirrored.
 static ggml_backend_meta_split_state mtmd_split_state(const ggml_tensor * tensor, void * userdata) {
     const mtmd_split_userdata * ud = (const mtmd_split_userdata *) userdata;
     std::string name = tensor->name;
@@ -116,27 +131,27 @@ static ggml_backend_meta_split_state mtmd_split_state(const ggml_tensor * tensor
     if (group == nullptr) {
         return mirrored;
     }
-    const int     n_dev  = ud->n_devices;
-    const int64_t n_head = group->n_head;
+    const int     n_dev    = ud->n_devices;
+    const int64_t ffn_gran = mtmd_split_ffn_gran(*group);
     if (ends_with(".attn_qkv.weight")) {
         const int64_t n = tensor->ne[1] / 3;
-        return mtmd_split_even(GGML_BACKEND_SPLIT_AXIS_1, n, 3, n_dev, n / n_head);
+        return mtmd_split_even(GGML_BACKEND_SPLIT_AXIS_1, n, 3, n_dev, mtmd_split_head_gran(*group, n));
     }
     if (ends_with(".attn_qkv.bias")) {
         const int64_t n = tensor->ne[0] / 3;
-        return mtmd_split_even(GGML_BACKEND_SPLIT_AXIS_0, n, 3, n_dev, n / n_head);
+        return mtmd_split_even(GGML_BACKEND_SPLIT_AXIS_0, n, 3, n_dev, mtmd_split_head_gran(*group, n));
     }
     if (ends_with(".attn_q.weight") || ends_with(".attn_k.weight") || ends_with(".attn_v.weight")) {
-        return mtmd_split_even(GGML_BACKEND_SPLIT_AXIS_1, tensor->ne[1], 1, n_dev, tensor->ne[1] / n_head);
+        return mtmd_split_even(GGML_BACKEND_SPLIT_AXIS_1, tensor->ne[1], 1, n_dev, mtmd_split_head_gran(*group, tensor->ne[1]));
     }
     if (ends_with(".attn_q.bias") || ends_with(".attn_k.bias") || ends_with(".attn_v.bias") || ends_with(".attn_out.weight")) {
-        return mtmd_split_even(GGML_BACKEND_SPLIT_AXIS_0, tensor->ne[0], 1, n_dev, tensor->ne[0] / n_head);
+        return mtmd_split_even(GGML_BACKEND_SPLIT_AXIS_0, tensor->ne[0], 1, n_dev, mtmd_split_head_gran(*group, tensor->ne[0]));
     }
     if (ends_with(".ffn_up.weight") || ends_with(".ffn_gate.weight")) {
-        return mtmd_split_even(GGML_BACKEND_SPLIT_AXIS_1, tensor->ne[1], 1, n_dev, 8);
+        return mtmd_split_even(GGML_BACKEND_SPLIT_AXIS_1, tensor->ne[1], 1, n_dev, ffn_gran);
     }
     if (ends_with(".ffn_up.bias") || ends_with(".ffn_gate.bias") || ends_with(".ffn_down.weight")) {
-        return mtmd_split_even(GGML_BACKEND_SPLIT_AXIS_0, tensor->ne[0], 1, n_dev, 8);
+        return mtmd_split_even(GGML_BACKEND_SPLIT_AXIS_0, tensor->ne[0], 1, n_dev, ffn_gran);
     }
     return mirrored;
 }
@@ -190,27 +205,40 @@ ggml_backend_dev_t mtmd_split_device(const char * fname, const ggml_backend_dev_
     } else {
         why = "only the qwen3vl_merger vision encoder and the minimax_music3 generator have split rules";
     }
+    // attn_out and ffn_down are split along their rows: a quantized one needs the device boundaries in whole blocks
+    auto ends_with = [](const std::string & s, const char * suffix) {
+        const size_t n = strlen(suffix);
+        return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
+    };
+    for (int64_t i = 0; i < gguf_get_n_tensors(ctx); ++i) {
+        const std::string name = gguf_get_tensor_name(ctx, i);
+        const int64_t blck = ggml_blck_size(gguf_get_tensor_type(ctx, i));
+        for (auto & g : groups) {
+            if (name.rfind(g.prefix, 0) != 0) {
+                continue;
+            }
+            if (ends_with(name, ".attn_out.weight")) {
+                g.blck_o = std::lcm(g.blck_o, blck);
+            } else if (ends_with(name, ".ffn_down.weight")) {
+                g.blck_ffn = std::lcm(g.blck_ffn, blck);
+            }
+        }
+    }
     for (const auto & g : groups) {
         if (why != nullptr) {
             break;
         }
         // a k/v projection with fewer heads than q (GQA) would need its own head count
         const std::string blk0 = g.prefix + "0.";
-        const int64_t n_q = n_rows(blk0 + "attn_q.weight");
+        const int64_t n_q    = n_rows(blk0 + "attn_q.weight");
+        const int64_t n_embd = n_q != 0 ? n_q : n_rows(blk0 + "attn_qkv.weight") / 3;
+        const int64_t n_ff   = n_rows(blk0 + "ffn_up.weight");
         if (n_devs > GGML_BACKEND_META_MAX_DEVICES || g.n_head < (int64_t) n_devs) {
             why = "too many devices for the number of heads";
         } else if (n_q != 0 && (n_rows(blk0 + "attn_k.weight") != n_q || n_rows(blk0 + "attn_v.weight") != n_q)) {
             why = "the blocks use grouped-query attention";
-        }
-    }
-    // the rows of a quantized weight could not be split in whole blocks at the head and ffn boundaries
-    for (int64_t i = 0; why == nullptr && i < gguf_get_n_tensors(ctx); ++i) {
-        const std::string name = gguf_get_tensor_name(ctx, i);
-        const ggml_type type = gguf_get_tensor_type(ctx, i);
-        for (const auto & g : groups) {
-            if (name.rfind(g.prefix, 0) == 0 && type != GGML_TYPE_F32 && type != GGML_TYPE_F16 && type != GGML_TYPE_BF16) {
-                why = "the split blocks have quantized weights";
-            }
+        } else if (n_embd / mtmd_split_head_gran(g, n_embd) < (int64_t) n_devs || n_ff / mtmd_split_ffn_gran(g) < (int64_t) n_devs) {
+            why = "too many devices for the quantization block size of attn_out or ffn_down";
         }
     }
     gguf_free(ctx);
@@ -220,6 +248,12 @@ ggml_backend_dev_t mtmd_split_device(const char * fname, const ggml_backend_dev_
         return nullptr;
     }
     LOG_INF("%s: splitting %s over %zu devices\n", __func__, what, n_devs);
+    for (const auto & g : groups) {
+        if (g.blck_o > 1 || g.blck_ffn > 1) {
+            LOG_INF("%s: %s* quantized: attn_out block %lld, ffn_down block %lld\n", __func__, g.prefix.c_str(),
+                (long long) g.blck_o, (long long) g.blck_ffn);
+        }
+    }
     // never freed: the meta device is cached for the process and keeps this pointer
     auto * ud = new mtmd_split_userdata { (int) n_devs, std::move(groups) };
     std::vector<ggml_backend_dev_t> dev_list(devs, devs + n_devs);
