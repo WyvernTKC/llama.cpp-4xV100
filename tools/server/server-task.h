@@ -7,6 +7,8 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <atomic>
+#include <memory>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -177,6 +179,14 @@ struct task_result_state {
         bool filter_tool_calls = false);
 };
 
+// progress of a TTS / song task, written by the slot and read by the MCP song jobs (server-mcp-music.cpp)
+struct server_tts_progress {
+    enum { QUEUED = 0, PROMPT = 1, GENERATING = 2, FINISHING = 3 };
+    std::atomic<int32_t> state     {QUEUED};
+    std::atomic<int32_t> n_decoded {0}; // frames generated
+    std::atomic<int32_t> n_total   {0}; // frame limit (n_predict or the model's)
+};
+
 struct server_task {
     int id = -1; // to be filled by server_queue
 
@@ -259,6 +269,8 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_TTS
     mtmd_helper::gen_audio::inp tts_inp;
+    // optional: the slot reports how far the generation got (MCP song jobs)
+    std::shared_ptr<server_tts_progress> tts_progress;
 
     server_task() = default;
 

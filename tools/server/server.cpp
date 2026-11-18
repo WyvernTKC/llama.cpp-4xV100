@@ -5,6 +5,7 @@
 #include "server-cors-proxy.h"
 #include "server-stream.h"
 #include "server-tools.h"
+#include "server-mcp-music.h"
 
 #include "arg.h"
 #include "build-info.h"
@@ -668,6 +669,13 @@ static int server_run_instance(common_params & params, server_role & role, commo
 
     if (!server_setup_features(ctx_http, params, mcp_mgr, tools, SERVER_ROLE_INSTANCE)) {
         return 1;
+    }
+
+    // MCP song tools for a music model (--enable-mcp-music); destroyed before routes and ctx_server
+    std::unique_ptr<server_mcp_music> mcp_music;
+    if (params.mcp_music) {
+        mcp_music = std::make_unique<server_mcp_music>(params, routes);
+        mcp_music->register_routes(ctx_http);
     }
 
     // setup clean up function, to be called before exit

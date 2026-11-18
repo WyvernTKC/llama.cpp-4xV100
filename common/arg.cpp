@@ -3511,6 +3511,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MCP_SERVERS_JSON"));
     add_opt(common_arg(
+        {"--enable-mcp-music"},
+        "serve an MCP endpoint at /mcp (streamable HTTP) with song tools (generate_song, get_song, get_latest_song, list_songs,\n"
+        "delete_song, job_status, cancel_job, get_server_info) for a music model loaded with -mm (e.g. MiniMax-Music3), so that\n"
+        "a chat model can make songs as a tool; songs are served at /mcp/songs/<id>.wav (default: disabled)",
+        [](common_params & params) {
+            params.mcp_music = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MCP_MUSIC"));
+    add_opt(common_arg(
+        {"--mcp-music-dir"}, "PATH",
+        "with --enable-mcp-music: directory where generated songs are saved as WAV files (default: none, songs stay in memory)",
+        [](common_params & params, const std::string & value) {
+            params.mcp_music_dir = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MCP_MUSIC_DIR"));
+    add_opt(common_arg(
         {"-ag", "--agent"},
         {"-no-ag", "--no-agent"},
         "whether to enable CORS proxy and all built-in tools - do not enable in untrusted environments (default: disabled)\n"

@@ -726,6 +726,10 @@ struct common_params {
     std::string mcp_servers_config;   // path to JSON file with MCP server definitions
     std::string mcp_servers_json;     // inline JSON with MCP server definitions
 
+    // MCP server endpoint (/mcp) for song generation with a music model (e.g. MiniMax-Music3)
+    bool        mcp_music     = false;
+    std::string mcp_music_dir;        // where generated songs are saved as WAV files (empty: kept in memory only)
+
     // router server configs
     std::string models_dir    = "";     // directory containing models for the router server
     std::string models_preset = "";     // directory containing model presets for the router server

@@ -147,6 +147,13 @@ struct server_routes {
     // to be used in router mode
     json get_model_info() const;
 
+    // generate audio from a /tts request body outside of an HTTP request (MCP song jobs): blocks until done,
+    // should_stop cancels; on success audio holds the WAV/PCM bytes, else error the reason
+    bool run_tts(const json & body, const std::shared_ptr<server_tts_progress> & progress,
+                 const std::function<bool()> & should_stop, std::string & audio, std::string & error);
+    // sample rate, channels, context size and model name of an audio generation model, {} if there is none
+    json tts_info() const;
+
 private:
     std::unique_ptr<server_res_generator> handle_completions_impl(
             const server_http_req & req,
@@ -160,7 +167,8 @@ private:
     std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);
     std::unique_ptr<server_res_generator> handle_embeddings_impl(const server_http_req & req, task_response_type res_type);
     std::unique_ptr<server_res_generator> handle_rerank_impl(const server_http_req & req);
-    std::unique_ptr<server_res_generator> handle_tts_impl(const server_http_req & req, json body);
+    std::unique_ptr<server_res_generator> handle_tts_impl(const server_http_req & req, json body,
+                                                          std::shared_ptr<server_tts_progress> progress = nullptr);
     std::unique_ptr<server_res_generator> handle_count_tokens(const server_http_req & req, task_response_type res_type);
 
     // using unique_ptr to allow late initialization of const

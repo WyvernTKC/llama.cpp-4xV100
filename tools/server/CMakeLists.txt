@@ -25,6 +25,8 @@ add_library(${TARGET} STATIC
     server-tools.h
     server-mcp.cpp
     server-mcp.h
+    server-mcp-music.cpp
+    server-mcp-music.h
     server-schema.cpp
     server-schema.h
     server-slot-sched.cpp

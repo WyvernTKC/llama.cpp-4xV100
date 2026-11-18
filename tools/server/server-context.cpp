@@ -4066,7 +4066,12 @@ private:
 
             llama_set_embeddings(ctx_tgt, true);
 
+            server_tts_progress * progress = slot.task->tts_progress.get();
+
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+                if (progress) {
+                    progress->state = server_tts_progress::PROMPT;
+                }
                 const int32_t ret = slot.tts.ctx.step_prompt(llama_n_batch(ctx_tgt));
                 if (ret < 0) {
                     send_error(slot, "TTS prompt processing failed", ERROR_TYPE_SERVER);
@@ -4087,6 +4092,12 @@ private:
             }
 
             const int32_t n_predict = slot.tts.ctx.max_frames(slot.n_predict_max);
+            if (progress) {
+                progress->n_total   = n_predict;
+                progress->n_decoded = slot.tts.n_decoded;
+                progress->state     = slot.tts.stop || slot.tts.n_decoded >= n_predict
+                    ? server_tts_progress::FINISHING : server_tts_progress::GENERATING;
+            }
             if (slot.tts.stop || slot.tts.n_decoded >= n_predict) {
                 int32_t      sample_rate = 0;
                 const char * data        = nullptr;
@@ -7457,7 +7468,38 @@ std::unique_ptr<server_res_generator> server_routes::handle_rerank_impl(const se
     return res;
 }
 
-std::unique_ptr<server_res_generator> server_routes::handle_tts_impl(const server_http_req & req, json body) {
+bool server_routes::run_tts(const json & body, const std::shared_ptr<server_tts_progress> & progress,
+        const std::function<bool()> & should_stop, std::string & audio, std::string & error) {
+    const server_http_req req { {}, {}, "/tts", "", body.dump(), {}, should_stop };
+    auto res = handle_tts_impl(req, body, progress);
+    if (res->status != 200) {
+        error = res->data;
+        return false;
+    }
+    if (res->data.empty()) {
+        error = should_stop() ? "cancelled" : "the model returned no audio";
+        return false;
+    }
+    audio = std::move(res->data);
+    return true;
+}
+
+json server_routes::tts_info() const {
+    if (!ctx_server.has_cap_tts()) {
+        return json::object();
+    }
+    const auto info = mtmd_gen_audio_get_info(ctx_server.mctx);
+    const int64_t n_ctx = meta ? (int64_t) meta->slot_n_ctx : 0;
+    return json {
+        {"model",       meta ? meta->model_name : std::string()},
+        {"sample_rate", (int64_t) info.sample_rate},
+        {"channels",    (int64_t) info.n_channels},
+        {"n_ctx",       n_ctx},
+    };
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_tts_impl(const server_http_req & req, json body,
+        std::shared_ptr<server_tts_progress> progress) {
     auto res = create_response();
     res->set_req(&req); // will also set spipe if needed
 
@@ -7479,6 +7521,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_tts_impl(const serve
 
     server_task task(SERVER_TASK_TYPE_TTS);
     server_schema::eval_tts_schema(params, task, body);
+    task.tts_progress = std::move(progress);
     const bool stream = task.params.stream;
     // a model with a "tts" chat template (e.g. LFM3-Audio) speaks the prompt rendered from it
     const std::string lang       = json_value(body, "lang", params.tts_lang);
