@@ -870,7 +870,9 @@ struct mtmd_context {
             ctx_a = std::make_unique<mtmd_subcontext>(*models.a, *backends, sctx_params);
         }
         if (models.gen_a) {
-            ctx_gen_a = std::make_unique<mtmd_subcontext>(*models.gen_a, *backends, sctx_params);
+            mtmd_subctx_params gen_params = sctx_params;
+            gen_params.sched_exclusive = !models.v && !models.a; // nothing else computes on the scheduler
+            ctx_gen_a = std::make_unique<mtmd_subcontext>(*models.gen_a, *backends, gen_params);
         }
         if (models.gen_a && models.gen_a->proj_type == PROJECTOR_TYPE_YUE2_GEN && !no_alloc) {
             yue2_nar.reset(mtmd_yue2_nar_load(mmproj_fname, device, models.gen_a->hparams));

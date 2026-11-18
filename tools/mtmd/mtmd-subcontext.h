@@ -27,6 +27,8 @@ enum mtmd_flash_attn_type {
 struct mtmd_subctx_params {
     enum mtmd_flash_attn_type flash_attn_type;
     bool warmup;
+    // the subcontext is the only user of the shared scheduler, so a graph it allocated stays allocated between calls
+    bool sched_exclusive = false;
 };
 
 // the device the weights and the graphs are placed on, nullptr means CPU
@@ -136,7 +138,7 @@ struct mtmd_subctx_encode_params {
     float   flow_t = 0.0f;                    // FLOW_STEP: flow-matching time, 0 = noise
     // FLOW_STEP: the part of the input that is the same in every step of a window, uploaded when the graph is built
     const std::vector<float> * feats_static = nullptr;
-    // FLOW_STEP: the previous call ran a step of the same window, its graph and the static input can be reused
+    // FLOW_STEP: the previous call ran a step of the same window, so the static input on the device is still this one's
     bool flow_reuse = false;
     bool * out_is_eos = nullptr;
 
@@ -176,9 +178,15 @@ struct mtmd_subcontext {
 
     bool support_batch = false;
 
-    // the last FLOW_STEP graph, still allocated: nothing has used the scheduler since (see encode())
-    ggml_cgraph * flow_gf      = nullptr;
-    size_t        flow_n_feats = 0;
+    // the last minimax_music3 GEN_CODE or FLOW_STEP graph, still allocated: nothing has used the scheduler since, and
+    //   what it was built for (see encode()); only kept with sched_exclusive
+    bool                    sched_exclusive = false;
+    ggml_cgraph *           kept_gf      = nullptr;
+    ggml_tensor *           kept_embd    = nullptr;
+    mtmd_subctx_gen_process kept_process = MTMD_SUBCTX_GEN_PROCESS_GEN_UNKNOWN;
+    size_t                  kept_n_feats = 0;
+    float                   kept_temp    = 0.0f;
+    float                   kept_cfg     = 0.0f;
 
     // model and backends must outlive the subcontext
     mtmd_subcontext(const mtmd_model & model, mtmd_backends & backends, const mtmd_subctx_params & params);

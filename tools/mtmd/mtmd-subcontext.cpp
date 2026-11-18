@@ -289,7 +289,8 @@ mtmd_subcontext::mtmd_subcontext(const mtmd_model & model, mtmd_backends & backe
         model(model),
         backends(backends),
         max_nodes(model.max_nodes),
-        flash_attn_type(params.flash_attn_type) {
+        flash_attn_type(params.flash_attn_type),
+        sched_exclusive(params.sched_exclusive) {
     if (flash_attn_type == MTMD_FLASH_ATTN_TYPE_AUTO && !model.flash_attn_auto) {
         flash_attn_type = MTMD_FLASH_ATTN_TYPE_DISABLED;
     }
@@ -338,7 +339,7 @@ mtmd_image_f32_batch mtmd_subcontext::get_dummy_batch() const {
 
 void mtmd_subcontext::warmup(const mtmd_image_f32_batch & batch) {
     support_info_graph info;
-    flow_gf = nullptr; // reserving reuses the graph memory
+    kept_gf = nullptr; // reserving reuses the graph memory
 
     if (flash_attn_type == MTMD_FLASH_ATTN_TYPE_AUTO) {
         // try to enable flash attention to see if it's supported
@@ -716,33 +717,44 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
         }
     }
 
-    // minimax_music3: the flow steps of a window run the same DiT graph back to back, so the graph stays built and
-    //   allocated (the scheduler computes an allocated graph again as is) and only the inputs that change are set;
-    //   any other graph built here replaces it
-    const bool flow_step  = params->gen_process == MTMD_SUBCTX_GEN_PROCESS_FLOW_STEP;
-    const bool flow_reuse = flow_step && params->flow_reuse && flow_gf != nullptr && params->feats != nullptr &&
-                            params->feats->size() == flow_n_feats;
+    // minimax_music3 runs the same depth decoder graph for every frame and the same DiT graph for every flow step of a
+    //   window, so the last such graph stays built and allocated (the scheduler computes an allocated graph again as
+    //   is) and only its inputs are set; any other graph built here replaces it. The graph depends on the process, the
+    //   number of input rows, the temperature and the guidance scale. A flow step also needs the static input of its
+    //   window on the device, which only the caller knows. The scheduler is shared by the subcontexts (and the audio
+    //   preprocessing), so this needs sched_exclusive. MTMD_NO_GRAPH_REUSE=1 builds every graph.
+    static const bool no_reuse = getenv("MTMD_NO_GRAPH_REUSE") != nullptr;
+    const bool flow_step = params->gen_process == MTMD_SUBCTX_GEN_PROCESS_FLOW_STEP;
+    const bool keepable  = !no_reuse && sched_exclusive && model.proj_type == PROJECTOR_TYPE_MINIMAX_MUSIC3_GEN &&
+                           params->feats != nullptr && (flow_step || params->gen_process == MTMD_SUBCTX_GEN_PROCESS_GEN_CODE);
+    const bool reuse     = keepable && kept_gf != nullptr && kept_process == params->gen_process &&
+                           kept_n_feats == params->feats->size() && kept_temp == params->temp &&
+                           kept_cfg == params->cfg_scale && (!flow_step || params->flow_reuse);
 
     // build the inference graph
-    ggml_cgraph * gf = flow_gf;
-    if (!flow_reuse) {
-        flow_gf = nullptr;
+    ggml_cgraph * gf         = kept_gf;
+    ggml_tensor * embeddings = params->out_embd ? kept_embd : nullptr;
+    if (!reuse) {
+        kept_gf = nullptr;
         ggml_backend_sched_reset(backends.sched.get());
         gf = mtmd_get_graph_builder(this, imgs, params)->build();
-    }
 
-    // the last node is the embedding tensor, code2wav has no out_embd
-    // read it before scheduling: backends may reorder the nodes of graphs with several outputs (Metal)
-    ggml_tensor * embeddings = params->out_embd ? ggml_graph_node(gf, -1) : nullptr;
+        // the last node is the embedding tensor, code2wav has no out_embd
+        // read it before scheduling: backends may reorder the nodes of graphs with several outputs (Metal)
+        ggml_tensor * last = ggml_graph_node(gf, -1);
+        embeddings = params->out_embd ? last : nullptr;
 
-    if (!flow_reuse) {
         if (!ggml_backend_sched_alloc_graph(backends.sched.get(), gf)) {
             LOG_ERR("%s: failed to allocate compute graph\n", __func__);
             return false;
         }
-        if (flow_step && model.proj_type == PROJECTOR_TYPE_MINIMAX_MUSIC3_GEN) {
-            flow_gf      = gf;
-            flow_n_feats = params->feats->size();
+        if (keepable) {
+            kept_gf      = gf;
+            kept_embd    = last;
+            kept_process = params->gen_process;
+            kept_n_feats = params->feats->size();
+            kept_temp    = params->temp;
+            kept_cfg     = params->cfg_scale;
         }
     }
 
@@ -1724,10 +1736,10 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
                 } else if (params->gen_process == MTMD_SUBCTX_GEN_PROCESS_FLOW_STEP) {
                     set_input_f32("inp_t", { params->flow_t });
                     // the static part is an output of the graph, so it is never overwritten while the graph is reused
-                    if (!flow_reuse) {
+                    if (!reuse) {
                         if (params->feats_static == nullptr) {
                             LOG_ERR("%s: the flow step needs its static input\n", __func__);
-                            flow_gf = nullptr;
+                            kept_gf = nullptr;
                             return false;
                         }
                         set_input_f32("inp_static", *params->feats_static);
