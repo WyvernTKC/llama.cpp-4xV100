@@ -185,8 +185,13 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // note: some pipelines ignore this token and use the hidden state instead
+    // note: some pipelines ignore this token and use the hidden state instead, they sample by themselves
+    //   (a full-vocab sampling per frame is on the critical path)
+    const bool uses_sampled = gen.uses_sampled();
     auto sample_semantic_code = [&]() -> llama_token {
+        if (!uses_sampled) {
+            return LLAMA_TOKEN_NULL;
+        }
         llama_token t = common_sampler_sample(smpl, lctx, -1);
         common_sampler_accept(smpl, t, true);
         return t;

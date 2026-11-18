@@ -4072,9 +4072,12 @@ private:
                     send_error(slot, "TTS prompt processing failed", ERROR_TYPE_SERVER);
                     slot.release();
                 } else if (ret == 0) {
-                    // done prompt, do sample and save h_state_prompt
-                    slot.tts.sampled = common_sampler_sample(slot.smpl.get(), ctx_tgt, -1);
-                    common_sampler_accept(slot.smpl.get(), slot.tts.sampled, true);
+                    // done prompt, do sample and save h_state_prompt (a pipeline that samples by itself takes no token)
+                    slot.tts.sampled = LLAMA_TOKEN_NULL;
+                    if (slot.tts.ctx.uses_sampled()) {
+                        slot.tts.sampled = common_sampler_sample(slot.smpl.get(), ctx_tgt, -1);
+                        common_sampler_accept(slot.smpl.get(), slot.tts.sampled, true);
+                    }
                     const float * h_embd = llama_get_embeddings_ith(ctx_tgt, -1);
                     slot.tts.h_state_prompt.assign(h_embd, h_embd + llama_model_n_embd(model_tgt));
                     slot.tts.h_state = slot.tts.h_state_prompt.data();
@@ -4114,7 +4117,7 @@ private:
             slot.tts.n_decoded++;
             slot.tts.stop = stop;
 
-            if (!stop) {
+            if (!stop && slot.tts.ctx.uses_sampled()) {
                 slot.tts.sampled = common_sampler_sample(slot.smpl.get(), ctx_tgt, -1);
                 common_sampler_accept(slot.smpl.get(), slot.tts.sampled, true);
             }

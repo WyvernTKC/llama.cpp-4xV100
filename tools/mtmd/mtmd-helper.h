@@ -373,6 +373,10 @@ MTMD_API int32_t mtmd_helper_gen_audio_step_gen(
 // false if the next step generates an audio frame from h_state_in
 MTMD_API bool mtmd_helper_gen_audio_next_is_text(mtmd_helper_gen_audio * ctx);
 
+// false if step_gen() never reads sampled (the pipeline samples from the logits by itself): the caller can skip its own
+// sampling of the backbone logits and pass LLAMA_TOKEN_NULL
+MTMD_API bool mtmd_helper_gen_audio_uses_sampled(const mtmd_helper_gen_audio * ctx);
+
 // bias for the text tokens the caller samples (e.g. no switch to audio in a text-only response), n_bias is set to its size
 MTMD_API const llama_logit_bias * mtmd_helper_gen_audio_get_logit_bias(mtmd_helper_gen_audio * ctx, size_t * n_bias);
 
@@ -487,6 +491,9 @@ struct gen_audio {
     }
     bool next_is_text() {
         return mtmd_helper_gen_audio_next_is_text(ctx.get());
+    }
+    bool uses_sampled() const {
+        return mtmd_helper_gen_audio_uses_sampled(ctx.get());
     }
     std::vector<llama_logit_bias> logit_bias() {
         size_t n = 0;

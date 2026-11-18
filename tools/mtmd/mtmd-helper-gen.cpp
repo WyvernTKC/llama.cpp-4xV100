@@ -133,6 +133,8 @@ public:
     // mtmd_helper_gen_audio_inp::flow_steps other than the default
     virtual bool supports_flow_steps() const { return false; }
     virtual bool next_is_text() const { return false; }
+    // step_gen() reads the token the caller samples from the backbone logits; false if it samples by itself
+    virtual bool uses_sampled() const { return true; }
 
     std::vector<llama_logit_bias> logit_bias; // see mtmd_helper_gen_audio_get_logit_bias()
 
@@ -3818,6 +3820,8 @@ public:
 
     bool supports_cfg() const override { return true; }
     bool supports_flow_steps() const override { return true; }
+    // the semantic code comes from sample() over the codes slice of the logits
+    bool uses_sampled() const override { return false; }
 
     // step_gen() stops at the frame limit of the reference
     int32_t max_frames() const override { return 0; }
@@ -4392,6 +4396,10 @@ int32_t mtmd_helper_gen_audio_step_prompt(mtmd_helper_gen_audio * ctx, int32_t n
 
 bool mtmd_helper_gen_audio_next_is_text(mtmd_helper_gen_audio * ctx) {
     return ctx->pipeline && ctx->pipeline->next_is_text();
+}
+
+bool mtmd_helper_gen_audio_uses_sampled(const mtmd_helper_gen_audio * ctx) {
+    return !ctx->pipeline || ctx->pipeline->uses_sampled();
 }
 
 const llama_logit_bias * mtmd_helper_gen_audio_get_logit_bias(mtmd_helper_gen_audio * ctx, size_t * n_bias) {
