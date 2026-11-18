@@ -652,6 +652,15 @@ extern "C" {
     // Returns the total size of all the tensors in the model in bytes
     LLAMA_API uint64_t llama_model_size(const struct llama_model * model);
 
+    // Parks the device weights of a model in host memory (pinned where the device has it) and frees their device memory.
+    //   The first park copies the weights out, later ones only free the device memory: the host copy is kept until the
+    //   model is freed. No context may exist on a parked model. Returns false, leaving the model as it was, if it cannot
+    //   be parked (LoRA adapters, a context split over several device buffers, no host memory).
+    LLAMA_API bool llama_model_park(struct llama_model * model);
+    // Allocates the device weights of a parked model again (at other addresses) and uploads them
+    LLAMA_API bool llama_model_unpark(struct llama_model * model);
+    LLAMA_API bool llama_model_is_parked(const struct llama_model * model);
+
     // Get the default chat template. Returns nullptr if not available
     // If name is NULL, returns the default chat template
     LLAMA_API const char * llama_model_chat_template(const struct llama_model * model, const char * name);

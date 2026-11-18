@@ -994,6 +994,11 @@ struct llama_model {
 
     llama_ftype ftype() const;
 
+    // weights parked in host memory, see llama_model_park() in llama.h
+    bool park();
+    bool unpark();
+    bool is_parked() const;
+
     size_t size() const; // file size
     size_t n_tensors() const;
     size_t n_devices() const;

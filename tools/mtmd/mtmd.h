@@ -150,6 +150,15 @@ MTMD_API mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
 
 MTMD_API void mtmd_free(mtmd_context * ctx);
 
+// Parks the device weights of the mmproj in host memory (pinned where the device has it; the first park copies them, the
+//   copy is kept until mtmd_free) and frees the device memory of its compute graphs: the backend instance and the
+//   scheduler buffers. Nothing may use the context until mtmd_unpark(). Returns false, leaving the context as it was, if
+//   it cannot be parked (yue2, no host memory).
+MTMD_API bool mtmd_park(mtmd_context * ctx);
+// Allocates the weights (at other addresses) and the compute buffers again, uploads the weights and warms up as
+//   mtmd_init_from_file() did
+MTMD_API bool mtmd_unpark(mtmd_context * ctx);
+
 // whether we need to set non-causal mask before llama_decode
 // if chunk is nullptr, we assume the default case where chunk is an image chunk
 MTMD_API bool mtmd_decode_use_non_causal(const mtmd_context * ctx, const mtmd_input_chunk * chunk);

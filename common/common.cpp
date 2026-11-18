@@ -1274,14 +1274,16 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
 }
 
-common_init_result::common_init_result(common_params & params, bool model_only) :
+common_init_result::common_init_result(common_params & params, bool model_only, llama_model * model_in) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
-    common_fit_apply(params, mparams, cparams);
-
-    llama_model * model = common_model_load(params.model.get_paths(), mparams);
+    llama_model * model = model_in;
+    if (model == nullptr) {
+        common_fit_apply(params, mparams, cparams);
+        model = common_model_load(params.model.get_paths(), mparams);
+    }
     if (model == NULL) {
         return;
     }
@@ -1405,6 +1407,15 @@ llama_context * common_init_result::context() {
     return pimpl->context.get();
 }
 
+llama_model * common_init_result::release_model() {
+    // in the order of ~impl: the samplers, adapters and context use the model (the threadpools go with this object)
+    pimpl->samplers.clear();
+    pimpl->samplers_seq_config.clear();
+    pimpl->lora.clear();
+    pimpl->context.reset();
+    return pimpl->model.release();
+}
+
 common_sampler * common_init_result::sampler(llama_seq_id seq_id) {
     if (seq_id < 0 || seq_id >= (int) pimpl->samplers.size()) {
         return nullptr;
@@ -1430,8 +1441,8 @@ static void common_batch_set_zero_state(common_batch & batch, const llama_model 
     }
 }
 
-common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
-    common_init_result_ptr res(new common_init_result(params, model_only));
+common_init_result_ptr common_init_from_params(common_params & params, bool model_only, llama_model * model_in) {
+    common_init_result_ptr res(new common_init_result(params, model_only, model_in));
 
     llama_model * model = res->model();
     if (model == NULL) {

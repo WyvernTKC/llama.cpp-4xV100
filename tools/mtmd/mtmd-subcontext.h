@@ -51,10 +51,22 @@ struct mtmd_backends {
     // its buffers fit the largest graph reserved by the subcontexts
     ggml_backend_sched_ptr sched;
 
+    // what the device backend and the scheduler are made from, see release()
+    ggml_backend_dev_t               device            = nullptr;
+    int                              max_nodes         = 0;
+    ggml_backend_sched_eval_callback cb_eval           = nullptr;
+    void *                           cb_eval_user_data = nullptr;
+    bool                             released          = false;
+
     // device nullptr means CPU
     mtmd_backends(ggml_backend_dev_t device, int n_threads, int max_nodes,
                   ggml_backend_sched_eval_callback cb_eval, void * cb_eval_user_data);
     ~mtmd_backends();
+
+    // frees the device backend and the scheduler with its compute buffers (mtmd_park); restore() makes them again, the
+    //   CPU backend and the threadpool stay
+    void release();
+    void restore();
 
     std::map<ggml_backend_dev_t, size_t> get_mem_compute() const;
 
@@ -178,6 +190,13 @@ struct mtmd_subcontext {
 
     bool support_batch = false;
 
+    // forget the graphs and allocation of the scheduler, which mtmd_backends::release() frees (mtmd_park)
+    void release_compute() {
+        kept_gf      = nullptr;
+        kept_embd    = nullptr;
+        is_allocated = false;
+    }
+
     // the last minimax_music3 GEN_CODE or FLOW_STEP graph, still allocated: nothing has used the scheduler since, and
     //   what it was built for (see encode()); only kept with sched_exclusive
     bool                    sched_exclusive = false;
@@ -195,6 +214,9 @@ struct mtmd_subcontext {
 
     // reserve the compute buffers for the given batch
     void warmup(const mtmd_image_f32_batch & batch);
+
+    // the batch the constructor warms up with (mtmd_unpark warms up with it again)
+    mtmd_image_f32_batch get_dummy_batch() const;
 
     // TODO: remove encode_image() and always use batched version
     bool encode_image(int n_threads, const mtmd_image_f32 * img, std::vector<float> & out_vec);
@@ -221,8 +243,6 @@ private:
 
         std::vector<support_info_op> ops;
     };
-
-    mtmd_image_f32_batch get_dummy_batch() const;
 
     // only initialize backend buffers, but do not allocate them yet
     support_info_graph reserve_compute_meta(const mtmd_image_f32_batch & batch);
