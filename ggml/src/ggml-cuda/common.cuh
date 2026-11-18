@@ -1493,6 +1493,16 @@ struct ggml_cuda_ar_fold_moe_args {
     int            n_used  = 0;
 };
 
+// A GLU whose two inputs are ADDs of one bias row each to x and g (gate/up matmuls on cuBLAS): the ADDs are skipped and
+//   the GLU adds the rows as it reads x and g, see ggml_cuda_try_fuse_glu_bias
+struct ggml_cuda_glu_bias {
+    const ggml_tensor * glu = nullptr;
+    const ggml_tensor * x   = nullptr; // in place of glu->src[0]
+    const float *       bx  = nullptr;
+    const ggml_tensor * g   = nullptr; // in place of glu->src[1]
+    const float *       bg  = nullptr;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1730,6 +1740,9 @@ struct ggml_backend_cuda_context {
         ggml_tensor *       glu    = nullptr;
         int                 target = -1;
     } glu_deferred;
+
+    // the GLU of a gate/up pair whose bias ADDs ggml_cuda_try_fuse_glu_bias skipped, run by ggml_cuda_glu_with_f16_copy
+    ggml_cuda_glu_bias glu_bias;
 
     ggml_cuda_dsv4_compress_fold dsv4_fold;
 

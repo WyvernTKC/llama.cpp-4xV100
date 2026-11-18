@@ -504,6 +504,76 @@ bool ggml_cuda_op_glu_f16_copy_supported(const ggml_tensor * dst) {
     }
 }
 
+// unary_gated_op_kernel of an f32 GLU whose inputs are x + bx and g + bg (bias rows): each sum rounded as the ADD apart
+template <float (*op)(float), bool f16_copy>
+static __global__ void unary_gated_bias_kernel(const float * x, const float * bx, const float * g, const float * bg,
+        float * dst, half * dst_f16, const int64_t k, const int64_t n, const uint3 n_fd, const int64_t o0, const int64_t o1) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+    int64_t row;
+    int64_t col;
+    if (n_fd.z != 0) {
+        const uint2 rc = fast_div_modulo((uint32_t) i, n_fd);
+        row = rc.x;
+        col = rc.y;
+    } else {
+        row = i / n;
+        col = i % n;
+    }
+    ggml_cuda_pdl_sync();
+    const float v = op(__fadd_rn(x[row*o0 + col], bx[col])) * __fadd_rn(g[row*o1 + col], bg[col]);
+    dst[i] = v;
+    if constexpr (f16_copy) {
+        dst_f16[i] = ggml_cuda_cast<half>(v);
+    }
+}
+
+template <float (*op)(float)>
+static void ggml_cuda_op_unary_gated_bias(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_glu_bias & b, half * dst_f16) {
+    const int64_t nc = dst->ne[0];
+    const int64_t k  = ggml_nelements(dst);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && b.x->type == GGML_TYPE_F32 && b.g->type == GGML_TYPE_F32 && ggml_is_contiguous(dst));
+    GGML_ASSERT(b.x->ne[0] == nc && b.g->ne[0] == nc && b.x->nb[0] == sizeof(float) && b.g->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_nrows(b.x) == ggml_nrows(dst) && ggml_nrows(b.g) == ggml_nrows(dst));
+    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3) num_blocks, CUDA_GLU_BLOCK_SIZE, 0, ctx.stream());
+    const uint3 n_fd = unary_gated_n_fastdiv(k, nc);
+    const int64_t o0 = b.x->nb[1] / (int64_t) sizeof(float);
+    const int64_t o1 = b.g->nb[1] / (int64_t) sizeof(float);
+    if (dst_f16 != nullptr) {
+        ggml_cuda_kernel_launch(unary_gated_bias_kernel<op, true>, launch_params, (const float *) b.x->data, b.bx,
+            (const float *) b.g->data, b.bg, (float *) dst->data, dst_f16, k, nc, n_fd, o0, o1);
+    } else {
+        ggml_cuda_kernel_launch(unary_gated_bias_kernel<op, false>, launch_params, (const float *) b.x->data, b.bx,
+            (const float *) b.g->data, b.bg, (float *) dst->data, dst_f16, k, nc, n_fd, o0, o1);
+    }
+}
+
+void ggml_cuda_op_glu_bias(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_glu_bias & b, half * dst_f16) {
+    switch (ggml_get_glu_op(dst)) {
+        case GGML_GLU_OP_REGLU:
+            ggml_cuda_op_unary_gated_bias<op_relu>(ctx, dst, b, dst_f16);
+            break;
+        case GGML_GLU_OP_GEGLU:
+            ggml_cuda_op_unary_gated_bias<op_gelu>(ctx, dst, b, dst_f16);
+            break;
+        case GGML_GLU_OP_SWIGLU:
+            ggml_cuda_op_unary_gated_bias<op_silu>(ctx, dst, b, dst_f16);
+            break;
+        case GGML_GLU_OP_GEGLU_ERF:
+            ggml_cuda_op_unary_gated_bias<op_gelu_erf>(ctx, dst, b, dst_f16);
+            break;
+        case GGML_GLU_OP_GEGLU_QUICK:
+            ggml_cuda_op_unary_gated_bias<op_gelu_quick>(ctx, dst, b, dst_f16);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+}
+
 void ggml_cuda_op_glu_f16_copy(ggml_backend_cuda_context & ctx, ggml_tensor * dst, half * dst_f16) {
     switch (ggml_get_glu_op(dst)) {
         case GGML_GLU_OP_REGLU:

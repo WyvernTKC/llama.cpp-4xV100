@@ -230,6 +230,46 @@ static __global__ void cpy_scalar_contiguous(const char * cx, char * cdst, const
     dst[i] = ggml_cuda_cast<dst_t>(x[i]);
 }
 
+// F32 -> F16 of a src whose rows are contiguous (ne00 % 4 == 0, 16-byte aligned row starts, any strides above) into a
+//   contiguous dst of the same shape, 4 values per thread: the permuted K/V cast in front of flash attention. Rounds
+//   like cpy_1_scalar (round to nearest).
+static __global__ void cpy_f32_f16_rows4(const char * cx, half * dst, const uint32_t n4, const uint32_t ne00_4,
+        const uint32_t ne01, const uint32_t ne02, const int64_t nb01, const int64_t nb02, const int64_t nb03) {
+    const uint32_t i = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= n4) {
+        return;
+    }
+    const uint32_t i00 = i % ne00_4;
+    uint32_t       r   = i / ne00_4;
+    const uint32_t i01 = r % ne01;
+    r /= ne01;
+    const uint32_t i02 = r % ne02;
+    const uint32_t i03 = r / ne02;
+
+    ggml_cuda_pdl_sync();
+    const float4 v = *(const float4 *) (cx + i01*nb01 + i02*nb02 + i03*nb03 + 16*(int64_t) i00);
+    half2 * d = (half2 *) (dst + 4*(int64_t) i);
+    d[0] = __floats2half2_rn(v.x, v.y);
+    d[1] = __floats2half2_rn(v.z, v.w);
+}
+
+static bool ggml_cpy_f32_f16_rows4_cuda(const ggml_tensor * src0, ggml_tensor * src1, cudaStream_t stream) {
+    static const bool disabled = getenv("GGML_CUDA_NO_CPY_F16_ROWS") != nullptr;
+    const int64_t n4 = ggml_nelements(src0) / 4;
+    if (disabled || src0->nb[0] != sizeof(float) || src0->ne[0] % 4 != 0 || !ggml_is_contiguous(src1) ||
+            !ggml_are_same_shape(src0, src1) || n4 > UINT32_MAX - 1024 ||
+            (uintptr_t) src0->data % 16 != 0 || src0->nb[1] % 16 != 0 || src0->nb[2] % 16 != 0 || src0->nb[3] % 16 != 0 ||
+            (uintptr_t) src1->data % 8 != 0) {
+        return false;
+    }
+    const int block = 256;
+    const uint32_t blocks = (uint32_t) ((n4 + block - 1) / block);
+    cpy_f32_f16_rows4<<<blocks, block, 0, stream>>>((const char *) src0->data, (half *) src1->data, (uint32_t) n4,
+        (uint32_t) (src0->ne[0] / 4), (uint32_t) src0->ne[1], (uint32_t) src0->ne[2], src0->nb[1], src0->nb[2], src0->nb[3]);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 template<typename src_t, typename dst_t>
 static void ggml_cpy_scalar_contiguous_cuda(
     const char * cx, char * cdst, const int64_t ne,
@@ -608,6 +648,8 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         if (contiguous_srcs) {
             ggml_cpy_scalar_contiguous_cuda<float, half>
                 (src0_ddc, src1_ddc, ne, main_stream);
+        } else if (ggml_cpy_f32_f16_rows4_cuda(src0, src1, main_stream)) {
+            // done
         } else {
             ggml_cpy_scalar_cuda<float, half>
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);

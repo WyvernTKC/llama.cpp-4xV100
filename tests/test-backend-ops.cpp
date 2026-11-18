@@ -4625,6 +4625,53 @@ struct test_norm_mul_add : public test_case {
         return out;
     }
 };
+// MUL_MAT up and gate with a bias row each into a split GLU, then (with_down) the down MUL_MAT: the CUDA backend folds the
+//   two bias ADDs into the GLU when the matmuls run on cuBLAS (ggml_cuda_try_fuse_glu_bias), with the f16 copy for the down
+//   matmul. Weights are plain leaves (a param weight would sit between the fused nodes).
+struct test_glu_bias_ffn : public test_case {
+    const ggml_glu_op op;
+    const int64_t n_embd;
+    const int64_t n_ff;
+    const int64_t n_tokens;
+    const bool with_down;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GLU_BIAS_FFN";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    std::string vars() override {
+        return std::string("op=") + ggml_glu_op_name(op) + "," + VARS_TO_STR4(n_embd, n_ff, n_tokens, with_down);
+    }
+
+    test_glu_bias_ffn(ggml_glu_op op = GGML_GLU_OP_SWIGLU, int64_t n_embd = 256, int64_t n_ff = 512, int64_t n_tokens = 64,
+            bool with_down = true)
+        : op(op), n_embd(n_embd), n_ff(n_ff), n_tokens(n_tokens), with_down(with_down) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * h  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * wu = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_embd, n_ff);
+        ggml_tensor * wg = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_embd, n_ff);
+        ggml_tensor * bu = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_ff);
+        ggml_tensor * bg = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_ff);
+        ggml_set_name(h, "h");
+
+        ggml_tensor * up   = ggml_add(ctx, ggml_mul_mat(ctx, wu, h), bu);
+        ggml_tensor * gate = ggml_add(ctx, ggml_mul_mat(ctx, wg, h), bg);
+        ggml_tensor * out  = ggml_glu_split(ctx, gate, up, op);
+        if (with_down) {
+            ggml_tensor * wd = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_ff, n_embd);
+            out = ggml_mul_mat(ctx, wd, out);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_NORM/RMS_NORM + GGML_OP_SCALE
 struct test_norm_scale : public test_case {
     const ggml_type type;
@@ -15332,6 +15379,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_cpy(type_src, type_dst, {256, 2, 3, 4}, {-1,-1,-1,-1}, {1, 0, 2, 3})); // cpy not-contiguous
         }
     }
+    // the permuted K/V cast in front of flash attention: rows of 64 and 72 f32 into a contiguous f16 (cpy_f32_f16_rows4 on
+    //   CUDA), and a row length that path does not take
+    for (int64_t d : { 64, 72, 6 }) {
+        test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F16, {d, 7, 5, 2}, {-1,-1,-1,-1}, {0, 2, 1, 3}));
+    }
     for (ggml_type type_src : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
         test_cases.emplace_back(new test_cpy(type_src, GGML_TYPE_F8_E4M3, {32, 2, 3, 4}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {64, 2, 3, 4}));
         test_cases.emplace_back(new test_cpy(type_src, GGML_TYPE_F8_E4M3, {32, 2, 3, 4}, {-1,-1,-1,-1}, {1, 0, 2, 3}, {1, 0, 2, 3}));
@@ -15717,6 +15769,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
         }
+    }
+    // up/gate FFN with bias rows: the fused GLU from 64 tokens (cuBLAS), unfused at 8
+    for (ggml_glu_op op : { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_REGLU, GGML_GLU_OP_GEGLU_ERF, GGML_GLU_OP_GEGLU_QUICK }) {
+        for (bool with_down : { true, false }) {
+            test_cases.emplace_back(new test_glu_bias_ffn(op, 256, 512, 64, with_down));
+        }
+        test_cases.emplace_back(new test_glu_bias_ffn(op, 256, 512, 8, true));
     }
     // layer norm with a weight and a bias row from 1024 columns: norm_f32<1024> with the MUL and ADD in its write loop
     for (uint32_t n : { 1024, 2048, 2304, 5376 }) {

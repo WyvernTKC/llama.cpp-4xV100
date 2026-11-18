@@ -98,6 +98,9 @@ bool ggml_cuda_op_glu_f16_copy_supported(const ggml_tensor * dst);
 
 void ggml_cuda_op_glu_f16_copy(ggml_backend_cuda_context & ctx, ggml_tensor * dst, half * dst_f16);
 
+// the GLU dst over the matmul outputs b.x and b.g plus their bias rows (ggml_cuda_try_fuse_glu_bias), also the f16 copy if dst_f16
+void ggml_cuda_op_glu_bias(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_glu_bias & b, half * dst_f16);
+
 void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);

@@ -3011,26 +3011,43 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
 // The GLU of an FFN whose down projection follows on cuBLAS in f16 also writes the f16 copy of its output that the
 //   matmul would convert, as the entry of ctx.cublas_src1 the matmul looks up
+//   A GLU whose bias ADDs ggml_cuda_try_fuse_glu_bias skipped (ctx.glu_bias) always runs here, with or without the copy.
 static bool ggml_cuda_glu_with_f16_copy(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
     ggml_tensor * glu = cgraph->nodes[i];
-    if (glu->op != GGML_OP_GLU || i + 1 >= cgraph->n_nodes || !ggml_cuda_op_glu_f16_copy_supported(glu)) {
+    ggml_cuda_glu_bias bias;
+    if (ctx.glu_bias.glu == glu && glu != nullptr) {
+        bias = ctx.glu_bias;
+        ctx.glu_bias = {};
+    }
+    const auto plain = [&]() {
+        if (bias.glu != nullptr) {
+            ggml_cuda_op_glu_bias(ctx, glu, bias, nullptr);
+            return true;
+        }
         return false;
+    };
+    if (glu->op != GGML_OP_GLU || i + 1 >= cgraph->n_nodes || !ggml_cuda_op_glu_f16_copy_supported(glu)) {
+        return plain();
     }
     const ggml_tensor * mm = cgraph->nodes[i + 1];
     if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != glu || (mm->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
             ggml_cuda_op_mul_mat_use_fwht(mm) || !ggml_cuda_cublas_keep_src1(ctx, glu)) {
-        return false;
+        return plain();
     }
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     if (ggml_cuda_mul_mat_choose(ctx, mm->src[0], glu, mm) != GGML_CUDA_MUL_MAT_PATH_CUBLAS ||
             ggml_cuda_mul_mat_cublas_compute_type(cc, mm->src[0], glu, mm) != GGML_TYPE_F16) {
-        return false;
+        return plain();
     }
 
     auto & cached = ctx.cublas_src1;
     cached.buf.reset();
     cached.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), ggml_nelements(glu)*sizeof(half));
-    ggml_cuda_op_glu_f16_copy(ctx, glu, (half *) cached.buf->get());
+    if (bias.glu != nullptr) {
+        ggml_cuda_op_glu_bias(ctx, glu, bias, (half *) cached.buf->get());
+    } else {
+        ggml_cuda_op_glu_f16_copy(ctx, glu, (half *) cached.buf->get());
+    }
     // a contiguous input keeps its strides through the conversion
     ggml_cuda_cublas_store_src1(ctx, glu, GGML_TYPE_F16, glu->nb[1]/sizeof(float), glu->nb[2]/sizeof(float),
         glu->nb[3]/sizeof(float), ggml_is_contiguous_2(glu));
@@ -7929,6 +7946,65 @@ static int ggml_cuda_try_fuse_norm_gated_mm(ggml_backend_cuda_context * cuda_ctx
     return j - i;
 }
 
+// A gate/up FFN with biases whose gate matmul runs on cuBLAS: ADD(up, b_up), MUL_MAT gate, ADD(gate, b_gate), GLU (the
+//   minimax_music3 DiT). The gate matmul runs here and the two ADDs are skipped; the GLU, left to the main loop so that
+//   ggml_cuda_glu_with_f16_copy still writes the f16 copy for the down matmul, adds the bias rows as it reads the matmul
+//   outputs (each sum rounded as the ADD apart). Returns the nodes consumed: the two ADDs and the matmul.
+//   GGML_CUDA_NO_GLU_BIAS=1 runs them apart.
+static int ggml_cuda_try_fuse_glu_bias(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_GLU_BIAS") != nullptr;
+    if (disabled || i + 3 >= cgraph->n_nodes || !cuda_ctx->stream_context().concurrent_events.empty()) {
+        return 0;
+    }
+    ggml_tensor * add_a = cgraph->nodes[i];
+    ggml_tensor * mm    = cgraph->nodes[i + 1];
+    ggml_tensor * add_b = cgraph->nodes[i + 2];
+    ggml_tensor * glu   = cgraph->nodes[i + 3];
+    const ggml_op ops[4]     = { GGML_OP_ADD, GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_GLU };
+    const int     outputs[2] = { i + 1, i + 3 };
+    // the ADDs feed nothing but the GLU; the q8_1 copy of a GLU of a few rows is not written by the biased kernel
+    if (!ggml_can_fuse_subgraph(cgraph, i, 4, ops, outputs, 2) || glu->src[1] == nullptr ||
+            !ggml_cuda_op_glu_f16_copy_supported(glu) || ggml_nrows(glu) <= MMVQ_MAX_BATCH_SIZE ||
+            !((glu->src[0] == add_a && glu->src[1] == add_b) || (glu->src[0] == add_b && glu->src[1] == add_a))) {
+        return 0;
+    }
+    // the input and the bias row of an ADD of one row to a whole f32 tensor of rows
+    const auto split = [](const ggml_tensor * add, const ggml_tensor *& in, const float *& b) {
+        for (int s : { 0, 1 }) {
+            const ggml_tensor * t  = add->src[s];
+            const ggml_tensor * bb = add->src[1 - s];
+            if (t->type == GGML_TYPE_F32 && bb->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32 && ggml_are_same_shape(t, add) &&
+                    ggml_is_contiguous(t) && ggml_is_contiguous(bb) && bb->ne[0] == add->ne[0] && ggml_nrows(bb) == 1 && ggml_nrows(add) > 1) {
+                in = t;
+                b  = (const float *) bb->data;
+                return true;
+            }
+        }
+        return false;
+    };
+    const ggml_tensor * in_a = nullptr;
+    const ggml_tensor * in_b = nullptr;
+    const float *       b_a  = nullptr;
+    const float *       b_b  = nullptr;
+    if (!split(add_a, in_a, b_a) || !split(add_b, in_b, b_b) || in_b != mm || in_a == mm || !ggml_is_contiguous(glu)) {
+        return 0;
+    }
+    // the gate matmul goes where ggml_cuda_mul_mat would run it on cuBLAS (fusions of a matmul with its bias are for
+    //   fewer tokens); its output must not land on the up output the GLU still reads, and the GLU writes over an input
+    //   only exactly (same layout: all contiguous, same shape)
+    if (ggml_get_op_params_i32(mm, 1) != GGML_HINT_NONE || ggml_cuda_op_mul_mat_use_fwht(mm) ||
+            ggml_cuda_mul_mat_choose(*cuda_ctx, mm->src[0], mm->src[1], mm) != GGML_CUDA_MUL_MAT_PATH_CUBLAS ||
+            ggml_cuda_tensors_overlap(mm, in_a) || !ggml_cuda_same_or_disjoint(glu, in_a) || !ggml_cuda_same_or_disjoint(glu, mm)) {
+        return 0;
+    }
+    if (!ggml_cuda_compute_forward(*cuda_ctx, mm)) {
+        GGML_ABORT("%s: the gate matmul %s failed", __func__, mm->name);
+    }
+    const bool a_first = glu->src[0] == add_a;
+    cuda_ctx->glu_bias = { glu, a_first ? in_a : in_b, a_first ? b_a : b_b, a_first ? in_b : in_a, a_first ? b_b : b_a };
+    return 2;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     ggml_cuda_try_gather_expert_group(cuda_ctx, cgraph, i);
 
@@ -7937,6 +8013,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // the GLU after ggml_cuda_try_fuse_glu_bias runs as is in the main loop, with the bias rows
+    if (node == cuda_ctx->glu_bias.glu) {
+        return 0;
+    }
+    if (node->op == GGML_OP_ADD) {
+        const int n_skip = ggml_cuda_try_fuse_glu_bias(cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
+        }
+    }
 
     // a build_conv_state that the qkv projection ran (ggml_cuda_gdn_conv_fold), or a topk_moe that the router's launch
     //   ran (ggml_cuda_topk_moe_fold)
