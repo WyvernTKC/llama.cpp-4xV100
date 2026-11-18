@@ -9,6 +9,7 @@
 
 #include "llama.h"
 #include "llama-cpp.h"
+#include "ggml-alloc.h"
 #include "../src/llama-ext.h"
 
 // fix problem with std::min and std::max
@@ -780,6 +781,23 @@ struct mtmd_context {
     // batching
     int32_t batch_max_tokens;
 
+    // mtmd_park: the host copies of the device weights of the models, made by the first park and kept (weights do not
+    //   change); warmup_on_unpark is ctx_params.warmup, mtmd_unpark warms up again as the constructor did
+    struct park_entry {
+        mtmd_model *               model;
+        ggml_backend_buffer_type_t buft;
+        ggml_backend_park_t        park;
+    };
+    std::vector<park_entry> park_entries;
+    bool                    parked           = false;
+    bool                    warmup_on_unpark = true;
+
+    ~mtmd_context() {
+        for (park_entry & e : park_entries) {
+            ggml_backend_park_free(e.park);
+        }
+    }
+
     // TODO @ngxson : add timings
 
     mtmd_context(const char * mmproj_fname,
@@ -857,6 +875,8 @@ struct mtmd_context {
         // no_alloc only measures memory, nothing is computed
         backends = std::make_unique<mtmd_backends>(device, no_alloc ? 1 : ctx_params.n_threads, max_nodes,
                                                    ctx_params.cb_eval, ctx_params.cb_eval_user_data);
+
+        warmup_on_unpark = ctx_params.warmup;
 
         // like llama_context::sched_reserve(), each warmup reserves its graph on the shared scheduler
         mtmd_subctx_params sctx_params {
@@ -1531,6 +1551,116 @@ mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
 
 void mtmd_free(mtmd_context * ctx) {
     delete ctx;
+}
+
+// the host buffer type to park the weights of buft in: pinned memory of its device where it has one (a meta device has
+//   the one its devices share), else pinned memory of any GPU, else plain CPU memory
+static ggml_backend_buffer_type_t mtmd_park_host_buft(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    ggml_backend_buffer_type_t host = dev != nullptr ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    for (size_t i = 0; host == nullptr && i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            host = ggml_backend_dev_host_buffer_type(d);
+        }
+    }
+    return host != nullptr ? host : ggml_backend_cpu_buffer_type();
+}
+
+bool mtmd_park(mtmd_context * ctx) {
+    std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+    if (ctx->parked) {
+        return true;
+    }
+    if (ctx->yue2_nar) {
+        LOG_WRN("%s: the yue2 NAR layers are not parked\n", __func__);
+        return false;
+    }
+    const int64_t t_start = ggml_time_us();
+
+    std::vector<mtmd_model *> todo;
+    for (mtmd_model * m : { ctx->models.v.get(), ctx->models.a.get(), ctx->models.gen_a.get() }) {
+        if (m != nullptr && m->buf && !ggml_backend_buffer_is_host(m->buf.get())) {
+            todo.push_back(m);
+        }
+    }
+    // copy first: a failure here leaves the context as it was
+    size_t n_copied = 0;
+    for (mtmd_model * m : todo) {
+        auto it = std::find_if(ctx->park_entries.begin(), ctx->park_entries.end(),
+            [m](const mtmd_context::park_entry & e) { return e.model == m; });
+        if (it != ctx->park_entries.end()) {
+            continue;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(m->buf.get());
+        ggml_backend_park_t park = ggml_backend_park_ctx_tensors(m->ctx_data.get(), mtmd_park_host_buft(buft));
+        if (park == nullptr) {
+            LOG_ERR("%s: failed to copy the weights of %s to host memory, not parked\n", __func__, ggml_backend_buft_name(buft));
+            return false;
+        }
+        n_copied += ggml_backend_park_size(park);
+        ctx->park_entries.push_back({ m, buft, park });
+    }
+
+    size_t n_freed = 0;
+    for (mtmd_model * m : todo) {
+        n_freed += ggml_backend_buffer_get_size(m->buf.get());
+        m->buf.reset();
+        ggml_backend_park_clear_ctx_tensors(m->ctx_data.get());
+    }
+    for (mtmd_subcontext * sub : { ctx->ctx_v.get(), ctx->ctx_a.get(), ctx->ctx_gen_a.get() }) {
+        if (sub != nullptr) {
+            sub->release_compute();
+        }
+    }
+    ctx->backends->release();
+    ctx->parked = true;
+    LOG_INF("%s: parked %.2f MiB of device weights in host memory (copied %.2f MiB), freed the compute buffers in %.2f s\n",
+        __func__, n_freed/1048576.0, n_copied/1048576.0, (ggml_time_us() - t_start)/1e6);
+    return true;
+}
+
+bool mtmd_unpark(mtmd_context * ctx) {
+    std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+    if (!ctx->parked) {
+        return true;
+    }
+    const int64_t t_start = ggml_time_us();
+    try {
+        ctx->backends->restore();
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: %s\n", __func__, e.what());
+        return false;
+    }
+    if (ctx->audio_preproc) {
+        ctx->audio_preproc->mel_config.sched = ctx->backends->sched.get();
+    }
+    size_t n_restored = 0;
+    for (mtmd_context::park_entry & e : ctx->park_entries) {
+        if (e.model->buf) {
+            continue;
+        }
+        ggml_backend_buffer_t buf = ggml_backend_park_restore_ctx_tensors(e.park, e.model->ctx_data.get(), e.buft);
+        if (buf == nullptr) {
+            LOG_ERR("%s: failed to allocate the %s weights again\n", __func__, ggml_backend_buft_name(e.buft));
+            return false;
+        }
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        n_restored += ggml_backend_buffer_get_size(buf);
+        e.model->buf.reset(buf);
+    }
+    const int64_t t_weights = ggml_time_us();
+    if (ctx->warmup_on_unpark) {
+        for (mtmd_subcontext * sub : { ctx->ctx_v.get(), ctx->ctx_a.get(), ctx->ctx_gen_a.get() }) {
+            if (sub != nullptr) {
+                sub->warmup(sub->get_dummy_batch());
+            }
+        }
+    }
+    ctx->parked = false;
+    LOG_INF("%s: restored %.2f MiB of device weights in %.2f s, warmed up in %.2f s\n", __func__, n_restored/1048576.0,
+        (t_weights - t_start)/1e6, (ggml_time_us() - t_weights)/1e6);
+    return true;
 }
 
 std::vector<std::vector<const mtmd_bitmap *>> mtmd_group_mergeable_bitmaps(std::vector<mtmd_internal_part> & parts, int n_merge) {

@@ -249,6 +249,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-sps, --slot-prompt-similarity SIMILARITY` | how much the prompt of a request must match the prompt of a slot in order to use that slot (default: 0.10, 0.0 = disabled) |
 | `--lora-init-without-apply` | load LoRA adapters without applying them (apply later via POST /lora-adapters) (default: disabled) |
 | `--sleep-idle-seconds SECONDS` | number of seconds of idleness after which the server will sleep (default: -1; -1 = disabled) |
+| `--sleep-mode {unload,park}` | what sleeping frees (see --sleep-idle-seconds):<br/>- unload: everything, waking up loads the model files again (default)<br/>- park: everything but the weights of the model and the mmproj, which wait in (pinned) host memory and are<br/>  uploaded again on waking up; takes host memory for the weights (no speculative decoding, no LoRA) |
 | `--log-prompts-dir PATH` | Log prompts to directory (auto-created if not present; only used for debugging, default: disabled) |
 | `--spec-draft-hf, -hfd, -hfrd, --hf-repo-draft <user>/<model>[:quant]` | Same as --hf-repo, but for the draft model (default: unused)<br/>(env: LLAMA_ARG_SPEC_DRAFT_HF_REPO) |
 | `--spec-draft-threads, -td, --threads-draft N` | number of threads to use during generation (default: same as --threads) |
@@ -2595,6 +2596,8 @@ Example of an error:
 The server supports an automatic sleep mode that activates after a specified period of inactivity (no incoming tasks). This feature, introduced in [PR #18228](https://github.com/ggml-org/llama.cpp/pull/18228), can be enabled using the `--sleep-idle-seconds` command-line argument. It works seamlessly in both single-model and multi-model configurations.
 
 When the server enters sleep mode, the model and its associated memory (including the KV cache) are unloaded from RAM to conserve resources. Any new incoming task will automatically trigger the model to reload.
+
+With `--sleep-mode park` the device weights of the model and the mmproj are kept in host memory (pinned where the device offers it) instead: sleeping frees the device memory of the weights, the KV cache and the compute buffers, and waking up uploads the weights again rather than loading the model files, which takes about as long as copying them to the devices. The host copy is made by the first sleep and kept, so it takes host memory for the size of the device weights. Speculative decoding and LoRA adapters fall back to unloading.
 
 The sleeping status can be retrieved from the `GET /props` endpoint (or `/props?model=(model_name)` in router mode).
 

@@ -2069,7 +2069,6 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 
 struct llama_model::impl {
     impl() = default;
-    ~impl() = default;
 
     uint64_t n_elements = 0;
 
@@ -2088,6 +2087,22 @@ struct llama_model::impl {
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
+
+    // llama_model_park: the host copy of the tensors of ctxs_bufs[i_ctx], made by the first park and kept, the weights
+    //   do not change
+    struct park_entry {
+        size_t                     i_ctx;
+        ggml_backend_buffer_type_t buft;
+        ggml_backend_park_t        park;
+    };
+    std::vector<park_entry> park_entries;
+    bool                    parked = false;
+
+    ~impl() {
+        for (park_entry & e : park_entries) {
+            ggml_backend_park_free(e.park);
+        }
+    }
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -3360,6 +3375,110 @@ std::string llama_model::desc() const {
 
 llama_ftype llama_model::ftype() const {
     return pimpl->ftype;
+}
+
+// the host buffer type to park the tensors of buft in: pinned memory of its device where it has one (a meta device has
+//   the one its devices share), else pinned memory of any GPU, else plain CPU memory
+static ggml_backend_buffer_type_t llama_park_host_buft(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    ggml_backend_buffer_type_t host = dev != nullptr ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    for (size_t i = 0; host == nullptr && i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            host = ggml_backend_dev_host_buffer_type(d);
+        }
+    }
+    return host != nullptr ? host : ggml_backend_cpu_buffer_type();
+}
+
+bool llama_model::park() {
+    if (pimpl->parked) {
+        return true;
+    }
+    if (!loras.empty()) {
+        LLAMA_LOG_WARN("%s: a model with LoRA adapters is not parked\n", __func__);
+        return false;
+    }
+    const int64_t t_start = ggml_time_us();
+
+    // the contexts whose tensors live in device memory (host buffers stay where they are), one buffer each as
+    //   ggml_backend_alloc_ctx_tensors_from_buft made it, so that allocating them again gives the same layout
+    std::vector<size_t> todo;
+    for (size_t i = 0; i < pimpl->ctxs_bufs.size(); i++) {
+        auto & bufs = pimpl->ctxs_bufs[i].second;
+        bool on_device = false;
+        for (const auto & buf : bufs) {
+            on_device = on_device || !ggml_backend_buffer_is_host(buf.get());
+        }
+        if (!on_device) {
+            continue;
+        }
+        if (bufs.size() != 1) {
+            LLAMA_LOG_WARN("%s: a context of the model has %zu device buffers, not parked\n", __func__, bufs.size());
+            return false;
+        }
+        todo.push_back(i);
+    }
+
+    // copy first: a failure here leaves the model as it was
+    size_t n_copied = 0;
+    for (size_t i : todo) {
+        auto it = std::find_if(pimpl->park_entries.begin(), pimpl->park_entries.end(),
+            [i](const impl::park_entry & e) { return e.i_ctx == i; });
+        if (it != pimpl->park_entries.end()) {
+            continue;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(pimpl->ctxs_bufs[i].second[0].get());
+        ggml_backend_park_t park = ggml_backend_park_ctx_tensors(pimpl->ctxs_bufs[i].first.get(), llama_park_host_buft(buft));
+        if (park == nullptr) {
+            LLAMA_LOG_ERROR("%s: failed to copy the weights of %s to host memory, not parked\n", __func__, ggml_backend_buft_name(buft));
+            return false;
+        }
+        n_copied += ggml_backend_park_size(park);
+        pimpl->park_entries.push_back({ i, buft, park });
+    }
+
+    size_t n_freed = 0;
+    for (size_t i : todo) {
+        auto & [ctx, bufs] = pimpl->ctxs_bufs[i];
+        n_freed += ggml_backend_buffer_get_size(bufs[0].get());
+        bufs.clear();
+        ggml_backend_park_clear_ctx_tensors(ctx.get());
+    }
+    pimpl->parked = true;
+    LLAMA_LOG_INFO("%s: parked %.2f MiB of device weights in host memory (copied %.2f MiB) in %.2f s\n", __func__,
+        n_freed/1048576.0, n_copied/1048576.0, (ggml_time_us() - t_start)/1e6);
+    return true;
+}
+
+bool llama_model::unpark() {
+    if (!pimpl->parked) {
+        return true;
+    }
+    const int64_t t_start = ggml_time_us();
+    size_t n_restored = 0;
+    for (impl::park_entry & e : pimpl->park_entries) {
+        auto & [ctx, bufs] = pimpl->ctxs_bufs[e.i_ctx];
+        if (!bufs.empty()) {
+            continue; // restored by an earlier call that failed further on
+        }
+        ggml_backend_buffer_t buf = ggml_backend_park_restore_ctx_tensors(e.park, ctx.get(), e.buft);
+        if (buf == nullptr) {
+            LLAMA_LOG_ERROR("%s: failed to allocate the %s weights again\n", __func__, ggml_backend_buft_name(e.buft));
+            return false;
+        }
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        n_restored += ggml_backend_buffer_get_size(buf);
+        bufs.emplace_back(buf);
+    }
+    pimpl->parked = false;
+    LLAMA_LOG_INFO("%s: restored %.2f MiB of device weights in %.2f s\n", __func__, n_restored/1048576.0,
+        (ggml_time_us() - t_start)/1e6);
+    return true;
+}
+
+bool llama_model::is_parked() const {
+    return pimpl->parked;
 }
 
 size_t llama_model::size() const {
@@ -4798,6 +4917,18 @@ llama_ftype llama_model_ftype(const llama_model * model) {
 
 uint64_t llama_model_size(const llama_model * model) {
     return model->size();
+}
+
+bool llama_model_park(llama_model * model) {
+    return model->park();
+}
+
+bool llama_model_unpark(llama_model * model) {
+    return model->unpark();
+}
+
+bool llama_model_is_parked(const llama_model * model) {
+    return model->is_parked();
 }
 
 const char * llama_model_chat_template(const llama_model * model, const char * name) {

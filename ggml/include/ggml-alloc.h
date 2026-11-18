@@ -82,6 +82,22 @@ GGML_API size_t                       ggml_backend_alloc_ctx_tensors_from_buft_s
 GGML_API struct ggml_backend_buffer * ggml_backend_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft);
 GGML_API struct ggml_backend_buffer * ggml_backend_alloc_ctx_tensors(struct ggml_context * ctx, ggml_backend_t backend);
 
+// Parking: the data of the tensors of a context kept in host memory while their (device) buffers are freed, then the
+//   tensors allocated again from the same buffer type and their data uploaded. The tensors themselves stay, so every
+//   pointer to them stays valid; their data moves to another address, so anything that cached it must be rebuilt.
+typedef struct ggml_backend_park * ggml_backend_park_t;
+
+// copies the data of every allocated tensor of ctx that is not a view into one buffer of host_buft (pinned host memory
+//   gives the fastest restore); returns NULL on failure
+GGML_API ggml_backend_park_t                ggml_backend_park_ctx_tensors(struct ggml_context * ctx, ggml_backend_buffer_type_t host_buft);
+// clears the data, buffer and extra of every tensor of ctx, which the caller has parked and whose buffers it frees
+GGML_API void                               ggml_backend_park_clear_ctx_tensors(struct ggml_context * ctx);
+// allocates the tensors of ctx from buft as ggml_backend_alloc_ctx_tensors_from_buft does and uploads their parked data;
+//   returns the new buffer, NULL on failure
+GGML_API struct ggml_backend_buffer *       ggml_backend_park_restore_ctx_tensors(ggml_backend_park_t park, struct ggml_context * ctx, ggml_backend_buffer_type_t buft);
+GGML_API size_t                             ggml_backend_park_size(ggml_backend_park_t park);
+GGML_API void                               ggml_backend_park_free(ggml_backend_park_t park);
+
 #ifdef  __cplusplus
 }
 #endif

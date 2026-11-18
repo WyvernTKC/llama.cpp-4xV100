@@ -695,6 +695,7 @@ struct common_params {
     int enable_reasoning = -1; // -1 = auto, 0 = disable, 1 = enable
     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
+    bool sleep_park = false;       // --sleep-mode park: keep the weights in (pinned) host memory while sleeping
 
     std::vector<std::string> api_keys;
 
@@ -1023,11 +1024,16 @@ common_gguf_info common_get_gguf_info(const std::string & fname);
 
 // note: defines the model, context, samplers, ets. lifetimes
 struct common_init_result {
-    common_init_result(common_params & params, bool model_only = false);
+    // model: an already loaded model to take over instead of loading params.model (e.g. one unparked after sleeping),
+    //   no --fit then: the caller passes the context size it wants
+    common_init_result(common_params & params, bool model_only = false, llama_model * model = nullptr);
     ~common_init_result();
 
     llama_model * model();
     llama_context * context();
+
+    // frees the context (and samplers) and hands the model over to the caller, which frees it
+    llama_model * release_model();
 
     common_sampler * sampler(llama_seq_id seq_id);
     void reset_samplers();
@@ -1041,7 +1047,7 @@ private:
 
 using common_init_result_ptr = std::unique_ptr<common_init_result>;
 
-common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
+common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false, llama_model * model = nullptr);
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);

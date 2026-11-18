@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <atomic>
 #include <list>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -3918,4 +3919,74 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
 ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size) {
     GGML_ASSERT((uintptr_t)ptr % TENSOR_ALIGNMENT == 0 && "buffer pointer must be aligned");
     return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
+}
+
+// parking, see ggml-alloc.h
+
+struct ggml_backend_park {
+    ggml_backend_buffer_t                         host = nullptr; // the data of all parked tensors
+    std::vector<std::pair<ggml_tensor *, size_t>> entries;        // tensor, offset of its data in host
+};
+
+ggml_backend_park_t ggml_backend_park_ctx_tensors(struct ggml_context * ctx, ggml_backend_buffer_type_t host_buft) {
+    GGML_ASSERT(ctx && host_buft);
+    auto park = std::make_unique<ggml_backend_park>();
+    const size_t align = std::max<size_t>(64, ggml_backend_buft_get_alignment(host_buft));
+    size_t total = 0;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->data == nullptr || t->buffer == nullptr || t->view_src != nullptr) {
+            continue;
+        }
+        park->entries.emplace_back(t, total);
+        total += GGML_PAD(ggml_nbytes(t), align);
+    }
+    park->host = ggml_backend_buft_alloc_buffer(host_buft, std::max<size_t>(total, align));
+    if (park->host == nullptr) {
+        GGML_LOG_ERROR("%s: failed to allocate %.2f MiB of %s to park the tensors\n", __func__, total/1048576.0,
+            ggml_backend_buft_name(host_buft));
+        return nullptr;
+    }
+    GGML_ASSERT(ggml_backend_buffer_is_host(park->host));
+    char * base = (char *) ggml_backend_buffer_get_base(park->host);
+    for (const auto & [t, off] : park->entries) {
+        ggml_backend_tensor_get(t, base + off, 0, ggml_nbytes(t));
+    }
+    return park.release();
+}
+
+void ggml_backend_park_clear_ctx_tensors(struct ggml_context * ctx) {
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        t->data   = nullptr;
+        t->buffer = nullptr;
+        t->extra  = nullptr;
+    }
+}
+
+ggml_backend_buffer_t ggml_backend_park_restore_ctx_tensors(ggml_backend_park_t park, struct ggml_context * ctx, ggml_backend_buffer_type_t buft) {
+    GGML_ASSERT(park && ctx && buft);
+    for (const auto & [t, off] : park->entries) {
+        GGML_ASSERT(t->data == nullptr && t->buffer == nullptr && "restoring a tensor that is still allocated");
+        GGML_UNUSED(off);
+    }
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf == nullptr) {
+        return nullptr;
+    }
+    const char * base = (const char *) ggml_backend_buffer_get_base(park->host);
+    for (const auto & [t, off] : park->entries) {
+        ggml_backend_tensor_set(t, base + off, 0, ggml_nbytes(t));
+    }
+    return buf;
+}
+
+size_t ggml_backend_park_size(ggml_backend_park_t park) {
+    return park && park->host ? ggml_backend_buffer_get_size(park->host) : 0;
+}
+
+void ggml_backend_park_free(ggml_backend_park_t park) {
+    if (park == nullptr) {
+        return;
+    }
+    ggml_backend_buffer_free(park->host);
+    delete park;
 }

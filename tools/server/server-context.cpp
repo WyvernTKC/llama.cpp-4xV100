@@ -1262,6 +1262,14 @@ public:
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
             destroy();
+        } else {
+            // --sleep-mode park keeps the model and the mmproj while sleeping
+            mtmd_free(mctx);
+            mctx = nullptr;
+            if (model_parked != nullptr) {
+                llama_model_free(model_parked);
+                model_parked = nullptr;
+            }
         }
     }
 
@@ -1336,6 +1344,10 @@ private:
 
     bool sleeping = false;
 
+    // --sleep-mode park: the model (and mctx) kept while sleeping, their device weights in host memory, see park_models()
+    llama_model * model_parked = nullptr;
+    int           n_ctx_parked = 0;
+
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
@@ -1358,6 +1370,46 @@ private:
         mctx = nullptr;
     }
 
+    // --sleep-mode park: frees what destroy() frees, except the model and the mmproj, whose device weights go to (pinned)
+    //   host memory; waking up uploads them again instead of loading the files (load_model). Falls back to destroy()
+    //   where it cannot park: then the wake-up loads the files as without the option.
+    void park_models() {
+        if (spec || spec_init || model_dft != nullptr || !params_base.lora_adapters.empty() || !llama_init) {
+            SRV_WRN("%s", "--sleep-mode park: not with speculative decoding or LoRA adapters, unloading instead\n");
+            destroy();
+            return;
+        }
+        if (prompt_cache) {
+            prompt_cache->wait_saves();
+        }
+        n_ctx_parked = n_ctx;
+        const int64_t t_start = ggml_time_us();
+
+        llama_model * model = llama_init->release_model();
+        llama_init.reset();
+        ctx_tgt   = nullptr;
+        model_tgt = nullptr;
+
+        if (!llama_model_park(model)) {
+            // the mmproj holds the text model, it cannot outlive it
+            SRV_WRN("%s", "--sleep-mode park: the model cannot be parked, unloading instead\n");
+            llama_model_free(model);
+            mtmd_free(mctx);
+            mctx = nullptr;
+            return;
+        }
+        model_parked = model;
+        const int64_t t_model = ggml_time_us();
+
+        if (mctx != nullptr && !mtmd_park(mctx)) {
+            SRV_WRN("%s", "--sleep-mode park: the mmproj cannot be parked, unloading it\n");
+            mtmd_free(mctx);
+            mctx = nullptr;
+        }
+        SRV_INF("parked the model in %.2f s%s\n", (t_model - t_start)/1e6,
+            mctx != nullptr ? string_format(", the mmproj in %.2f s", (ggml_time_us() - t_model)/1e6).c_str() : "");
+    }
+
     void handle_sleeping_state(bool new_state) {
         GGML_ASSERT(sleeping != new_state);
         if (new_state) {
@@ -1366,7 +1418,11 @@ private:
                 // note: for sleeping == false, event is emitted by load_model()
             }
             SRV_INF("%s", "server is entering sleeping state\n");
-            destroy();
+            if (params_base.sleep_park) {
+                park_models();
+            } else {
+                destroy();
+            }
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
             if (!load_model(params_base)) {
@@ -1472,7 +1528,8 @@ private:
         // get the memory usage of mmproj, also used to check image_max_tokens against n_ubatch
         mtmd_memory_usage mmproj_usage = {{}, -1, false};
         int64_t mmproj_usage_t_us = 0;
-        if (has_mmproj) {
+        // a parked mmproj (--sleep-mode park) is taken over as it is
+        if (has_mmproj && mctx == nullptr) {
             int64_t t_start = ggml_time_us();
             mmproj_usage = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
             mmproj_usage_t_us = ggml_time_us() - t_start;
@@ -1514,7 +1571,30 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        llama_init = common_init_from_params(params_base);
+        if (model_parked != nullptr) {
+            // --sleep-mode park: upload the parked weights, then the context the model had, without --fit (the weights are
+            //   already on the devices again)
+            const int64_t t_unpark = ggml_time_us();
+            llama_model * model = model_parked;
+            model_parked = nullptr;
+            if (!llama_model_unpark(model)) {
+                llama_model_free(model);
+                mtmd_free(mctx);
+                mctx = nullptr;
+                SRV_ERR("%s", "failed to unpark the model\n");
+                return false;
+            }
+            const bool    fit_params = params_base.fit_params;
+            const int32_t n_ctx_cfg  = params_base.n_ctx;
+            params_base.fit_params = false;
+            params_base.n_ctx      = n_ctx_parked;
+            llama_init = common_init_from_params(params_base, false, model);
+            params_base.fit_params = fit_params;
+            params_base.n_ctx      = n_ctx_cfg;
+            SRV_INF("unparked the model and created its context in %.2f s\n", (ggml_time_us() - t_unpark)/1e6);
+        } else {
+            llama_init = common_init_from_params(params_base);
+        }
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -1601,7 +1681,17 @@ private:
                 }
             }
 
-            mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
+            if (mctx != nullptr) {
+                // parked with the model (--sleep-mode park), it holds model_tgt
+                const int64_t t_unpark = ggml_time_us();
+                if (!mtmd_unpark(mctx)) {
+                    SRV_ERR("failed to unpark the multimodal model, '%s'\n", mmproj_path.c_str());
+                    return false;
+                }
+                SRV_INF("unparked the multimodal model in %.2f s\n", (ggml_time_us() - t_unpark)/1e6);
+            } else {
+                mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
+            }
             if (mctx == nullptr) {
                 SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
                 return false;

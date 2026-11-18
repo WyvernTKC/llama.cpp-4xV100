@@ -3912,6 +3912,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--sleep-mode"}, "{unload,park}",
+        "what sleeping frees (see --sleep-idle-seconds):\n"
+        "- unload: everything, waking up loads the model files again (default)\n"
+        "- park: everything but the weights of the model and the mmproj, which wait in (pinned) host memory and are\n"
+        "  uploaded again on waking up; takes host memory for the weights (no speculative decoding, no LoRA)",
+        [](common_params & params, const std::string & value) {
+            if (value == "unload") {
+                params.sleep_park = false;
+            } else if (value == "park") {
+                params.sleep_park = true;
+            } else {
+                throw std::invalid_argument("invalid value: " + value);
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--simple-io"},
         "use basic IO for better compatibility in subprocesses and limited consoles",
         [](common_params & params) {

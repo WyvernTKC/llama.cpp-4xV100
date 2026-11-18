@@ -5428,6 +5428,11 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    if (model->is_parked()) {
+        LLAMA_LOG_ERROR("%s: the model is parked, unpark it first (llama_model_unpark)\n", __func__);
+        return nullptr;
+    }
+
     if (params.n_batch == 0 && params.n_ubatch == 0) {
         LLAMA_LOG_ERROR("%s: n_batch and n_ubatch cannot both be zero\n", __func__);
         return nullptr;

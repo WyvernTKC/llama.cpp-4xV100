@@ -227,7 +227,8 @@ ggml_backend_dev_t mtmd_split_device(const char * fname, const ggml_backend_dev_
 }
 
 mtmd_backends::mtmd_backends(ggml_backend_dev_t device, int n_threads, int max_nodes,
-                             ggml_backend_sched_eval_callback cb_eval, void * cb_eval_user_data) {
+                             ggml_backend_sched_eval_callback cb_eval, void * cb_eval_user_data) :
+        device(device), max_nodes(max_nodes), cb_eval(cb_eval), cb_eval_user_data(cb_eval_user_data) {
     threadpool = mtmd_threadpool_init(n_threads);
 
     backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -241,10 +242,20 @@ mtmd_backends::mtmd_backends(ggml_backend_dev_t device, int n_threads, int max_n
             set_threadpool_fn(backend_cpu, threadpool.get());
         }
     }
+    try {
+        restore();
+    } catch (...) {
+        ggml_backend_free(backend_cpu);
+        throw;
+    }
+}
+
+void mtmd_backends::restore() {
+    GGML_ASSERT(sched == nullptr && ptrs.empty());
+    backend = nullptr;
     if (device != nullptr) {
         backend = ggml_backend_dev_init(device, nullptr);
         if (!backend) {
-            ggml_backend_free(backend_cpu);
             throw std::runtime_error(mtmd_format("%s: failed to initialize \"%s\" backend\n",
                                                    __func__, ggml_backend_dev_name(device)));
         }
@@ -266,15 +277,24 @@ mtmd_backends::mtmd_backends(ggml_backend_dev_t device, int n_threads, int max_n
     if (cb_eval != nullptr) {
         ggml_backend_sched_set_eval_callback(sched.get(), cb_eval, cb_eval_user_data);
     }
+    released = false;
+}
+
+void mtmd_backends::release() {
+    // before the backend it uses
+    sched.reset();
+    if (backend != nullptr && backend != backend_cpu) {
+        ggml_backend_free(backend);
+    }
+    backend = nullptr;
+    ptrs.clear();
+    bufts.clear();
+    released = true;
 }
 
 mtmd_backends::~mtmd_backends() {
-    // before the backends it uses
-    sched.reset();
-    ggml_backend_free(backend);
-    if (backend != backend_cpu) {
-        ggml_backend_free(backend_cpu);
-    }
+    release();
+    ggml_backend_free(backend_cpu);
 }
 
 std::map<ggml_backend_dev_t, size_t> mtmd_backends::get_mem_compute() const {
