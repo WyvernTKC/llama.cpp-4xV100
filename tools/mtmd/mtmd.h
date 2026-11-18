@@ -108,7 +108,7 @@ typedef bool (*mtmd_progress_callback)(float progress, void * user_data);
 struct mtmd_context_params {
     bool use_gpu;
     ggml_backend_dev_t device;
-    // more than one device: split the vision encoder over them (tensor parallel, qwen3vl only), else use `device`
+    // more than one device: split the vision encoder (qwen3vl) or the minimax_music3 generator over them (tensor parallel), else use `device`
     const ggml_backend_dev_t * devices;
     size_t n_devices;
     bool print_timings;

@@ -3003,6 +3003,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 }
             } break;
             case GGML_OP_CONV_TRANSPOSE_2D:
+            case GGML_OP_COL2IM_1D:
             case GGML_OP_POOL_2D_BACK:
             case GGML_OP_UPSCALE: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);

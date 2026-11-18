@@ -2622,7 +2622,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         // note: "-mmdev" must sort after "--rpc" in the preset map, else RPC devices are not registered yet
         {"-mmdev", "--mmproj-device"}, "DEVICE",
         "device to use for multimodal projector (none = don't offload, default: follows --device)\n"
-        "a comma-separated list splits the vision encoder over these devices (qwen3vl only)\n"
+        "a comma-separated list splits the vision encoder (qwen3vl) or the minimax_music3 depth decoder and DiT over these devices\n"
         "use --list-devices to see a list of available devices",
         [](common_params & params, const std::string & value) {
             params.mmproj_devices.clear();
