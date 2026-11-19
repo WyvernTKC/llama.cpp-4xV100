@@ -365,7 +365,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     if (is_mla || arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_GLM5_NEXT) {
         n_head_kv = 1; // MLA shares one latent kv head; QWEN3 gives MQA coverage
     } else if (arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_MUSE_SPARK || arch == LLM_ARCH_AFMOE || arch == LLM_ARCH_MAION_CODER ||
-            arch == LLM_ARCH_KOLIBRI1 || arch == LLM_ARCH_LIMITE || arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_RICURSIVE) {
+            arch == LLM_ARCH_KOLIBRI1 || arch == LLM_ARCH_LIMITE || arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_RICURSIVE ||
+            arch == LLM_ARCH_ZAYA1) {
         n_head_kv = 2; // GQA coverage
     }
     if (arch == LLM_ARCH_BEAM) {
@@ -772,9 +773,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_INTERLEAVE_MOE_LAYER_STEP,  uint32_t(2));
         // all experts are used: with a random router the top-k has near-ties, and a flip between two kernels fails the NMSE check.
         //   gemma4 uses 8 like its real models, for their 8-way reduction. The host experts test needs more experts than a ubatch
-        //   uses, so that the copy of the used experts skips some of them.
+        //   uses, so that the copy of the used experts skips some of them. ZAYA routes top-1.
         const uint32_t n_expert      = host_experts_test(arch) ? 64 : arch == LLM_ARCH_GEMMA4 ? 8 : arch == LLM_ARCH_CLOVER_MOE ? 4 : 2;
-        const uint32_t n_expert_used = host_experts_test(arch) ? 2 : n_expert;
+        const uint32_t n_expert_used = arch == LLM_ARCH_ZAYA1 ? 1 : host_experts_test(arch) ? 2 : n_expert;
         ms.add_kv(LLM_KV_EXPERT_COUNT,               n_expert);
         ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          n_expert_used);
         ms.add_kv(LLM_KV_EXPERT_SHARED_COUNT,        uint32_t(1));
@@ -834,7 +835,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     ms.add_kv(LLM_KV_XIELU_BETA,                1.0f);
     ms.add_kv(LLM_KV_XIELU_EPS,                 1.0e-7f);
     ms.add_kv(LLM_KV_SSM_INNER_SIZE,            arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_CLOVER_MOE || arch == LLM_ARCH_ZONOS3 ? 256 : 2*n_embd);
-    ms.add_kv(LLM_KV_SSM_CONV_KERNEL,           uint32_t(4));
+    ms.add_kv(LLM_KV_ROUTER_HIDDEN_SIZE,        n_embd);
+    ms.add_kv(LLM_KV_SSM_CONV_KERNEL,           uint32_t(arch == LLM_ARCH_ZAYA1 ? 2 : 4)); // ZAYA CCA convs have kernel 2
     // Mamba-1 has a decay per state and the backends implement that variant only for the shape the real
     //   models use (d_state 16, a single group), so give those architectures a realistic configuration
     //   instead of one that silently falls back to the CPU
@@ -1251,6 +1253,7 @@ static double check_draft_rollback(llama_model * model, const std::vector<llama_
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_FLINT:
+        case LLM_ARCH_ZAYA1:
         case LLM_ARCH_LLAMA4:
         case LLM_ARCH_MAION_CODER:
         case LLM_ARCH_COHERE2MOE:
@@ -1363,6 +1366,9 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_BERT || arch == LLM_ARCH_MODERN_BERT || arch == LLM_ARCH_NOMIC_BERT || arch == LLM_ARCH_NOMIC_BERT_MOE ||
             arch == LLM_ARCH_NEO_BERT || arch == LLM_ARCH_JINA_BERT_V2 || arch == LLM_ARCH_JINA_BERT_V3 || arch == LLM_ARCH_EUROBERT) {
         return false; // TODO vocab
+    }
+    if (arch == LLM_ARCH_KOKORO || arch == LLM_ARCH_TINY_VOCA) {
+        return false; // TODO encoder without memory, a sequence must fit in one ubatch
     }
     if (arch == LLM_ARCH_PLM) {
         return false; // TODO tensor shapes

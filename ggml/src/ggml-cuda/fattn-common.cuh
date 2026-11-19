@@ -1704,7 +1704,7 @@ void launch_fattn(
     dim3 blocks_num;
     if (stream_k) {
         // Stream-K splits the work before the mask scan is applied, so skipped KV tiles make the blocks uneven.
-        const bool prefer_whole_tiles = GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DGX_SPARK && async_kv_preload && scan_mask;
+        const bool prefer_whole_tiles = GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_GB10 && async_kv_preload && scan_mask;
 
         // Volta: under a causal mask the last Q tiles see the most KV, use whole tiles (run last to first) while n_kv <= ratio*n_q.
         //     A sliding-window mask with ranges has the same work per tile. GGML_CUDA_FATTN_CAUSAL_RATIO=0 turns it off.

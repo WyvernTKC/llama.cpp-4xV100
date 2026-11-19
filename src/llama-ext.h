@@ -116,6 +116,8 @@ LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * m
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
+LLAMA_API std::vector<ggml_tensor *> llama_memory_get_tensors(const llama_memory_t mem);
+
 // the backend buffers that a state write of this memory would touch - empty caches report none
 LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
 
@@ -155,6 +157,9 @@ LLAMA_API int32_t llama_batch_ext_add_state_row(struct llama_batch_ext * batch, 
 //   flags are set. False (the host copies stay) when the devices cannot: not one device per context, no events.
 //   LLAMA_SPEC_STATES_DEVICE=0 keeps the host copies.
 LLAMA_API bool llama_set_spec_states_device(struct llama_context * ctx_tgt, struct llama_context * ctx_dft);
+// Questions packed after a shared state in one sequence, contexts without memory only
+// 0 (default) is the state, k > 0 the k-th question; full attention layers hide other questions from a question
+LLAMA_API bool llama_batch_ext_set_decision_group(struct llama_batch_ext * batch, int32_t idx, int32_t group);
 
 // Label of option i of a decision model ("<arch>.decision.labels"), nullptr past the last one
 LLAMA_API const char * llama_model_decision_label(const struct llama_model * model, uint32_t i);

@@ -245,6 +245,9 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                                            { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
         // an FP8 table keeps its checkpoint bytes, so its per-tensor scale is applied after the gather
         per_layer_tok_embd_s = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "scale"), { 1 }, TENSOR_NOT_REQUIRED);
+        if (per_layer_tok_embd_s && per_layer_tok_embd_s->type != GGML_TYPE_F32) {
+            throw std::runtime_error(format("%s must be F32", per_layer_tok_embd_s->name));
+        }
     }
 
     const int mtp_flags = !ml.load_mtp ? TENSOR_SKIP : 0;
@@ -1898,7 +1901,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
     ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
     if (model.per_layer_tok_embd_s) {
-        emb = ggml_mul(ctx0, emb, model.per_layer_tok_embd_s);
+        emb = ggml_scale(ctx0, emb, model.per_layer_tok_embd_scale);
     }
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);

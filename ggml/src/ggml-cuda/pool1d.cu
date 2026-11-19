@@ -50,30 +50,32 @@ static __global__ void pool1d_nchw_kernel(
 }
 
 // a window covering the whole row gives one output per row: reduce it with a block instead of one thread
-static __global__ void pool1d_row_kernel(const int iw, const float * src, float * dst, const enum ggml_op_pool op) {
-    const bool is_max = op == GGML_OP_POOL_MAX;
+template <ggml_op_pool op>
+static __global__ void pool1d_row_kernel(const int iw, const float * src, float * dst) {
+    static_assert(op == GGML_OP_POOL_MAX || op == GGML_OP_POOL_AVG, "unsupported pool op");
+
     const float * row = src + (int64_t) blockIdx.x*iw;
 
-    float res = is_max ? -FLT_MAX : 0.0f;
+    float res = op == GGML_OP_POOL_MAX ? -FLT_MAX : 0.0f;
     for (int i = threadIdx.x; i < iw; i += blockDim.x) {
-        const float cur = row[i];
-        res = is_max ? max(res, cur) : res + cur;
+        res = op == GGML_OP_POOL_MAX ? max(res, row[i]) : res + row[i];
     }
-    res = is_max ? warp_reduce_max(res) : warp_reduce_sum(res);
 
     __shared__ float buf[WARP_SIZE];
-    const int lane = threadIdx.x % WARP_SIZE;
-    const int warp = threadIdx.x / WARP_SIZE;
-    if (lane == 0) {
-        buf[warp] = res;
+    res = block_reduce<op == GGML_OP_POOL_MAX ? block_reduce_method::MAX : block_reduce_method::SUM>(res, buf);
+
+    if (threadIdx.x == 0) {
+        dst[blockIdx.x] = op == GGML_OP_POOL_MAX ? res : res/iw;
     }
-    __syncthreads();
-    if (warp == 0) {
-        res = lane < (int) (blockDim.x/WARP_SIZE) ? buf[lane] : (is_max ? -FLT_MAX : 0.0f);
-        res = is_max ? warp_reduce_max(res) : warp_reduce_sum(res);
-        if (lane == 0) {
-            dst[blockIdx.x] = is_max ? res : res/iw;
-        }
+}
+
+static void pool1d_row_f32_cuda(const int iw, const int64_t nr, const float * src, float * dst, const enum ggml_op_pool op, cudaStream_t stream) {
+    const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    const dim3 block_dims(nr/nsm < 2 ? 512 : (iw < 1024 ? 32 : 128));
+    if (op == GGML_OP_POOL_MAX) {
+        pool1d_row_kernel<GGML_OP_POOL_MAX><<<nr, block_dims, 0, stream>>>(iw, src, dst);
+    } else {
+        pool1d_row_kernel<GGML_OP_POOL_AVG><<<nr, block_dims, 0, stream>>>(iw, src, dst);
     }
 }
 
@@ -107,8 +109,9 @@ void ggml_cuda_op_pool1d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t OW = dst->ne[0];
     const int64_t nr = ggml_nrows(src0);
 
-    if (OW == 1 && p0 == 0 && k0 >= IW && (op == GGML_OP_POOL_MAX || op == GGML_OP_POOL_AVG)) {
-        pool1d_row_kernel<<<nr, 256, 0, stream>>>(IW, src0_d, dst_d, op);
+    // short rows: one thread per row is faster
+    if (OW == 1 && p0 == 0 && k0 == IW && IW >= CUDA_POOL1D_ROW_MIN_IW && (op == GGML_OP_POOL_MAX || op == GGML_OP_POOL_AVG)) {
+        pool1d_row_f32_cuda(IW, nr, src0_d, dst_d, op, stream);
         return;
     }
 
