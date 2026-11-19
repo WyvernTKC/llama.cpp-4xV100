@@ -468,6 +468,191 @@ class DeepseekV2Model(TextModel):
                 raise ValueError(f"Unprocessed experts: {experts}")
 
 
+@ModelBase.register("LongcatFlashForCausalLM")
+class LongcatFlashModel(DeepseekV2Model):
+    model_arch = gguf.MODEL_ARCH.LONGCAT_FLASH
+    merge_expert = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # 2 attention + dense FFN sub-blocks per HF layer -> 2 llama.cpp blocks per HF layer
+        self.block_count = self.hparams["num_layers"] * 2
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+        # the DeepseekV2Model hparam names
+        self.hparams["num_hidden_layers"]     = self.block_count
+        self.hparams["intermediate_size"]     = self.hparams["ffn_hidden_size"]
+        self.hparams["moe_intermediate_size"] = self.hparams["expert_ffn_hidden_size"]
+        self.hparams["num_experts_per_tok"]   = self.hparams["moe_topk"]
+        # modify_tensors() splits kv_b_proj per head with this, set_gguf_parameters() then writes 1 for MLA
+        self.hparams["num_key_value_heads"]   = self.hparams["num_attention_heads"]
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, _ = item
+        # MTP head, not supported yet
+        if name.startswith("model.mtp."):
+            return None
+        return super().filter_tensors(item)
+
+    def _tensor_requires_f32(self, new_name: str, bid: int | None, n_dims: int) -> bool:
+        # bid is the HF layer here, new_name is in block 2*bid or 2*bid + 1
+        if (match := re.match(r"blk\.(\d+)\.", new_name)) is not None:
+            bid = int(match.group(1))
+        return super()._tensor_requires_f32(new_name, bid, n_dims)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        zero_expert_type = self.hparams.get("zero_expert_type", "identity")
+        assert zero_expert_type == "identity", "only the 'identity' zero expert type is supported"
+        self.gguf_writer.add_n_zero_experts(self.hparams.get("zero_expert_num") or 0)
+
+        # fixed MLA lora-rank scales, applied in the graph (folding them into the weights hurts quantization)
+        if self.hparams.get("mla_scale_q_lora"):
+            self.gguf_writer.add_q_lora_scale((self.hparams["hidden_size"] / self.hparams["q_lora_rank"]) ** 0.5)
+        if self.hparams.get("mla_scale_kv_lora"):
+            self.gguf_writer.add_kv_lora_scale((self.hparams["hidden_size"] / self.hparams["kv_lora_rank"]) ** 0.5)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if bid is not None:
+            # doubled sub-components, e.g. model.layers.{L}.self_attn.{0,1}.q_a_proj.weight
+            match = re.match(r"model\.layers\.\d+\.(mlps|self_attn|input_layernorm|post_attention_layernorm)\.(\d+)\.(.*)", name)
+            if match:
+                new_bid = bid * 2 + int(match.group(2))
+                mid = "mlp" if match.group(1) == "mlps" else match.group(1)
+                new_name = f"model.layers.{new_bid}.{mid}.{match.group(3)}"
+                yield from super().modify_tensors(data_torch, new_name, new_bid)
+                return
+
+            # the MoE (mlp.router.*, mlp.experts.*) has no sub-index, it goes to the even block
+            new_bid = bid * 2
+            new_name = name.replace(f"model.layers.{bid}.", f"model.layers.{new_bid}.", 1)
+            for out_name, out_tensor in super().modify_tensors(data_torch, new_name, new_bid):
+                if out_name.endswith("_exps.weight"):
+                    # one extra all-zero expert: the slots of the identity experts point at it
+                    out_tensor = torch.cat([out_tensor, torch.zeros_like(out_tensor[:1])], dim=0)
+                yield out_name, out_tensor
+            return
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("LongcatFlashNgramForCausalLM")
+class LongcatNgramModel(LongcatFlashModel):
+    model_arch = gguf.MODEL_ARCH.LONGCAT_NGRAM
+
+    # the reference hashes each token with its n-1 predecessors into k*(n-1) tables, projects every
+    # lookup to hidden_size and sums them into the token embedding. the tables stay separate
+    # (ngram_embd.{i}), the projections are concatenated: sum_i P_i @ e_i == [P_0 | ... | P_m] @ concat(e_i)
+    _ngram_projs: dict[int, Tensor]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self._ngram_projs = {}
+
+        n = self.hparams["emb_neighbor_num"]
+        k = self.hparams["emb_split_num"]
+        self.ngram_n = n
+        self.ngram_k = k
+        self.ngram_count = k * (n - 1)
+
+        # LongCat-Next hashes over the text vocab only, its multimodal tokens come after it
+        self.ngram_base = self.hparams.get("text_vocab_size") or self.hparams["vocab_size"]
+
+        # int(ratio * base + 2*i + 1), see NgramEmbedding
+        m = self.hparams["ngram_vocab_size_ratio"] * self.ngram_base
+        self.ngram_vocab_sizes = [int(m + i * 2 + 1) for i in range(self.ngram_count)]
+
+    def ngram_ignored_token_ids(self) -> list[int]:
+        return list(self.hparams.get("oe_ignored_token_ids") or [])
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        self.gguf_writer.add_ngram_neighbor_count(self.ngram_n)
+        self.gguf_writer.add_ngram_split_count(self.ngram_k)
+        self.gguf_writer.add_ngram_vocab_sizes(self.ngram_vocab_sizes)
+        self.gguf_writer.add_ngram_hash_base(self.ngram_base)
+
+        # the n-gram context restarts after EOS, see _shift_right_ignore_eos
+        eos_token_id = self.hparams["eos_token_id"]
+        assert isinstance(eos_token_id, int), "n-gram segmentation needs a single EOS token id"
+        self.gguf_writer.add_ngram_eos_token_id(eos_token_id)
+
+        if ignored := self.ngram_ignored_token_ids():
+            self.gguf_writer.add_ngram_ignored_token_ids(ignored)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # note: bid is the table index here
+        if (match := re.match(r"model\.ngram_embeddings\.(embedders|post_projs)\.(\d+)\.weight", name)):
+            idx = int(match.group(2))
+            assert idx < self.ngram_count, f"unexpected n-gram index {idx} in {name}"
+
+            if match.group(1) == "embedders":
+                assert data_torch.shape[0] == self.ngram_vocab_sizes[idx], \
+                    f"{name}: expected {self.ngram_vocab_sizes[idx]} rows, got {data_torch.shape[0]}"
+                yield self.format_tensor_name(gguf.MODEL_TENSOR.NGRAM_EMBD, idx), data_torch
+                return
+
+            self._ngram_projs[idx] = data_torch
+            if len(self._ngram_projs) == self.ngram_count:
+                projs = [self._ngram_projs.pop(i) for i in range(self.ngram_count)]
+                yield self.format_tensor_name(gguf.MODEL_TENSOR.NGRAM_PROJ), torch.cat(projs, dim=1)
+            return
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+
+        if self._ngram_projs:
+            raise ValueError(f"Unprocessed n-gram projections: {sorted(self._ngram_projs)}")
+
+
+@ModelBase.register("LongcatNextForCausalLM")
+class LongcatNextModel(LongcatNgramModel):
+    # text only: the visual/audio tokenizers and the visual/audio generation heads are not converted
+    model_arch = gguf.MODEL_ARCH.LONGCAT_NGRAM
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # the LM head covers the text vocab and the multimodal special tokens, embed_tokens also
+        # carries the visual and audio codebook ids, which only those heads use
+        self.hparams["vocab_size"] = self.hparams["text_vocab_plus_multimodal_special_token_size"]
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, _ = item
+        if name.startswith(("model.visual_tokenizer.", "model.audio_tokenizer.", "visual_head.", "audio_head.")):
+            return None
+        return super().filter_tensors(item)
+
+    def ngram_ignored_token_ids(self) -> list[int]:
+        # same default as LongcatNextConfig: the multimodal special tokens
+        ids = super().ngram_ignored_token_ids()
+        if not ids:
+            ids = list(range(self.hparams["text_vocab_size"], self.hparams["text_vocab_plus_multimodal_special_token_size"]))
+        return ids
+
+    def set_vocab(self):
+        tokens, toktypes, tokpre = self.get_vocab_base()
+        self.gguf_writer.add_tokenizer_model("gpt2")
+        self.gguf_writer.add_tokenizer_pre(tokpre)
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_types(toktypes)
+
+        special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
+        # tokenizer_config sets add_eos_token, but the reference tokenizer adds no EOS to a prompt
+        special_vocab.add_special_token["eos"] = False
+        special_vocab.add_to_gguf(self.gguf_writer)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name == "model.embed_tokens.weight":
+            data_torch = data_torch[:self.hparams["vocab_size"]]
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
 @ModelBase.register("DeepseekV32ForCausalLM")
 @ModelBase.example("deepseek-ai/DeepSeek-V3.2-Exp")
 class DeepseekV32Model(DeepseekV2Model):

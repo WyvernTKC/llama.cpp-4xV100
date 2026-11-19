@@ -227,6 +227,7 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,              hparams.expert_weights_scale);
     add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,               hparams.expert_weights_norm);
     add_kv(LLM_KV_EXPERT_GATING_FUNC,                hparams.expert_gating_func);
+    add_kv(LLM_KV_N_ZERO_EXPERTS,                    hparams.n_zero_experts);
     add_kv(LLM_KV_EXPERT_GROUP_SCALE,                hparams.expert_group_scale);
     add_kv(LLM_KV_EXPERTS_PER_GROUP,                 hparams.n_group_experts);
     add_kv(LLM_KV_MOE_EVERY_N_LAYERS,                hparams.moe_every_n_layers);
@@ -285,6 +286,8 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ATTENTION_CAUSAL,                  hparams.causal_attn);
     add_kv(LLM_KV_ATTENTION_Q_LORA_RANK,             hparams.n_lora_q);
     add_kv(LLM_KV_ATTENTION_KV_LORA_RANK,            hparams.n_lora_kv);
+    add_kv(LLM_KV_ATTENTION_Q_LORA_SCALE,            hparams.f_attn_q_lora_scale);
+    add_kv(LLM_KV_ATTENTION_KV_LORA_SCALE,           hparams.f_attn_kv_lora_scale);
     add_kv(LLM_KV_ATTENTION_DECAY_LORA_RANK,         hparams.n_lora_decay);
     add_kv(LLM_KV_ATTENTION_ICLR_LORA_RANK,          hparams.n_lora_iclr);
     add_kv(LLM_KV_ATTENTION_VALUE_RESIDUAL_MIX_LORA_RANK, hparams.n_lora_value_res_mix);

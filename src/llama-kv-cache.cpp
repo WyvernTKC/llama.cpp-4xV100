@@ -2613,8 +2613,8 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
 }
 
 bool llama_kv_cache::has_cell_ext() const {
-    // M-RoPE needs the 2D position, the PLE and engram n-gram hashes need the token id
-    return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0 || hparams.engram_n_head > 0;
+    // M-RoPE needs the 2D position, the PLE, engram and longcat n-gram hashes need the token id
+    return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0 || hparams.engram_n_head > 0 || hparams.n_ngram_table > 0;
 }
 
 void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {

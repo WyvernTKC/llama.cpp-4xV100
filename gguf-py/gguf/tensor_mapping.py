@@ -632,6 +632,7 @@ class TensorNameMap:
             "backbone.layers.{bid}.mixer.gate",                 # nemotron-h-moe
             "model.layers.{bid}.moe.gate",                      # step3.5
             "model.layers.{bid}.router.proj",                   # gemma4
+            "model.layers.{bid}.mlp.router.classifier",         # longcat-flash
             "layers.{bid}.moe.expert_router",                   # metis16
         ),
 
@@ -654,6 +655,7 @@ class TensorNameMap:
             "model.layers.{bid}.block_sparse_moe.gate.e_score_correction",  # kimi
             "model.layers.{bid}.moe.router_bias",                           # step3.5 expert selection bias
             "model.layers.{bid}.mlp.experts.e_score_correction",       # laguna
+            "model.layers.{bid}.mlp.router.e_score_correction",        # longcat-flash
         ),
 
         # Feed-forward up

@@ -2458,6 +2458,9 @@ class TextModel(ModelBase):
         if chkhsh == "972da7b59cec44d1f0a490a86c96df53859e486e481563e5dddac155013d87ac":
             # ref: https://huggingface.co/poolside/Laguna-XS.2
             res = "laguna"
+        if chkhsh == "27d87c17bcffe5262a1e80b2ceb9a5e002c4f8a17d796fd5afac9180dd8bd96e":
+            # ref: https://huggingface.co/meituan-longcat/LongCat-Flash-Chat
+            res = "longcat-flash"
         if chkhsh == "653660222fb704f61cbf2b618a8ae6502b7f8b20c980f9a5de07ed78e13319cd":
             # ref: https://huggingface.co/ufakai/ufakzeka-1
             res = "ufakzeka"

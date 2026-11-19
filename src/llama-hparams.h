@@ -132,6 +132,13 @@ struct llama_hparams {
     uint32_t n_expert_groups    = 0;
     uint32_t n_group_used       = 0;
     uint32_t n_group_experts    = 0;
+    uint32_t n_zero_experts     = 0; // longcat-flash: identity experts the router can pick next to the real ones
+
+    float    f_attn_q_lora_scale  = 0.0f; // longcat-flash: fixed MLA scales, 0 = none
+    float    f_attn_kv_lora_scale = 0.0f;
+
+    // longcat-ngram: number of n-gram hash tables of the input embeddings, the KV cells keep the token ids for them
+    uint32_t n_ngram_table = 0;
 
     // MLA + SWA (i.e. dots3note)
     uint32_t n_lora_kv_swa           = 0;

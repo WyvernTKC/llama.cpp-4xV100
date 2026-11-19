@@ -1272,6 +1272,58 @@ struct llama_model_deepseek2 : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+// LongCat-Flash: each HF layer is two attention + dense FFN blocks (two llama.cpp layers) and one MoE
+// whose output is added after the second block. The router also picks identity ("zero") experts.
+struct llama_model_longcat_flash : public llama_model_base {
+    llama_model_longcat_flash(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llm_graph_context {
+        graph(const llm_graph_params & params);
+
+        // MoE with identity experts next to the real ones, see load_arch_tensors
+        ggml_tensor * build_moe_zero(ggml_tensor * cur, const llama_layer & layer, int il) const;
+
+        // token embedding + hashed n-gram embeddings, longcat-ngram only
+        ggml_tensor * build_inp_ngram(ggml_tensor * inp_embd) const;
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+// LongCat-Flash-Lite, LongCat-Next (text): longcat-flash with hash-based n-gram input embeddings
+struct llama_model_longcat_ngram : public llama_model_longcat_flash {
+    llama_model_longcat_ngram(const struct llama_model_params & params) : llama_model_longcat_flash(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    uint32_t    ngram_n_neighbor = 0; // n-gram order
+    uint32_t    ngram_n_split    = 0; // tables per order
+    uint32_t    ngram_hash_base  = 0; // the token ids are digits of this base in the hash
+    llama_token ngram_eos_id     = LLAMA_TOKEN_NULL; // the n-gram context restarts after it
+
+    std::vector<uint32_t> ngram_vocab_sizes; // [n_table], the hash modulus of each table
+    std::vector<uint64_t> ngram_pow_mods;    // [n_table][n_neighbor - 1], base^(s+1) mod vocab_sizes[t]
+
+    // tokens that take no part in the hash: they read as 0 and get the plain token embedding
+    std::vector<uint8_t> ngram_ignored; // [n_vocab]
+
+    std::vector<ggml_tensor *> ngram_embd; // [n_table], each [n_embd/n_table, vocab_sizes[t]]
+    ggml_tensor * ngram_proj = nullptr;    // [n_embd, n_embd], all table projections side by side
+
+    // the token id as the hash sees it
+    int64_t ngram_tok(llama_token tok) const {
+        if (tok < 0 || (size_t) tok >= ngram_ignored.size() || ngram_ignored[tok]) {
+            return 0;
+        }
+        return tok;
+    }
+
+private:
+    std::vector<std::string> ngram_suffixes;
+};
+
 struct llama_model_deepseek32 : public llama_model_base {
     llama_model_deepseek32(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;

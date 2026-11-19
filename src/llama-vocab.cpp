@@ -652,6 +652,13 @@ struct llm_tokenizer_bpe : llm_tokenizer {
                 regex_exprs = { "\\p{N}", "\\s+|[\\p{L}\\p{N}_]+|[^\\p{L}\\p{N}_\\s]+" };
                 byte_encode = false;
                 break;
+            case LLAMA_VOCAB_PRE_TYPE_LONGCAT_FLASH:
+                regex_exprs = {
+                    "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+                    " ?[！-／：-～‘-‟　-。《》「」【】]+",
+                    "[一-龥ࠀ-一가-퟿]+",
+                };
+                break;
             case LLAMA_VOCAB_PRE_TYPE_ZONOS3:
                 // SuperBPE: no split on whitespace, tokens can span several words
                 regex_exprs = {
@@ -3018,6 +3025,10 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
             } else if (
                 tokenizer_pre == "zonos3") {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_ZONOS3;
+                clean_spaces = false;
+            } else if (
+                tokenizer_pre == "longcat-flash") {
+                pre_type = LLAMA_VOCAB_PRE_TYPE_LONGCAT_FLASH;
                 clean_spaces = false;
             } else {
                 throw std::runtime_error(format("unknown pre-tokenizer type: '%s'", tokenizer_pre.c_str()));

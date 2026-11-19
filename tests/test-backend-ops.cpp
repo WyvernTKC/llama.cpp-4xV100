@@ -17690,11 +17690,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                 for (int nr3 : { 1, 3, }) {
                                     if (hsk > 64 && nr3 > 1) continue; // skip broadcast for large head sizes
                                     for (int nr2 : { 1, 4, 8, 12, 16, 20, 32 }) {
-                                        if (nr2 ==  8 && hsk != 192) continue;
+                                        if (nr2 ==  8 && hsk != 192 && (nh != 1 || hsk != 576)) continue; // LongCat MLA under -sm tensor
                                         if (nr2 == 12 && hsk != 128) continue;
                                         if (nr2 == 16 && hsk != 192) continue;
                                         if (nr2 == 20 && (nh != 1 || hsk != 576)) continue;
-                                        if (nr2 == 32 && (nh != 1 || hsk != 320)) continue;
+                                        if (nr2 == 32 && (nh != 1 || (hsk != 320 && hsk != 576))) continue; // Mistral4, LongCat MLA
                                         //for (int kv : { 1, 17, 31, 33, 61, 113, 65, 127, 129, 130, 255, 260, 371, 380, 407, 512, 1024, }) {
                                         for (int kv : { 113, 512, 1024, }) {
                                             if (nr2 != 1 && kv != 512) continue;

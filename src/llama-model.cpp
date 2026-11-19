@@ -228,6 +228,10 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_mistral4(params);
         case LLM_ARCH_MISTRAL_LARGE4:
             return new llama_model_mistral_large4(params);
+        case LLM_ARCH_LONGCAT_FLASH:
+            return new llama_model_longcat_flash(params);
+        case LLM_ARCH_LONGCAT_NGRAM:
+            return new llama_model_longcat_ngram(params);
         case LLM_ARCH_CHATGLM:
             return new llama_model_chatglm(params);
         case LLM_ARCH_GLM4:
@@ -3695,7 +3699,8 @@ void llama_model::print_info() const {
         if (arch == LLM_ARCH_DEEPSEEK2 || arch == LLM_ARCH_DEEPSEEK2OCR ||
                 arch == LLM_ARCH_DEEPSEEK32 || arch == LLM_ARCH_GLM_DSA ||
                 arch == LLM_ARCH_DOTS3NOTE || arch == LLM_ARCH_MISTRAL4 ||
-                arch == LLM_ARCH_MISTRAL_LARGE4 || arch == LLM_ARCH_HY_V4) {
+                arch == LLM_ARCH_MISTRAL_LARGE4 || arch == LLM_ARCH_HY_V4 ||
+                arch == LLM_ARCH_LONGCAT_FLASH || arch == LLM_ARCH_LONGCAT_NGRAM) {
             LLAMA_LOG_INFO("%s: n_layer_dense_lead    = %d\n",     __func__, hparams.n_layer_dense_lead);
             LLAMA_LOG_INFO("%s: n_lora_q              = %d\n",     __func__, hparams.n_lora_q);
             LLAMA_LOG_INFO("%s: n_lora_kv             = %d\n",     __func__, hparams.n_lora_kv);
@@ -4713,6 +4718,8 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_ZONOS3:
         case LLM_ARCH_LIMITE:
         case LLM_ARCH_TINY_VOCA:
+        case LLM_ARCH_LONGCAT_FLASH:
+        case LLM_ARCH_LONGCAT_NGRAM:
             return LLAMA_ROPE_TYPE_NORM;
         case LLM_ARCH_BAILINGMOE3:
             // VL files carry mrope sections; text-only files keep NORM rope

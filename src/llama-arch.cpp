@@ -184,6 +184,8 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_KOLIBRI1,         "kolibri1"         },
     { LLM_ARCH_RICURSIVE,        "ricursive"        },
     { LLM_ARCH_INKLING2,         "inkling2"         },
+    { LLM_ARCH_LONGCAT_FLASH,    "longcat-flash"    },
+    { LLM_ARCH_LONGCAT_NGRAM,    "longcat-ngram"    },
     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
 };
 
@@ -246,6 +248,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_EXPERT_WEIGHTS_NORM,               "%s.expert_weights_norm"               },
     { LLM_KV_EXPERT_LATENT_LENGTH,              "%s.expert_latent_length"              },
     { LLM_KV_EXPERT_GATING_FUNC,                "%s.expert_gating_func"                },
+    { LLM_KV_N_ZERO_EXPERTS,                    "%s.n_zero_experts"                    },
     { LLM_KV_EXPERT_GROUP_SCALE,                "%s.expert_group_scale"                },
     { LLM_KV_EXPERTS_PER_GROUP,                 "%s.experts_per_group"                 },
     { LLM_KV_MOE_EVERY_N_LAYERS,                "%s.moe_every_n_layers"                },
@@ -305,6 +308,8 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ATTENTION_CAUSAL,                       "%s.attention.causal"                       },
     { LLM_KV_ATTENTION_Q_LORA_RANK,                  "%s.attention.q_lora_rank"                  },
     { LLM_KV_ATTENTION_KV_LORA_RANK,                 "%s.attention.kv_lora_rank"                 },
+    { LLM_KV_ATTENTION_Q_LORA_SCALE,                 "%s.attention.q_lora_scale"                 },
+    { LLM_KV_ATTENTION_KV_LORA_SCALE,                "%s.attention.kv_lora_scale"                },
     { LLM_KV_ATTENTION_DECAY_LORA_RANK,              "%s.attention.decay_lora_rank"              },
     { LLM_KV_ATTENTION_ICLR_LORA_RANK,               "%s.attention.iclr_lora_rank"               },
     { LLM_KV_ATTENTION_VALUE_RESIDUAL_MIX_LORA_RANK, "%s.attention.value_residual_mix_lora_rank" },
@@ -379,6 +384,13 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_HYPER_CONNECTION_SINGLE_PASS,           "%s.hyper_connection.single_pass"           },
 
     { LLM_KV_ENGRAM_PAD_TOKEN_ID,                    "%s.engram.pad_token_id"                    },
+
+    { LLM_KV_NGRAM_NEIGHBOR_COUNT,                   "%s.ngram.neighbor_count"                   },
+    { LLM_KV_NGRAM_SPLIT_COUNT,                      "%s.ngram.split_count"                      },
+    { LLM_KV_NGRAM_VOCAB_SIZES,                      "%s.ngram.vocab_sizes"                      },
+    { LLM_KV_NGRAM_EOS_TOKEN_ID,                     "%s.ngram.eos_token_id"                     },
+    { LLM_KV_NGRAM_HASH_BASE,                        "%s.ngram.hash_base"                        },
+    { LLM_KV_NGRAM_IGNORED_TOKEN_IDS,                "%s.ngram.ignored_token_ids"                },
 
     { LLM_KV_PLE_LAYERS,                             "%s.ple.layers"                             },
     { LLM_KV_PLE_NGRAM_SIZE,                         "%s.ple.ngram_size"                         },
@@ -895,6 +907,8 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_ENGRAM_K,                               "blk.%d.engram_k" },
     { LLM_TENSOR_ENGRAM_Q,                               "blk.%d.engram_q" },
     { LLM_TENSOR_ENGRAM_WKV,                             "blk.%d.engram_wkv" },
+    { LLM_TENSOR_NGRAM_EMBD,                             "ngram_embd" },
+    { LLM_TENSOR_NGRAM_PROJ,                             "ngram_proj" },
     { LLM_TENSOR_INDEXER_KPOOL_GATE,                     "blk.%d.indexer_compressor_gate" },
     { LLM_TENSOR_INDEXER_KPOOL_APE,                      "blk.%d.indexer_compressor_ape" },
     { LLM_TENSOR_FFN_GATE_TID2EID,                       "blk.%d.ffn_gate_tid2eid" },
@@ -1259,6 +1273,8 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_ENGRAM_K,                   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
     {LLM_TENSOR_ENGRAM_Q,                   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
     {LLM_TENSOR_ENGRAM_WKV,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_NGRAM_EMBD,                 {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
+    {LLM_TENSOR_NGRAM_PROJ,                 {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
     {LLM_TENSOR_INDEXER_KPOOL_GATE,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_INDEXER_KPOOL_APE,          {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
     {LLM_TENSOR_FFN_GATE_TID2EID,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
@@ -1600,6 +1616,7 @@ bool llama_arch_supports_save(llm_arch arch) {
         case LLM_ARCH_APERTUS:
         case LLM_ARCH_STEP35:
         case LLM_ARCH_CLEF: // the head tensors are not saved
+        case LLM_ARCH_LONGCAT_NGRAM: // the n-gram tables and constants are not saved
         case LLM_ARCH_VLLM_DECISION2:
             return false;
         default:

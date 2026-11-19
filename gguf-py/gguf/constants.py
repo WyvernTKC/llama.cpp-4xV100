@@ -128,6 +128,7 @@ class Keys:
         EXPERT_WEIGHTS_SCALE              = "{arch}.expert_weights_scale"
         EXPERT_WEIGHTS_NORM               = "{arch}.expert_weights_norm"
         EXPERT_GATING_FUNC                = "{arch}.expert_gating_func"
+        N_ZERO_EXPERTS                    = "{arch}.n_zero_experts"
         EXPERT_GROUP_SCALE                = "{arch}.expert_group_scale"
         EXPERT_LATENT_LENGTH              = "{arch}.expert_latent_length"
         EXPERTS_PER_GROUP                 = "{arch}.experts_per_group"
@@ -203,6 +204,8 @@ class Keys:
         CAUSAL                       = "{arch}.attention.causal"
         Q_LORA_RANK                  = "{arch}.attention.q_lora_rank"
         KV_LORA_RANK                 = "{arch}.attention.kv_lora_rank"
+        Q_LORA_SCALE                 = "{arch}.attention.q_lora_scale"
+        KV_LORA_SCALE                = "{arch}.attention.kv_lora_scale"
         DECAY_LORA_RANK              = "{arch}.attention.decay_lora_rank"
         ICLR_LORA_RANK               = "{arch}.attention.iclr_lora_rank"
         VALUE_RESIDUAL_MIX_LORA_RANK = "{arch}.attention.value_residual_mix_lora_rank"
@@ -271,6 +274,15 @@ class Keys:
         SOURCE_LAYER = "{arch}.attention.candidate.source_layer"
         TOPK_BLOCKS  = "{arch}.attention.candidate.topk_blocks"
         BLOCK_SIZE   = "{arch}.attention.candidate.block_size"
+
+    class NGram:
+        # hash-based n-gram input embeddings, see longcat-ngram
+        NEIGHBOR_COUNT    = "{arch}.ngram.neighbor_count"
+        SPLIT_COUNT       = "{arch}.ngram.split_count"
+        VOCAB_SIZES       = "{arch}.ngram.vocab_sizes"
+        EOS_TOKEN_ID      = "{arch}.ngram.eos_token_id"
+        HASH_BASE         = "{arch}.ngram.hash_base"
+        IGNORED_TOKEN_IDS = "{arch}.ngram.ignored_token_ids"
 
     class Engram:
         LAYER_IDS      = "{arch}.engram.layer_ids"
@@ -791,6 +803,8 @@ class MODEL_ARCH(IntEnum):
     KOLIBRI1         = auto()
     LIMITE           = auto()
     INKLING2         = auto()
+    LONGCAT_FLASH    = auto()
+    LONGCAT_NGRAM    = auto()
 
 
 class VISION_PROJECTOR_TYPE(IntEnum):
@@ -1139,6 +1153,8 @@ class MODEL_TENSOR(IntEnum):
     ENGRAM_K               = auto()
     ENGRAM_Q               = auto()
     ENGRAM_WKV             = auto()
+    NGRAM_EMBD             = auto()
+    NGRAM_PROJ             = auto()
     INDEXER_PROJ         = auto()
     INDEXER_ATTN_K       = auto()
     INDEXER_ATTN_Q_B     = auto()
@@ -1795,6 +1811,8 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.KOLIBRI1:         "kolibri1",
     MODEL_ARCH.LIMITE:           "limite",
     MODEL_ARCH.INKLING2:         "inkling2",
+    MODEL_ARCH.LONGCAT_FLASH:    "longcat-flash",
+    MODEL_ARCH.LONGCAT_NGRAM:    "longcat-ngram",
 }
 
 VISION_PROJECTOR_TYPE_NAMES: dict[VISION_PROJECTOR_TYPE, str] = {
@@ -2141,6 +2159,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.ENGRAM_K:                  "blk.{bid}.engram_k",
     MODEL_TENSOR.ENGRAM_Q:                  "blk.{bid}.engram_q",
     MODEL_TENSOR.ENGRAM_WKV:                "blk.{bid}.engram_wkv",
+    MODEL_TENSOR.NGRAM_EMBD:                "ngram_embd.{bid}",
+    MODEL_TENSOR.NGRAM_PROJ:                "ngram_proj",
     MODEL_TENSOR.INDEXER_PROJ:              "blk.{bid}.indexer.proj",
     MODEL_TENSOR.INDEXER_ATTN_K:            "blk.{bid}.indexer.attn_k",
     MODEL_TENSOR.INDEXER_ATTN_Q_B:          "blk.{bid}.indexer.attn_q_b",
@@ -7070,6 +7090,54 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_UP,
         MODEL_TENSOR.MUDD_DOWN,
         MODEL_TENSOR.MUDD_UP,
+    ],
+    MODEL_ARCH.LONGCAT_FLASH: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q_A,
+        MODEL_TENSOR.ATTN_Q_B,
+        MODEL_TENSOR.ATTN_KV_A_MQA,
+        MODEL_TENSOR.ATTN_K_B,
+        MODEL_TENSOR.ATTN_V_B,
+        MODEL_TENSOR.ATTN_Q_A_NORM,
+        MODEL_TENSOR.ATTN_KV_A_NORM,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+    ],
+    MODEL_ARCH.LONGCAT_NGRAM: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.NGRAM_EMBD,
+        MODEL_TENSOR.NGRAM_PROJ,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q_A,
+        MODEL_TENSOR.ATTN_Q_B,
+        MODEL_TENSOR.ATTN_KV_A_MQA,
+        MODEL_TENSOR.ATTN_K_B,
+        MODEL_TENSOR.ATTN_V_B,
+        MODEL_TENSOR.ATTN_Q_A_NORM,
+        MODEL_TENSOR.ATTN_KV_A_NORM,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
     ],
     MODEL_ARCH.INKLING2: [
         MODEL_TENSOR.TOKEN_EMBD,
