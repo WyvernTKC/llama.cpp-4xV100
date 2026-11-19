@@ -2416,8 +2416,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             } break;
         case GGML_OP_GET_ROWS:
             {
-                // waking the other threads costs more than a small lookup, e.g. when this is the only CPU node of an offloaded model
-                n_tasks = ggml_nelements(node) >= 262144 ? n_threads : 1;
+                // one thread: with the model on the GPUs, waking the batch threads for it slows the kernel launches that follow
+                n_tasks = 1;
             } break;
         case GGML_OP_SCALE:
         case GGML_OP_SET:
