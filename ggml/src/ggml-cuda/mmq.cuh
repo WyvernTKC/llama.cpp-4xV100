@@ -1704,6 +1704,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int stream_k_blocks = GGML_CUDA_CC_IS_GCN(cc) ? nsm * config.occupancy : nsm;
 
     const int k_chunks = (args.ncols_x + config.K_vram - 1) / config.K_vram;
+    // GCN only: on CUDA the force_tiling kernels would double the MMQ modules and their first-use load
+#if defined(GGML_USE_HIP)
     // Use tiling when Stream-K is unlikely to improve performance:
     // With at least 2 full waves of tiles, tiling already saturates the device and Stream-K only adds overhead.
     // With few K chunks per tile, the extra parallelism of Stream-K is not needed.
@@ -1723,6 +1725,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              ntx_fd, tile_map.ptr);
         return;
     }
+#endif // defined(GGML_USE_HIP)
 
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 
