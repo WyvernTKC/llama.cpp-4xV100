@@ -17623,6 +17623,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // a few tokens on 2 Q heads per K/V head at head size 256 (gemma-4's sliding-window layers in a drafted verify), which
+    //     have their own tile config on Volta
+    for (int kv : { 1024, 3072 }) {
+        for (int nb : { 5, 6, 8 }) {
+            for (float logit_softcap : { 0.0f, 10.0f }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {2, 1}, kv, nb, true, false, 0, logit_softcap,
+                    GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+            }
+        }
+    }
+
     // a GQA ratio that is not a power of 2 (6 Q heads per K/V head), which the kernels may pad to 8 heads
     for (int nh : { 1, 4 }) {
         for (int kv : { 256, 1024 }) {
@@ -18934,6 +18945,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2048));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 1, 2, 3}, true, false, 2048));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0));
+    }
+    // the sliding-window layers of gemma-4-31B in a 6-token drafted verify on one of 4 devices (2 q heads on each of 4 kv heads)
+    for (int64_t kv : {1024, 3072}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {2, 1}, kv, 6, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
     // dense decode of a full attention layer of head size 512 on one of 4 devices: gemma-4-31B (8 q heads on 1 kv head),
     //     Goetia-26B-A4B (4 on 1)

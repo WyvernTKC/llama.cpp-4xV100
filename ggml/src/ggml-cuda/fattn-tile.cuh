@@ -10,6 +10,8 @@
 // A second config row for the same column count is keyed ncols + GGML_CUDA_FATTN_TILE_CFG_DEEP (the cfg template
 //     parameter of flash_attn_tile), picked by the launcher for one token deep in the cache.
 #define GGML_CUDA_FATTN_TILE_CFG_DEEP 1000
+// The same for a few tokens on Volta (see launch_fattn_tile_switch_ncols1), which also keeps its chunk loops rolled.
+#define GGML_CUDA_FATTN_TILE_CFG_FEW  2000
 
 // The ROCm compiler cannot handle templating in __launch_bounds__.
 // As a workaround, define a macro to package the kernel parameters as uint32_t:
@@ -76,6 +78,8 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nv
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 256, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  64,  64)
+    // a few tokens on 2 Q heads per K/V head on Volta, see launch_fattn_tile_switch_ncols1
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16 + GGML_CUDA_FATTN_TILE_CFG_FEW, 512, 1,  64,  64)
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256, 16, 256, 2,  64,  64)
 
@@ -673,7 +677,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
 
 // Function that performs a single iteration of the main loop over up to nbatch_fa tokens.
 template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int DV, int nbatch_fa, int nbatch_K,
-    bool use_logit_softcap, bool oob_check, ggml_type type_KV, typename T_vec_dot, typename T_KQ, typename T_acc>
+    bool use_logit_softcap, bool oob_check, ggml_type type_KV, bool roll_chunks, typename T_vec_dot, typename T_KQ, typename T_acc>
 static __device__ __forceinline__ void flash_attn_tile_iter(
         T_vec_dot * const Q_tmp,
         const half2 * const __restrict__ K_h2,
@@ -723,8 +727,9 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     // KQ = K @ Q matrix multiplication:
     constexpr int nbatch_K_last = DKQ % nbatch_K;
     // a head size of 512 unrolled over all of its chunks no longer fits the instruction cache: with the few blocks of a
-    //     decode most stalls were instruction fetches, so its chunk loops stay rolled
-    constexpr int unroll_chunks = DKQ >= 512 ? 1 : 64;
+    //     decode most stalls were instruction fetches, so its chunk loops stay rolled; so do those of a config that runs
+    //     its code once per call (roll_chunks)
+    constexpr int unroll_chunks = DKQ >= 512 || roll_chunks ? 1 : 64;
 #pragma unroll unroll_chunks
     for (int k_KQ_0 = 0; k_KQ_0 < DKQ - nbatch_K_last; k_KQ_0 += nbatch_K) {
         flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>(
@@ -918,7 +923,7 @@ static constexpr __device__ int ggml_cuda_fattn_tile_cfg_key(const int DKQ, cons
     return cfg != 0 && ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols + cfg) != 0 ? ncols + cfg : ncols;
 }
 
-// cfg: 0, or GGML_CUDA_FATTN_TILE_CFG_DEEP for the second config row of the same column count
+// cfg: 0, or GGML_CUDA_FATTN_TILE_CFG_DEEP / _FEW for the second config row of the same column count
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, ggml_type type_KV, int cfg = 0> // D == head size
 __launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ggml_cuda_fattn_tile_cfg_key(DKQ, DV, ncols1*ncols2, cfg)),
                   ggml_cuda_fattn_tile_get_occupancy(DKQ, DV, ggml_cuda_fattn_tile_cfg_key(DKQ, DV, ncols1*ncols2, cfg)))
@@ -983,6 +988,7 @@ static __global__ void flash_attn_tile(
     constexpr int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cfg_key) / warp_size;
     constexpr int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cfg_key);
     constexpr int nbatch_K  = ggml_cuda_fattn_tile_get_nbatch_K (DKQ, DV, cfg_key);
+    constexpr bool roll_chunks = cfg_key == ncols1*ncols2 + GGML_CUDA_FATTN_TILE_CFG_FEW;
 
     // In this kernel Q, K, V are matrices while i, j, k are matrix indices.
 
@@ -1126,14 +1132,14 @@ static __global__ void flash_attn_tile(
         int k_VKQ_0 = skip_hole(blockIdx.y*nbatch_fa);
         while (k_VKQ_0 <= k_VKQ_max - nbatch_fa) {
             constexpr bool oob_check = false;
-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>
+            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV, roll_chunks>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
                 stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
             k_VKQ_0 = skip_hole(k_VKQ_0 + gridDim.y*nbatch_fa);
         }
         if (k_VKQ_0 < k_VKQ_max) {
             constexpr bool oob_check = true;
-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>
+            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV, roll_chunks>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
                 stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
         }
@@ -1141,7 +1147,7 @@ static __global__ void flash_attn_tile(
         // Branch without out-of-bounds checks.
         for (int k_VKQ_0 = skip_hole(blockIdx.y*nbatch_fa); k_VKQ_0 < k_VKQ_max; k_VKQ_0 = skip_hole(k_VKQ_0 + gridDim.y*nbatch_fa)) {
             constexpr bool oob_check = false;
-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>
+            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV, roll_chunks>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
                 stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
         }
@@ -1363,6 +1369,27 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     if constexpr (ncols2 <= 16) {
         if (Q->ne[1] > 8/ncols2) {
             constexpr int cols_per_block = 16;
+            // Volta, head size 256, 2 Q heads per K/V head (gemma-4-31B's sliding-window layers in a 6-token drafted verify):
+            //     a block reads one 64-cell tile of the window, so a call runs the kernel's code once, and the first call
+            //     after a global layer (whose kernels evict it) waited on instruction fetches. 16 warps of one column each
+            //     with the chunk loops rolled, at one block per SM: in situ 24.4 -> 21.0 us per call, 48.4 -> 26.2 us after
+            //     a global layer, the verify forward -3.1%. GGML_CUDA_FATTN_TILE_FEW=0 turns it off.
+            if constexpr (DKQ == 256 && DV == 256 && ncols2 == 2 && type_KV == GGML_TYPE_F16) {
+                static const bool few = [] {
+                    const char * env = getenv("GGML_CUDA_FATTN_TILE_FEW");
+                    return env == nullptr || atoi(env) != 0;
+                }();
+                if (cc == GGML_CUDA_CC_VOLTA && few && Q->ne[2] == 2*dst->src[1]->ne[2]) {
+                    constexpr int key   = cols_per_block + GGML_CUDA_FATTN_TILE_CFG_FEW;
+                    const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, key, cc) / warp_size;
+                    const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, key, cc);
+                    fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV,
+                        GGML_CUDA_FATTN_TILE_CFG_FEW>;
+                    launch_fattn<DV, cols_per_block/ncols2, ncols2>
+                        (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, need_f16, need_f16, false, false, warp_size);
+                    return;
+                }
+            }
             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
             fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;
