@@ -205,7 +205,13 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 #define GGML_CUDA_TOPK_SLOT_COUNT 512
 #define GGML_CUDA_TOPK_EPOCH      (GGML_CUDA_TOPK_SLOTS + 2*GGML_CUDA_TOPK_SLOT_COUNT)
 #define GGML_CUDA_TOPK_WARM       (GGML_CUDA_TOPK_EPOCH + 8)
-#define GGML_CUDA_BLOCK_FLAGS     (GGML_CUDA_TOPK_WARM + 64)
+// the polling norm of a fold of up to 8 rows (rms_norm_add_rms_norm_ar_rows_f32): an epoch per row, a count of the rows
+//   done polling, and 64 uint4 slots per row
+#define GGML_CUDA_ROW_SPLIT_MT_ROWS  8
+#define GGML_CUDA_ROW_SPLIT_MT_EPOCH (GGML_CUDA_TOPK_WARM + 64)
+#define GGML_CUDA_ROW_SPLIT_MT_COUNT (GGML_CUDA_ROW_SPLIT_MT_EPOCH + GGML_CUDA_ROW_SPLIT_MT_ROWS)
+#define GGML_CUDA_ROW_SPLIT_MT_SLOTS (GGML_CUDA_ROW_SPLIT_MT_COUNT + 8)
+#define GGML_CUDA_BLOCK_FLAGS        (GGML_CUDA_ROW_SPLIT_MT_SLOTS + GGML_CUDA_ROW_SPLIT_MT_ROWS*64*4)
 
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg);

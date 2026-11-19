@@ -15969,12 +15969,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_mul_mat_sibling_glu(type, 2560, 512, 3, true));
     }
-    // 2-4 tokens of q8_0 rows in pairs: qwen4exp's hyper-connection down projection and its inject, a gated delta net's
-    //   qkv, gate and alpha rows per device
-    for (int64_t n_tokens : { 2, 4 }) {
+    // 5-8 tokens of q8_0 (a draft's verify batch): gate and up as sibling rows of one launch, the GLU after it
+    for (int64_t n_tokens : { 5, 6, 8 }) {
+        test_cases.emplace_back(new test_mul_mat_sibling_glu(GGML_TYPE_Q8_0, 2560, 160, n_tokens));
+        test_cases.emplace_back(new test_mul_mat_sibling_glu(GGML_TYPE_Q8_0, 5376, 1344, n_tokens, true));
+    }
+    // 2-8 tokens of q8_0 rows in pairs: qwen4exp's hyper-connection down projection and its inject, a gated delta net's
+    //   qkv, gate and alpha rows per device, gemma's Q, K and V per device in a 6-token verify batch
+    for (int64_t n_tokens : { 2, 4, 6, 8 }) {
         test_cases.emplace_back(new test_mul_mat_sibling_rows(GGML_TYPE_Q8_0, 10240, 320, 4, 0, n_tokens));
         test_cases.emplace_back(new test_mul_mat_sibling_rows(GGML_TYPE_Q8_0, 2560, 2560, 1536, 12, n_tokens));
     }
+    test_cases.emplace_back(new test_mul_mat_sibling_rows(GGML_TYPE_Q8_0, 5376, 2048, 1024, 1024, 6));
     test_cases.emplace_back(new test_mul_mat_sibling_rows(GGML_TYPE_Q8_0, 2560, 2560, 12, 12, 3));
     // one token runs the shared expert in the experts' launches (the down projection only for q8_0 rows of K 128),
     //   two tokens do not

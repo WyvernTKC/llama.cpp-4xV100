@@ -9286,15 +9286,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_cuda_mul_mat_choose(*cuda_ctx, w, y, t) == GGML_CUDA_MUL_MAT_PATH_MMVF;
         return ok ? 3 : 0;
     };
-    // 4: mmvq of 2-4 tokens (the verify batch of a draft: qwen4exp's hyper-connection down projection and its 4-row inject,
-    //   the qkv and gate projections of a gated delta net layer), rows in pairs
+    // 4: mmvq of 2-8 tokens (the verify batch of a draft: qwen4exp's hyper-connection down projection and its 4-row inject,
+    //   the qkv and gate projections of a gated delta net layer, the Q, K and V projections of gemma's 6-token verify), rows
+    //   in pairs. GGML_CUDA_SIBLING_ROWS_MMVQ_MT4=1 keeps it to 4 tokens.
+    static const int mmvq_mt_max_cols = getenv("GGML_CUDA_SIBLING_ROWS_MMVQ_MT4") != nullptr ? 4 : 8;
     const auto sibling_kernel_mmvq_mt = [&](const ggml_tensor * t) -> int {
         const ggml_tensor * w = t->src[0];
         const ggml_tensor * y = t->src[1];
         const bool bad_padding_clear = ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
             ggml_nbytes(w) != ggml_backend_buffer_get_alloc_size(w->buffer, w) && w->view_src;
         const bool ok = ggml_is_quantized(w->type) && !bad_padding_clear && ggml_nrows(w) == w->ne[1] && w->ne[1] % 2 == 0 &&
-            y->ne[1] >= 2 && y->ne[1] <= 4 && ggml_nrows(y) == y->ne[1] && !ggml_cuda_expert_cache_is(w) &&
+            y->ne[1] >= 2 && y->ne[1] <= mmvq_mt_max_cols && ggml_nrows(y) == y->ne[1] && !ggml_cuda_expert_cache_is(w) &&
             !ggml_cuda_op_mul_mat_use_fwht(t) && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_mul_mat_choose(*cuda_ctx, w, y, t) == GGML_CUDA_MUL_MAT_PATH_MMVQ;
         return ok ? 4 : 0;
@@ -10037,7 +10039,8 @@ static int ggml_cuda_ar_fold_consume(ggml_backend_cuda_context * cuda_ctx, ggml_
             if (t_dry != nullptr) {
                 return n_ops;
             }
-            ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + n_ops - 1);
+            // the rows of a batch at the padded stride, as rms_norm_add_rms_norm_ar_rows_f32 writes them
+            ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + n_ops - 1, false, true);
             ggml_cuda_op_rms_norm_add_rms_norm_ar(*cuda_ctx, n[0], n[1], n[2], has_scale ? n[3] : nullptr, n[n_ops - 2],
                 n[n_ops - 1], c.args, t);
             return n_ops;
@@ -10570,6 +10573,9 @@ static int ggml_backend_cuda_session_plan(ggml_backend_t backend, ggml_cgraph **
     return mode;
 }
 
+// per device, set by ggml_backend_cuda_session_begin: see there (each device's sessions run on one thread)
+static std::vector<const ggml_tensor *> ggml_cuda_ar_fold_rows_poll[GGML_CUDA_MAX_DEVICES];
+
 // cgraph_next: the first subgraph of the session that follows this one with the all-reduce after the last subgraph
 //   between them, nullptr if none
 static void ggml_backend_cuda_session_begin(ggml_backend_t backend, ggml_cgraph ** cgraphs, int n_cgraphs, int mode,
@@ -10628,6 +10634,22 @@ static void ggml_backend_cuda_session_begin(ggml_backend_t backend, ggml_cgraph 
     }
     cuda_ctx->ar_fold.l2pf = l2pf;
 
+    // the all-reduces of the rows of a batch whose next subgraph starts with a launch that polls them, the only ones of
+    //   more than a row that ggml_backend_cuda_session_allreduce_next folds (the others keep the LL kernel, one launch)
+    std::vector<const ggml_tensor *> & rows_poll = ggml_cuda_ar_fold_rows_poll[cuda_ctx->device];
+    rows_poll.clear();
+    for (int k = 0; k < n_cgraphs; ++k) {
+        ggml_cgraph * next = k + 1 < n_cgraphs ? cgraphs[k + 1] : cgraph_next;
+        ggml_tensor * t    = cgraphs[k]->n_nodes > 0 ? cgraphs[k]->nodes[cgraphs[k]->n_nodes - 1] : nullptr;
+        if (next == nullptr || t == nullptr || ggml_nrows(t) <= 1) {
+            continue;
+        }
+        const int i_next = ggml_cuda_first_compute_node(next);
+        if (i_next >= 0 && ggml_cuda_ar_fold_consume(cuda_ctx, next, i_next, t) > 0) {
+            rows_poll.push_back(t);
+        }
+    }
+
     // lines the session before left (see ggml_backend_cuda_session_end): the first subgraph receives them
     ggml_backend_cuda_context::ar_fold_t & f = cuda_ctx->ar_fold;
     GGML_ASSERT(!f.recv && f.captured == nullptr);
@@ -10681,15 +10703,19 @@ static void ggml_backend_cuda_session_allreduce_next(void * comm_ctx_v, struct g
     f.next   = nullptr;
     f.pushed = false;
     // the norm that polls the lines keeps the row in registers, up to 8 columns per thread of its 1024-thread layout (see
-    //   rms_norm_pre_add_ar_split_f32)
-    const int64_t ncols = ggml_nelements(tensors[rank]);
+    //   rms_norm_pre_add_ar_split_f32); the rows of a draft's verify batch, up to GGML_CUDA_ROW_SPLIT_MT_ROWS of them, each
+    //   in their own blocks (rms_norm_add_rms_norm_ar_rows_f32, GGML_CUDA_NO_AR_FOLD_MT=1 turns it off)
+    static const bool no_fold_mt = getenv("GGML_CUDA_NO_AR_FOLD_MT") != nullptr;
+    const std::vector<const ggml_tensor *> & rows_poll = ggml_cuda_ar_fold_rows_poll[cuda_ctx->device];
+    const bool size_ok = ggml_nrows(tensors[rank]) == 1 ? ggml_nelements(tensors[rank]) <= 8*1024 :
+        !no_fold_mt && std::find(rows_poll.begin(), rows_poll.end(), tensors[rank]) != rows_poll.end();
     // GGML_CUDA_AR_CARRY_TEST=1: the all-reduce after the last subgraph is not folded but its lines still go to the next
     //   session, by the push on its own (see ggml_backend_cuda_session_allreduce)
     static const bool carry_test = getenv("GGML_CUDA_AR_CARRY_TEST") != nullptr;
     if (carry_test && tensors[rank] == f.bound) {
         return;
     }
-    if (no_fold || ncols > 8*1024 || comm_ctx->p2p_ar == nullptr ||
+    if (no_fold || !size_ok || comm_ctx->p2p_ar == nullptr ||
             !ggml_cuda_p2p_ar_fold_args(comm_ctx->p2p_ar, comm_ctx->backends.data(), tensors, rank, f.next_call.args)) {
         return;
     }
@@ -10706,17 +10732,24 @@ static void ggml_backend_cuda_session_allreduce(void * comm_ctx_v, struct ggml_t
     // the matmul pushed the lines: the next subgraph receives them
     ggml_backend_cuda_context::ar_fold_t & f = cuda_ctx->ar_fold;
     const bool pushed = f.pushed && f.next == tensors[rank];
+    // the rows of a batch (a draft's verify): pushed here on their own, their matmul keeps 2 rows a block and its scattered
+    //   pushes cost more than the LL kernel; the next subgraph polls them as it polls a matmul's
+    const bool push_rows = !pushed && f.next == tensors[rank] && ggml_nrows(tensors[rank]) > 1;
     f.next   = nullptr;
     f.pushed = false;
     // after the last subgraph, see ggml_backend_cuda_session_end
     const bool bound = tensors[rank] == f.bound;
     static const bool carry_test = getenv("GGML_CUDA_AR_CARRY_TEST") != nullptr;
     if (bound) {
-        f.bound_carry = f.bound_match >= 0 ? f.bound_match == 1 : (pushed || carry_test) && f.bound_poll;
+        f.bound_carry = f.bound_match >= 0 ? f.bound_match == 1 : (pushed || push_rows || carry_test) && f.bound_poll;
     }
-    if (pushed) {
+    if (pushed || push_rows) {
         GGML_ASSERT(!f.recv);
         ggml_cuda_session_reduction_flush(cuda_ctx);
+        if (push_rows) {
+            ggml_cuda_ar_fold_launch_push(f.next_call.args, (const float *) tensors[rank]->data, ggml_nelements(tensors[rank]),
+                cuda_ctx->stream());
+        }
         f.recv_call = f.next_call;
         f.recv      = true;
         return;
