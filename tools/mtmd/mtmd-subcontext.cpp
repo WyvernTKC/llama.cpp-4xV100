@@ -189,7 +189,8 @@ ggml_backend_dev_t mtmd_split_device(const char * fname, const ggml_backend_dev_
     const char * what = nullptr;
     const char * why  = nullptr;
     std::vector<mtmd_split_group> groups;
-    if (projector_type_from_string(proj) == PROJECTOR_TYPE_QWEN3VL) {
+    const projector_type proj_v = projector_type_from_string(proj);
+    if (proj_v == PROJECTOR_TYPE_QWEN3VL || proj_v == PROJECTOR_TYPE_GEMMA4V) {
         what = "the vision encoder";
         if (get_bool(KEY_HAS_AUDIO_ENC) || get_bool(KEY_HAS_GEN_AUDIO_ENC)) {
             why = "the mmproj has an audio encoder";
@@ -203,7 +204,7 @@ ggml_backend_dev_t mtmd_split_device(const char * fname, const ggml_backend_dev_
         groups.push_back({ "a.gen.code.blk.", get_u32(mtmd_format(KEY_N_HEAD, "gen.audio")) });
         groups.push_back({ "a.gen.flow.blk.", n_rows("a.gen.flow.blk.0.attn_q.weight") / mtmd_graph_music3_gen::dit_d_head });
     } else {
-        why = "only the qwen3vl_merger vision encoder and the minimax_music3 generator have split rules";
+        why = "only the qwen3vl_merger and gemma4v vision encoders and the minimax_music3 generator have split rules";
     }
     // attn_out and ffn_down are split along their rows: a quantized one needs the device boundaries in whole blocks
     auto ends_with = [](const std::string & s, const char * suffix) {
@@ -217,7 +218,10 @@ ggml_backend_dev_t mtmd_split_device(const char * fname, const ggml_backend_dev_
             if (name.rfind(g.prefix, 0) != 0) {
                 continue;
             }
-            if (ends_with(name, ".attn_out.weight")) {
+            // gemma4v clamps: one on the output of a row-split attn_out or ffn_down would see partial sums
+            if (ends_with(name, ".output_max") || ends_with(name, ".output_min")) {
+                why = "the blocks clamp their projection outputs";
+            } else if (ends_with(name, ".attn_out.weight")) {
                 g.blck_o = std::lcm(g.blck_o, blck);
             } else if (ends_with(name, ".ffn_down.weight")) {
                 g.blck_ffn = std::lcm(g.blck_ffn, blck);
