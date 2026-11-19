@@ -1119,7 +1119,9 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         const auto & cells = v_cells[seq_to_stream[seq_id]];
 
-        uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
+        // a cache that shares the cells of another one never moves its own head (apply_ubatch and seq_rm skip it), so
+        //   start where the owner of the cells would: from 0, every draft of a gemma4 assistant scanned all used cells
+        uint32_t head_cur = (other ? other->v_heads : v_heads)[seq_to_stream[seq_id]];
 
         // if we have enough unused cells before the current head ->
         //   better to start searching from the beginning of the cache, hoping to fill it
