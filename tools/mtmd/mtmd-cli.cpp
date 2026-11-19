@@ -135,6 +135,12 @@ struct mtmd_cli_context {
             exit(1);
         }
 
+        // the non-jinja path only knows common templates (not e.g. Gemma 4), and it throws on the others
+        if (!params.use_jinja && params.chat_template.empty() && !common_chat_verify_template(llama_model_chat_template(model, nullptr), false)) {
+            LOG_WRN("%s: the model chat template is not supported without jinja, enabling --jinja\n", __func__);
+            params.use_jinja = true;
+        }
+
         tmpls = common_chat_templates_init(model, params.chat_template);
         use_jinja = params.use_jinja;
         chat_history.clear();
