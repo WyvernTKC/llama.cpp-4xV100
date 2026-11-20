@@ -1335,13 +1335,20 @@ static __global__ void mul_mat_vec_q(
     }
 
     // ar: every lane holds the sums of the block's rows; lane p pushes rows 2p and 2p + 1 (the host only folds whole
-    //   blocks of rows)
+    //   blocks of rows), plus a fused bias (another partial sum added to this one: LongCat's MoE to its dense FFN)
     if constexpr (ar && rows_per_cuda_block % 2 == 0) {
+        const float * ar_bias = (const float *) fusion.x_bias;
 #pragma unroll
         for (int p = 0; p < rows_per_cuda_block/2; ++p) {
             if (threadIdx.x == p) {
                 const int r = row0 + 2*p;
-                ggml_cuda_ar_fold_push(conv_args, ar_seq, r/4, (r/2) % 2, tmp[0][2*p], tmp[0][2*p + 1]);
+                float v0 = tmp[0][2*p];
+                float v1 = tmp[0][2*p + 1];
+                if (ar_bias != nullptr) {
+                    v0 += ar_bias[r];
+                    v1 += ar_bias[r + 1];
+                }
+                ggml_cuda_ar_fold_push(conv_args, ar_seq, r/4, (r/2) % 2, v0, v1);
             }
         }
     }
@@ -1937,8 +1944,23 @@ static void mul_mat_vec_q_switch_fusion(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+
+    // an all-reduce folded into the launch: one column, whole blocks of an even number of rows, nothing else fused but a
+    //   bias, which the pushed rows include
+    bool ar_fold = false;
+    if constexpr (c_ncols_dst == 1 && small_k && ggml_cuda_mmvq_ar_fold_type(type)) {
+        constexpr int rpb = calc_rows_per_block(type, c_ncols_dst, MMVQ_PARAMETERS_VOLTA, small_k,
+            calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_VOLTA, small_k, halve_iters));
+        const bool bias_only = fusion.gate == nullptr && fusion.gate_bias == nullptr && fusion.x_scale == nullptr &&
+            fusion.gate_scale == nullptr && fusion.conv.w == nullptr;
+        ar_fold = fusion.ar_pushed != nullptr && ids == nullptr && fusion.sib_x == nullptr && fusion.sib2_x == nullptr &&
+                fusion.gdn_x == nullptr && fusion.shared_up == nullptr && bias_only && block_dims.y == (unsigned) rpb && rpb % 2 == 0 &&
+                block_nums.x*rpb == stride_col_dst && block_nums.y == 1 && block_nums.z == 1 &&
+                get_device_table_id(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) == MMVQ_PARAMETERS_VOLTA;
+    }
+
     if constexpr (c_ncols_dst == 1) {
-        if (has_fusion) {
+        if (has_fusion && !ar_fold) {
             dim3 grid = block_nums;
             if (ids && fusion.sib_x) {
                 grid.y += 1; // the sibling pair, see mul_mat_vec_q
@@ -1963,7 +1985,7 @@ static void mul_mat_vec_q_switch_fusion(
         }
     }
 
-    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+    GGML_ASSERT((!has_fusion || ar_fold) && "fusion only supported for ncols_dst=1");
     if constexpr (paired) {
         GGML_ABORT("the paired layout needs a fused gate");
     }
@@ -1985,14 +2007,8 @@ static void mul_mat_vec_q_switch_fusion(
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
 
-    // an all-reduce folded into the launch: one column, whole blocks of an even number of rows, nothing else fused
     if constexpr (c_ncols_dst == 1 && small_k && ggml_cuda_mmvq_ar_fold_type(type)) {
-        constexpr int rpb = calc_rows_per_block(type, c_ncols_dst, MMVQ_PARAMETERS_VOLTA, small_k,
-            calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_VOLTA, small_k, halve_iters));
-        if (fusion.ar_pushed != nullptr && ids == nullptr && fusion.sib_x == nullptr && fusion.sib2_x == nullptr &&
-                fusion.gdn_x == nullptr && fusion.shared_up == nullptr && block_dims.y == (unsigned) rpb && rpb % 2 == 0 &&
-                block_nums.x*rpb == stride_col_dst && block_nums.y == 1 && block_nums.z == 1 &&
-                get_device_table_id(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) == MMVQ_PARAMETERS_VOLTA) {
+        if (ar_fold) {
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, wide, false, false, true>, launch_params,
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
