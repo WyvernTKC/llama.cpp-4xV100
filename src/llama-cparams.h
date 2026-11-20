@@ -49,6 +49,7 @@ struct llama_cparams {
     bool auto_fqsa;
     bool fused_top_k_mask;   // use fused top-k sparse attention mask
     bool auto_ftkm;
+    uint32_t n_tp_dev = 0;   // devices of -sm tensor, 0 otherwise
     bool fused_kv_rows;      // unified cache: attend to the cells of each sequence only (ggml_flash_attn_ext_rows)
     bool auto_fkvr;
     bool split_tensor;       // -sm tensor: page-sparse decode only through the ops that have split rules (FUSED=3)

@@ -5623,6 +5623,19 @@ void ggml_flash_attn_ext_set_n_kv_max(
     ggml_set_op_params_i32(a, 4, n_kv_max);
 }
 
+void ggml_flash_attn_ext_set_lse(
+        struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->data == NULL && a->ne[0] >= a->ne[1]);
+
+    ggml_set_op_params_i32(a, 7, 1);
+
+    a->ne[1] += 1;
+    for (int i = 2; i < GGML_MAX_DIMS; i++) {
+        a->nb[i] = a->nb[i - 1]*a->ne[i - 1];
+    }
+}
+
 void ggml_flash_attn_ext_set_chunk_list(
         struct ggml_tensor * a,
         struct ggml_tensor * list) {

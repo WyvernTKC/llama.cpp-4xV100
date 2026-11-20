@@ -2353,6 +2353,12 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // Partial attention over a share of the K/V cells, to be combined with other shares: the result gets one more row
+    //   after the heads of each token, whose element h is the log-sum-exp of the scaled scores of head h (-INF if all
+    //   masked, the head output is then 0). Call it right after ggml_flash_attn_ext, before any use of the result.
+    GGML_API void ggml_flash_attn_ext_set_lse(
+            struct ggml_tensor * a);
+
     // A hint of which K/V cells each mask row can see, so that a backend may skip the cells it cannot:
     //   ranges: I32 [3, mask->ne[1], 1, mask->ne[3]], per mask row {end, hole_begin, hole_end} in cells, multiples of
     //   GGML_KQ_RANGE_CHUNK (end may be n_kv): every mask value of the row at a cell >= end or in [hole_begin,

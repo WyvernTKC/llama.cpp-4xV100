@@ -353,6 +353,7 @@ llama_context::llama_context(
     // not under -sm tensor: the indexer may score a slice of the tokens per device, ggml_top_k_mask needs them all
     cparams.fused_top_k_mask = model.split_mode() != LLAMA_SPLIT_MODE_TENSOR;
     cparams.auto_ftkm        = cparams.fused_top_k_mask && hparams.indexer_top_k > 0;
+    cparams.n_tp_dev         = model.split_mode() == LLAMA_SPLIT_MODE_TENSOR ? model.get_split_state_ud.n_devices : 0;
     cparams.split_tensor     = model.split_mode() == LLAMA_SPLIT_MODE_TENSOR;
 
     // with causal attention, the batch size is limited by the context size

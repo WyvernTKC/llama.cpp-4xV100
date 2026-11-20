@@ -739,6 +739,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
+    // a log-sum-exp row (ggml_flash_attn_ext_set_lse) comes out of the parallel-block combine of the tile kernel
+    if (ggml_get_op_params_i32(dst, 7) != 0) {
+        return gqa_opt_applies && !kv_rows && KQV->src[7] == nullptr ? BEST_FATTN_KERNEL_TILE : BEST_FATTN_KERNEL_NONE;
+    }
+
     // a chunk list (page-sparse decode) is read only by the paged vector kernel: one query, no softcap, n_kv_max set
     if (KQV->src[7]) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)

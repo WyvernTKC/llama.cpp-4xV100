@@ -2631,6 +2631,20 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_flash_attn_ext = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // Partial attention over shares of the cells (ggml_flash_attn_ext_set_lse): q is the same for every share along
+        //   dim 3 and k/v/mask hold one share each there, all replicated. Each device takes one share, its views are cut
+        //   in ggml_backend_meta_buffer_init_tensor_impl, and the model combines the shares by their log-sum-exp.
+        if (ggml_get_op_params_i32(tensor, 7) != 0 && tensor->ne[3] == int64_t(n_bufs)) {
+            for (int i = 0; i < 4; i++) {
+                GGML_ASSERT(tensor->src[i] == nullptr || src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+            GGML_ASSERT(tensor->src[4] == nullptr && tensor->src[5] == nullptr && tensor->src[6] == nullptr && tensor->src[7] == nullptr);
+            ggml_backend_meta_split_state ret = {GGML_BACKEND_SPLIT_AXIS_3, {0}, {1}, 1};
+            for (size_t j = 0; j < n_bufs; j++) {
+                ret.ne[j] = 1;
+            }
+            return ret;
+        }
         // a mask split along dim 3 like q: the problems along dim 3 below, each device made the mask of its own
         const bool mask_split = tensor->src[3] != nullptr && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_3 &&
             split_states_equal(src_ss[3], src_ss[0]);
@@ -3148,7 +3162,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         // a split that a handler originated from mirrored srcs (the lightning indexer slicing its queries) has
         //   no src to take the ratio from and filled ne itself
-        const bool ne_from_handler = tensor->op == GGML_OP_LIGHTNING_INDEXER && split_state.axis == GGML_BACKEND_SPLIT_AXIS_1;
+        const bool ne_from_handler = (tensor->op == GGML_OP_LIGHTNING_INDEXER && split_state.axis == GGML_BACKEND_SPLIT_AXIS_1) ||
+            (tensor->op == GGML_OP_FLASH_ATTN_EXT && ggml_get_op_params_i32(tensor, 7) != 0 && split_state.axis == GGML_BACKEND_SPLIT_AXIS_3);
         if (!ne_from_handler && split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
             bool first_src_split_by_axis = true;
             const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
@@ -3375,7 +3390,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
     std::vector<ggml_tensor *> simple_tensors;
     simple_tensors.reserve(n_simple_bufs);
     for (size_t j = 0; j < n_simple_bufs; j++) {
-        ggml_context          * simple_ctx = stc.ctx(j, 4); // the tensor and up to 3 views of its srcs
+        ggml_context          * simple_ctx = stc.ctx(j, 5); // the tensor and up to 4 views of its srcs
         ggml_backend_buffer_t   simple_buf = buf_ctx->bufs[j].get();
 
         if (split_dim >= 0 && split_dim < GGML_MAX_DIMS) {
@@ -3577,6 +3592,11 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             slice_replicated(1, int(split_state.axis) - 1); // indices
         }
         if (tensor->op == GGML_OP_FLASH_ATTN_EXT && split_state.axis == GGML_BACKEND_SPLIT_AXIS_3) {
+            if (ggml_get_op_params_i32(tensor, 7) != 0) {
+                slice_replicated(0, 3); // q
+                slice_replicated(1, 3); // k
+                slice_replicated(2, 3); // v
+            }
             slice_replicated(3, 3); // mask
         }
         if ((tensor->op == GGML_OP_ADD || tensor->op == GGML_OP_SUB || tensor->op == GGML_OP_MUL || tensor->op == GGML_OP_DIV ||

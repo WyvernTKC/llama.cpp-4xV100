@@ -4065,7 +4065,24 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    // One token under -sm tensor: the MLA cache is mirrored, so a split by head has every device read all of it. Split
+    //   by cells instead: each device attends its share of them for all heads, see build_attn_mla_cp. The tile kernel
+    //   takes 16 heads a pass over the cells, so it pays only while the passes of all heads are fewer than the devices
+    //   (32 heads on 4: 2 passes over a quarter of the cells against 1 pass over all). Two all-gathers and a few small
+    //   kernels a layer cost ~2 ms a token on LongCat-Next, against a third off the depth slope: 4x V100 tg64 -10% at
+    //   32k cells, -3% at 64k, +15% at 128k. LLAMA_MLA_CP = the fewest cells for it, 0 = off.
+    static const int64_t mla_cp_min_kv = [] {
+        const char * env = getenv("LLAMA_MLA_CP");
+        return env != nullptr ? (int64_t) atoll(env) : (int64_t) 81920;
+    }();
+    const int64_t n_dev  = cparams.n_tp_dev;
+    const bool    use_cp = mla_cp_min_kv > 0 && n_dev > 1 && v_mla != nullptr && kq_b == nullptr && sinks == nullptr &&
+        kv_rows == nullptr && q->ne[2] == 1 && q->ne[1] % n_dev == 0 && (q->ne[1] + 15)/16 < n_dev &&
+        k->ne[1] == 1 && k->ne[3] == 1 && k->ne[2] >= mla_cp_min_kv && k->ne[2] % (256*n_dev) == 0 &&
+        kq_mask != nullptr && kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1;
+
+    ggml_tensor * cur = use_cp ? build_attn_mla_cp(q, k, kq_mask, v_mla, kq_scale, il) :
+        build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -4084,6 +4101,74 @@ ggml_tensor * llm_graph_context::build_attn(
     if (wo_b) {
         cur = ggml_add(ctx0, cur, wo_b);
     }
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_attn_mla_cp(
+        ggml_tensor * q,
+        ggml_tensor * k,
+        ggml_tensor * kq_mask,
+        ggml_tensor * v_mla,
+              float   kq_scale,
+                int   il) const {
+    const int64_t n_dev  = cparams.n_tp_dev;
+    const int64_t D_k    = q->ne[0];
+    const int64_t n_head = q->ne[1];
+    const int64_t D_v    = v_mla->ne[0];
+    const int64_t n_kv_d = k->ne[2] / n_dev;
+
+    // An all-gather: x split by device on every device, whole. It ends the meta backend's session; gathering through
+    //   an all-reduce inside it instead (x^T times the device's rows of the identity, summed) ran 6-8% slower, its
+    //   small GEMMs, copies and all-reduce waits cost more than the host enqueue of the gather
+    auto gather = [&](ggml_tensor * x) {
+        ggml_tensor * y = ggml_cont(ctx0, ggml_reshape_1d(ctx0, x, ggml_nelements(x)));
+        y->flags |= GGML_TENSOR_FLAG_MIRRORED;
+        return y;
+    };
+
+    // the queries of all heads on every device
+    ggml_tensor * qg = gather(q);
+    cb(qg, "q_cp", il);
+
+    // [D, 1, n_head, n_dev]: the same queries for every share, k/v/mask hold share j at dim 3
+    ggml_tensor * q4 = ggml_repeat_4d(ctx0, ggml_reshape_4d(ctx0, qg, D_k, 1, n_head, 1), D_k, 1, n_head, n_dev);
+    ggml_tensor * k4 = ggml_view_4d(ctx0, k, D_k, n_kv_d, 1, n_dev, k->nb[2], k->nb[1], n_kv_d*k->nb[2], 0);
+    ggml_tensor * v4 = ggml_view_4d(ctx0, k, D_v, n_kv_d, 1, n_dev, k->nb[2], k->nb[1], n_kv_d*k->nb[2], 0);
+    ggml_tensor * m4 = ggml_view_4d(ctx0, kq_mask, n_kv_d, 1, 1, n_dev,
+        kq_mask->nb[1], kq_mask->nb[2], n_kv_d*kq_mask->nb[0], 0);
+
+    ggml_tensor * fa = ggml_flash_attn_ext(ctx0, q4, k4, v4, m4, kq_scale, hparams.f_max_alibi_bias, 0.0f);
+    ggml_flash_attn_ext_set_lse(fa); // [D_v, n_head + 1, 1, n_dev]
+    ggml_prec_set_acc(fa, GGML_PREC_F32);
+    cb(fa, "fattn_cp", il);
+
+    // the shares of all devices on every device
+    ggml_tensor * g = gather(fa);
+    cb(g, "fattn_cp_all", il);
+
+    const size_t row = D_v*sizeof(float);
+    ggml_tensor * o   = ggml_view_4d(ctx0, g, D_v, n_head, 1, n_dev, row, row*(n_head + 1), row*(n_head + 1), 0);
+    ggml_tensor * lse = ggml_view_2d(ctx0, g, n_head, n_dev, row*(n_head + 1), row*n_head);
+
+    // the weight of each share per head [n_dev, n_head], then [n_dev, D_v, n_head] x [n_dev, 1, n_head] -> [D_v, 1, n_head]
+    ggml_tensor * w    = ggml_soft_max(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, lse)));
+    ggml_tensor * comb = ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, o, 1, 2, 3, 0)), ggml_reshape_3d(ctx0, w, n_dev, 1, n_head));
+    cb(comb, "fattn_cp_comb", il);
+
+    // back to the split by head: adding a zero split by head keeps the heads of the device. comb goes in as a strided
+    //   view, so ggml-alloc cannot run the add in place over the replicated src it slices
+    ggml_tensor * zero = ggml_scale(ctx0, q, 0.0f);
+    zero = ggml_permute(ctx0, ggml_view_3d(ctx0, zero, D_v, n_head, 1, zero->nb[1], zero->nb[2], 0), 0, 2, 1, 3);
+    comb = ggml_permute(ctx0, ggml_reshape_3d(ctx0, comb, D_v, n_head, 1), 0, 2, 1, 3);
+
+    ggml_tensor * cur = ggml_add(ctx0, zero, comb);
+
+    cur = ggml_mul_mat(ctx0, v_mla, cur);
+    cb(cur, "fattn_mla", il);
+    cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 0, 2, 1, 3));
+    cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], 1);
+    ggml_build_forward_expand(gf, cur);
 
     return cur;
 }

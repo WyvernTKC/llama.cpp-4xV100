@@ -1289,7 +1289,8 @@ static __global__ void flash_attn_combine_results(
         const int parallel_blocks,
         block_q8_1 * q8_dst,
         const float * gate,
-        const int64_t gate_s1) {
+        const int64_t gate_s1,
+        const int lse) {
     static_assert(D % DS == 0 && (DS == D || DS % WARP_SIZE == 0), "bad column split");
     ggml_cuda_pdl_lc();
     const float  * GGML_CUDA_RESTRICT VKQ_parts = VKQ_parts_ptr;
@@ -1312,9 +1313,12 @@ static __global__ void flash_attn_combine_results(
 
     const int j_dst_unrolled = (sequence*ne01 + col)*ne02 + head;
 
+    // ggml_flash_attn_ext_set_lse: one more row after the heads of each token holds the log-sum-exp of each head
+    float * dst_lse = lse ? dst + ((sequence*ne01 + col)*(ne02 + 1) + ne02)*D + head : nullptr;
+
     VKQ_parts += j_dst_unrolled * parallel_blocks*D;
     VKQ_meta  += j_dst_unrolled * parallel_blocks;
-    dst       += j_dst_unrolled *                 D;
+    dst       += (lse ? (sequence*ne01 + col)*(ne02 + 1) + head : j_dst_unrolled) * D;
 
     const int tid = threadIdx.x;
     const int d   = (blockIdx.z % nslices)*DS + tid;
@@ -1390,6 +1394,13 @@ static __global__ void flash_attn_combine_results(
     }
 
     float val = VKQ_numerator / VKQ_denominator;
+    if (lse) {
+        // a share whose cells are all masked has no weight in the combination, and must not give NaN
+        val = VKQ_denominator > 0.0f ? val : 0.0f;
+        if (d == 0) {
+            *dst_lse = VKQ_denominator > 0.0f ? kqmax + logf(VKQ_denominator) : -INFINITY;
+        }
+    }
     if (gate != nullptr) {
         // as ggml_cuda_op_cont_unary_mul computes it
         val = ggml_cuda_op_sigmoid_single(gate[j_dst_unrolled*gate_s1 + d]) * val;
@@ -1425,6 +1436,10 @@ void launch_fattn(
     GGML_ASSERT(!kv_rows || !use_sparse);
 
     ggml_tensor * KQV = dst;
+
+    // ggml_flash_attn_ext_set_lse: the log-sum-exp comes out of the combine of the parallel blocks
+    const bool lse = ggml_get_op_params_i32(dst, 7) != 0;
+    GGML_ASSERT(!lse || (!stream_k && !use_sparse));
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
     GGML_ASSERT(KQV->type == GGML_TYPE_F32);
@@ -1791,6 +1806,11 @@ void launch_fattn(
             }
         }
 
+        if (lse) {
+            GGML_ASSERT(ntiles_KV >= 2);
+            parallel_blocks = std::max(parallel_blocks, 2);
+        }
+
         blocks_num.x = ntiles_x;
         blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
@@ -1892,7 +1912,7 @@ void launch_fattn(
         ggml_tensor * out     = KQV;
         const float * gate    = nullptr;
         int64_t       gate_s1 = 0;
-        if (ctx.fattn_gate.mul != nullptr && Q->ne[3] == 1) {
+        if (ctx.fattn_gate.mul != nullptr && Q->ne[3] == 1 && !lse) {
             out     = ctx.fattn_gate.mul;
             gate    = (const float *) ctx.fattn_gate.cont->src[0]->data;
             gate_s1 = ctx.fattn_gate.cont->src[0]->nb[1] / sizeof(float);
@@ -1903,7 +1923,7 @@ void launch_fattn(
         //   blocks of 32 in a head and no padding
         block_q8_1 * q8_dst = nullptr;
         if (DV % QK8_1 == 0 && Q->ne[1] == 1 && Q->ne[3] == 1 && ggml_is_contiguous(out) &&
-                ggml_nelements(out) % MATRIX_ROW_PADDING == 0) {
+                ggml_nelements(out) % MATRIX_ROW_PADDING == 0 && !lse) {
             int64_t ne_padded = 0;
             q8_dst = (block_q8_1 *) ctx.q8_1_emit_alloc(out, ne_padded);
             GGML_ASSERT(q8_dst == nullptr || ne_padded == ggml_nelements(out));
@@ -1911,7 +1931,7 @@ void launch_fattn(
 
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
         ggml_cuda_kernel_launch(flash_attn_combine_results<DV, DS>, launch_params,
-            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) out->data, parallel_blocks, q8_dst, gate, gate_s1);
+            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) out->data, parallel_blocks, q8_dst, gate, gate_s1, (int) lse);
     }
     CUDA_CHECK(cudaGetLastError());
 }

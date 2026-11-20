@@ -1385,6 +1385,15 @@ struct llm_graph_context {
                     int   il,
             ggml_tensor * chunk_list = nullptr) const; // I32 [n_kv/32 + 1, n_head_q, n_stream], see ggml_flash_attn_ext_set_chunk_list
 
+    // one-token MLA attention under -sm tensor split by cells instead of by head, see build_attn(llm_graph_input_attn_k *)
+    ggml_tensor * build_attn_mla_cp(
+            ggml_tensor * q,       // [n_embd_head_q, n_head_q, 1]
+            ggml_tensor * k,       // [n_embd_head_k, 1, n_kv, 1], the mirrored cache
+            ggml_tensor * kq_mask,
+            ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+                  float   kq_scale,
+                    int   il) const;
+
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
     ggml_tensor * build_attn(
