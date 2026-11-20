@@ -18518,6 +18518,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // LongCat-Next one-token MLA decode attention per device under -sm tensor: 8 Q heads on the latent, V a view of K;
+    //   32 heads over a quarter of the cells with a cell split
+    for (int64_t nr : {8, 32}) {
+        for (int64_t kv : {512, 2048, 4096, 8192, 16384, 32768}) {
+            test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {nr, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
+        }
+    }
+
     // MiniMax-M3 MSA decode attention: 16 q heads on one kv group, one token, the 2048 picked cells gathered contiguous
     //   (-sm tensor: one group per device; one device: four)
     for (int64_t nh : {1, 4}) {

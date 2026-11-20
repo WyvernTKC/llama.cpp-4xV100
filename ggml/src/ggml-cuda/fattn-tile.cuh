@@ -1501,6 +1501,17 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
             launch_fattn_tile_switch_ncols1<DKQ, DV, 16, use_logit_softcap, type_KV>(ctx, dst);
             return;
         }
+        // 8 Q heads on the K/V head (LongCat-Next under -sm tensor): one block takes all of them, so each K/V tile is
+        //     read once instead of once per 4 heads. V100, one token: 32k cells 182 -> 153 us, but 512-2k cells
+        //     20 -> 23 us (half the blocks). GGML_CUDA_FATTN_TILE_576_GQA8 = the fewest cells for it, 0 = off.
+        static const int64_t gqa8_min_kv = [] {
+            const char * env = getenv("GGML_CUDA_FATTN_TILE_576_GQA8");
+            return env != nullptr ? (int64_t) atoll(env) : (int64_t) 4096;
+        }();
+        if (gqa8_min_kv > 0 && dst->src[1]->ne[1] >= gqa8_min_kv && use_gqa_opt && gqa_ratio % 8 == 0) {
+            launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap, type_KV>(ctx, dst);
+            return;
+        }
         if (use_gqa_opt && gqa_ratio % 4 == 0) {
             launch_fattn_tile_switch_ncols1<DKQ, DV, 4, use_logit_softcap, type_KV>(ctx, dst);
             return;
