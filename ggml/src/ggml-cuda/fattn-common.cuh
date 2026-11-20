@@ -1920,13 +1920,15 @@ void launch_fattn(
         }
 
         // the q8_1 copy of one token's output for the MMVQ matmul that reads it, see ggml_cuda_q8_1_request: whole
-        //   blocks of 32 in a head and no padding
+        //   blocks of 32 in a head and no padding. The matmul may read it as one row (an O projection) or as rows that
+        //   need no padding (MLA's per-head V up-projection reads a row per head): either way the copy is in the order of
+        //   the output's elements, as the combine writes it
         block_q8_1 * q8_dst = nullptr;
         if (DV % QK8_1 == 0 && Q->ne[1] == 1 && Q->ne[3] == 1 && ggml_is_contiguous(out) &&
                 ggml_nelements(out) % MATRIX_ROW_PADDING == 0 && !lse) {
             int64_t ne_padded = 0;
-            q8_dst = (block_q8_1 *) ctx.q8_1_emit_alloc(out, ne_padded);
-            GGML_ASSERT(q8_dst == nullptr || ne_padded == ggml_nelements(out));
+            q8_dst = (block_q8_1 *) ctx.q8_1_emit_alloc(out, ne_padded, ggml_nelements(out));
+            GGML_ASSERT(q8_dst == nullptr || ggml_nelements(out) % ne_padded == 0);
         }
 
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
