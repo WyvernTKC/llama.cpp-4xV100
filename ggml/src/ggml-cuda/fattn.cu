@@ -412,9 +412,12 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
             const int gqa_ratio = Q->ne[2] / K->ne[2];
             if (gqa_ratio % 16 == 0) {
                 ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<192, 128, 16>(ctx, dst);
-            } else {
-                GGML_ASSERT(gqa_ratio % 8 == 0);
+            } else if (gqa_ratio % 8 == 0) {
                 ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<192, 128,  8>(ctx, dst);
+            } else {
+                // one Q head per K/V head: MLA's prompt attention in the decompressed form (build_attn_mla_mha)
+                GGML_ASSERT(gqa_ratio == 1);
+                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<192, 128,  1>(ctx, dst);
             }
         } break;
         case 256:
@@ -700,7 +703,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             }
             break;
         case 192:
-            if (V->ne[0] != 128 || !gqa_opt_applies) {
+            if (V->ne[0] != 128) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+            // one Q head per K/V head (MLA decompressed, build_attn_mla_mha): the MMA kernel at 32 or more columns only
+            if (gqa_ratio == 1) {
+                const bool mma = (turing_mma_available(cc) || volta_mma_available(cc)) && Q->ne[1] >= 32 && mask &&
+                    mask->ne[2] == 1 && max_bias == 0.0f && !kv_rows && KQV->src[7] == nullptr;
+                return mma ? BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
+            }
+            if (!gqa_opt_applies) {
                 return BEST_FATTN_KERNEL_NONE;
             }
             if (gqa_ratio % 8 != 0) {

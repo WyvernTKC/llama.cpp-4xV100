@@ -1385,6 +1385,20 @@ struct llm_graph_context {
                     int   il,
             ggml_tensor * chunk_list = nullptr) const; // I32 [n_kv/32 + 1, n_head_q, n_stream], see ggml_flash_attn_ext_set_chunk_list
 
+    // MLA attention of a prompt batch in the decompressed (MHA) form, see build_attn_mla_mha in llama-graph.cpp: whether
+    //   it applies to this batch, and the attention with the store of the latent row and the output projection
+    bool mla_mha_applies(const llm_graph_input_attn_k * inp) const;
+    ggml_tensor * build_attn_mla_mha(
+            llm_graph_input_attn_k * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur,   // [n_embd_head_k_mla, n_head, n_tokens], the nope part then the roped part
+            ggml_tensor * k_cur,   // [kv_lora_rank + n_rot, 1, n_tokens], the row the cache stores
+            ggml_tensor * wk_b,    // [n_embd_head_qk_nope, kv_lora_rank, n_head]
+            ggml_tensor * wv_b,    // [kv_lora_rank, n_embd_head_v_mla, n_head]
+                  float   kq_scale,
+                    int   il) const;
+
     // one-token MLA attention under -sm tensor split by cells instead of by head, see build_attn(llm_graph_input_attn_k *)
     ggml_tensor * build_attn_mla_cp(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, 1]

@@ -2375,6 +2375,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
         }
+        // and a replicated first operand broadcast over the batches of the second, which are split (MLA's decompressed
+        //   keys and values: the latents of all cells times each device's heads of the up-projection)
+        if (src_ss[1].axis >= GGML_BACKEND_SPLIT_AXIS_2 && src_ss[1].axis < GGML_MAX_DIMS &&
+                src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && tensor->src[0]->ne[src_ss[1].axis] == 1) {
+            return src_ss[1];
+        }
         GGML_ABORT("unsupported mul_mat split states: node=%s src0=%s axis=%d src1=%s axis=%d",
             tensor->name, tensor->src[0]->name, (int) src_ss[0].axis, tensor->src[1]->name, (int) src_ss[1].axis);
         //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};

@@ -91,7 +91,7 @@ for ncols in [8, 16, 32, 64]:
 
             for head_size_kq in HEAD_SIZES_KQ:
                 # Skip compilation of unused ncols2 values for niche head sizes:
-                if head_size_kq == 192 and ncols2 not in (8, 16): # MiMo-V2.5
+                if head_size_kq == 192 and ncols2 not in (1, 8, 16): # MiMo-V2.5, MLA prompt attention decompressed (1)
                     continue
                 if head_size_kq == 320 and ncols2 != 32: # Mistral Small 4
                     continue

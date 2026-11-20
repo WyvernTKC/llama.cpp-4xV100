@@ -2325,7 +2325,7 @@ static __global__ void flash_attn_ext_f16(
         NO_DEVICE_CODE;
         return;
     }
-    if (DKQ == 192 && ncols2 != 8 && ncols2 != 16) {
+    if (DKQ == 192 && ncols2 != 1 && ncols2 != 8 && ncols2 != 16) { // 1: MLA decompressed (build_attn_mla_mha)
         NO_DEVICE_CODE;
         return;
     }

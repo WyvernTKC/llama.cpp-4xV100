@@ -472,6 +472,9 @@ llama_model_longcat_flash::graph::graph(const llm_graph_params & params) :
             // {n_embd_head_k, n_head, n_tokens}
             q = ggml_reshape_3d(ctx0, q, n_embd_head_k, n_head, n_tokens);
 
+            const float q_scale = (hparams.f_attn_q_lora_scale != 0.0f ? hparams.f_attn_q_lora_scale : 1.0f) * kq_scale;
+            const bool  mha     = mla_mha_applies(inp_attn_k);
+
             // split into {kv_lora_rank, n_tokens}
             ggml_tensor * kv_cmpr = ggml_view_2d(ctx0, kv_cmpr_pe, kv_lora_rank, n_tokens,
                     ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope), 0);
@@ -528,7 +531,7 @@ llama_model_longcat_flash::graph::graph(const llm_graph_params & params) :
             // the q lora scale and kq_scale on the whole query, linear through the absorption and the rope: with the lora
             //   scales the raw q.k sums overflow F16 in the Volta flash attention. The CUDA backend runs the rope, the
             //   concat and this scale in one launch (ggml_cuda_try_fuse_mla_q)
-            Qcur = ggml_scale(ctx0, Qcur, (hparams.f_attn_q_lora_scale != 0.0f ? hparams.f_attn_q_lora_scale : 1.0f) * kq_scale);
+            Qcur = ggml_scale(ctx0, Qcur, q_scale);
             cb(Qcur, "Qcur", il);
 
             kv_cmpr = ggml_reshape_3d(ctx0, kv_cmpr, kv_lora_rank, 1, n_tokens);
@@ -542,10 +545,19 @@ llama_model_longcat_flash::graph::graph(const llm_graph_params & params) :
             ggml_tensor * Vcur = kv_cmpr;
             cb(Vcur, "Vcur", il);
 
+            if (mha) {
+                // a prompt batch: the decompressed form, the rope over the last n_rot dims of each head and the scales
+                //   on the whole query, as in the absorbed form
+                ggml_tensor * Qm = ggml_rope_set_offset(build_rope(q, inp_pos, il), n_embd_head_qk_nope);
+                Qm = ggml_scale(ctx0, Qm, q_scale);
+                cb(Qm, "Qcur_mha", il);
+                cur = build_attn_mla_mha(inp_attn_k, layer.wo, layer.wo_s, Qm, Kcur, layer.wk_b, layer.wv_b, 1.0f, il);
+            } else {
             // note: MLA with the absorption optimization converts into MQA (ie: GQA with 1 group)
             cur = build_attn(inp_attn_k,
                     layer.wo, NULL, layer.wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, layer.wv_b, 1.0f, il);
+            }
         }
 
         const bool out_rows = il == n_layer - 1 && inp_out_ids;
