@@ -12648,8 +12648,9 @@ struct test_flash_attn_ext_window : public test_flash_attn_ext {
 
     test_flash_attn_ext_window(int64_t hsk, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb,
                                int64_t window, int64_t offset, ggml_type type_KV = GGML_TYPE_F16,
-                               bool ranges = false, int32_t n_visible_max = 0)
-        : test_flash_attn_ext(hsk, hsv, nh, nr23, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV),
+                               bool ranges = false, int32_t n_visible_max = 0, bool v_is_view_of_k = false)
+        : test_flash_attn_ext(hsk, hsv, nh, nr23, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3},
+                              true, v_is_view_of_k),
           window(window), offset(offset), ranges(ranges), n_visible_max(n_visible_max) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -17833,6 +17834,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 4096,  24, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {8, 1}, 4096,  24, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false));
 
+    // one token of the MLA shape with 8 Q heads on the latent, V a view of K, F16 cache (LongCat-Next per device under
+    //     -sm tensor; the Volta tensor-core kernel): a few tiles to a deep cache, two K/V heads and two sequences, large
+    //     scores (the online softmax rescales), and masks with a masked tail, a hole, with and without the graph's ranges
+    for (int64_t kv : {256, 1024, 4096, 16384, 32768, 65536, 131072}) {
+        test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 2, {8, 2}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext_large_logits(576, 512, 1, {8, 1}, 32768, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
+    for (int64_t offset : { 30000, 7001, 0 }) {
+        for (bool ranges : { false, true }) {
+            test_cases.emplace_back(new test_flash_attn_ext_window(576, 512, 1, {8, 1}, 32768, 1, 20000, offset, GGML_TYPE_F16, ranges, 0, true));
+        }
+    }
+
     // sliding window in a ring cache (gemma-4 SWA: D 256, gqa 2; muse-glimmer SWA: D 128, gqa 16): the vec and tile
     //     kernels skip the masked hole - window at the top, in the middle at an unaligned offset, wrapped, at 0
     for (int64_t offset : { 15360, 7001, 16000, 0 }) {
@@ -18558,7 +18573,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // LongCat-Next one-token MLA decode attention per device under -sm tensor: 8 Q heads on the latent, V a view of K;
     //   32 heads over a quarter of the cells with a cell split
     for (int64_t nr : {8, 32}) {
-        for (int64_t kv : {512, 2048, 4096, 8192, 16384, 32768}) {
+        for (int64_t kv : {512, 2048, 4096, 8192, 16384, 32768, 65536, 131072}) {
+            if (nr == 32 && kv > 32768) {
+                continue;
+            }
             test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {nr, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32,
                 GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
         }

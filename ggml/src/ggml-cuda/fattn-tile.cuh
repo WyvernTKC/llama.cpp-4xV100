@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
+#include "fattn-volta-mla.cuh"
 
 // nbatch_fa == number of KQ rows to process per iteration
 // nbatch_K == number of K columns to load in parallel for KQ calculation
@@ -1497,6 +1498,13 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
     }
 
     if constexpr (DKQ == 576) {
+        // one token, 8 Q heads on the K/V head, V a view of K: on Volta tensor cores, see fattn-volta-mla.cuh
+        if constexpr (DV == 512 && type_KV == GGML_TYPE_F16 && !use_logit_softcap) {
+            if (use_gqa_opt && ggml_cuda_fattn_volta_mla_applies(cc, dst)) {
+                ggml_cuda_flash_attn_ext_volta_mla(ctx, dst);
+                return;
+            }
+        }
         if (use_gqa_opt && gqa_ratio % 16 == 0) {
             launch_fattn_tile_switch_ncols1<DKQ, DV, 16, use_logit_softcap, type_KV>(ctx, dst);
             return;
