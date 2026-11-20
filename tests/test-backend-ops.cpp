@@ -11262,6 +11262,59 @@ struct test_glu_mul_mat : public test_case {
     }
 };
 
+// A matvec whose output another matvec reads: a gate/up GLU before its down projection, or MLA's V up-projection per head
+//   (permuted and made contiguous, as in build_attn_mha) before the output projection. One token on CUDA: the first
+//   matvec writes the q8_1 copy of its output (ggml_cuda_mmvq_q8_args).
+struct test_mul_mat_q8_1_chain : public test_case {
+    const ggml_type type;
+    const bool    mla;
+    const int64_t k;  // the input, the latent per head with mla
+    const int64_t ff; // the rows, per head with mla
+    const int64_t nh; // the heads with mla
+    const int64_t nb; // the tokens
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_Q8_1_CHAIN";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, mla, k, ff, nh, nb);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_q8_1_chain(ggml_type type = GGML_TYPE_Q8_0, bool mla = false, int64_t k = 1024, int64_t ff = 1536,
+            int64_t nh = 1, int64_t nb = 1)
+        : type(type), mla(mla), k(k), ff(ff), nh(nh), nb(nb) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur;
+        if (mla) {
+            ggml_tensor * kqv = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, nh, nb);
+            ggml_tensor * wv  = ggml_new_tensor_3d(ctx, type, k, ff, nh);
+            cur = ggml_mul_mat(ctx, wv, ggml_permute(ctx, kqv, 0, 2, 1, 3));
+            cur = ggml_cont(ctx, ggml_permute(ctx, cur, 0, 2, 1, 3));
+            cur = ggml_reshape_2d(ctx, cur, ff*nh, nb);
+        } else {
+            ggml_tensor * x    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, nb);
+            ggml_tensor * wu   = ggml_new_tensor_2d(ctx, type, k, ff);
+            ggml_tensor * wg   = ggml_new_tensor_2d(ctx, type, k, ff);
+            ggml_tensor * up   = ggml_mul_mat(ctx, wu, x);
+            ggml_tensor * gate = ggml_mul_mat(ctx, wg, x);
+            cur = ggml_swiglu_split(ctx, gate, up);
+        }
+        ggml_tensor * wo  = ggml_new_tensor_2d(ctx, type, cur->ne[0], 512);
+        ggml_tensor * out = ggml_mul_mat(ctx, wo, cur);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // mul_mat with src1 in [0, 1]: a zero-mean src1 hides errors in the zero point or the min of a quantized src0
 struct test_mul_mat_pos : public test_mul_mat {
     using test_mul_mat::test_mul_mat;
@@ -18188,6 +18241,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_glu_mul_mat(type, GGML_GLU_OP_GEGLU_QUICK, false, 256, 512, 256));
         test_cases.emplace_back(new test_glu_mul_mat(type, GGML_GLU_OP_GEGLU_ERF, true, 512, 64, 1024));
+    }
+    // a matvec into a matvec: LongCat-Next's dense GLU and MLA V up-projection split four ways, a GLU of the paired layout
+    //   (5120 rows), outputs that are not whole 512-blocks, and two tokens
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        for (int64_t nb : {1, 2}) {
+            test_cases.emplace_back(new test_mul_mat_q8_1_chain(type, false, 3072, 1536, 1, nb));
+            test_cases.emplace_back(new test_mul_mat_q8_1_chain(type, false, 1024, 5120, 1, nb));
+            test_cases.emplace_back(new test_mul_mat_q8_1_chain(type, false, 1024, 1280, 1, nb));
+            test_cases.emplace_back(new test_mul_mat_q8_1_chain(type, true, 512, 128, 8, nb));
+            test_cases.emplace_back(new test_mul_mat_q8_1_chain(type, true, 512, 128, 4, nb));
+            test_cases.emplace_back(new test_mul_mat_q8_1_chain(type, true, 512, 64, 4, nb));
+        }
     }
     // one token of a quantized gate and up over enough rows that Volta puts four of them in a block, which fuses them in
     //   the paired layout: gemma-4-31B split four ways, and an odd tail row

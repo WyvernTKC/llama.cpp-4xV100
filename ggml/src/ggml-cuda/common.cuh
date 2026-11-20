@@ -211,7 +211,12 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 #define GGML_CUDA_ROW_SPLIT_MT_EPOCH (GGML_CUDA_TOPK_WARM + 64)
 #define GGML_CUDA_ROW_SPLIT_MT_COUNT (GGML_CUDA_ROW_SPLIT_MT_EPOCH + GGML_CUDA_ROW_SPLIT_MT_ROWS)
 #define GGML_CUDA_ROW_SPLIT_MT_SLOTS (GGML_CUDA_ROW_SPLIT_MT_COUNT + 8)
-#define GGML_CUDA_BLOCK_FLAGS        (GGML_CUDA_ROW_SPLIT_MT_SLOTS + GGML_CUDA_ROW_SPLIT_MT_ROWS*64*4)
+// a matvec that writes the q8_1 copy of its output (ggml_cuda_mmvq_q8_args): a 64-bit slot per row, for up to
+//   GGML_CUDA_Q8_1_GROUP_COUNT groups of 32 rows
+#define GGML_CUDA_Q8_1_GROUP_COUNT   512
+#define GGML_CUDA_Q8_1_SLOTS         (GGML_CUDA_ROW_SPLIT_MT_SLOTS + GGML_CUDA_ROW_SPLIT_MT_ROWS*64*4)
+#define GGML_CUDA_BLOCK_FLAGS        (GGML_CUDA_Q8_1_SLOTS + 2*32*GGML_CUDA_Q8_1_GROUP_COUNT)
+static_assert(GGML_CUDA_Q8_1_SLOTS % 2 == 0, "the q8_1 slots are 64-bit");
 
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg);
@@ -1637,7 +1642,8 @@ struct ggml_backend_cuda_context {
     // two flags for a kernel whose blocks wait on its first block (see rms_norm_emit_q8_1), then the ticket of the
     //   topk_moe in a router's launch (ggml_cuda_topk_moe_fold), all zero between launches; then the epoch and the
     //   tagged slots of a row split over blocks (row_split_reduce in norm.cu); from GGML_CUDA_TOPK_SLOTS the tagged logit
-    //   slots, their epoch and the scratch of a router launch with a waiting block (mul_mat_vec_f_router)
+    //   slots, their epoch and the scratch of a router launch with a waiting block (mul_mat_vec_f_router); from
+    //   GGML_CUDA_Q8_1_SLOTS the slots of the q8_1 copy of a matvec output, empty between launches (ggml_cuda_mmvq_q8_args)
     unsigned int * block_flags[GGML_CUDA_MAX_DEVICES] = { nullptr };
 
     // Called before a capture begins (graph_compute, session_begin): a memset in a capture would run again at every replay.
@@ -2032,6 +2038,15 @@ struct ggml_cuda_mmvq_conv_args {
     float *         slot0      = nullptr;
     float *         slot1      = nullptr;
 };
+// The q8_1 copy of a one-token mmvq output for the matvec that reads it next (see ggml_cuda_q8_1_request), in the order of
+//   the output's elements. A block stores each of its rows with a tag in one 64-bit slot; the blocks from block0 on in each
+//   channel wait, one per group of 32 rows, until all its slots hold a row, quantize them as quantize_q8_1 does and empty
+//   the slots for the next launch: no ticket, fence or epoch (as mul_mat_vec_f_router, but its epoch load cost 1 us here)
+struct ggml_cuda_mmvq_q8_args {
+    block_q8_1 *         dst    = nullptr;
+    unsigned long long * slots  = nullptr; // block_flags + GGML_CUDA_Q8_1_SLOTS
+    uint32_t             block0 = 0;
+};
 struct ggml_cuda_mmvf_topk_args {
     const float *  logits          = nullptr; // see ggml_cuda_mm_fusion_args_host
     float *        weights         = nullptr;
@@ -2077,6 +2092,9 @@ struct ggml_cuda_mm_fusion_args_launch : ggml_cuda_mm_fusion_args_device {
     const float *            ar_weights = nullptr;
     const float *            ar_gate    = nullptr;
     int                      ar_n_used  = 0;
+    // with q8.dst: a launch that can write the q8_1 copy of its output does so and sets *q8_written
+    ggml_cuda_mmvq_q8_args   q8;
+    bool *                   q8_written = nullptr;
 };
 
 struct ggml_cuda_kernel_launch_params {

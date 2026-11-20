@@ -48,6 +48,7 @@ enum ggml_cuda_spin_site : unsigned int {
     GGML_CUDA_SPIN_SITE_NORM_PAIR_Q8,   // rms_norm_add_rms_norm_f32, its q8_1 blocks
     GGML_CUDA_SPIN_SITE_EXPERT_CPU,     // expert_cpu_wait_add (expert-cpu.cu)
     GGML_CUDA_SPIN_SITE_FOLD_NORM_PAIR, // rms_norm_add_rms_norm_ar_split_f32, the lines
+    GGML_CUDA_SPIN_SITE_MMVQ_Q8,        // mul_mat_vec_q, a waiting block of its q8_1 copy
     GGML_CUDA_SPIN_SITE_COUNT,
 };
 
@@ -140,6 +141,7 @@ void ggml_cuda_spin_set_allreduce_p2p(const ggml_cuda_spin_config & cfg);
 void ggml_cuda_spin_set_mmvf         (const ggml_cuda_spin_config & cfg);
 void ggml_cuda_spin_set_norm         (const ggml_cuda_spin_config & cfg);
 void ggml_cuda_spin_set_expert_cpu   (const ggml_cuda_spin_config & cfg);
+void ggml_cuda_spin_set_mmvq         (const ggml_cuda_spin_config & cfg);
 
 // defines the setter above of the file it is in
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

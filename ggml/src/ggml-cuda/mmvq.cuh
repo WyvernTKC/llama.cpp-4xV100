@@ -31,6 +31,10 @@ bool ggml_cuda_mul_mat_vec_q_short_sibling(const ggml_tensor * src0, const ggml_
 bool ggml_cuda_mul_mat_vec_q_moe_sibling(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
         const ggml_tensor * sib, const ggml_tensor * sib_y);
 
+// whether the launch of a MUL_MAT with nothing fused reads src1 as f32 (the short q8_0 kernel quantizes its own part of
+//   it); else it reads only the q8_1 copy, made or found before the launch, so dst may lie over src1
+bool ggml_cuda_mul_mat_vec_q_reads_f32_src1(const ggml_tensor * src0, const ggml_tensor * dst);
+
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 

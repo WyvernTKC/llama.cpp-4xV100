@@ -1,6 +1,7 @@
 #include "mmvq.cuh"
 #include "allreduce-p2p.cuh"
 #include "quantize.cuh"
+#include "spin.cuh"
 #include "ssm-conv.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -9,6 +10,8 @@
 #include <cstdint>
 #include <memory>
 #include <type_traits>
+
+GGML_CUDA_SPIN_SETTER(mmvq)
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
 // has little exposed latency left to hide and the extra requests cost more than they save.
@@ -918,6 +921,44 @@ static constexpr __host__ __device__ int mmvq_paired_min_blocks(const ggml_type 
 #endif
 }
 
+// The slots of the q8_1 copy are read and written by blocks of one launch, so at GPU scope: with volatile (system scope)
+//   loads and stores LongCat-Next's dense GLU took 0.7 us more
+static __device__ __forceinline__ void mmvq_q8_1_slot_store(unsigned long long * p, const unsigned long long v) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    asm volatile("st.relaxed.gpu.global.u64 [%0], %1;" :: "l"(p), "l"(v) : "memory");
+#else
+    *(volatile unsigned long long *) p = v;
+#endif
+}
+
+static __device__ __forceinline__ unsigned long long mmvq_q8_1_slot_load(const unsigned long long * p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    unsigned long long v;
+    asm volatile("ld.relaxed.gpu.global.u64 %0, [%1];" : "=l"(v) : "l"(p) : "memory");
+    return v;
+#else
+    return *(const volatile unsigned long long *) p;
+#endif
+}
+
+// a row in its slot: the tag in the high half, 0 = empty
+#define MMVQ_Q8_1_SLOT_TAG (1ull << 32)
+
+// A waiting block of the q8_1 copy (one warp, ggml_cuda_mmvq_q8_args): once the 32 slots of group g hold a row, it
+//   quantizes them and empties the slots
+static __device__ __forceinline__ void mul_mat_vec_q_q8_1_wait(const ggml_cuda_mmvq_q8_args & q8, const uint32_t g, const int lane) {
+    unsigned long long * slot = q8.slots + g*QK8_1 + lane;
+    unsigned long long v = 0;
+    if (!ggml_cuda_spin_until([&]() {
+            v = mmvq_q8_1_slot_load(slot);
+            return __all_sync(0xFFFFFFFF, v >= MMVQ_Q8_1_SLOT_TAG);
+        })) {
+        ggml_cuda_spin_trap(GGML_CUDA_SPIN_SITE_MMVQ_Q8, -1, GGML_CUDA_SPIN_PEER_BLOCKS);
+    }
+    quantize_q8_1_lane(__uint_as_float((unsigned int) v), q8.dst + g, lane);
+    mmvq_q8_1_slot_store(slot, 0);
+}
+
 // paired: a fused gate on twice the warps, the first half summing x and the second half the gate over the same rows and
 //   K slices as the plain kernel, so a thread keeps the sums of one matrix as there and each sum is the plain one
 // conv: the convolution of build_conv_state in the epilogue of the rows of x (conv_args), one row per block
@@ -925,8 +966,10 @@ static constexpr __host__ __device__ int mmvq_paired_min_blocks(const ggml_type 
 //   not to dst; see ggml_cuda_ar_fold_push
 // sib_ch: with ids and nothing fused, the channel past the used experts is the sibling sib_x (with its own y channel, see
 //   ggml_cuda_mul_mat_vec_q_moe_sibling); has_fusion's variant takes the sibling with a gate
+// q8: the q8_1 copy of dst (conv_args holds its ggml_cuda_mmvq_q8_args); one column and sample, a contiguous dst whose
+//   channels are whole groups of 32 rows, each channel's blocks from block0 on waiting for one group each
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool wide = false,
-          bool paired = false, bool conv = false, bool ar = false, bool sib_ch = false, bool sign_dp4a = false>
+          bool paired = false, bool conv = false, bool ar = false, bool sib_ch = false, bool sign_dp4a = false, bool q8 = false>
 __launch_bounds__((paired ? 2 : 1)*calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(),
     conv ? mmvq_conv_min_blocks(type) : paired ? mmvq_paired_min_blocks(type, wide) : 1)
 static __global__ void mul_mat_vec_q(
@@ -936,7 +979,8 @@ static __global__ void mul_mat_vec_q(
         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
         const uint32_t ids_stride,
-        const std::conditional_t<conv, ggml_cuda_mmvq_conv_args, std::conditional_t<ar, ggml_cuda_ar_fold_args, ggml_cuda_no_args>> conv_args) {
+        const std::conditional_t<conv, ggml_cuda_mmvq_conv_args, std::conditional_t<ar, ggml_cuda_ar_fold_args,
+            std::conditional_t<q8, ggml_cuda_mmvq_q8_args, ggml_cuda_no_args>>> conv_args) {
     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
@@ -1014,6 +1058,18 @@ static __global__ void mul_mat_vec_q(
     uint32_t sample_dst;
 
     ggml_cuda_pdl_sync();
+
+    // q8: the waiting blocks
+    static_assert(!q8 || (ncols_dst == 1 && !paired && !conv && !ar && !sib_ch), "q8 copies the rows of one column");
+    if constexpr (q8) {
+        if (blockIdx.x >= conv_args.block0) {
+            if (threadIdx.y == 0) {
+                mul_mat_vec_q_q8_1_wait(conv_args, (channel_dst*stride_channel_dst)/QK8_1 + blockIdx.x - conv_args.block0, threadIdx.x);
+            }
+            return;
+        }
+    }
+
     channel_x  = shared_expert ? 0 : ncols_dst == 1 && ids ? (sib ? 0 : ids[channel_dst]) : fastdiv(channel_dst, channel_ratio);
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
@@ -1311,6 +1367,10 @@ static __global__ void mul_mat_vec_q(
                     }
                 }
                 dst[j*col_stride_dst + i] = result;
+                if constexpr (q8) {
+                    mmvq_q8_1_slot_store(conv_args.slots + channel_dst*stride_channel_dst + row0 + i,
+                        MMVQ_Q8_1_SLOT_TAG | __float_as_uint(result));
+                }
                 if constexpr (conv) {
                     // as ssm_conv_state_f32 with one token; conv_dst may sit exactly on dst, so it is written last
                     if (conv_row) {
@@ -1931,6 +1991,29 @@ static constexpr bool ggml_cuda_mmvq_ar_fold_type(const ggml_type type) {
     return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q6_K;
 }
 
+// the types whose one-token launches can write the q8_1 copy of their output (q8 of mul_mat_vec_q); q8_0: LongCat-Next's
+//   dense gate/up GLU before its down projection and MLA's V up-projection before the attention output
+static constexpr bool ggml_cuda_mmvq_q8_type(const ggml_type type) {
+    return type == GGML_TYPE_Q8_0;
+}
+
+// the launch of a q8 kernel: the blocks of a channel (rpb rows each, all of them whole) and then one waiting block per
+//   group of 32 rows; false (nothing launched) if the rows do not fill the blocks
+template <typename kernel_t, typename... Args>
+static bool mul_mat_vec_q_launch_q8(kernel_t kernel, const ggml_cuda_mm_fusion_args_launch & fusion, const int rpb,
+        const uint32_t stride_channel_dst, dim3 grid, const dim3 & block_dims, const int nbytes_shared, cudaStream_t stream,
+        Args &&... args) {
+    if (grid.x*rpb != stride_channel_dst || grid.z != 1) {
+        return false;
+    }
+    ggml_cuda_mmvq_q8_args q8 = fusion.q8;
+    q8.block0 = grid.x;
+    grid.x += stride_channel_dst/QK8_1;
+    ggml_cuda_kernel_launch(kernel, ggml_cuda_kernel_launch_params(grid, block_dims, nbytes_shared, stream), std::forward<Args>(args)..., q8);
+    *fusion.q8_written = true;
+    return true;
+}
+
 template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, bool wide = false, bool paired = false,
          bool sign_dp4a = false>
 static void mul_mat_vec_q_switch_fusion(
@@ -1976,6 +2059,18 @@ static void mul_mat_vec_q_switch_fusion(
                 }
             }
             GGML_ASSERT(fusion.conv.w == nullptr);
+            if constexpr (!small_k && !halve_iters && !paired && ggml_cuda_mmvq_q8_type(type)) {
+                constexpr int rpb = calc_rows_per_block(type, c_ncols_dst, MMVQ_PARAMETERS_VOLTA, false,
+                    calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_VOLTA));
+                if (fusion.q8.dst != nullptr && !ids && mul_mat_vec_q_launch_q8(
+                        mul_mat_vec_q<type, c_ncols_dst, true, false, false, wide, false, false, false, false, false, true>,
+                        fusion, rpb, stride_channel_dst, grid, block_dims, nbytes_shared, stream,
+                        vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride)) {
+                    return;
+                }
+            }
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, wide, paired, false, false, false, sign_dp4a>,
                  launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
@@ -2014,6 +2109,19 @@ static void mul_mat_vec_q_switch_fusion(
                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, fusion.ar);
             *fusion.ar_pushed = true;
+            return;
+        }
+    }
+
+    if constexpr (c_ncols_dst == 1 && small_k && !halve_iters && ggml_cuda_mmvq_q8_type(type)) {
+        constexpr int rpb = calc_rows_per_block(type, c_ncols_dst, MMVQ_PARAMETERS_VOLTA, true,
+            calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_VOLTA, true));
+        if (fusion.q8.dst != nullptr && !ids && mul_mat_vec_q_launch_q8(
+                mul_mat_vec_q<type, c_ncols_dst, false, true, false, wide, false, false, false, false, false, true>,
+                fusion, rpb, stride_channel_dst, block_nums, block_dims, nbytes_shared, stream,
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride)) {
             return;
         }
     }
@@ -2901,6 +3009,27 @@ static void ggml_cuda_mul_mat_vec_q_impl(
     }
     GGML_ASSERT(fusion_local.sib_y == nullptr);
 
+    // the q8_1 copy of one token's output for the matvec that reads it next (see ggml_cuda_q8_1_request), in the order of
+    //   its elements: whole rows that need no padding, channels of whole 32-row groups. A q8 kernel writes it, else it is
+    //   quantized after the launch. Measured on Volta only.
+    bool q8_written = false;
+    if (ctx.q8_1_emit == dst && ctx.q8_1_emit_as != nullptr && ggml_cuda_mmvq_q8_type(src0->type) && !ids && ne1 == 1 &&
+            ne3 == 1 && src1_rot == 0 && ggml_is_contiguous(dst) && ne0 % QK8_1 == 0 &&
+            ggml_nelements(dst) % MATRIX_ROW_PADDING == 0 && ctx.q8_1_emit_as->ne[0] % MATRIX_ROW_PADDING == 0 &&
+            ggml_nelements(dst) <= QK8_1*GGML_CUDA_Q8_1_GROUP_COUNT && fusion_local.sib_x == nullptr &&
+            fusion_local.sib2_x == nullptr && fusion_local.gdn_x == nullptr && fusion_local.shared_up == nullptr &&
+            fusion_local.conv.w == nullptr && fusion_local.ar_pushed == nullptr &&
+            get_device_table_id(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) == MMVQ_PARAMETERS_VOLTA) {
+        int64_t ne_padded = 0;
+        fusion_local.q8.dst = (block_q8_1 *) ctx.q8_1_emit_alloc(dst, ne_padded, ggml_nelements(dst));
+        if (fusion_local.q8.dst != nullptr) {
+            GGML_ASSERT(ggml_nelements(dst) % ne_padded == 0);
+            unsigned int * flags = ctx.block_flags_get();
+            fusion_local.q8.slots   = (unsigned long long *) (flags + GGML_CUDA_Q8_1_SLOTS);
+            fusion_local.q8_written = &q8_written;
+        }
+    }
+
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
 
     const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
@@ -2993,6 +3122,11 @@ static void ggml_cuda_mul_mat_vec_q_impl(
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+
+    if (fusion_local.q8.dst != nullptr && !q8_written) {
+        const int64_t n = ggml_nelements(dst);
+        quantize_row_q8_1_cuda(dst_d, fusion_local.q8.dst, n, n, n, n, n, 1, 1, 1, stream);
+    }
 }
 
 bool ggml_cuda_mul_mat_vec_q_moe_sibling(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
@@ -3005,6 +3139,12 @@ bool ggml_cuda_mul_mat_vec_q_moe_sibling(const ggml_tensor * src0, const ggml_te
         ggml_nrows(sib) == sib->ne[1] &&
         sib_y->type == GGML_TYPE_F32 && ggml_is_contiguous(sib_y) && ggml_nelements(sib_y) == src0->ne[0] &&
         !ggml_cuda_mul_mat_vec_q_short_sibling(src0, src1, ids, sib, sib_y);
+}
+
+bool ggml_cuda_mul_mat_vec_q_reads_f32_src1(const ggml_tensor * src0, const ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    return src0->type == GGML_TYPE_Q8_0 &&
+        mmvq_short_quant_y_lanes(get_device_table_id(cc), src0->ne[0], dst->ne[1], dst->ne[3], false, {}) != 0;
 }
 
 bool ggml_cuda_mul_mat_vec_q_short_sibling(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,

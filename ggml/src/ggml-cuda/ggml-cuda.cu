@@ -6830,6 +6830,50 @@ static void ggml_cuda_q8_1_request(ggml_backend_cuda_context * cuda_ctx, const g
     }
 }
 
+// a one-token q8_0 matvec writes the q8_1 copy of its output for the matvec that reads it next, see
+//   ggml_cuda_mmvq_q8_args. GGML_CUDA_NO_MMVQ_Q8_1=1 turns it off.
+static bool ggml_cuda_mmvq_q8_1_enabled() {
+    static const bool disabled = getenv("GGML_CUDA_NO_MMVQ_Q8_1") != nullptr;
+    return !disabled;
+}
+
+// MLA's V up-projection at one token (v_mla in build_attn_mha) is a matvec per head, permuted and made contiguous for the
+//   output projection. With one token the permutation keeps the memory order and the CONT is a plain copy: the matvec
+//   writes its output to the CONT's buffer, with the q8_1 copy for the output projection.
+static int ggml_cuda_try_fuse_mmvq_cont(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    const int out_nodes[] = { i + 2 };
+    if (!ggml_cuda_mmvq_q8_1_enabled() ||
+            !ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_PERMUTE, GGML_OP_CONT }, { i + 2 })) {
+        return 0;
+    }
+    const ggml_tensor * mm   = cgraph->nodes[i];
+    const ggml_tensor * perm = cgraph->nodes[i + 1];
+    const ggml_tensor * cont = cgraph->nodes[i + 2];
+    if (perm->src[0] != mm || cont->src[0] != perm || mm->type != GGML_TYPE_F32 || cont->type != GGML_TYPE_F32 ||
+            mm->ne[1] != 1 || !ggml_is_contiguous(mm) || !ggml_is_contiguous(perm) || !ggml_is_contiguous(cont) ||
+            ggml_cuda_op_mul_mat_use_fwht(mm) ||
+            ggml_cuda_mul_mat_choose(*cuda_ctx, mm->src[0], mm->src[1], mm) != GGML_CUDA_MUL_MAT_PATH_MMVQ) {
+        return 0;
+    }
+    // the CONT may take the memory of the attention output that the matvec reads, which then reads only its q8_1 copy
+    const ggml_tensor * may_alias = ggml_cuda_mul_mat_vec_q_reads_f32_src1(mm->src[0], mm) ? nullptr : mm->src[1];
+    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 1, false, may_alias)) {
+        return 0;
+    }
+    ggml_tensor dst = *mm;
+    dst.data = cont->data;
+    ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + 2);
+    if (cuda_ctx->q8_1_emit == cont) {
+        cuda_ctx->q8_1_emit = &dst;
+    }
+    ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm->src[0], mm->src[1], nullptr, &dst);
+    if (cuda_ctx->q8_1_emit == &dst) {
+        cuda_ctx->q8_1_emit    = nullptr;
+        cuda_ctx->q8_1_emit_as = nullptr;
+    }
+    return 2;
+}
+
 // The gate and up MUL_MAT_IDs of a GLU whose weights are pools of cached experts of the same layout: each pool holds the
 //   used experts in its own slots, so the fused launch reads the gate through its own remapped ids (gate_ids)
 static bool ggml_cuda_expert_cache_glu_pair(const ggml_tensor * up, const ggml_tensor * gate) {
@@ -8516,7 +8560,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (node->op == GGML_OP_MUL_MAT) {
-        const int n_skip = ggml_cuda_try_defer_glu(cuda_ctx, cgraph, i, /*dry_run =*/ false);
+        int n_skip = ggml_cuda_try_defer_glu(cuda_ctx, cgraph, i, /*dry_run =*/ false);
+        if (n_skip == 0) {
+            n_skip = ggml_cuda_try_fuse_mmvq_cont(cuda_ctx, cgraph, i);
+        }
         if (n_skip != 0) {
             return n_skip;
         }
@@ -9278,6 +9325,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     ggml_cuda_expert_cache_remap(*cuda_ctx, gate->src[0], ids, &remap[1]);
                     fusion_data.gate_ids = &remap[1];
                     ids = &remap[0];
+                }
+
+                // the q8_1 copy of a dense GLU for its down projection, see ggml_cuda_mmvq_q8_args
+                if (op == GGML_OP_MUL_MAT && ggml_cuda_mmvq_q8_1_enabled()) {
+                    ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + 2);
                 }
 
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
@@ -13159,6 +13211,7 @@ void ggml_cuda_spin_init(int device) {
         ggml_cuda_spin_set_mmvf(cfg);
         ggml_cuda_spin_set_norm(cfg);
         ggml_cuda_spin_set_expert_cpu(cfg);
+        ggml_cuda_spin_set_mmvq(cfg);
     });
 }
 
@@ -13168,7 +13221,7 @@ void ggml_cuda_spin_print() {
         "ggml_cuda_p2p_ar_ll_kernel_n (receive)", "ggml_cuda_p2p_ar_ll_moe_reduce_kernel", "rms_norm_pre_add_ar_f32",
         "rms_norm_pre_add_ar_f32 (q8_1 blocks)", "rms_norm_pre_add_ar_split_f32", "ggml_cuda_ar_kernel", "mul_mat_vec_f_router",
         "hc_post_blocks_sync", "row_split_reduce", "rms_norm_pre_add_f32 (q8_1 blocks)", "rms_norm_add_rms_norm_f32 (q8_1 blocks)",
-        "expert_cpu_wait_add", "rms_norm_add_rms_norm_ar_split_f32",
+        "expert_cpu_wait_add", "rms_norm_add_rms_norm_ar_split_f32", "mul_mat_vec_q (q8_1 copy)",
     };
     if (ggml_cuda_spin_records == nullptr) {
         return;
