@@ -1101,6 +1101,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "TOP_K_MASK",
     "PAGE_TOP_K",
     "PAGE_STATS",
+    "MLA_UP",
 
     "UNARY",
 
@@ -1118,7 +1119,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1218,6 +1219,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "top_k_mask(mask, top_k, score, blocks, extra)",
     "page_top_k(q, stats, pmask)",
     "page_stats(k, ps, upd)",
+    "mla_up(w, c, pe)",
 
     "unary(x)",
 
@@ -1235,7 +1237,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6840,6 +6842,31 @@ void ggml_page_top_k_set_score(
     GGML_ASSERT(a->op == GGML_OP_PAGE_TOP_K);
     GGML_ASSERT(score == GGML_PAGE_SCORE_QUEST || score == GGML_PAGE_SCORE_MV);
     ggml_set_op_params_i32(a, 3, (int32_t) score);
+}
+
+// ggml_mla_up
+
+struct ggml_tensor * ggml_mla_up(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * pe) {
+    GGML_ASSERT(w->type == GGML_TYPE_F16 && ggml_is_contiguous(w) && w->ne[3] == 1);
+    GGML_ASSERT(c->type == GGML_TYPE_F16 && c->ne[0] == w->ne[0] && c->nb[0] == ggml_type_size(c->type) &&
+        c->ne[2] == 1 && c->ne[3] == 1);
+    GGML_ASSERT(pe == NULL || (pe->type == GGML_TYPE_F16 && pe->nb[0] == ggml_type_size(pe->type) &&
+        pe->ne[1] == c->ne[1] && pe->ne[2] == 1 && pe->ne[3] == 1));
+
+    const int64_t m = w->ne[1] + (pe != NULL ? pe->ne[0] : 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, m, c->ne[1], w->ne[2]);
+
+    result->op     = GGML_OP_MLA_UP;
+    result->src[0] = w;
+    result->src[1] = c;
+    result->src[2] = pe;
+
+    return result;
 }
 
 // ggml_page_stats

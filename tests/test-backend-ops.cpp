@@ -13611,6 +13611,38 @@ struct test_page_stats : public test_case {
     }
 };
 
+// GGML_OP_MLA_UP: the latents and the rope part as row views of one cache-like tensor
+struct test_mla_up : public test_case {
+    const int64_t n_lat;
+    const int64_t m;
+    const int64_t n_head;
+    const int64_t n_cell;
+    const int64_t n_pe; // 0: no shared part
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_lat, m, n_head, n_cell, n_pe);
+    }
+
+    double max_nmse_err() override {
+        return 5e-6; // f16 output, f32 sums in another order
+    }
+
+    test_mla_up(int64_t n_lat = 512, int64_t m = 128, int64_t n_head = 8, int64_t n_cell = 256, int64_t n_pe = 64)
+        : n_lat(n_lat), m(m), n_head(n_head), n_cell(n_cell), n_pe(n_pe) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_lat, m, n_head);
+        ggml_set_name(w, "w");
+        ggml_tensor * kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_lat + n_pe, n_cell);
+        ggml_set_name(kv, "kv");
+        ggml_tensor * c  = ggml_view_2d(ctx, kv, n_lat, n_cell, kv->nb[1], 0);
+        ggml_tensor * pe = n_pe > 0 ? ggml_view_2d(ctx, kv, n_pe, n_cell, kv->nb[1], ggml_row_size(kv->type, n_lat)) : nullptr;
+        ggml_tensor * out = ggml_mla_up(ctx, w, c, pe);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_TOP_K_MASK
 struct test_top_k_mask : public test_case {
     const ggml_type type;
@@ -14685,6 +14717,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_page_top_k(type, 128, 2, 8, 12000, 3000, 4, -INFINITY, true, true));
         test_cases.emplace_back(new test_page_top_k(type, 64, 1, 40, 41, 1, 3, -INFINITY, true, true));
     }
+
+    // MLA up-projection: LongCat-Next's keys (with the rope part) and values at 8 heads a device, an odd shape
+    test_cases.emplace_back(new test_mla_up(512, 128, 8, 256, 64));
+    test_cases.emplace_back(new test_mla_up(512, 128, 8, 1000, 0));
+    test_cases.emplace_back(new test_mla_up(64, 32, 3, 77, 16));
 
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         // blocks with extra cells and scores (k-pool)

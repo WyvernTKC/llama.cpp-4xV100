@@ -3405,6 +3405,62 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
+// MLA's up-projection to f16 keys or values (ggml_mla_up): one strided-batched GEMM over the heads, the latents shared
+//   by all of them (stride 0), f32 accumulation, f16 output straight into the rows of the result; then the shared part
+//   (the rope part of the keys) copied after the projected rows of each head
+static __global__ void ggml_cuda_mla_up_pe(const half * pe, const int64_t s_pe, half * dst, const int64_t s1, const int64_t s2,
+        const int m, const int n_pe) {
+    const int64_t j = blockIdx.x;
+    const int64_t h = blockIdx.y;
+    for (int k = threadIdx.x; k < n_pe; k += blockDim.x) {
+        dst[h*s2 + j*s1 + m + k] = pe[j*s_pe + k];
+    }
+}
+
+static bool ggml_cuda_mla_up_supported(const ggml_tensor * op) {
+    const ggml_tensor * w  = op->src[0];
+    const ggml_tensor * c  = op->src[1];
+    const ggml_tensor * pe = op->src[2];
+    return op->type == GGML_TYPE_F16 && ggml_is_contiguous(op) && w->type == GGML_TYPE_F16 && ggml_is_contiguous(w) &&
+        c->type == GGML_TYPE_F16 && c->nb[1] % ggml_type_size(c->type) == 0 &&
+        (pe == nullptr || (pe->type == GGML_TYPE_F16 && pe->nb[1] % ggml_type_size(pe->type) == 0));
+}
+
+static void ggml_cuda_op_mla_up(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * w  = dst->src[0];
+    const ggml_tensor * c  = dst->src[1];
+    const ggml_tensor * pe = dst->src[2];
+
+    const int64_t n_lat  = w->ne[0];
+    const int64_t m      = w->ne[1];
+    const int64_t n_head = w->ne[2];
+    const int64_t n_cell = c->ne[1];
+    const size_t  ts     = sizeof(half);
+
+    cudaStream_t   stream   = ctx.stream();
+    cublasHandle_t cublas_h = ctx.cublas_handle();
+    CUBLAS_CHECK(cublasSetStream(cublas_h, stream));
+
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+    // column-major: w_h is n_lat x m (lda n_lat), c is n_lat x n_cell (ldb its row stride), the result of head h is
+    //   (m + n_pe) x n_cell, of which the GEMM writes the first m rows
+    CUBLAS_CHECK(
+    cublasGemmStridedBatchedEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+            m, n_cell, n_lat,
+            &alpha, w->data,   CUDA_R_16F, w->nb[1]/ts,   w->nb[2]/ts,
+                    c->data,   CUDA_R_16F, c->nb[1]/ts,   0,
+            &beta,  dst->data, CUDA_R_16F, dst->nb[1]/ts, dst->nb[2]/ts,
+            n_head, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+    if (pe != nullptr) {
+        const dim3 blocks(n_cell, n_head, 1);
+        ggml_cuda_mla_up_pe<<<blocks, 64, 0, stream>>>((const half *) pe->data, pe->nb[1]/ts, (half *) dst->data,
+            dst->nb[1]/ts, dst->nb[2]/ts, (int) m, (int) pe->ne[0]);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
         case GGML_OP_ARGMAX:
@@ -3766,6 +3822,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_PAGE_STATS:
             ggml_cuda_op_page_stats(ctx, dst);
+            break;
+        case GGML_OP_MLA_UP:
+            ggml_cuda_op_mla_up(ctx, dst);
             break;
         default:
             return false;
@@ -12685,6 +12744,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_page_top_k_supported(op);
         case GGML_OP_PAGE_STATS:
             return ggml_cuda_page_stats_supported(op);
+        case GGML_OP_MLA_UP:
+            return ggml_cuda_mla_up_supported(op);
 
         default:
             return false;

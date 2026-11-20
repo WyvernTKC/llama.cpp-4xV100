@@ -12018,6 +12018,53 @@ void ggml_compute_forward_page_top_k(
     }
 }
 
+// ggml_compute_forward_mla_up: the rows (cell, head) of the result split over the threads, each a dot product in f32
+//   per column of w
+
+void ggml_compute_forward_mla_up(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * w  = dst->src[0];
+    const ggml_tensor * c  = dst->src[1];
+    const ggml_tensor * pe = dst->src[2];
+
+    const int64_t n_lat  = w->ne[0];
+    const int64_t m      = w->ne[1];
+    const int64_t n_head = w->ne[2];
+    const int64_t n_cell = c->ne[1];
+    const int64_t n_pe   = pe != nullptr ? pe->ne[0] : 0;
+
+    const int64_t n_rows = n_cell*n_head;
+    const int64_t dr     = (n_rows + params->nth - 1)/params->nth;
+    const int64_t r0     = dr*params->ith;
+    const int64_t r1     = std::min(r0 + dr, n_rows);
+
+    std::vector<float> cv(n_lat);
+    for (int64_t r = r0; r < r1; r++) {
+        const int64_t h = r / n_cell;
+        const int64_t j = r % n_cell;
+        const ggml_fp16_t * cj = (const ggml_fp16_t *) ((const char *) c->data + j*c->nb[1]);
+        for (int64_t k = 0; k < n_lat; k++) {
+            cv[k] = GGML_CPU_FP16_TO_FP32(cj[k]);
+        }
+        ggml_fp16_t * y = (ggml_fp16_t *) ((char *) dst->data + j*dst->nb[1] + h*dst->nb[2]);
+        for (int64_t i = 0; i < m; i++) {
+            const ggml_fp16_t * wi = (const ggml_fp16_t *) ((const char *) w->data + i*w->nb[1] + h*w->nb[2]);
+            float s = 0.0f;
+            for (int64_t k = 0; k < n_lat; k++) {
+                s += GGML_CPU_FP16_TO_FP32(wi[k])*cv[k];
+            }
+            y[i] = GGML_CPU_FP32_TO_FP16(s);
+        }
+        if (pe != nullptr) {
+            const ggml_fp16_t * pj = (const ggml_fp16_t *) ((const char *) pe->data + j*pe->nb[1]);
+            for (int64_t k = 0; k < n_pe; k++) {
+                y[m + k] = pj[k];
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_page_stats
 
 void ggml_compute_forward_page_stats(

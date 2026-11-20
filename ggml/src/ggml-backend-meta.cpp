@@ -627,6 +627,32 @@ static bool ggml_backend_meta_leaf_split_state(ggml_backend_buffer_type_t buft, 
     return true;
 }
 
+// The split of MLA's up-projection (ggml_mla_up) before it has a buffer: it follows its weights (see the GGML_OP_MLA_UP
+//   split rule), which reach it through copies and a transpose of a weight split by head (dims 0 and 1 swap, the heads
+//   stay in dim 2). False unless that weight is split along dim 2 in one segment, as the rule then finds at run time.
+//   The result is the largest tensor of a prompt's decompressed attention (32 heads at 131072 cells: 2.5 GiB), and each
+//   device holds only its heads of it.
+static bool ggml_backend_meta_mla_up_split_state(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor,
+        ggml_backend_meta_split_state & split_state) {
+    if (tensor->op != GGML_OP_MLA_UP) {
+        return false;
+    }
+    const ggml_tensor * w = tensor->src[0];
+    while (w != nullptr && (w->op == GGML_OP_CPY || w->op == GGML_OP_CONT || w->op == GGML_OP_TRANSPOSE)) {
+        w = w->src[0]; // a copy's source, a transpose's (a view of it)
+    }
+    if (w == nullptr || !ggml_backend_meta_leaf_split_state(buft, w, split_state) ||
+            split_state.axis != GGML_BACKEND_SPLIT_AXIS_2 || split_state.n_segments != 1 || split_state.nr[0] != 1 ||
+            w->ne[2] != tensor->ne[2]) {
+        return false;
+    }
+    int64_t ne_sum = 0;
+    for (size_t j = 0; j < ggml_backend_meta_buft_n_bufts(buft); j++) {
+        ne_sum += split_state.ne[j];
+    }
+    return ne_sum == tensor->ne[2];
+}
+
 static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
 
@@ -653,6 +679,20 @@ static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_t
             }
             return max_alloc_size;
         }
+    }
+
+    // a node is sized whole: its split comes from the graph, which a buffer type cannot see, except the one above.
+    //   GGML_META_MLA_UP_FULL_SIZE=1 sizes it whole too.
+    static const bool mla_up_full_size = getenv("GGML_META_MLA_UP_FULL_SIZE") != nullptr;
+    if (!mla_up_full_size && ggml_backend_meta_mla_up_split_state(buft, tensor, split_state)) {
+        size_t max_alloc_size = 0;
+        for (size_t j = 0; j < n_simple_bufts; j++) {
+            ggml_tensor slice = *tensor;
+            ggml_backend_meta_slice_shape(tensor, split_state, n_simple_bufts, j, slice.ne, slice.nb);
+            max_alloc_size = std::max(max_alloc_size,
+                ggml_backend_buft_get_alloc_size(ggml_backend_meta_buft_simple_buft(buft, j), &slice));
+        }
+        return max_alloc_size;
     }
 
     size_t max_alloc_size = 0;
@@ -3091,6 +3131,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_DSV4_HC_PRE:
             case GGML_OP_DSV4_HC_POST: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
+            // MLA's up-projection: the weights split by head (dim 2) or replicated, the latents and the shared part
+            //   replicated; the result follows the weights
+            case GGML_OP_MLA_UP: {
+                GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                GGML_ASSERT(tensor->src[2] == nullptr || src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                split_state = src_ss[0];
             } break;
             // page statistics, refreshed in place: k [d, n_kv_h, n_kv] and ps [4d, n_kv_h, n_page] split by kv head
             //   (dim 1) or both mirrored, the page list replicated

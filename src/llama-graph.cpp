@@ -4107,22 +4107,32 @@ ggml_tensor * llm_graph_context::build_attn(
 
 // MLA attention of a prompt batch in the decompressed (MHA) form. The absorbed form attends with 576-wide keys and 512-wide
 //   values per head; decompressing the cached latents of all cells with the up-projections gives 192 and 128 instead,
-//   ~3.4x fewer attention FLOPs, at the cost of the decompression (two GEMMs per batch over all cells) and of holding the
-//   decompressed keys and values: ~9-12 KB a cell per 8 heads on a device at the peak. So only for batches of at least
-//   LLAMA_MLA_MHA_MIN_TOKENS (512) tokens over at most LLAMA_MLA_MHA_MAX_KV cells (24576: measured on LongCat-Next under
-//   -sm tensor at a 131072 context, the peak memory grows ~33 KB a cell per GPU, 0.61 GB at 24576; 65536 took 2.1 GB);
-//   0 turns it off.
+//   ~3.4x fewer attention FLOPs, at the cost of the decompression (two GEMMs per batch over all cells, ggml_mla_up) and of
+//   holding the decompressed keys and values in f16: (192 + 128)*2 bytes a cell per head of a device. So only for batches
+//   of at least LLAMA_MLA_MHA_MIN_TOKENS (512) tokens, over as many cells as LLAMA_MLA_MHA_MAX_MIB (768) MiB of those keys
+//   and values hold per device (LongCat-Next under -sm tensor, 8 heads a GPU: 157k cells), or LLAMA_MLA_MHA_MAX_KV
+//   cells if set. 0 turns it off.
 bool llm_graph_context::mla_mha_applies(const llm_graph_input_attn_k * inp) const {
     static const int64_t min_tokens = [] {
         const char * env = getenv("LLAMA_MLA_MHA_MIN_TOKENS");
         return env != nullptr ? (int64_t) atoll(env) : (int64_t) 512;
     }();
-    static const int64_t max_kv = [] {
-        const char * env = getenv("LLAMA_MLA_MHA_MAX_KV");
-        return env != nullptr ? (int64_t) atoll(env) : (int64_t) 24576;
+    static const int64_t max_mib = [] {
+        const char * env = getenv("LLAMA_MLA_MHA_MAX_MIB");
+        return env != nullptr ? (int64_t) atoll(env) : (int64_t) 768;
     }();
+    static const int64_t max_kv_env = [] {
+        const char * env = getenv("LLAMA_MLA_MHA_MAX_KV");
+        return env != nullptr ? (int64_t) atoll(env) : (int64_t) -1;
+    }();
+    const int64_t n_head_dev  = std::max<int64_t>(1, hparams.n_head(0) / std::max<int64_t>(1, cparams.n_tp_dev));
+    const int64_t cell_bytes  = n_head_dev*(hparams.n_embd_head_k_mla() + hparams.n_embd_head_v_mla())*2;
+    const int64_t max_kv      = max_kv_env >= 0 ? max_kv_env : max_mib*1024*1024/std::max<int64_t>(1, cell_bytes);
+    if (inp->mctx->type_k() != GGML_TYPE_F16) {
+        return false; // ggml_mla_up reads f16 latents
+    }
     // the CUDA kernel for one Q head per K/V head at 192/128 takes at least 32 queries (Volta has no device code below)
-    if (min_tokens <= 0 || max_kv <= 0 || !cparams.flash_attn || n_tokens < std::max<int64_t>(min_tokens, 32) ||
+    if (min_tokens <= 0 || max_mib <= 0 || max_kv <= 0 || !cparams.flash_attn || n_tokens < std::max<int64_t>(min_tokens, 32) ||
             inp->self_attn_mask.rows != nullptr) {
         return false;
     }
@@ -4161,27 +4171,19 @@ ggml_tensor * llm_graph_context::build_attn_mla_mha(
     const int64_t n_head = wk_b->ne[2];
     GGML_ASSERT(wv_b->ne[0] == rank && wv_b->ne[2] == n_head && q_cur->ne[0] == n_nope + n_rot && q_cur->ne[1] == n_head);
 
-    // the latents and the rope part of all cells
-    ggml_tensor * c    = ggml_cont(ctx0, ggml_view_2d(ctx0, k, rank, n_kv, k->nb[2], 0));        // [rank, n_kv]
+    // the latents and the rope part of all cells, rows of the cache
+    ggml_tensor * c    = ggml_view_2d(ctx0, k, rank, n_kv, k->nb[2], 0);                              // [rank, n_kv]
     ggml_tensor * k_pe = ggml_view_2d(ctx0, k, n_rot, n_kv, k->nb[2], ggml_row_size(k->type, rank)); // [n_rot, n_kv]
 
-    // the up-projections over the latent as f16 matrices; the key one with n_rot zero rows that the rope part fills
-    ggml_tensor * w_k = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_cast(ctx0, wk_b, GGML_TYPE_F32)));  // [rank, n_nope, n_head]
-    w_k = ggml_cast(ctx0, ggml_pad(ctx0, w_k, 0, (int) n_rot, 0, 0), GGML_TYPE_F16);                    // [rank, n_nope + n_rot, n_head]
-    ggml_tensor * w_v = ggml_cast(ctx0, ggml_cast(ctx0, wv_b, GGML_TYPE_F32), GGML_TYPE_F16);          // [rank, n_v, n_head]
+    // the up-projections over the latent as f16 matrices [rank, n, n_head]
+    ggml_tensor * w_k = ggml_cast(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, ggml_cast(ctx0, wk_b, GGML_TYPE_F32))), GGML_TYPE_F16);
+    ggml_tensor * w_v = ggml_cast(ctx0, ggml_cast(ctx0, wv_b, GGML_TYPE_F32), GGML_TYPE_F16);
 
-    // keys [n_nope + n_rot, n_kv, n_head]: the decompressed nope part and the shared rope part of each cell. mul_mat
-    //   broadcasts its first operand over the batches of the second, so the latents go first and the result comes
-    //   transposed, [n_kv, n_nope + n_rot, n_head]; the rope part is added there and one copy gives the f16 keys
-    ggml_tensor * kk = ggml_mul_mat(ctx0, c, w_k);
-    ggml_tensor * pe = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_cast(ctx0, k_pe, GGML_TYPE_F32)));   // [n_kv, n_rot]
-    pe = ggml_pad_ext(ctx0, pe, 0, 0, (int) n_nope, 0, 0, 0, 0, 0);                                    // [n_kv, n_nope + n_rot]
-    kk = ggml_add(ctx0, kk, pe);
-    kk = ggml_cast(ctx0, ggml_permute(ctx0, kk, 1, 0, 2, 3), GGML_TYPE_F16);
+    // the keys [n_nope + n_rot, n_kv, n_head] (the nope part and the rope part each head shares) and the values
+    //   [n_v, n_kv, n_head] of all cells, in f16 as the attention reads them (ggml_mla_up)
+    ggml_tensor * kk = ggml_mla_up(ctx0, w_k, c, k_pe);
     cb(kk, "attn_k_mha", il);
-
-    // values [n_v, n_kv, n_head], the same way
-    ggml_tensor * vv = ggml_cast(ctx0, ggml_permute(ctx0, ggml_mul_mat(ctx0, c, w_v), 1, 0, 2, 3), GGML_TYPE_F16);
+    ggml_tensor * vv = ggml_mla_up(ctx0, w_v, c, nullptr);
     cb(vv, "attn_v_mha", il);
 
     ggml_tensor * q = ggml_permute(ctx0, q_cur, 0, 2, 1, 3); // [n_nope + n_rot, n_tokens, n_head]

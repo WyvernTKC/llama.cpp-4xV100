@@ -417,6 +417,7 @@ extern "C" {
         GGML_OP_TOP_K_MASK,
         GGML_OP_PAGE_TOP_K,
         GGML_OP_PAGE_STATS,
+        GGML_OP_MLA_UP,
 
         GGML_OP_UNARY,
 
@@ -2352,6 +2353,17 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // MLA's up-projection of the cached latents of all cells to per-head keys or values, in f16:
+    //   w [n_lat, m, n_head] f16, c [n_lat, n_cell] f16 (rows at any stride), pe [n_pe, n_cell] f16 or NULL (rows at any
+    //   stride) -> [m + n_pe, n_cell, n_head] f16 with result[i, j, h] = sum_r w[r, i, h]*c[r, j] for i < m, and
+    //   pe[i - m, j] after that (a part each head shares, as MLA's rope part of the keys). ggml_mul_mat(w, c) with c over
+    //   all the matrices of w and an f16 result, without the f32 one in between.
+    GGML_API struct ggml_tensor * ggml_mla_up(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * pe);
 
     // Partial attention over a share of the K/V cells, to be combined with other shares: the result gets one more row
     //   after the heads of each token, whose element h is the log-sum-exp of the scaled scores of head h (-INF if all
