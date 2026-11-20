@@ -8101,6 +8101,152 @@ static int ggml_cuda_try_fuse_glu_bias(ggml_backend_cuda_context * cuda_ctx, ggm
     return 2;
 }
 
+// a view or reshape that only relabels its source, followed back to the tensor it views
+static const ggml_tensor * ggml_cuda_mla_unview(const ggml_tensor * t) {
+    while (t != nullptr && (t->op == GGML_OP_RESHAPE || (t->op == GGML_OP_VIEW && t->view_offs == 0 && t->src[0] != nullptr &&
+            ggml_nelements(t) == ggml_nelements(t->src[0]) && ggml_is_contiguous(t) && ggml_is_contiguous(t->src[0])))) {
+        t = t->src[0];
+    }
+    return t;
+}
+
+static bool ggml_cuda_mla_rows_disabled() {
+    static const bool disabled = getenv("GGML_CUDA_NO_MLA_ROWS") != nullptr;
+    return disabled;
+}
+
+// MLA, the latent cache row of each token in one launch (ggml_cuda_op_mla_kv_row): from the RMS_NORM of the latent at i,
+//   the MUL by its weight, an optional SCALE, the ROPE of the rope part, the CONCAT of both and its SET_ROWS into the
+//   cache, views between; five launches before. GGML_CUDA_NO_MLA_ROWS=1 turns it and ggml_cuda_try_fuse_mla_q off.
+//   Returns the nodes to skip.
+static int ggml_cuda_try_fuse_mla_kv_row(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    ggml_tensor * norm = cgraph->nodes[i];
+    if (ggml_cuda_mla_rows_disabled() || norm->op != GGML_OP_RMS_NORM || !cuda_ctx->stream_context().concurrent_events.empty()) {
+        return 0;
+    }
+    const ggml_tensor * mul      = nullptr;
+    const ggml_tensor * scale    = nullptr;
+    const ggml_tensor * rope     = nullptr;
+    const ggml_tensor * concat   = nullptr;
+    ggml_tensor *       set_rows = nullptr;
+
+    int          idxs[16];
+    enum ggml_op ops[16];
+    int          n = 0;
+    idxs[n] = i;
+    ops[n++] = GGML_OP_RMS_NORM;
+    for (int k = i + 1; k < cgraph->n_nodes && n < 16 && set_rows == nullptr; k++) {
+        ggml_tensor * t = cgraph->nodes[k];
+        if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) {
+            // a view of a node of the fusion is part of it, a view of another tensor (the rope part of the projection)
+            //   is an input
+            bool inner = false;
+            for (int j = 0; j < n && !inner; j++) {
+                inner = cgraph->nodes[idxs[j]] == t->src[0];
+            }
+            if (!inner) {
+                continue;
+            }
+        } else if (mul == nullptr) {
+            if (t->op != GGML_OP_MUL) {
+                return 0;
+            }
+            mul = t;
+        } else if (scale == nullptr && rope == nullptr && t->op == GGML_OP_SCALE) {
+            scale = t;
+        } else if (rope == nullptr) {
+            if (t->op != GGML_OP_ROPE) {
+                return 0;
+            }
+            rope = t;
+        } else if (concat == nullptr) {
+            if (t->op != GGML_OP_CONCAT) {
+                return 0;
+            }
+            concat = t;
+        } else {
+            if (t->op != GGML_OP_SET_ROWS) {
+                return 0;
+            }
+            set_rows = t;
+        }
+        idxs[n] = k;
+        ops[n++] = t->op;
+    }
+    if (set_rows == nullptr) {
+        return 0;
+    }
+
+    const ggml_tensor * a = norm->src[0];
+    const ggml_tensor * w = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    const int64_t na = a->ne[0];
+    const int64_t nt = ggml_nrows(a);
+    float bias = 0.0f;
+    if (scale != nullptr) {
+        memcpy(&bias, (const float *) scale->op_params + 1, sizeof(float));
+    }
+    const ggml_tensor * normed = scale != nullptr ? scale : mul;
+    const ggml_tensor * idx    = set_rows->src[1];
+    if (a->type != GGML_TYPE_F32 || a->nb[0] != sizeof(float) || a->ne[1] != nt || norm->type != GGML_TYPE_F32 ||
+            (mul->src[0] != norm && mul->src[1] != norm) || mul->type != GGML_TYPE_F32 ||
+            w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || ggml_nelements(w) != na ||
+            (scale != nullptr && (scale->src[0] != mul || bias != 0.0f)) ||
+            !ggml_cuda_mla_rope_supported(rope) || rope->ne[1] != 1 || rope->ne[2] != nt ||
+            concat->type != GGML_TYPE_F32 || ggml_get_op_params_i32(concat, 0) != 0 || concat->src[1] != rope ||
+            ggml_cuda_mla_unview(concat->src[0]) != normed || concat->ne[0] != na + rope->ne[0] || concat->ne[1] != 1 ||
+            concat->ne[2] != nt || ggml_cuda_mla_unview(set_rows->src[0]) != concat ||
+            (set_rows->type != GGML_TYPE_F16 && set_rows->type != GGML_TYPE_F32) || set_rows->ne[0] != concat->ne[0] ||
+            set_rows->nb[0] != ggml_type_size(set_rows->type) ||
+            idx->type != GGML_TYPE_I64 || !ggml_is_contiguous(idx) || ggml_nelements(idx) != nt) {
+        return 0;
+    }
+    const int out = idxs[n - 1];
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, n, ops, &out, 1)) {
+        return 0;
+    }
+    ggml_cuda_op_mla_kv_row(*cuda_ctx, norm, mul, scale, rope, set_rows);
+    return out - i;
+}
+
+// MLA, the query in one launch (ggml_cuda_op_mla_q): from the ROPE of the rope part at i, the CONCAT after the absorbed
+//   nope part and an optional SCALE of both; two or three launches before. Returns the nodes to skip.
+static int ggml_cuda_try_fuse_mla_q(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    const ggml_tensor * rope = cgraph->nodes[i];
+    if (ggml_cuda_mla_rows_disabled() || rope->op != GGML_OP_ROPE || i + 1 >= cgraph->n_nodes ||
+            !cuda_ctx->stream_context().concurrent_events.empty()) {
+        return 0;
+    }
+    const ggml_tensor * concat = cgraph->nodes[i + 1];
+    const ggml_tensor * scale  = i + 2 < cgraph->n_nodes && cgraph->nodes[i + 2]->op == GGML_OP_SCALE &&
+        cgraph->nodes[i + 2]->src[0] == concat ? cgraph->nodes[i + 2] : nullptr;
+    float bias = 0.0f;
+    if (scale != nullptr) {
+        memcpy(&bias, (const float *) scale->op_params + 1, sizeof(float));
+    }
+    if (bias != 0.0f) {
+        scale = nullptr;
+    }
+    const ggml_tensor * dst = scale != nullptr ? scale : concat;
+    if (concat->op != GGML_OP_CONCAT || concat->type != GGML_TYPE_F32 || ggml_get_op_params_i32(concat, 0) != 0 ||
+            concat->src[1] != rope || !ggml_cuda_mla_rope_supported(rope) || concat->ne[3] != 1) {
+        return 0;
+    }
+    const ggml_tensor * a = concat->src[0];
+    if (a->type != GGML_TYPE_F32 || a->nb[0] != sizeof(float) || a->ne[1] != rope->ne[1] || a->ne[2] != rope->ne[2] ||
+            concat->ne[0] != a->ne[0] + rope->ne[0] || !ggml_is_contiguous(dst) || dst->type != GGML_TYPE_F32 ||
+            ggml_cuda_tensors_overlap(dst, a) || ggml_cuda_tensors_overlap(dst, rope->src[0])) {
+        return 0;
+    }
+    const enum ggml_op ops[3] = { GGML_OP_ROPE, GGML_OP_CONCAT, GGML_OP_SCALE };
+    const int n   = scale != nullptr ? 3 : 2;
+    const int out = i + n - 1;
+    if (!ggml_can_fuse_subgraph(cgraph, i, n, ops, &out, 1)) {
+        return 0;
+    }
+    ggml_cuda_op_mla_q(*cuda_ctx, rope, concat, scale);
+    return n - 1;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     ggml_cuda_try_gather_expert_group(cuda_ctx, cgraph, i);
 
@@ -8133,6 +8279,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         cuda_ctx->topk_folded_node  = nullptr;
         cuda_ctx->topk_folded_defer = nullptr;
         return cuda_ctx->topk_folded_skip;
+    }
+
+    if (node->op == GGML_OP_RMS_NORM) {
+        const int n_skip = ggml_cuda_try_fuse_mla_kv_row(cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
+        }
+    }
+    if (node->op == GGML_OP_ROPE) {
+        const int n_skip = ggml_cuda_try_fuse_mla_q(cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
+        }
     }
 
     if (node->op == GGML_OP_UNARY) {

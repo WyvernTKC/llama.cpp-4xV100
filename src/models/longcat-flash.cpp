@@ -448,10 +448,6 @@ llama_model_longcat_flash::graph::graph(const llm_graph_params & params) :
             q = ggml_mul_mat(ctx0, layer.wq_b, q);
             cb(q, "q", il);
 
-            // kq_scale goes in here too: with the lora scales the raw q.k sums overflow F16 in the Volta flash attention
-            q = ggml_scale(ctx0, q, (hparams.f_attn_q_lora_scale != 0.0f ? hparams.f_attn_q_lora_scale : 1.0f) * kq_scale);
-            cb(q, "q_scaled", il);
-
             // {n_embd_head_k, n_head, n_tokens}
             q = ggml_reshape_3d(ctx0, q, n_embd_head_k, n_head, n_tokens);
 
@@ -510,6 +506,11 @@ llama_model_longcat_flash::graph::graph(const llm_graph_params & params) :
             // {n_embd_head_qk_rope + kv_lora_rank, n_head, n_tokens}
             // note: rope must go first for in-place context shifting in build_rope_shift()
             ggml_tensor * Qcur = ggml_concat(ctx0, q_nope_absorbed, q_pe, 0);
+
+            // the q lora scale and kq_scale on the whole query, linear through the absorption and the rope: with the lora
+            //   scales the raw q.k sums overflow F16 in the Volta flash attention. The CUDA backend runs the rope, the
+            //   concat and this scale in one launch (ggml_cuda_try_fuse_mla_q)
+            Qcur = ggml_scale(ctx0, Qcur, (hparams.f_attn_q_lora_scale != 0.0f ? hparams.f_attn_q_lora_scale : 1.0f) * kq_scale);
             cb(Qcur, "Qcur", il);
 
             kv_cmpr = ggml_reshape_3d(ctx0, kv_cmpr, kv_lora_rank, 1, n_tokens);

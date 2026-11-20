@@ -1489,3 +1489,198 @@ void ggml_cuda_op_get_rows_mean_norm_rope_fused(ggml_backend_cuda_context & ctx,
         eps, (const float *) w->data, (const int32_t *) rope->src[1]->data,
         freq_scale, ext_factor, attn_factor, corr_dims, theta_scale, sections, mode == GGML_ROPE_TYPE_IMROPE);
 }
+
+// MLA (deepseek2-style latent attention, build_attn with v_mla): the rope parameters of a ROPE node, as the rope kernels
+//   take them
+struct mla_rope_params {
+    const int32_t * pos;
+    const float *   freq_factors;
+    float           freq_scale, ext_factor, attn_factor, theta_scale;
+    rope_corr_dims  corr_dims;
+    bool            is_neox;
+    int             n_dims;
+};
+
+static mla_rope_params mla_rope_params_of(const ggml_tensor * rope) {
+    mla_rope_params p = {};
+    const int   n_dims     = ((const int32_t *) rope->op_params)[1];
+    const int   mode       = ((const int32_t *) rope->op_params)[2];
+    const int   n_ctx_orig = ((const int32_t *) rope->op_params)[4];
+    float freq_base = 0.0f, beta_fast = 0.0f, beta_slow = 0.0f;
+    memcpy(&freq_base,     (const int32_t *) rope->op_params +  5, sizeof(float));
+    memcpy(&p.freq_scale,  (const int32_t *) rope->op_params +  6, sizeof(float));
+    memcpy(&p.ext_factor,  (const int32_t *) rope->op_params +  7, sizeof(float));
+    memcpy(&p.attn_factor, (const int32_t *) rope->op_params +  8, sizeof(float));
+    memcpy(&beta_fast,     (const int32_t *) rope->op_params +  9, sizeof(float));
+    memcpy(&beta_slow,     (const int32_t *) rope->op_params + 10, sizeof(float));
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, ggml_rope_get_truncate(rope), p.corr_dims.v);
+    p.pos          = (const int32_t *) rope->src[1]->data;
+    p.freq_factors = rope->src[2] != nullptr ? (const float *) rope->src[2]->data : nullptr;
+    p.theta_scale  = powf(freq_base, -2.0f/n_dims);
+    p.is_neox      = (mode & GGML_ROPE_TYPE_NEOX) != 0;
+    p.n_dims       = n_dims;
+    return p;
+}
+
+bool ggml_cuda_mla_rope_supported(const ggml_tensor * rope) {
+    if (rope->op != GGML_OP_ROPE || rope->type != GGML_TYPE_F32 || rope->src[0]->type != GGML_TYPE_F32 ||
+            rope->src[0]->nb[0] != sizeof(float) || rope->src[1]->type != GGML_TYPE_I32 || rope->src[0]->ne[3] != 1) {
+        return false;
+    }
+    const int n_dims = ((const int32_t *) rope->op_params)[1];
+    const int mode   = ((const int32_t *) rope->op_params)[2];
+    const int n_offs = ((const int32_t *) rope->op_params)[15];
+    // the whole row rotated, plain or neox pairs, one position per token
+    return (mode == GGML_ROPE_TYPE_NORMAL || mode == GGML_ROPE_TYPE_NEOX) && n_dims == rope->ne[0] && n_dims % 2 == 0 &&
+        n_offs == 0 && rope->src[1]->ne[0] == rope->ne[2];
+}
+
+// the pair (i0, i0 + 1) of a plain rope, (i0/2, i0/2 + n_dims/2) of neox, of row x (position p), rotated as rope_norm
+//   and rope_neox round it
+static __device__ __forceinline__ void mla_rope_pair(
+        const float * x, const int i0, const int p, const mla_rope_params & r, int & ix0, int & ix1, float & y0, float & y1) {
+    if (r.is_neox) {
+        ix0 = i0/2;
+        ix1 = i0/2 + r.n_dims/2;
+    } else {
+        ix0 = i0;
+        ix1 = i0 + 1;
+    }
+    const float x0 = x[ix0];
+    const float x1 = x[ix1];
+
+    const float theta_base  = p*powf(r.theta_scale, i0/2.0f);
+    const float freq_factor = r.freq_factors != nullptr ? r.freq_factors[i0/2] : 1.0f;
+
+    float cos_theta;
+    float sin_theta;
+    rope_yarn<true>(theta_base/freq_factor, r.freq_scale, r.corr_dims, i0, r.ext_factor, r.attn_factor, cos_theta, sin_theta);
+
+    y0 = __fmaf_rn(cos_theta, x0, -__fmul_rn(sin_theta, x1));
+    y1 = __fmaf_rn(sin_theta, x0,  __fmul_rn(cos_theta, x1));
+}
+
+// The latent cache row of a token: RMS_NORM of the latent a, MUL by the norm weight and an optional SCALE, the ROPE of
+//   the rope part b, their CONCAT and its SET_ROWS into the cache, in one launch: one block of 256 per token, the norm
+//   reduced as rms_norm_f32<256> reduces it and every product in the order of the separate kernels.
+template <typename D>
+static __global__ void __launch_bounds__(256) mla_kv_row_f32(
+        const float * a, const int64_t sa, const float * b, const int64_t sb, const float * w,
+        const int na, const int nb, const float eps, const float s, const bool has_scale,
+        const mla_rope_params r, D * dst, const int64_t * idx, const int64_t s_dst) {
+    const int t   = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    a += t*sa;
+    b += t*sb;
+
+    extern __shared__ float s_sum[];
+
+    float tmp = 0.0f;
+    for (int c = tid; c < na; c += 256) {
+        const float x = a[c];
+        tmp += x*x;
+    }
+    tmp = block_reduce<block_reduce_method::SUM, 256>(tmp, s_sum);
+
+    const float mean  = tmp / na;
+    const float scale = rsqrtf(mean + eps);
+
+    D * y = dst + idx[t]*s_dst;
+    for (int c = tid; c < na; c += 256) {
+        float v = scale * a[c] * w[c];
+        if (has_scale) {
+            v = s * v;
+        }
+        y[c] = ggml_cuda_cast<D>(v);
+    }
+    for (int i0 = 2*tid; i0 < nb; i0 += 2*256) {
+        int   ix0, ix1;
+        float y0, y1;
+        mla_rope_pair(b, i0, r.pos[t], r, ix0, ix1, y0, y1);
+        y[na + ix0] = ggml_cuda_cast<D>(y0);
+        y[na + ix1] = ggml_cuda_cast<D>(y1);
+    }
+}
+
+void ggml_cuda_op_mla_kv_row(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, const ggml_tensor * mul,
+        const ggml_tensor * scale, const ggml_tensor * rope, ggml_tensor * set_rows) {
+    const ggml_tensor * a = rms_norm->src[0];
+    const ggml_tensor * b = rope->src[0];
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+
+    const int na = (int) a->ne[0];
+    const int nb = (int) b->ne[0];
+    const int nt = (int) ggml_nrows(a);
+
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    float s = 1.0f;
+    if (scale != nullptr) {
+        memcpy(&s, scale->op_params, sizeof(float));
+    }
+
+    const mla_rope_params r = mla_rope_params_of(rope);
+
+    const int64_t s_dst = set_rows->nb[1] / ggml_type_size(set_rows->type);
+    const dim3 blocks(nt, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params(blocks, dim3(256, 1, 1), 32*sizeof(float), ctx.stream());
+    if (set_rows->type == GGML_TYPE_F16) {
+        ggml_cuda_kernel_launch(mla_kv_row_f32<half>, launch_params, (const float *) a->data, (int64_t) (a->nb[1]/sizeof(float)),
+            (const float *) b->data, (int64_t) (b->nb[2]/sizeof(float)), (const float *) w->data, na, nb, eps, s, scale != nullptr,
+            r, (half *) set_rows->data, (const int64_t *) set_rows->src[1]->data, s_dst);
+    } else {
+        ggml_cuda_kernel_launch(mla_kv_row_f32<float>, launch_params, (const float *) a->data, (int64_t) (a->nb[1]/sizeof(float)),
+            (const float *) b->data, (int64_t) (b->nb[2]/sizeof(float)), (const float *) w->data, na, nb, eps, s, scale != nullptr,
+            r, (float *) set_rows->data, (const int64_t *) set_rows->src[1]->data, s_dst);
+    }
+}
+
+// The query of MLA: CONCAT of the absorbed nope part a and the ROPE of the rope part b, and an optional SCALE, in one
+//   launch: one block per head and token, as the separate kernels round it.
+static __global__ void __launch_bounds__(256) mla_q_f32(
+        const float * a, const int64_t sa1, const int64_t sa2, const float * b, const int64_t sb1, const int64_t sb2,
+        const int na, const int nb, const float s, const bool has_scale, const mla_rope_params r,
+        float * dst, const int64_t sd1, const int64_t sd2) {
+    const int h   = blockIdx.x;
+    const int t   = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    a   += t*sa2 + h*sa1;
+    b   += t*sb2 + h*sb1;
+    dst += t*sd2 + h*sd1;
+
+    for (int c = tid; c < na; c += 256) {
+        const float v = a[c];
+        dst[c] = has_scale ? s * v : v;
+    }
+    for (int i0 = 2*tid; i0 < nb; i0 += 2*256) {
+        int   ix0, ix1;
+        float y0, y1;
+        mla_rope_pair(b, i0, r.pos[t], r, ix0, ix1, y0, y1);
+        dst[na + ix0] = has_scale ? s * y0 : y0;
+        dst[na + ix1] = has_scale ? s * y1 : y1;
+    }
+}
+
+void ggml_cuda_op_mla_q(ggml_backend_cuda_context & ctx, const ggml_tensor * rope, const ggml_tensor * concat,
+        const ggml_tensor * scale) {
+    const ggml_tensor * a   = concat->src[0];
+    const ggml_tensor * b   = rope->src[0];
+    ggml_tensor *       dst = scale != nullptr ? (ggml_tensor *) scale : (ggml_tensor *) concat;
+
+    float s = 1.0f;
+    if (scale != nullptr) {
+        memcpy(&s, scale->op_params, sizeof(float));
+    }
+
+    const mla_rope_params r = mla_rope_params_of(rope);
+
+    const dim3 blocks((unsigned) concat->ne[1], (unsigned) concat->ne[2], 1);
+    const ggml_cuda_kernel_launch_params launch_params(blocks, dim3(256, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(mla_q_f32, launch_params,
+        (const float *) a->data, (int64_t) (a->nb[1]/sizeof(float)), (int64_t) (a->nb[2]/sizeof(float)),
+        (const float *) b->data, (int64_t) (b->nb[1]/sizeof(float)), (int64_t) (b->nb[2]/sizeof(float)),
+        (int) a->ne[0], (int) b->ne[0], s, scale != nullptr, r,
+        (float *) dst->data, (int64_t) (dst->nb[1]/sizeof(float)), (int64_t) (dst->nb[2]/sizeof(float)));
+}

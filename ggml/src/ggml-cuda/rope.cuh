@@ -22,3 +22,16 @@ bool ggml_cuda_rms_norm_mul_rope_fused_dst_supported(ggml_type type);
 bool ggml_cuda_op_rms_norm_mul_rope_multi(ggml_backend_cuda_context & ctx, ggml_tensor * nodes[][4], int n);
 
 void ggml_cuda_op_get_rows_mean_norm_rope_fused(ggml_backend_cuda_context & ctx, ggml_tensor * get_rows_mean, ggml_tensor * rms_norm, ggml_tensor * mul, ggml_tensor * rope);
+
+// MLA (build_attn with v_mla): whether a ROPE rotates whole rows of plain or neox pairs, one position per token
+bool ggml_cuda_mla_rope_supported(const ggml_tensor * rope);
+
+// MLA: RMS_NORM of the latent, MUL by its weight, an optional SCALE (may be null), ROPE of the rope part, their CONCAT
+//   and its SET_ROWS into the cache, in one launch
+void ggml_cuda_op_mla_kv_row(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, const ggml_tensor * mul,
+    const ggml_tensor * scale, const ggml_tensor * rope, ggml_tensor * set_rows);
+
+// MLA: CONCAT of the absorbed nope part (concat->src[0]) and the ROPE of the rope part, and an optional SCALE (may be
+//   null), in one launch
+void ggml_cuda_op_mla_q(ggml_backend_cuda_context & ctx, const ggml_tensor * rope, const ggml_tensor * concat,
+    const ggml_tensor * scale);
