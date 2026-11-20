@@ -1168,6 +1168,10 @@ void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
 
     mctx->set_input_attn_mask(self_attn_mask, ubatch, cparams.causal_attn);
+
+    if (self_attn_mask.ranges && self_attn_mask.ranges->buffer) {
+        mctx->set_input_kq_ranges(self_attn_mask.ranges, ubatch, cparams.causal_attn, self_attn_mask.raw->ne[0]);
+    }
 }
 
 bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
@@ -4023,6 +4027,13 @@ llm_graph_input_attn_k * llm_graph_context::build_attn_inp_k() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
     auto inp = build_attn_inp_k_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+
+    // the KV ranges of the mask rows, as for build_attn_inp_kv: without them every layer's flash attention scans the
+    //   mask (MLA one-token decode: 28 scans of ~6 us a token at 32k cells on LongCat-Next)
+    inp->self_attn_mask.ranges = build_attn_inp_kq_ranges(ctx0, inp->self_attn_mask, cparams);
+    if (inp->self_attn_mask.ranges) {
+        res->kq_ranges[inp->self_attn_mask.raw] = { inp->self_attn_mask.ranges, 0 };
+    }
 
     return (llm_graph_input_attn_k *) res->add_input(std::move(inp));
 }
