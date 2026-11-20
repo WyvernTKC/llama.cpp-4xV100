@@ -457,6 +457,12 @@ llama_model_longcat_flash::graph::graph(const llm_graph_params & params) :
             ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq_a, cur);
             cb(q, "q", il);
 
+            // the kv projection right after the q one, of the same input: the CUDA backend runs both in one launch
+            ggml_tensor * kv_cmpr_pe = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
+            cb(kv_cmpr_pe, "kv_cmpr_pe", il);
+            ggml_build_forward_expand(gf, q);
+            ggml_build_forward_expand(gf, kv_cmpr_pe);
+
             q = build_norm(q, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
             cb(q, "q", il);
 
@@ -465,9 +471,6 @@ llama_model_longcat_flash::graph::graph(const llm_graph_params & params) :
 
             // {n_embd_head_k, n_head, n_tokens}
             q = ggml_reshape_3d(ctx0, q, n_embd_head_k, n_head, n_tokens);
-
-            ggml_tensor * kv_cmpr_pe = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
-            cb(kv_cmpr_pe, "kv_cmpr_pe", il);
 
             // split into {kv_lora_rank, n_tokens}
             ggml_tensor * kv_cmpr = ggml_view_2d(ctx0, kv_cmpr_pe, kv_lora_rank, n_tokens,
