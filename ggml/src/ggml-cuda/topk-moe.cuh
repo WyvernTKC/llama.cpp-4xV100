@@ -23,6 +23,18 @@ struct ggml_cuda_topk_moe_args {
     int  n_group_used{1};
 };
 
+// After the picks of a row (LongCat's identity experts, see build_moe_route): the GET_ROWS of each pick from two tables
+//   of the row, [1, n_experts, n_rows], the expert it runs (I32) and a weight factor (F32), and the sum over the picks of
+//   weight times factor (MUL + SUM_ROWS), as the separate kernels compute them
+struct topk_moe_tail {
+    const int32_t * lut_ids    = nullptr;
+    int64_t         lut_ids_s  = 0; // row stride in elements
+    int32_t *       ids_mapped = nullptr; // [n_expert_used, n_rows]
+    const float *   lut_w      = nullptr;
+    int64_t         lut_w_s    = 0;
+    float *         w_sum      = nullptr; // [n_rows]
+};
+
 void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
                            const ggml_tensor *             logits,
                            ggml_tensor *                   weights,
@@ -30,7 +42,8 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
                            const ggml_tensor *             clamp,
                            const ggml_tensor *             scale,
                            const ggml_tensor *             bias,
-                           const ggml_cuda_topk_moe_args & args);
+                           const ggml_cuda_topk_moe_args & args,
+                           const topk_moe_tail *           tail = nullptr);
 
 bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
                                    const ggml_tensor * weights,

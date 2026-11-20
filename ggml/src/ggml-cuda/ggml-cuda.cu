@@ -6545,16 +6545,86 @@ static bool ggml_cuda_topk_moe_plan_at(const ggml_cgraph * cgraph, const int i, 
     return false;
 }
 
+// LongCat's identity experts after a topk_moe (build_moe_route): GET_ROWS of the picks from a table of the expert they
+//   run, its RESHAPE, GET_ROWS from a table of weight factors, MUL by the weights, RESHAPE and SUM_ROWS, run by the
+//   topk_moe launch (topk_moe_tail): five launches less per MoE layer. GGML_CUDA_NO_TOPK_TAIL=1 turns it off. Returns
+//   the tail's nodes, 0 if it does not match.
+static int ggml_cuda_topk_moe_tail_match(const ggml_cgraph * cgraph, const int i, const struct ggml_cuda_topk_moe_plan & p,
+        topk_moe_tail & tail) {
+    static const bool disabled = getenv("GGML_CUDA_NO_TOPK_TAIL") != nullptr;
+    const int k = i + p.n_ops;
+    if (disabled || k + 5 >= cgraph->n_nodes || p.args.delayed_softmax) {
+        return 0;
+    }
+    ggml_tensor ** n = cgraph->nodes + k;
+    const ggml_tensor * ids = p.ids;
+    const int64_t n_exp  = ids->src[0] != nullptr ? ids->src[0]->ne[0] : 0;
+    const int64_t n_used = p.weights->ne[1];
+    const int64_t n_rows = p.weights->ne[2];
+    const ggml_tensor * lut_i = n[0]->src[0];
+    const ggml_tensor * lut_w = n[2]->src[0];
+    const ggml_tensor * mul   = n[3];
+    if (n[0]->op != GGML_OP_GET_ROWS || n[0]->src[1] != ids || n[0]->type != GGML_TYPE_I32 || lut_i->type != GGML_TYPE_I32 ||
+            n[1]->op != GGML_OP_RESHAPE || n[1]->src[0] != n[0] ||
+            n[2]->op != GGML_OP_GET_ROWS || n[2]->src[1] != ids || n[2]->type != GGML_TYPE_F32 || lut_w->type != GGML_TYPE_F32 ||
+            mul->op != GGML_OP_MUL || !((mul->src[0] == p.weights && mul->src[1] == n[2]) || (mul->src[1] == p.weights && mul->src[0] == n[2])) ||
+            !ggml_are_same_shape(mul, p.weights) ||
+            n[4]->op != GGML_OP_RESHAPE || n[4]->src[0] != mul || n[5]->op != GGML_OP_SUM_ROWS || n[5]->src[0] != n[4] ||
+            n[5]->type != GGML_TYPE_F32 || ggml_nelements(n[5]) != n_rows) {
+        return 0;
+    }
+    for (const ggml_tensor * lut : { lut_i, lut_w }) {
+        if (lut->ne[0] != 1 || lut->ne[1] != n_exp || lut->ne[2] != n_rows || lut->ne[3] != 1 || lut->nb[1] != ggml_type_size(lut->type)) {
+            return 0;
+        }
+    }
+    if (!ggml_is_contiguous(n[0]) || ggml_nelements(n[0]) != n_used*n_rows || !ggml_is_contiguous(n[5]) || !ggml_is_contiguous(p.weights)) {
+        return 0;
+    }
+    // one fusion with the topk_moe: its ids (the GET_ROWS' index) go nowhere else now, its weights may
+    std::vector<ggml_op> ops;
+    for (int j = i; j < k + 6; j++) {
+        ops.push_back(cgraph->nodes[j]->op);
+    }
+    const int outs[3] = { p.out_nodes[1], k + 1, k + 5 };
+    if (ops.size() >= 32 || !ggml_can_fuse_subgraph(cgraph, i, (int) ops.size(), ops.data(), outs, 3)) {
+        return 0;
+    }
+    // the tail's outputs are written after the picks: not over what the kernel reads or writes before. Over the logits
+    //   only in one block, whose rows read all of them before the barrier (ggml-alloc gives a tail the freed logits)
+    for (const ggml_tensor * out : { (const ggml_tensor *) n[0], (const ggml_tensor *) n[5] }) {
+        if ((ggml_cuda_tensors_overlap(out, p.logits) && n_rows > TOPK_MOE_ROWS_PER_BLOCK) || ggml_cuda_tensors_overlap(out, p.weights) ||
+                ggml_cuda_tensors_overlap(out, ids->src[0]) || ggml_cuda_tensors_overlap(out, lut_i) ||
+                ggml_cuda_tensors_overlap(out, lut_w) || (p.bias != nullptr && ggml_cuda_tensors_overlap(out, p.bias))) {
+            return 0;
+        }
+    }
+    if (ggml_cuda_tensors_overlap(n[0], n[5])) {
+        return 0;
+    }
+    tail.lut_ids    = (const int32_t *) lut_i->data;
+    tail.lut_ids_s  = lut_i->nb[2] / sizeof(int32_t);
+    tail.ids_mapped = (int32_t *) n[0]->data;
+    tail.lut_w      = (const float *) lut_w->data;
+    tail.lut_w_s    = lut_w->nb[2] / sizeof(float);
+    tail.w_sum      = (float *) n[5]->data;
+    return 6;
+}
+
 // The outputs of the fused topk_moe may lie over the logits: ggml-alloc puts them there once nothing else reads the
 // logits when no alloc dep keeps them (none does under the meta backend). Up to TOPK_MOE_ROWS_PER_BLOCK rows
 // one block reads all logits before it writes; with more, the other blocks would read logits already overwritten, so
 // they read a copy (a prefill batch otherwise took the unfused argsort path, ~0.1 ms per layer at 2048 tokens).
 static bool ggml_cuda_topk_moe_launch(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i,
         const int n_ops, const int * out_nodes, const ggml_tensor * logits, ggml_tensor * weights, ggml_tensor * ids,
-        const ggml_tensor * clamp, const ggml_tensor * scale, const ggml_tensor * bias, const ggml_cuda_topk_moe_args & args) {
+        const ggml_tensor * clamp, const ggml_tensor * scale, const ggml_tensor * bias, const ggml_cuda_topk_moe_args & args,
+        const topk_moe_tail * tail = nullptr) {
     if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, out_nodes, 2, /*is_topk_moe=*/true)) {
-        ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+        ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args, tail);
         return true;
+    }
+    if (tail != nullptr) {
+        return false;
     }
     if (!ggml_is_contiguous(logits) ||
             !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, out_nodes, 2, /*is_topk_moe=*/true, logits)) {
@@ -8688,10 +8758,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
             cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
         ggml_cuda_topk_moe_plan p;
-        if (ggml_cuda_topk_moe_plan_at(cgraph, i, p) &&
-                ggml_cuda_topk_moe_launch(cuda_ctx, cgraph, i, p.n_ops, p.out_nodes, p.logits, p.weights, p.ids, p.clamp, p.scale,
-                    p.bias, p.args)) {
-            return p.n_ops - 1;
+        if (ggml_cuda_topk_moe_plan_at(cgraph, i, p)) {
+            topk_moe_tail tail;
+            const int n_tail = ggml_cuda_topk_moe_tail_match(cgraph, i, p, tail);
+            if (n_tail > 0 && ggml_cuda_topk_moe_launch(cuda_ctx, cgraph, i, p.n_ops, p.out_nodes, p.logits, p.weights, p.ids,
+                    p.clamp, p.scale, p.bias, p.args, &tail)) {
+                return p.n_ops + n_tail - 1;
+            }
+            if (ggml_cuda_topk_moe_launch(cuda_ctx, cgraph, i, p.n_ops, p.out_nodes, p.logits, p.weights, p.ids, p.clamp,
+                    p.scale, p.bias, p.args)) {
+                return p.n_ops - 1;
+            }
         }
     }
 

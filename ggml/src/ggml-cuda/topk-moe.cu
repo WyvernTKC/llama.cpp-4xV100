@@ -24,7 +24,8 @@ __global__ void topk_moe_cuda(const float *         logits,
                               const int             n_expert_used,
                               const float           clamp_val,
                               const float           scale_val,
-                              const topk_moe_config config) {
+                              const topk_moe_config config,
+                              const topk_moe_tail   tail) {
 #if defined(GGML_USE_MUSA)
     // MUSA: every warp of a partially filled block must reach the barrier below.
     const int row = MIN(blockIdx.x * blockDim.y + threadIdx.y, n_rows - 1);
@@ -66,6 +67,21 @@ __global__ void topk_moe_cuda(const float *         logits,
     __syncthreads();
 
     topk_moe_select<n_experts, has_bias, grouped>(wt, bias_v, weights, ids, n_expert_used, clamp_val, scale_val, config);
+
+    if (tail.w_sum != nullptr) {
+        // the ids came from the lanes that own the experts
+        __syncwarp();
+        float w = 0.0f;
+        if ((int) threadIdx.x < n_expert_used) {
+            const int e = ids[threadIdx.x];
+            tail.ids_mapped[(int64_t) row*n_expert_used + threadIdx.x] = tail.lut_ids[row*tail.lut_ids_s + e];
+            w = weights[threadIdx.x] * tail.lut_w[row*tail.lut_w_s + e];
+        }
+        w = warp_reduce_sum(w);
+        if (threadIdx.x == 0) {
+            tail.w_sum[row] = w;
+        }
+    }
 }
 
 template <int n_experts, bool has_bias, bool grouped>
@@ -78,9 +94,10 @@ static void launch_topk_moe_cuda_n(const ggml_cuda_kernel_launch_params & launch
                                    const int                              n_expert_used,
                                    const float                            clamp_val,
                                    const float                            scale_val,
-                                   const topk_moe_config                  config) {
+                                   const topk_moe_config                  config,
+                                   const topk_moe_tail                    tail) {
     ggml_cuda_kernel_launch(topk_moe_cuda<n_experts, has_bias, grouped>, launch_params,
-        logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+        logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, tail);
 }
 
 template<bool has_bias, bool grouped>
@@ -94,7 +111,8 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
                                  const int                   n_expert_used,
                                  const float                 clamp_val,
                                  const float                 scale_val,
-                                 const topk_moe_config       config) {
+                                 const topk_moe_config       config,
+                                 const topk_moe_tail         tail) {
     GGML_ASSERT(!(config.with_norm && config.delayed_softmax) &&
                 "delayed softmax is not supported with weight normalization");
     const int    rows_per_block = TOPK_MOE_ROWS_PER_BLOCK;
@@ -106,7 +124,7 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
 #define TOPK_MOE_CASE(n) \
         case n: \
             launch_topk_moe_cuda_n<n, has_bias, grouped>(launch_params, logits, weights, ids, bias, n_rows, n_expert_used, \
-                clamp_val, scale_val, config); \
+                clamp_val, scale_val, config, tail); \
             break;
 
     if constexpr (grouped) {
@@ -162,7 +180,9 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
                            const ggml_tensor *             clamp,
                            const ggml_tensor *             scale,
                            const ggml_tensor *             bias,
-                           const ggml_cuda_topk_moe_args & args) {
+                           const ggml_cuda_topk_moe_args & args,
+                           const topk_moe_tail *           tail_p) {
+    const topk_moe_tail tail = tail_p != nullptr ? *tail_p : topk_moe_tail();
     GGML_ASSERT(logits->type == GGML_TYPE_F32);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
@@ -199,14 +219,14 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     if (bias && args.n_groups > 1) {
         GGML_ASSERT(ggml_cuda_topk_moe_groups_supported(n_experts, args.n_groups, args.n_group_used));
         launch_topk_moe_cuda<true, true>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used,
-                                         clamp_val, scale_val, config);
+                                         clamp_val, scale_val, config, tail);
     } else if (bias) {
         launch_topk_moe_cuda<true, false>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used,
-                                          clamp_val, scale_val, config);
+                                          clamp_val, scale_val, config, tail);
     } else {
         GGML_ASSERT(args.n_groups <= 1);
         launch_topk_moe_cuda<false, false>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used,
-                                           clamp_val, scale_val, config);
+                                           clamp_val, scale_val, config, tail);
     }
 }
 

@@ -426,6 +426,21 @@ llama_model_longcat_flash::graph::graph(const llm_graph_params & params) :
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    // the tables of the routers' picks, first in the graph: nothing between a router and the tail after it, which the
+    //   CUDA backend runs in the router's topk_moe launch (topk_moe_tail)
+    if (model.layers[0].ffn_gate_inp) {
+        const int64_t n_expert_router = model.layers[0].ffn_gate_inp->ne[1];
+        // [1, n_expert_router, n_tokens]: get_rows takes a table per token
+        ggml_tensor * e = ggml_arange(ctx0, 0.0f, float(n_expert_router), 1.0f);
+        e = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, e, 1, n_expert_router, 1), 1, n_expert_router, n_tokens, 1);
+        // identity experts -> the all-zero expert n_expert
+        lut_ids  = ggml_cast(ctx0, ggml_clamp(ctx0, e, 0.0f, float(n_expert)), GGML_TYPE_I32);
+        // 1 for an identity expert, 0 for a real one: clamp(e - (n_expert - 1), 0, 1)
+        lut_zero = ggml_clamp(ctx0, ggml_scale_bias(ctx0, e, 1.0f, -float(n_expert - 1)), 0.0f, 1.0f);
+        ggml_build_forward_expand(gf, lut_ids);
+        ggml_build_forward_expand(gf, lut_zero);
+    }
+
     // the MoE of the current HF layer, routed in its first block
     moe_route route;
 
@@ -645,15 +660,7 @@ llama_model_longcat_flash::graph::moe_route llama_model_longcat_flash::graph::bu
     // the router's nodes in that order, before anything else reads them
     ggml_build_forward_expand(gf, weights);
 
-    if (lut_ids == nullptr) {
-        // [1, n_expert_router, n_tokens]: get_rows takes a table per token
-        ggml_tensor * e = ggml_arange(ctx0, 0.0f, float(n_expert_router), 1.0f);
-        e = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, e, 1, n_expert_router, 1), 1, n_expert_router, n_tokens, 1);
-        // identity experts -> the all-zero expert n_expert
-        lut_ids  = ggml_cast(ctx0, ggml_clamp(ctx0, e, 0.0f, float(n_expert)), GGML_TYPE_I32);
-        // 1 for an identity expert, 0 for a real one: clamp(e - (n_expert - 1), 0, 1)
-        lut_zero = ggml_clamp(ctx0, ggml_scale_bias(ctx0, e, 1.0f, -float(n_expert - 1)), 0.0f, 1.0f);
-    }
+    GGML_ASSERT(lut_ids != nullptr && lut_ids->ne[1] == n_expert_router);
 
     moe_route route;
     route.cur     = cur;
