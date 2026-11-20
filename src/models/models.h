@@ -1282,8 +1282,23 @@ struct llama_model_longcat_flash : public llama_model_base {
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
 
-        // MoE with identity experts next to the real ones, see load_arch_tensors
-        ggml_tensor * build_moe_zero(ggml_tensor * cur, const llama_layer & layer, int il) const;
+        // MoE with identity experts next to the real ones, see load_arch_tensors. It is routed in the first block of its
+        //   HF layer (build_moe_route) and its routed experts run in the second (build_moe_experts), where their sum
+        //   joins the dense FFN's before one all-reduce
+        struct moe_route {
+            ggml_tensor * cur      = nullptr; // the input, [n_embd, n_tokens]
+            ggml_tensor * ids      = nullptr; // [n_expert_used, n_tokens], an identity expert -> the all-zero expert
+            ggml_tensor * weights  = nullptr; // [1, n_expert_used, n_tokens]
+            ggml_tensor * identity = nullptr; // [n_embd, n_tokens], cur times the weights of the identity experts picked
+            int           il       = -1;      // the layer that holds the experts
+        };
+        moe_route     build_moe_route(ggml_tensor * cur, const llama_layer & layer, int il) const;
+        ggml_tensor * build_moe_experts(const moe_route & route, int il) const;
+
+        // over the router's experts, built once a graph: the expert a pick runs (I32) and whether it is an identity
+        //   expert (F32), as rows of one value for get_rows
+        mutable ggml_tensor * lut_ids  = nullptr;
+        mutable ggml_tensor * lut_zero = nullptr;
 
         // token embedding + hashed n-gram embeddings, longcat-ngram only
         ggml_tensor * build_inp_ngram(ggml_tensor * inp_embd) const;

@@ -426,7 +426,8 @@ llama_model_longcat_flash::graph::graph(const llm_graph_params & params) :
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    ggml_tensor * moe_out = nullptr;
+    // the MoE of the current HF layer, routed in its first block
+    moe_route route;
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
@@ -528,12 +529,10 @@ llama_model_longcat_flash::graph::graph(const llm_graph_params & params) :
                     Qcur, Kcur, Vcur, nullptr, nullptr, layer.wv_b, 1.0f, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        const bool out_rows = il == n_layer - 1 && inp_out_ids;
+        if (out_rows) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
-            if (moe_out) {
-                moe_out = ggml_get_rows(ctx0, moe_out, inp_out_ids);
-            }
         }
 
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
@@ -542,10 +541,30 @@ llama_model_longcat_flash::graph::graph(const llm_graph_params & params) :
         cur = build_norm(ffn_inp, layer.ffn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
+        // the residual add and the norm first after the all-reduce of the attention: under -sm tensor the norm polls it
+        ggml_build_forward_expand(gf, cur);
+
         // the MoE of the HF layer reads the input of its first dense FFN
         if (layer.ffn_gate_inp) {
-            moe_out = build_moe_zero(cur, layer, il);
-            cb(moe_out, "ffn_moe_out", il);
+            route = build_moe_route(cur, layer, il);
+        }
+
+        // and lands after its second block: the identity part goes to the residual here, the routed experts run before
+        //   the dense FFN, so that the two partial sums meet in one add, one all-reduce under -sm tensor, and the add of
+        //   the residual is the first node after it
+        const bool    moe_here = il % 2 == 1 && route.il >= 0;
+        ggml_tensor * residual = ffn_inp;
+        ggml_tensor * moe_sum  = nullptr;
+        if (moe_here) {
+            residual = ggml_add(ctx0, ffn_inp, out_rows ? ggml_get_rows(ctx0, route.identity, inp_out_ids) : route.identity);
+            cb(residual, "ffn_inp_moe_identity", il);
+            ggml_build_forward_expand(gf, residual);
+
+            moe_sum = build_moe_experts(route, il);
+            if (out_rows) {
+                moe_sum = ggml_get_rows(ctx0, moe_sum, inp_out_ids);
+            }
+            route = moe_route();
         }
 
         cur = build_ffn(cur,
@@ -555,14 +574,12 @@ llama_model_longcat_flash::graph::graph(const llm_graph_params & params) :
                 NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
         cb(cur, "ffn_out", il);
 
-        cur = ggml_add(ctx0, cur, ffn_inp);
-
-        // and lands after its second block
-        if (il % 2 == 1 && moe_out) {
-            cur = ggml_add(ctx0, cur, moe_out);
+        if (moe_sum) {
+            cur = ggml_add(ctx0, moe_sum, cur);
             cb(cur, "ffn_out_moe", il);
-            moe_out = nullptr;
         }
+
+        cur = ggml_add(ctx0, cur, residual);
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
@@ -583,10 +600,12 @@ llama_model_longcat_flash::graph::graph(const llm_graph_params & params) :
     ggml_build_forward_expand(gf, cur);
 }
 
-// The router scores n_expert real and n_zero_experts identity experts. The slots that pick an identity
-// expert point at the extra all-zero expert n_expert, so mul_mat_id gives 0 for them, and the identity
-// part comes back as cur times the sum of their weights.
-ggml_tensor * llama_model_longcat_flash::graph::build_moe_zero(ggml_tensor * cur, const llama_layer & layer, int il) const {
+// The router scores n_expert real and n_zero_experts identity experts. The picks of an identity expert run the extra
+//   all-zero expert n_expert, so mul_mat_id gives 0 for them, and the identity part is cur times the sum of their
+//   weights. The router is built in the order of build_moe_ffn (softmax, its reshape, the bias, top-k, the weights),
+//   which the CUDA backend runs as one kernel (topk_moe), and the ids and identity mask are rows of two tables.
+llama_model_longcat_flash::graph::moe_route llama_model_longcat_flash::graph::build_moe_route(
+        ggml_tensor * cur, const llama_layer & layer, int il) const {
     const int64_t n_expert_router = layer.ffn_gate_inp->ne[1];
 
     ggml_tensor * logits = ggml_mul_mat(ctx0, layer.ffn_gate_inp, cur); // [n_expert_router, n_tokens]
@@ -594,6 +613,8 @@ ggml_tensor * llama_model_longcat_flash::graph::build_moe_zero(ggml_tensor * cur
 
     ggml_tensor * probs = ggml_soft_max(ctx0, logits);
     cb(probs, "ffn_moe_probs", il);
+
+    ggml_tensor * probs_rows = ggml_reshape_3d(ctx0, probs, 1, n_expert_router, n_tokens);
 
     // the bias only steers the selection, the weights come from the plain probabilities
     ggml_tensor * selection_probs = probs;
@@ -605,7 +626,7 @@ ggml_tensor * llama_model_longcat_flash::graph::build_moe_zero(ggml_tensor * cur
     ggml_tensor * selected = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
     cb(selected, "ffn_moe_topk", il);
 
-    ggml_tensor * weights = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, probs, 1, n_expert_router, n_tokens), selected); // [1, n_expert_used, n_tokens]
+    ggml_tensor * weights = ggml_get_rows(ctx0, probs_rows, selected); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
 
     if (hparams.expert_weights_norm) {
@@ -620,51 +641,79 @@ ggml_tensor * llama_model_longcat_flash::graph::build_moe_zero(ggml_tensor * cur
         weights = ggml_scale(ctx0, weights, hparams.expert_weights_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
     }
+    // the router's nodes in that order, before anything else reads them
+    ggml_build_forward_expand(gf, weights);
 
-    ggml_tensor * ids_f32 = ggml_cast(ctx0, selected, GGML_TYPE_F32);
+    if (lut_ids == nullptr) {
+        // [1, n_expert_router, n_tokens]: get_rows takes a table per token
+        ggml_tensor * e = ggml_arange(ctx0, 0.0f, float(n_expert_router), 1.0f);
+        e = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, e, 1, n_expert_router, 1), 1, n_expert_router, n_tokens, 1);
+        // identity experts -> the all-zero expert n_expert
+        lut_ids  = ggml_cast(ctx0, ggml_clamp(ctx0, e, 0.0f, float(n_expert)), GGML_TYPE_I32);
+        // 1 for an identity expert, 0 for a real one: clamp(e - (n_expert - 1), 0, 1)
+        lut_zero = ggml_clamp(ctx0, ggml_scale_bias(ctx0, e, 1.0f, -float(n_expert - 1)), 0.0f, 1.0f);
+    }
 
-    // identity experts -> the all-zero expert n_expert
-    ggml_tensor * ids = ggml_cast(ctx0, ggml_clamp(ctx0, ids_f32, 0.0f, float(n_expert)), GGML_TYPE_I32);
-    cb(ids, "ffn_moe_ids", il);
+    moe_route route;
+    route.cur     = cur;
+    route.weights = weights;
+    route.il      = il;
 
-    // 1 for an identity expert, 0 for a real one: clamp(id - (n_expert - 1), 0, 1)
-    ggml_tensor * zero_mask = ggml_clamp(ctx0, ggml_scale_bias(ctx0, ids_f32, 1.0f, -float(n_expert - 1)), 0.0f, 1.0f);
+    route.ids = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, lut_ids, selected), n_expert_used, n_tokens);
+    cb(route.ids, "ffn_moe_ids", il);
+
+    ggml_tensor * zero_mask = ggml_get_rows(ctx0, lut_zero, selected); // [1, n_expert_used, n_tokens]
     cb(zero_mask, "ffn_moe_zero_mask", il);
 
-    ggml_tensor * cur_3d = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+    ggml_tensor * w_zero = ggml_sum_rows(ctx0, ggml_reshape_2d(ctx0, ggml_mul(ctx0, weights, zero_mask), n_expert_used, n_tokens)); // [1, n_tokens]
+    cb(w_zero, "ffn_moe_weights_zero", il);
 
-    ggml_tensor * up   = ggml_mul_mat_id(ctx0, layer.ffn_up_exps,   cur_3d, ids); // [n_ff_exp, n_expert_used, n_tokens]
-    ggml_tensor * gate = ggml_mul_mat_id(ctx0, layer.ffn_gate_exps, cur_3d, ids);
+    route.identity = ggml_mul(ctx0, cur, w_zero);
+    cb(route.identity, "ffn_moe_identity", il);
+
+    ggml_build_forward_expand(gf, route.ids);
+    ggml_build_forward_expand(gf, route.identity);
+
+    return route;
+}
+
+// The weighted sum of the routed experts, views before adds as in build_moe_ffn: the CUDA backend sums them in one kernel,
+//   and under -sm tensor the meta backend all-reduces the sum (with the next partial sum it is added to)
+ggml_tensor * llama_model_longcat_flash::graph::build_moe_experts(const moe_route & route, int il) const {
+    const llama_layer & layer = model.layers[route.il];
+
+    ggml_tensor * cur_3d = ggml_reshape_3d(ctx0, route.cur, n_embd, 1, n_tokens);
+
+    ggml_tensor * up   = ggml_mul_mat_id(ctx0, layer.ffn_up_exps,   cur_3d, route.ids); // [n_ff_exp, n_expert_used, n_tokens]
+    ggml_tensor * gate = ggml_mul_mat_id(ctx0, layer.ffn_gate_exps, cur_3d, route.ids);
     cb(up,   "ffn_moe_up",   il);
     cb(gate, "ffn_moe_gate", il);
 
     ggml_tensor * experts = ggml_swiglu_split(ctx0, gate, up);
     cb(experts, "ffn_moe_swiglu", il);
 
-    experts = ggml_mul_mat_id(ctx0, layer.ffn_down_exps, experts, ids); // [n_embd, n_expert_used, n_tokens]
+    experts = ggml_mul_mat_id(ctx0, layer.ffn_down_exps, experts, route.ids); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
-    experts = ggml_mul(ctx0, experts, weights);
+    experts = ggml_mul(ctx0, experts, route.weights);
     cb(experts, "ffn_moe_weighted", il);
+    ggml_build_forward_expand(gf, experts);
 
-    ggml_tensor * moe_out = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], 0);
+    ggml_tensor * views[LLAMA_MAX_EXPERTS] = { nullptr };
+    for (int64_t i = 0; i < n_expert_used; ++i) {
+        views[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
+        ggml_build_forward_expand(gf, views[i]);
+    }
+
+    ggml_tensor * moe_sum = views[0];
     for (int64_t i = 1; i < n_expert_used; ++i) {
-        moe_out = ggml_add(ctx0, moe_out, ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]));
+        moe_sum = ggml_add(ctx0, moe_sum, views[i]);
+        ggml_build_forward_expand(gf, moe_sum);
     }
+    if (n_expert_used == 1) {
+        moe_sum = ggml_cont(ctx0, moe_sum);
+    }
+    cb(moe_sum, "ffn_moe_out", il);
 
-    // the identity part reads its own copy of the selected probabilities: under -sm tensor a second consumer of the
-    // weights that scale the expert outputs does not see their values
-    ggml_tensor * w_zero = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, probs, 1, n_expert_router, n_tokens), selected);
-    w_zero = ggml_reshape_2d(ctx0, w_zero, n_expert_used, n_tokens);
-    if (hparams.expert_weights_norm) {
-        w_zero = ggml_div(ctx0, w_zero, ggml_clamp(ctx0, ggml_sum_rows(ctx0, w_zero), 6.103515625e-5f, INFINITY));
-    }
-    w_zero = ggml_mul(ctx0, w_zero, zero_mask);
-    if (hparams.expert_weights_scale != 0.0f && hparams.expert_weights_scale != 1.0f) {
-        w_zero = ggml_scale(ctx0, w_zero, hparams.expert_weights_scale);
-    }
-    w_zero = ggml_sum_rows(ctx0, w_zero); // [1, n_tokens]
-    cb(w_zero, "ffn_moe_weights_zero", il);
-
-    return ggml_add(ctx0, moe_out, ggml_mul(ctx0, cur, w_zero));
+    return moe_sum;
 }
