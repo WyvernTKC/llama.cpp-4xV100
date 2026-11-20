@@ -4070,10 +4070,12 @@ ggml_tensor * llm_graph_context::build_attn(
     //   takes 16 heads a pass over the cells, so it pays only while the passes of all heads are fewer than the devices
     //   (32 heads on 4: 2 passes over a quarter of the cells against 1 pass over all). Two all-gathers and a few small
     //   kernels a layer cost ~2 ms a token on LongCat-Next, against a third off the depth slope: 4x V100 tg64 -10% at
-    //   32k cells, -3% at 64k, +15% at 128k. LLAMA_MLA_CP = the fewest cells for it, 0 = off.
+    //   32k cells, -3% at 64k, +15% at 128k against the tile kernel. Since the 8 heads of the split by head run on Volta
+    //   tensor cores (fattn-volta-mla.cuh) the split by head is faster at every depth (97k cells 67.2 -> 101.7 t/s,
+    //   131k 57.7 -> 87.6 without CP), so it is off by default. LLAMA_MLA_CP = the fewest cells for it, 0 = off.
     static const int64_t mla_cp_min_kv = [] {
         const char * env = getenv("LLAMA_MLA_CP");
-        return env != nullptr ? (int64_t) atoll(env) : (int64_t) 81920;
+        return env != nullptr ? (int64_t) atoll(env) : (int64_t) 0;
     }();
     const int64_t n_dev  = cparams.n_tp_dev;
     const bool    use_cp = mla_cp_min_kv > 0 && n_dev > 1 && v_mla != nullptr && kq_b == nullptr && sinks == nullptr &&
