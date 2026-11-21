@@ -7042,6 +7042,57 @@ static int ggml_cuda_try_fuse_cont_small_k(ggml_backend_cuda_context * cuda_ctx,
     return 1;
 }
 
+// The SITU activation of Inkling 2's experts (build_moe_ffn): SCALE, TANH, SCALE of the gate, the SIGMOID of the gate and
+//   its MUL, then SCALE, TANH, SCALE of the up view and the MUL of the two, in one launch (ggml_cuda_op_situ) instead of
+//   eight. GGML_CUDA_NO_SITU_FUSION=1 turns it off.
+static int ggml_cuda_try_fuse_situ(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_SITU_FUSION") != nullptr;
+    if (disabled || i + 9 >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * const * nd = cgraph->nodes + i;
+    auto unary = [](const ggml_tensor * t, ggml_unary_op op) { return t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == op; };
+    const ggml_tensor * g  = nd[0]->src[0];
+    const ggml_tensor * s1 = nd[0];
+    const ggml_tensor * t1 = nd[1];
+    const ggml_tensor * s2 = nd[2];
+    const ggml_tensor * sg = nd[3];
+    const ggml_tensor * m1 = nd[4];
+    const int o = nd[5]->op == GGML_OP_VIEW ? 6 : 5; // the up view, if it comes here
+    if (i + o + 3 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * s3  = nd[o + 0];
+    const ggml_tensor * t2  = nd[o + 1];
+    const ggml_tensor * s4  = nd[o + 2];
+    ggml_tensor       * out = nd[o + 3];
+    const ggml_tensor * u   = s3->src[0];
+    if (!unary(t1, GGML_UNARY_OP_TANH) || t1->src[0] != s1 || s2->op != GGML_OP_SCALE || s2->src[0] != t1 ||
+            !unary(sg, GGML_UNARY_OP_SIGMOID) || sg->src[0] != g || m1->op != GGML_OP_MUL ||
+            !((m1->src[0] == s2 && m1->src[1] == sg) || (m1->src[0] == sg && m1->src[1] == s2)) ||
+            s3->op != GGML_OP_SCALE || !unary(t2, GGML_UNARY_OP_TANH) || t2->src[0] != s3 || s4->op != GGML_OP_SCALE ||
+            s4->src[0] != t2 || out->op != GGML_OP_MUL || out->src[0] != m1 || out->src[1] != s4 ||
+            !(out->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+        return 0;
+    }
+    for (const ggml_tensor * t : { s1, t1, s2, sg, m1, s3, t2, s4 }) {
+        if (!(t->flags & GGML_TENSOR_FLAG_COMPUTE) || (t->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_cuda_graph_use_count(cgraph, t) != 1 ||
+                t->type != GGML_TYPE_F32) {
+            return 0;
+        }
+    }
+    const int out_nodes[] = { i + o + 3 };
+    if (!ggml_cuda_should_fuse_situ(g, u, out) || !ggml_cuda_check_fusion_memory_ranges(cgraph, i, o + 4, out_nodes, 1)) {
+        return 0;
+    }
+    const float sb[8] = {
+        ggml_get_op_params_f32(s1, 0), ggml_get_op_params_f32(s1, 1), ggml_get_op_params_f32(s2, 0), ggml_get_op_params_f32(s2, 1),
+        ggml_get_op_params_f32(s3, 0), ggml_get_op_params_f32(s3, 1), ggml_get_op_params_f32(s4, 0), ggml_get_op_params_f32(s4, 1),
+    };
+    ggml_cuda_op_situ(*cuda_ctx, g, u, out, sb);
+    return o + 3;
+}
+
 // The depth mix of Inkling 2 (llama_model_inkling2::graph::mix): RMS_NORM(cur), CONCAT(normed blocks, it), the scores
 //   MUL_MAT (one token: states by queries; a batch: queries by states, RESHAPE, then RESHAPE or PERMUTE + CONT), SOFT_MAX,
 //   TRANSPOSE, CONT and the weighted sum MUL_MAT in one launch (ggml_cuda_op_depth_mix). GGML_CUDA_NO_DEPTH_MIX_FUSION=1 off.
@@ -8779,6 +8830,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_MUL || node->op == GGML_OP_SQR) {
         const int n_skip = ggml_cuda_try_fuse_l2_clip(cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_SCALE) {
+        const int n_skip = ggml_cuda_try_fuse_situ(cuda_ctx, cgraph, i);
         if (n_skip > 0) {
             return n_skip;
         }

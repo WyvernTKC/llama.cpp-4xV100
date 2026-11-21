@@ -187,3 +187,8 @@ bool ggml_cuda_should_fuse_tanh_gate(const ggml_tensor * tf, const ggml_tensor *
         const ggml_tensor * tg, const ggml_tensor * mul_gm, const ggml_tensor * add);
 void ggml_cuda_op_tanh_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * tf, const ggml_tensor * tg,
         const ggml_tensor * sub, const ggml_tensor * mul_gm, ggml_tensor * add);
+
+// the MoE activation of Inkling 2 from its gate and up views, sb: the scale and bias of the four SCALEs in graph order
+bool ggml_cuda_should_fuse_situ(const ggml_tensor * g, const ggml_tensor * u, const ggml_tensor * dst);
+void ggml_cuda_op_situ(ggml_backend_cuda_context & ctx, const ggml_tensor * g, const ggml_tensor * u, ggml_tensor * dst,
+        const float * sb);

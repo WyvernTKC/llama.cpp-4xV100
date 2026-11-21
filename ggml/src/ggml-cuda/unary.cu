@@ -1368,3 +1368,42 @@ void ggml_cuda_op_tanh_gate(ggml_backend_cuda_context & ctx, const ggml_tensor *
         c->nb[1], c->nb[2], c->nb[3], m->nb[1], m->nb[2], m->nb[3]);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// situ(g, u) = (tanh(g*s1 + b1)*s2 + b2)*sigmoid(g) * (tanh(u*s3 + b3)*s4 + b4), the MoE activation of Inkling 2, with the
+//   values of its SCALE, TANH, SIGMOID and MUL nodes: g and u of one shape with any row strides (the gate and up views of
+//   the gate_up product), dst contiguous
+static __global__ void situ_f32(const char * __restrict__ g, const char * __restrict__ u, float * __restrict__ dst, const int64_t n,
+        const int ne0, const int ne1, const int64_t nbg1, const int64_t nbg2, const int64_t nbu1, const int64_t nbu2,
+        const float s1, const float b1, const float s2, const float b2, const float s3, const float b3, const float s4, const float b4) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const int64_t i0 = i % ne0;
+    const int64_t i1 = (i/ne0) % ne1;
+    const int64_t i2 = i/ne0/ne1;
+    const float gv = *(const float *) (g + i0*sizeof(float) + i1*nbg1 + i2*nbg2);
+    const float uv = *(const float *) (u + i0*sizeof(float) + i1*nbu1 + i2*nbu2);
+    const float act = (s2*tanhf(s1*gv + b1) + b2)*op_sigmoid(gv);
+    const float up  = s4*tanhf(s3*uv + b3) + b4;
+    dst[i] = act*up;
+}
+
+bool ggml_cuda_should_fuse_situ(const ggml_tensor * g, const ggml_tensor * u, const ggml_tensor * dst) {
+    for (const ggml_tensor * t : { g, u, dst }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_are_same_shape(t, dst) || t->nb[0] != sizeof(float) || t->ne[3] != 1) {
+            return false;
+        }
+    }
+    return ggml_is_contiguous(dst);
+}
+
+void ggml_cuda_op_situ(ggml_backend_cuda_context & ctx, const ggml_tensor * g, const ggml_tensor * u, ggml_tensor * dst,
+        const float * sb) {
+    GGML_ASSERT(ggml_cuda_should_fuse_situ(g, u, dst));
+    const int64_t n = ggml_nelements(dst);
+    const int block = 256;
+    situ_f32<<<(n + block - 1)/block, block, 0, ctx.stream()>>>((const char *) g->data, (const char *) u->data, (float *) dst->data,
+        n, dst->ne[0], dst->ne[1], g->nb[1], g->nb[2], u->nb[1], u->nb[2], sb[0], sb[1], sb[2], sb[3], sb[4], sb[5], sb[6], sb[7]);
+    CUDA_CHECK(cudaGetLastError());
+}
