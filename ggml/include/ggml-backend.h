@@ -231,6 +231,8 @@ extern "C" {
     typedef void   (*ggml_backend_comm_allreduce_launch_t)(void * comm_ctx, struct ggml_tensor ** tensors, size_t rank);
     // srcs[i] are slices along dim 0 that, concatenated in device order, give dsts[i]; all dsts have the same shape
     typedef bool   (*ggml_backend_comm_allgather_tensor_t)(void * comm_ctx, struct ggml_tensor ** srcs, struct ggml_tensor ** dsts);
+    // Optional: reduce every tensor in F32, also the large ones a backend would otherwise send in 16 bits
+    typedef void   (*ggml_backend_comm_set_reduce_f32_t)(void * comm_ctx, bool reduce_f32);
 
     // Expert cache in device memory for a MoE weight that stays in host memory (meta backend). The handle goes
     // into the extra of a pool tensor holding cap experts of this device's slice; MUL_MAT_ID on that pool gathers
@@ -519,6 +521,11 @@ extern "C" {
     //       express this as a backend registry functionality instead
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
+
+    // the all-reduces of the backends of this meta device sum in F32 whatever the tensor size (a backend may reduce large
+    // tensors in 16 bits); for results that feed a quantizer or another step sensitive to rounding. Set before the
+    // first backend of the device is created.
+    GGML_API void ggml_backend_meta_device_set_reduce_f32(ggml_backend_dev_t meta_dev, bool reduce_f32);
 
     // number of simple devices a tensor in a meta buffer is spread over; 0 if the tensor is not in a meta buffer
     GGML_API size_t ggml_backend_meta_tensor_n_simple(const struct ggml_tensor * tensor);

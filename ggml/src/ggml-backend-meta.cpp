@@ -65,6 +65,7 @@ struct ggml_backend_meta_device_context {
     ggml_backend_meta_get_split_state_t get_split_state;
     void *                              get_split_state_ud;
     std::vector<ggml_backend_t>         live_backends; // buffer operations borrow the first one's launch workers
+    bool                                reduce_f32 = false; // see ggml_backend_meta_device_set_reduce_f32
 
     std::string name;
     std::string description;
@@ -421,6 +422,11 @@ ggml_backend_dev_t ggml_backend_meta_device(
 
     auto result = meta_devs.emplace(*ctxs.back(), meta_dev);
     return &result.first->second;
+}
+
+void ggml_backend_meta_device_set_reduce_f32(ggml_backend_dev_t meta_dev, bool reduce_f32) {
+    GGML_ASSERT(ggml_backend_dev_is_meta(meta_dev));
+    static_cast<ggml_backend_meta_device_context *>(meta_dev->context)->reduce_f32 = reduce_f32;
 }
 
 //
@@ -5138,6 +5144,13 @@ struct ggml_backend_meta_context {
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_init");
             if (comm_init != nullptr) {
                 comm_ctx = comm_init(simple_backends.data(), simple_backends.size());
+            }
+        }
+        if (comm_ctx != nullptr && static_cast<const ggml_backend_meta_device_context *>(meta_dev->context)->reduce_f32) {
+            auto set_reduce_f32 = (ggml_backend_comm_set_reduce_f32_t) ggml_backend_reg_get_proc_address(
+                ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_set_reduce_f32");
+            if (set_reduce_f32 != nullptr) {
+                set_reduce_f32(comm_ctx, true);
             }
         }
         if (comm_ctx != nullptr) {

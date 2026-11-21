@@ -1562,6 +1562,9 @@ struct ggml_backend_cuda_comm_context {
     // comm_init_rank created this context.
     int                         world_size = 0;
 
+    // Reduce in F32 at every size: no BF16 round trip for large tensors (ggml_backend_meta_device_set_reduce_f32)
+    bool                        reduce_f32 = false;
+
     // Number of ranks taking part in the reduction. For a communicator from comm_init_rank this is
     // world_size. Otherwise it is the number of backends this process holds. The NCCL reduction
     // uses it to choose the tensor size below which it reduces in F32 rather than converting to
@@ -1654,7 +1657,7 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
 
     // For small tensors, simply reduce them as FP32.
     // The following heuristic for how "small" a tensor should be is based on RTX 4090s connected via 16x PCIe 4.0.
-    if (ar_dt == AR_F32 ||
+    if (ar_dt == AR_F32 || comm_ctx->reduce_f32 ||
             (n_ranks <= 2 && ne < 32768) || (n_ranks == 3 && ne < 131072) || (n_ranks >= 4 && ne < 262144)) {
         for (size_t i = 0; i < n_backends; ++i) {
             if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
@@ -1824,6 +1827,10 @@ static bool ggml_backend_cuda_comm_try_allreduce_nccl(
 
 static bool ggml_backend_cuda_comm_try_allreduce_internal(
         ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    // the pipeline sends F32 tensors as BF16; the meta backend's own reduction stays in F32
+    if (comm_ctx->reduce_f32) {
+        return false;
+    }
     return ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors);
 }
 
@@ -2075,6 +2082,12 @@ static bool ggml_backend_cuda_comm_allreduce_prepare(void * comm_ctx_v, struct g
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
     return comm_ctx->p2p_ar != nullptr &&
         ggml_cuda_p2p_ar_prepare(comm_ctx->p2p_ar, comm_ctx->backends.data(), tensors);
+}
+
+static void ggml_backend_cuda_comm_set_reduce_f32(void * comm_ctx_v, bool reduce_f32) {
+    if (comm_ctx_v != nullptr) {
+        static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v)->reduce_f32 = reduce_f32;
+    }
 }
 
 static void ggml_backend_cuda_comm_allreduce_launch(void * comm_ctx_v, struct ggml_tensor ** tensors, size_t rank) {
@@ -13025,6 +13038,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_prepare") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_prepare;
+    }
+    if (strcmp(name, "ggml_backend_comm_set_reduce_f32") == 0) {
+        return (void *)ggml_backend_cuda_comm_set_reduce_f32;
     }
     if (strcmp(name, "ggml_backend_expert_cache_create") == 0) {
         return (void *)ggml_backend_cuda_expert_cache_create;

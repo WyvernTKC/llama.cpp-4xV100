@@ -291,6 +291,8 @@ struct mtmd_graph_longcat_next_gen : mtmd_graph_chatterbox {
     static constexpr int est_chunk = 100;
     static constexpr int n_steps   = 10;
     static constexpr float cfg     = 0.7f;
+    // head size of the decoder and prenet layers (their configs give the width, 1280 and 512)
+    static constexpr int dec_d_head = 64;
 
   private:
     ggml_cgraph * build_depth_head();

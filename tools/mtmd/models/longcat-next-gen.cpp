@@ -144,7 +144,7 @@ ggml_cgraph * mtmd_graph_longcat_next_gen::build_mel() {
 
     ggml_tensor * causal = build_inp_attn_mask(T2, T2, 0);
     for (const auto & l : g.dec_layers) {
-        y = dec_layer(l, y, NORM_TYPE_NORMAL, 1e-5f, (int) (n_dec / 64), causal);
+        y = dec_layer(l, y, NORM_TYPE_NORMAL, 1e-5f, (int) (n_dec / dec_d_head), causal);
     }
     y = build_norm(y, g.dec_post_ln_w, g.dec_post_ln_b, NORM_TYPE_NORMAL, 1e-5f, -1);
     cb(y, "dec_out", -1);
@@ -153,7 +153,7 @@ ggml_cgraph * mtmd_graph_longcat_next_gen::build_mel() {
     y = cbx_linear(g.pre_in2_w, g.pre_in2_b, ggml_silu(ctx0, cbx_linear(g.pre_in1_w, g.pre_in1_b, y)));
     const int64_t n_pre = y->ne[0];
     for (const auto & l : g.pre_layers) {
-        y = dec_layer(l, y, NORM_TYPE_RMS, 1e-6f, (int) (n_pre / 64), causal);
+        y = dec_layer(l, y, NORM_TYPE_RMS, 1e-6f, (int) (n_pre / dec_d_head), causal);
     }
     y = build_norm(y, g.pre_out_norm_w, nullptr, NORM_TYPE_RMS, 1e-6f, -1);
     ggml_tensor * mu = build_mm(g.pre_out_w, y); // [80, T2]

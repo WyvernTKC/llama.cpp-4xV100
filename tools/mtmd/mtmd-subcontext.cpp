@@ -189,6 +189,8 @@ ggml_backend_dev_t mtmd_split_device(const char * fname, const ggml_backend_dev_
     const char * what = nullptr;
     const char * why  = nullptr;
     std::vector<mtmd_split_group> groups;
+    // sum the partial results in F32 also where the backend would use 16 bits for large tensors
+    bool reduce_f32 = false;
     const projector_type proj_v = projector_type_from_string(proj);
     if (proj_v == PROJECTOR_TYPE_QWEN3VL || proj_v == PROJECTOR_TYPE_GEMMA4V) {
         what = "the vision encoder";
@@ -196,6 +198,26 @@ ggml_backend_dev_t mtmd_split_device(const char * fname, const ggml_backend_dev_
             why = "the mmproj has an audio encoder";
         }
         groups.push_back({ "v.blk.", get_u32(mtmd_format(KEY_N_HEAD, "vision")) });
+    } else if (proj_v == PROJECTOR_TYPE_LONGCAT_NEXT_V ||
+               projector_type_from_string(get_str(KEY_AUDIO_PROJ_TYPE)) == PROJECTOR_TYPE_LONGCAT_NEXT_A ||
+               proj_gen == PROJECTOR_TYPE_LONGCAT_NEXT_GEN) {
+        // every part of the LongCat-Next mmproj: the vision and audio encoders, and the speech generator's depth head,
+        //   decoder and prenet (its flow-matching estimator and vocoder stay mirrored)
+        what = "the LongCat-Next encoders and speech generator";
+        // the encoders end in a residual quantizer: BF16 sums moved 66% of the image codes and 19% of the audio codes
+        reduce_f32 = true;
+        if (get_bool(KEY_HAS_VISION_ENC)) {
+            groups.push_back({ "v.blk.", get_u32(mtmd_format(KEY_N_HEAD, "vision")) });
+        }
+        if (get_bool(KEY_HAS_AUDIO_ENC)) {
+            groups.push_back({ "a.blk.", get_u32(mtmd_format(KEY_N_HEAD, "audio")) });
+        }
+        if (proj_gen == PROJECTOR_TYPE_LONGCAT_NEXT_GEN) {
+            const int64_t d_head = mtmd_graph_longcat_next_gen::dec_d_head;
+            groups.push_back({ "a.gen.head.blk.", get_u32(mtmd_format(KEY_N_HEAD, "gen.audio")) });
+            groups.push_back({ "a.gen.dec.blk.", n_rows("a.gen.dec.blk.0.attn_q.weight") / d_head });
+            groups.push_back({ "a.gen.pre.blk.", n_rows("a.gen.pre.blk.0.attn_q.weight") / d_head });
+        }
     } else if (proj_gen == PROJECTOR_TYPE_MINIMAX_MUSIC3_GEN) {
         what = "the depth decoder and the DiT";
         if (get_bool(KEY_HAS_VISION_ENC) || get_bool(KEY_HAS_AUDIO_ENC)) {
@@ -204,7 +226,7 @@ ggml_backend_dev_t mtmd_split_device(const char * fname, const ggml_backend_dev_
         groups.push_back({ "a.gen.code.blk.", get_u32(mtmd_format(KEY_N_HEAD, "gen.audio")) });
         groups.push_back({ "a.gen.flow.blk.", n_rows("a.gen.flow.blk.0.attn_q.weight") / mtmd_graph_music3_gen::dit_d_head });
     } else {
-        why = "only the qwen3vl_merger and gemma4v vision encoders and the minimax_music3 generator have split rules";
+        why = "only the qwen3vl_merger and gemma4v vision encoders, LongCat-Next and the minimax_music3 generator have split rules";
     }
     // attn_out and ffn_down are split along their rows: a quantized one needs the device boundaries in whole blocks
     auto ends_with = [](const std::string & s, const char * suffix) {
@@ -261,7 +283,11 @@ ggml_backend_dev_t mtmd_split_device(const char * fname, const ggml_backend_dev_
     // never freed: the meta device is cached for the process and keeps this pointer
     auto * ud = new mtmd_split_userdata { (int) n_devs, std::move(groups) };
     std::vector<ggml_backend_dev_t> dev_list(devs, devs + n_devs);
-    return ggml_backend_meta_device(dev_list.data(), dev_list.size(), mtmd_split_state, ud);
+    ggml_backend_dev_t dev = ggml_backend_meta_device(dev_list.data(), dev_list.size(), mtmd_split_state, ud);
+    if (reduce_f32) {
+        ggml_backend_meta_device_set_reduce_f32(dev, true);
+    }
+    return dev;
 }
 
 mtmd_backends::mtmd_backends(ggml_backend_dev_t device, int n_threads, int max_nodes,
