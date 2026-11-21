@@ -1174,3 +1174,53 @@ void ggml_cuda_op_get_rows_dot_max(ggml_backend_cuda_context & ctx, const ggml_t
     }
     CUDA_CHECK(cudaGetLastError());
 }
+
+// The per-head flash attention mask of a relative-position bias (Inkling 2): out[kv, t', h, s] = table[h, pos[kv, t], t] +
+//   mask[kv, t', 0, s], t = t' + s*n_tps, in f16. The GET_ROWS, the CONT of its permute, the cast of the mask, the ADD and
+//   the cast of the sum in one pass, without the f32 bias [n_kv, n_tokens, n_head] in memory.
+static __global__ void rel_pos_mask_f16(const float * __restrict__ table, const int32_t * __restrict__ pos,
+        const half * __restrict__ mask, half * __restrict__ dst, const int n_kv, const int n_tps, const int n_head,
+        const int64_t st1, const int64_t st2, const int64_t sp1, const int64_t sm1, const int64_t sm3) {
+    const int kv = blockIdx.x*blockDim.x + threadIdx.x;
+    if (kv >= n_kv) {
+        return;
+    }
+    const int tq = blockIdx.y;      // token in its stream
+    const int hs = blockIdx.z;      // head + n_head*stream
+    const int h  = hs % n_head;
+    const int s  = hs / n_head;
+    const int t  = tq + s*n_tps;
+    const int d  = pos[kv + t*sp1];
+    const float b = table[h + d*st1 + t*st2];
+    const float m = __half2float(mask[kv + tq*sm1 + s*sm3]);
+    dst[kv + (int64_t) n_kv*(tq + (int64_t) n_tps*(h + (int64_t) n_head*s))] = __float2half(b + m);
+}
+
+bool ggml_cuda_should_fuse_rel_pos_mask(const ggml_tensor * get_rows, const ggml_tensor * cont, const ggml_tensor * mask,
+        const ggml_tensor * dst) {
+    const ggml_tensor * table = get_rows->src[0];
+    const ggml_tensor * pos   = get_rows->src[1];
+    return table->type == GGML_TYPE_F32 && ggml_is_contiguous(table) && pos->type == GGML_TYPE_I32 && ggml_is_contiguous(pos) &&
+        mask->type == GGML_TYPE_F16 && mask->nb[0] == sizeof(half) && mask->ne[2] == 1 && dst->type == GGML_TYPE_F16 &&
+        ggml_is_contiguous(dst) && cont->type == GGML_TYPE_F32 && ggml_are_same_shape(cont, dst) &&
+        get_rows->ne[0] == table->ne[0] && pos->ne[0] == dst->ne[0] && mask->ne[0] == dst->ne[0] && mask->ne[1] == dst->ne[1] &&
+        mask->ne[3] == dst->ne[3] && dst->ne[2] == table->ne[0] && pos->ne[1] == table->ne[2] &&
+        pos->ne[1] == dst->ne[1]*dst->ne[3] && dst->ne[1] <= 65535 && dst->ne[2]*dst->ne[3] <= 65535;
+}
+
+void ggml_cuda_op_rel_pos_mask(ggml_backend_cuda_context & ctx, const ggml_tensor * get_rows, const ggml_tensor * mask,
+        ggml_tensor * dst) {
+    const ggml_tensor * table = get_rows->src[0];
+    const ggml_tensor * pos   = get_rows->src[1];
+    const int n_kv   = dst->ne[0];
+    const int n_tps  = dst->ne[1];
+    const int n_head = dst->ne[2];
+    const int n_s    = dst->ne[3];
+    const dim3 block(256, 1, 1);
+    const dim3 grid((n_kv + block.x - 1)/block.x, n_tps, n_head*n_s);
+    rel_pos_mask_f16<<<grid, block, 0, ctx.stream()>>>((const float *) table->data, (const int32_t *) pos->data,
+        (const half *) mask->data, (half *) dst->data, n_kv, n_tps, n_head,
+        table->nb[1]/sizeof(float), table->nb[2]/sizeof(float), pos->nb[1]/sizeof(int32_t),
+        mask->nb[1]/sizeof(half), mask->nb[3]/sizeof(half));
+    CUDA_CHECK(cudaGetLastError());
+}

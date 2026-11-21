@@ -37,3 +37,9 @@ void ggml_cuda_op_get_rows_dot_max(ggml_backend_cuda_context & ctx, const ggml_t
 // whether two fusable GET_ROWS -> SET_ROWS pairs share their indices, types and row count and neither writes what the other reads
 bool ggml_cuda_can_pair_get_rows_set_rows(const ggml_tensor * get_rows0, const ggml_tensor * set_rows0,
         const ggml_tensor * get_rows1, const ggml_tensor * set_rows1);
+
+// the f16 per-head mask table[h, pos[kv, t], t] + mask[kv, t] of a relative-position bias in one pass (see getrows.cu)
+bool ggml_cuda_should_fuse_rel_pos_mask(const ggml_tensor * get_rows, const ggml_tensor * cont, const ggml_tensor * mask,
+        const ggml_tensor * dst);
+void ggml_cuda_op_rel_pos_mask(ggml_backend_cuda_context & ctx, const ggml_tensor * get_rows, const ggml_tensor * mask,
+        ggml_tensor * dst);

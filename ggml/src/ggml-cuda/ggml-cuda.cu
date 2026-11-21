@@ -6897,9 +6897,63 @@ static bool ggml_cuda_mmvq_q8_1_enabled() {
     return !disabled;
 }
 
-// MLA's V up-projection at one token (v_mla in build_attn_mha) is a matvec per head, permuted and made contiguous for the
-//   output projection. With one token the permutation keeps the memory order and the CONT is a plain copy: the matvec
-//   writes its output to the CONT's buffer, with the q8_1 copy for the output projection.
+// The per-head mask of a relative-position bias (Inkling 2): GET_ROWS(table, pos), RESHAPE, PERMUTE, CONT, CPY(mask -> f32),
+//   ADD, CPY(-> f16) in one pass (ggml_cuda_op_rel_pos_mask). GGML_CUDA_NO_REL_POS_MASK_FUSION=1 turns it off.
+static int ggml_cuda_try_fuse_rel_pos_mask(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_REL_POS_MASK_FUSION") != nullptr;
+    const ggml_tensor * gr = cgraph->nodes[i];
+    if (disabled || gr->src[1]->type != GGML_TYPE_I32 || gr->src[1]->ne[2] != 1 || gr->src[0]->type != GGML_TYPE_F32 ||
+            i + 6 >= cgraph->n_nodes || cgraph->nodes[i + 1]->op != GGML_OP_RESHAPE) {
+        return 0;
+    }
+    // the views between carry no compute flag in a split graph, so the uses are checked here instead of ggml_can_fuse_subgraph
+    static const ggml_op ops[7] = { GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_CPY, GGML_OP_ADD, GGML_OP_CPY };
+    for (int k = 0; k < 7; ++k) {
+        const ggml_tensor * n = cgraph->nodes[i + k];
+        const bool view = k == 1 || k == 2;
+        if (n->op != ops[k] || (!view && !(n->flags & GGML_TENSOR_FLAG_COMPUTE)) || (k < 6 && (n->flags & GGML_TENSOR_FLAG_OUTPUT)) ||
+                (k < 6 && k != 4 && ggml_cuda_graph_use_count(cgraph, n) != 1)) {
+            return 0;
+        }
+    }
+    const ggml_tensor * rs   = cgraph->nodes[i + 1];
+    const ggml_tensor * perm = cgraph->nodes[i + 2];
+    const ggml_tensor * cont = cgraph->nodes[i + 3];
+    const ggml_tensor * mcpy = cgraph->nodes[i + 4];
+    const ggml_tensor * add  = cgraph->nodes[i + 5];
+    ggml_tensor       * out  = cgraph->nodes[i + 6];
+    const ggml_tensor * mask = mcpy->src[0];
+    if (rs->src[0] != gr || perm->src[0] != rs || cont->src[0] != perm || add->src[0] != cont || add->src[1] != mcpy ||
+            out->src[0] != add || mcpy->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 ||
+            perm->op_params[0] != 2 || perm->op_params[1] != 0 || perm->op_params[2] != 1 || perm->op_params[3] != 3 ||
+            !ggml_are_same_shape(mcpy, mask) || !ggml_cuda_should_fuse_rel_pos_mask(gr, cont, mask, out)) {
+        return 0;
+    }
+    // the index and the mask are read while the output is written; the f32 cast of the mask may have more readers
+    const ggml_tensor * table = gr->src[0];
+    const bool mcpy_runs = ggml_cuda_graph_use_count(cgraph, mcpy) != 1;
+    if (ggml_cuda_tensors_overlap(out, gr->src[1]) || ggml_cuda_tensors_overlap(out, mask) ||
+            (mcpy_runs && ggml_cuda_tensors_overlap(out, mcpy))) {
+        return 0;
+    }
+    // ggml-alloc may place the output over the table, which the elided GET_ROWS read last: the kernel then reads a copy
+    ggml_cuda_pool_alloc<char> table_copy(cuda_ctx->pool());
+    ggml_tensor table_staged = *table;
+    if (ggml_cuda_tensors_overlap(out, table)) {
+        table_copy.alloc(ggml_nbytes(table));
+        CUDA_CHECK(cudaMemcpyAsync(table_copy.get(), table->data, ggml_nbytes(table), cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+        table_staged.data = table_copy.get();
+    }
+    ggml_tensor gr_staged = *gr;
+    gr_staged.src[0] = &table_staged;
+    ggml_cuda_op_rel_pos_mask(*cuda_ctx, &gr_staged, mask, out);
+    // a cast with other readers runs after the kernel, as ggml-alloc may have put it over the inputs of the elided GET_ROWS
+    if (mcpy_runs) {
+        ggml_cuda_cpy(*cuda_ctx, mcpy->src[0], mcpy->src[1]);
+    }
+    return 6;
+}
+
 // A row clipped to an L2 norm of at most t (Inkling 2): [MUL(x, s)], SQR, SUM_ROWS, SQRT, SCALE, FILL(t), DIV, CLAMP, MUL
 //   in one launch (ggml_cuda_op_l2_clip) instead of eight or nine. GGML_CUDA_NO_L2_CLIP_FUSION=1 turns it off.
 static int ggml_cuda_try_fuse_l2_clip(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
@@ -6988,6 +7042,9 @@ static int ggml_cuda_try_fuse_cont_small_k(ggml_backend_cuda_context * cuda_ctx,
     return 1;
 }
 
+// MLA's V up-projection at one token (v_mla in build_attn_mha) is a matvec per head, permuted and made contiguous for the
+//   output projection. With one token the permutation keeps the memory order and the CONT is a plain copy: the matvec
+//   writes its output to the CONT's buffer, with the q8_1 copy for the output projection.
 static int ggml_cuda_try_fuse_mmvq_cont(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
     const int out_nodes[] = { i + 2 };
     if (!ggml_cuda_mmvq_q8_1_enabled() ||
@@ -8627,6 +8684,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_FILL) {
         const int n_skip = ggml_cuda_try_fuse_qsa_topk_mask(cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_GET_ROWS) {
+        const int n_skip = ggml_cuda_try_fuse_rel_pos_mask(cuda_ctx, cgraph, i);
         if (n_skip > 0) {
             return n_skip;
         }
