@@ -2,6 +2,9 @@
 
 #define MMVF_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVF kernels.
 
+#define MMF_SMALL_K_MAX      16 // max. row length of src0 for ggml_cuda_mul_mat_small_k
+#define MMF_SMALL_K_MAX_COLS  8 // max. src1 columns for ggml_cuda_mul_mat_small_k
+
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 
@@ -39,3 +42,7 @@ bool ggml_cuda_mul_mat_vec_f_gdn_qkv(const ggml_tensor * src0, const ggml_tensor
 //   one token of f16 rows, every block normalizing all of y, which saves the norm's launch
 bool ggml_cuda_mul_mat_vec_f_norm_gated(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
     const ggml_tensor * x, const ggml_tensor * z, const ggml_tensor * w);
+
+// f32 matrix products with rows of at most MMF_SMALL_K_MAX: one thread per row of src0, which can be a transposed view
+bool ggml_cuda_should_use_mul_mat_small_k(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+void ggml_cuda_mul_mat_small_k(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);

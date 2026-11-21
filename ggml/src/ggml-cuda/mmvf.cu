@@ -2481,3 +2481,97 @@ bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, 
             return false;
     }
 }
+
+// dst[r, c] = sum_k x[k, r]*y[k, c] for a few k and c, per batch: one thread per row, y of the batch in shared memory.
+//   x may be a transposed view (stride sx0 between the k of a row), which a warp then reads coalesced along the rows.
+template <int ncols>
+static __global__ void mul_mat_f32_small_k(
+        const float * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst, const int k_x, const int nrows,
+        const int64_t sx0, const int64_t sx1, const int64_t sx2, const int64_t sx3,
+        const int64_t sy1, const int64_t sy2, const int64_t sy3,
+        const int64_t sd1, const int64_t sd2, const int64_t sd3, const int r2, const int r3) {
+    __shared__ float ys[MMF_SMALL_K_MAX*ncols];
+
+    const int i2 = blockIdx.y;
+    const int i3 = blockIdx.z;
+
+    const float * yb = y + i2*sy2 + i3*sy3;
+    for (int t = threadIdx.x; t < k_x*ncols; t += blockDim.x) {
+        const int c = t / k_x;
+        const int k = t - c*k_x;
+        ys[t] = yb[c*sy1 + k];
+    }
+    __syncthreads();
+
+    const int r = blockIdx.x*blockDim.x + threadIdx.x;
+    if (r >= nrows) {
+        return;
+    }
+
+    const float * xr = x + (i2/r2)*sx2 + (i3/r3)*sx3 + r*sx1;
+
+    float acc[ncols] = {0.0f};
+    for (int k = 0; k < k_x; ++k) {
+        const float xv = xr[k*sx0];
+#pragma unroll
+        for (int c = 0; c < ncols; ++c) {
+            acc[c] += xv*ys[c*k_x + k];
+        }
+    }
+
+    float * d = dst + i2*sd2 + i3*sd3 + r;
+#pragma unroll
+    for (int c = 0; c < ncols; ++c) {
+        d[c*sd1] = acc[c];
+    }
+}
+
+bool ggml_cuda_should_use_mul_mat_small_k(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        src0->ne[0] <= MMF_SMALL_K_MAX && src1->ne[1] <= MMF_SMALL_K_MAX_COLS && src0->ne[1] >= 64 &&
+        src1->nb[0] == sizeof(float) && src0->nb[0] % sizeof(float) == 0 && src0->nb[1] % sizeof(float) == 0 &&
+        src0->nb[2] % sizeof(float) == 0 && src0->nb[3] % sizeof(float) == 0 &&
+        src1->nb[1] % sizeof(float) == 0 && src1->nb[2] % sizeof(float) == 0 && src1->nb[3] % sizeof(float) == 0 &&
+        ggml_is_contiguous(dst) && src1->ne[2] % src0->ne[2] == 0 && src1->ne[3] % src0->ne[3] == 0 &&
+        src1->ne[2] <= 65535 && src1->ne[3] <= 65535;
+}
+
+void ggml_cuda_mul_mat_small_k(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_cuda_should_use_mul_mat_small_k(src0, src1, dst));
+
+    const int64_t ts = sizeof(float);
+    const int k_x   = src0->ne[0];
+    const int nrows = src0->ne[1];
+    const int ncols = src1->ne[1];
+
+    const dim3 block(256, 1, 1);
+    const dim3 grid((nrows + block.x - 1)/block.x, src1->ne[2], src1->ne[3]);
+
+    const float * x = (const float *) src0->data;
+    const float * y = (const float *) src1->data;
+    float       * d = (float *) dst->data;
+
+    const int r2 = src1->ne[2]/src0->ne[2];
+    const int r3 = src1->ne[3]/src0->ne[3];
+
+    cudaStream_t stream = ctx.stream();
+
+#define MUL_MAT_SMALL_K_CASE(n) \
+    case n: mul_mat_f32_small_k<n><<<grid, block, 0, stream>>>(x, y, d, k_x, nrows, \
+        src0->nb[0]/ts, src0->nb[1]/ts, src0->nb[2]/ts, src0->nb[3]/ts, src1->nb[1]/ts, src1->nb[2]/ts, src1->nb[3]/ts, \
+        dst->nb[1]/ts, dst->nb[2]/ts, dst->nb[3]/ts, r2, r3); break;
+
+    switch (ncols) {
+        MUL_MAT_SMALL_K_CASE(1)
+        MUL_MAT_SMALL_K_CASE(2)
+        MUL_MAT_SMALL_K_CASE(3)
+        MUL_MAT_SMALL_K_CASE(4)
+        MUL_MAT_SMALL_K_CASE(5)
+        MUL_MAT_SMALL_K_CASE(6)
+        MUL_MAT_SMALL_K_CASE(7)
+        MUL_MAT_SMALL_K_CASE(8)
+        default: GGML_ABORT("fatal error");
+    }
+#undef MUL_MAT_SMALL_K_CASE
+    CUDA_CHECK(cudaGetLastError());
+}

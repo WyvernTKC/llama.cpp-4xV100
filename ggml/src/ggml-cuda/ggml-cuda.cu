@@ -3013,6 +3013,7 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
 
 enum ggml_cuda_mul_mat_path {
     GGML_CUDA_MUL_MAT_PATH_CUBLAS,
+    GGML_CUDA_MUL_MAT_PATH_SMALL_K,
     GGML_CUDA_MUL_MAT_PATH_MMVF,
     GGML_CUDA_MUL_MAT_PATH_MMVF_TRANSPOSED,
     GGML_CUDA_MUL_MAT_PATH_MMF,
@@ -3024,6 +3025,11 @@ enum ggml_cuda_mul_mat_path {
 // the kernel ggml_cuda_mul_mat runs a MUL_MAT without the Hadamard hint on
 static ggml_cuda_mul_mat_path ggml_cuda_mul_mat_choose(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
+
+    // rows of a few values (the weighted sum of a depth mix): one thread per row beats a warp per row and batched cuBLAS
+    if (ggml_cuda_should_use_mul_mat_small_k(src0, src1, dst)) {
+        return GGML_CUDA_MUL_MAT_PATH_SMALL_K;
+    }
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
@@ -3078,6 +3084,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
                 break;
             }
             ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+            break;
+        case GGML_CUDA_MUL_MAT_PATH_SMALL_K:
+            ggml_cuda_mul_mat_small_k(ctx, src0, src1, dst);
             break;
         case GGML_CUDA_MUL_MAT_PATH_MMVF:
             ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
@@ -6876,6 +6885,34 @@ static bool ggml_cuda_mmvq_q8_1_enabled() {
 // MLA's V up-projection at one token (v_mla in build_attn_mha) is a matvec per head, permuted and made contiguous for the
 //   output projection. With one token the permutation keeps the memory order and the CONT is a plain copy: the matvec
 //   writes its output to the CONT's buffer, with the q8_1 copy for the output projection.
+// A CONT of a transposed view that only a MUL_MAT with rows of a few values reads (the weighted sum of a depth mix):
+//   the small-k kernel reads the view in place, coalesced along the rows, instead of a copy. GGML_CUDA_NO_SMALL_K_CONT=1 off.
+static int ggml_cuda_try_fuse_cont_small_k(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_SMALL_K_CONT") != nullptr;
+    const int out_nodes[] = { i + 1 };
+    if (disabled || !ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_CONT, GGML_OP_MUL_MAT }, { i + 1 })) {
+        return 0;
+    }
+    const ggml_tensor * cont = cgraph->nodes[i];
+    ggml_tensor       * mm   = cgraph->nodes[i + 1];
+    const ggml_tensor * view = cont->src[0];
+    if (mm->src[0] != cont || mm->src[1] == cont || view == nullptr || view->type != GGML_TYPE_F32 || cont->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(view, cont) || ggml_cuda_op_mul_mat_use_fwht(mm) ||
+            ggml_cuda_mul_mat_choose(*cuda_ctx, cont, mm->src[1], mm) != GGML_CUDA_MUL_MAT_PATH_SMALL_K) {
+        return 0;
+    }
+    ggml_tensor x = *cont;
+    x.data = view->data;
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        x.nb[d] = view->nb[d];
+    }
+    if (!ggml_cuda_should_use_mul_mat_small_k(&x, mm->src[1], mm) || !ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
+        return 0;
+    }
+    ggml_cuda_mul_mat_small_k(*cuda_ctx, &x, mm->src[1], mm);
+    return 1;
+}
+
 static int ggml_cuda_try_fuse_mmvq_cont(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
     const int out_nodes[] = { i + 2 };
     if (!ggml_cuda_mmvq_q8_1_enabled() ||
@@ -8515,6 +8552,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_FILL) {
         const int n_skip = ggml_cuda_try_fuse_qsa_topk_mask(cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_CONT) {
+        const int n_skip = ggml_cuda_try_fuse_cont_small_k(cuda_ctx, cgraph, i);
         if (n_skip > 0) {
             return n_skip;
         }
