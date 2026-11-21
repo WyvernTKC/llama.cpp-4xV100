@@ -113,3 +113,7 @@ void ggml_cuda_op_dsv4_hc_post_pre(ggml_backend_cuda_context & ctx, ggml_tensor 
 void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// dst = y*clamp(t/(sqrt(sum(y*y))*scale + bias), lo, hi) per row, y = x*s (s: a vector per row of x, or none)
+void ggml_cuda_op_l2_clip(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * s, ggml_tensor * dst,
+        float scale, float bias, float t, float lo, float hi);

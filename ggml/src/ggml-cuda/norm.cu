@@ -3869,3 +3869,53 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
+
+// rows clipped to an L2 norm of at most t after an optional per-row scale vector (Inkling 2): y = x*s,
+//   f = clamp(t/(sqrt(sum(y*y))*scale + bias), lo, hi), dst = y*f. One warp per row.
+static __global__ void l2_clip_f32(const float * __restrict__ x, const float * __restrict__ s, float * __restrict__ dst,
+        const int ncols, const int nrows, const int ne1, const int ne2, const int64_t sx1, const int64_t sx2, const int64_t sx3,
+        const int64_t ss1, const int s_ne1, const float scale, const float bias, const float t, const float lo, const float hi) {
+    const int row  = blockIdx.x*(blockDim.x/WARP_SIZE) + threadIdx.x/WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    if (row >= nrows) {
+        return;
+    }
+    const int i1 = row % ne1;
+    const int i2 = (row/ne1) % ne2;
+    const int i3 = row/(ne1*ne2);
+
+    const float * xr = x + i1*sx1 + i2*sx2 + i3*sx3;
+    const float * sr = s ? s + (s_ne1 == 1 ? 0 : i1)*ss1 : nullptr;
+
+    float sum = 0.0f;
+    for (int c = lane; c < ncols; c += WARP_SIZE) {
+        const float v = sr ? xr[c]*sr[c] : xr[c];
+        sum += v*v;
+    }
+    sum = warp_reduce_sum(sum);
+
+    const float f = fminf(fmaxf(t/(sqrtf(sum)*scale + bias), lo), hi);
+
+    float * dr = dst + (int64_t) row*ncols;
+    for (int c = lane; c < ncols; c += WARP_SIZE) {
+        const float v = sr ? xr[c]*sr[c] : xr[c];
+        dr[c] = v*f;
+    }
+}
+
+void ggml_cuda_op_l2_clip(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * s, ggml_tensor * dst,
+        float scale, float bias, float t, float lo, float hi) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_are_same_shape(x, dst));
+    GGML_ASSERT(s == nullptr || (s->type == GGML_TYPE_F32 && ggml_is_contiguous(s) && s->ne[0] == x->ne[0] &&
+        (s->ne[1] == 1 || s->ne[1] == x->ne[1]) && s->ne[2] == 1 && s->ne[3] == 1));
+
+    const int64_t ts    = sizeof(float);
+    const int     nrows = ggml_nrows(x);
+    const int     rows_per_block = 4;
+
+    l2_clip_f32<<<(nrows + rows_per_block - 1)/rows_per_block, rows_per_block*WARP_SIZE, 0, ctx.stream()>>>(
+        (const float *) x->data, s ? (const float *) s->data : nullptr, (float *) dst->data, x->ne[0], nrows, x->ne[1], x->ne[2],
+        x->nb[1]/ts, x->nb[2]/ts, x->nb[3]/ts, s ? s->nb[1]/ts : 0, s ? s->ne[1] : 1, scale, bias, t, lo, hi);
+    CUDA_CHECK(cudaGetLastError());
+}

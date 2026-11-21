@@ -6885,6 +6885,66 @@ static bool ggml_cuda_mmvq_q8_1_enabled() {
 // MLA's V up-projection at one token (v_mla in build_attn_mha) is a matvec per head, permuted and made contiguous for the
 //   output projection. With one token the permutation keeps the memory order and the CONT is a plain copy: the matvec
 //   writes its output to the CONT's buffer, with the q8_1 copy for the output projection.
+// A row clipped to an L2 norm of at most t (Inkling 2): [MUL(x, s)], SQR, SUM_ROWS, SQRT, SCALE, FILL(t), DIV, CLAMP, MUL
+//   in one launch (ggml_cuda_op_l2_clip) instead of eight or nine. GGML_CUDA_NO_L2_CLIP_FUSION=1 turns it off.
+static int ggml_cuda_try_fuse_l2_clip(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_L2_CLIP_FUSION") != nullptr;
+    const bool scaled = cgraph->nodes[i]->op == GGML_OP_MUL;
+    const int  o      = scaled ? 1 : 0; // index of the SQR from i
+    const int  n      = o + 8;
+    if (disabled || i + n > cgraph->n_nodes) {
+        return 0;
+    }
+    const bool ok = scaled ?
+        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL,
+            GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL }, { i + n - 1 }) :
+        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL,
+            GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL }, { i + n - 1 });
+    if (!ok) {
+        return 0;
+    }
+    ggml_tensor * const * nd = cgraph->nodes + i;
+    const ggml_tensor * y    = scaled ? nd[0] : nd[0]->src[0];
+    const ggml_tensor * x    = scaled ? nd[0]->src[0] : y;
+    const ggml_tensor * sv   = scaled ? nd[0]->src[1] : nullptr;
+    const ggml_tensor * sqr  = nd[o + 0];
+    const ggml_tensor * sum  = nd[o + 1];
+    const ggml_tensor * sq   = nd[o + 2];
+    const ggml_tensor * sc   = nd[o + 3];
+    const ggml_tensor * fill = nd[o + 4];
+    const ggml_tensor * div  = nd[o + 5];
+    const ggml_tensor * clp  = nd[o + 6];
+    ggml_tensor       * out  = nd[o + 7];
+    if (sqr->src[0] != y || sum->src[0] != sqr || sq->src[0] != sum || sc->src[0] != sq || fill->src[0] != sc ||
+            div->src[0] != fill || div->src[1] != sc || clp->src[0] != div || out->src[0] != y || out->src[1] != clp) {
+        return 0;
+    }
+    for (const ggml_tensor * t : { x, y, sqr, sum, sq, sc, fill, div, clp, (const ggml_tensor *) out }) {
+        if (t->type != GGML_TYPE_F32) {
+            return 0;
+        }
+    }
+    if (x->nb[0] != sizeof(float) || x->ne[0] > 1024 || !ggml_is_contiguous(out) || !ggml_are_same_shape(x, out) ||
+            sum->ne[0] != 1 || !ggml_are_same_shape(sum, clp)) {
+        return 0;
+    }
+    if (scaled && (sv->type != GGML_TYPE_F32 || !ggml_is_contiguous(sv) || sv->ne[0] != x->ne[0] ||
+            (sv->ne[1] != 1 && sv->ne[1] != x->ne[1]) || sv->ne[2] != 1 || sv->ne[3] != 1)) {
+        return 0;
+    }
+    const int out_nodes[] = { i + n - 1 };
+    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, n, out_nodes, 1)) {
+        return 0;
+    }
+    const float scale = ggml_get_op_params_f32(sc, 0);
+    const float bias  = ggml_get_op_params_f32(sc, 1);
+    const float t     = ggml_get_op_params_f32(fill, 0);
+    const float lo    = ggml_get_op_params_f32(clp, 0);
+    const float hi    = ggml_get_op_params_f32(clp, 1);
+    ggml_cuda_op_l2_clip(*cuda_ctx, x, sv, out, scale, bias, t, lo, hi);
+    return n - 1;
+}
+
 // A CONT of a transposed view that only a MUL_MAT with rows of a few values reads (the weighted sum of a depth mix):
 //   the small-k kernel reads the view in place, coalesced along the rows, instead of a copy. GGML_CUDA_NO_SMALL_K_CONT=1 off.
 static int ggml_cuda_try_fuse_cont_small_k(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
@@ -8552,6 +8612,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_FILL) {
         const int n_skip = ggml_cuda_try_fuse_qsa_topk_mask(cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_MUL || node->op == GGML_OP_SQR) {
+        const int n_skip = ggml_cuda_try_fuse_l2_clip(cuda_ctx, cgraph, i);
         if (n_skip > 0) {
             return n_skip;
         }
