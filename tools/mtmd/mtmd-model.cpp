@@ -2686,7 +2686,11 @@ struct mtmd_model_loader {
                     model.mm_norm_mid_b = get_tensor(mtmd_format(TN_MM_NORM_MID, "bias"));
                     // the levels of the quantizer and their LLM rows are concatenated: [dim, sum of the codebook sizes]
                     model.rvq_codebook   = get_tensor(mtmd_format(TN_A_RVQ_CODEBOOK, "weight"));
-                    model.mm_a_code_embd = get_tensor(mtmd_format(TN_MM_A_CODE_EMBD, "weight"));
+                    // with the speech generator in the same file its code rows are these rows and one more:
+                    // mtmd_model_load() points this model at them instead of loading a second copy
+                    if (!has_gen_audio || gguf_find_tensor(ctx_gguf.get(), TN_GEN_CODE_EMBD) < 0) {
+                        model.mm_a_code_embd = get_tensor(mtmd_format(TN_MM_A_CODE_EMBD, "weight"));
+                    }
                     int64_t n_codes = 0;
                     for (int32_t n : hparams.rvq_codebook_size) {
                         if (n <= 0) {
@@ -2695,7 +2699,7 @@ struct mtmd_model_loader {
                         n_codes += n;
                     }
                     if (model.rvq_codebook->type != GGML_TYPE_F32 || model.rvq_codebook->ne[0] != model.mm_2_w->ne[1] ||
-                            model.rvq_codebook->ne[1] != n_codes || model.mm_a_code_embd->ne[1] != n_codes) {
+                            model.rvq_codebook->ne[1] != n_codes || (model.mm_a_code_embd && model.mm_a_code_embd->ne[1] != n_codes)) {
                         throw std::runtime_error(mtmd_format("%s: longcat-next: audio codebooks and code embedding do not match\n", __func__));
                     }
                 } break;
@@ -3646,7 +3650,7 @@ struct mtmd_model_loader {
                     };
 
                     // depth head
-                    g.code_embd     = get_tensor("a.gen.code_embd.weight");
+                    g.code_embd     = get_tensor(TN_GEN_CODE_EMBD);
                     g.hidden_norm_w = get_tensor("a.gen.head.hidden_norm.weight");
                     g.hidden_proj_w = get_tensor("a.gen.head.hidden_proj.weight");
                     load_layers("a.gen.head", g.head_layers);
@@ -4744,6 +4748,19 @@ mtmd_models mtmd_model_load(const char * fname, const mtmd_model_params & params
 
     if (loader.has_gen_audio) {
         res.gen_a = load(MTMD_MODALITY_GEN_AUDIO);
+    }
+
+    // longcat-next: the audio encoder reads its code rows from the speech generator's table (the same rows, one more)
+    if (res.a && res.a->proj_type == PROJECTOR_TYPE_LONGCAT_NEXT_A && !res.a->mm_a_code_embd) {
+        int64_t n_codes = 0;
+        for (int32_t n : res.a->hparams.rvq_codebook_size) {
+            n_codes += n;
+        }
+        const ggml_tensor * rows = res.gen_a && res.gen_a->proj_type == PROJECTOR_TYPE_LONGCAT_NEXT_GEN ? res.gen_a->lcn.code_embd : nullptr;
+        if (rows == nullptr || rows->ne[1] < n_codes) {
+            throw std::runtime_error(mtmd_format("%s: longcat-next: no code rows for the audio encoder\n", __func__));
+        }
+        res.a->mm_a_code_embd = res.gen_a->lcn.code_embd;
     }
 
     return res;

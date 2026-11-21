@@ -83,9 +83,19 @@ static int64_t mtmd_split_ffn_gran(const mtmd_split_group & g) {
     return std::lcm((int64_t) 8, g.blck_ffn);
 }
 
+// a two-linear MLP outside the transformer blocks, split like an FFN: the first linear(s) and their bias by output rows,
+// the second by input columns; gran: lcm of 8 and the block size of the second, so both cut at the same places
+struct mtmd_split_mlp {
+    std::vector<std::string> up;   // weights of the first linear(s), [n_in, n_ff]
+    std::string              up_b; // bias of the first linear, [n_ff], empty if none
+    std::string              down; // weight of the second linear, [n_ff, n_out]
+    int64_t                  gran = 8;
+};
+
 struct mtmd_split_userdata {
     int n_devices;
     std::vector<mtmd_split_group> groups;
+    std::vector<mtmd_split_mlp>   mlps;
 };
 
 // even split of ne in multiples of gran, segment repeated nr times (the q, k and v parts of a fused qkv)
@@ -125,6 +135,14 @@ static ggml_backend_meta_split_state mtmd_split_state(const ggml_tensor * tensor
     const bool head_kv_slot = name.rfind(std::string("gen_state_") + mtmd_graph_longcat_next_gen::head_kv_slot, 0) == 0;
     if (head_kv_slot) {
         name = "a.gen.head.blk.";
+    }
+    for (const auto & m : ud->mlps) {
+        if (std::find(m.up.begin(), m.up.end(), name) != m.up.end()) {
+            return mtmd_split_even(GGML_BACKEND_SPLIT_AXIS_1, tensor->ne[1], 1, ud->n_devices, m.gran);
+        }
+        if (name == m.up_b || name == m.down) {
+            return mtmd_split_even(GGML_BACKEND_SPLIT_AXIS_0, tensor->ne[0], 1, ud->n_devices, m.gran);
+        }
     }
     const mtmd_split_group * group = nullptr;
     for (const auto & g : ud->groups) {
@@ -197,6 +215,7 @@ ggml_backend_dev_t mtmd_split_device(const char * fname, const ggml_backend_dev_
     const char * what = nullptr;
     const char * why  = nullptr;
     std::vector<mtmd_split_group> groups;
+    std::vector<mtmd_split_mlp>   mlps;
     // sum the partial results in F32 also where the backend would use 16 bits for large tensors
     bool reduce_f32 = false;
     const projector_type proj_v = projector_type_from_string(proj);
@@ -226,6 +245,13 @@ ggml_backend_dev_t mtmd_split_device(const char * fname, const ggml_backend_dev_
             groups.push_back({ "a.gen.dec.blk.", n_rows("a.gen.dec.blk.0.attn_q.weight") / d_head });
             groups.push_back({ "a.gen.pre.blk.", n_rows("a.gen.pre.blk.0.attn_q.weight") / d_head });
         }
+        // the per-token MLPs around the encoders (2.4 GiB of the mmproj is mirrored, these are 0.47 GiB of it)
+        mlps = {
+            { { "mm.0.weight" },                          "mm.0.bias",         "mm.2.weight" },         // vision merger
+            { { "v.rvq.in_fc1.weight" },                  "v.rvq.in_fc1.bias", "v.rvq.in_fc2.weight" }, // vision quantizer input
+            { { "mm.up.weight", "mm.gate.weight" },       "",                  "mm.down.weight" },      // visual embedding
+            { { "mm.a.mlp.0.weight", "mm.a.mlp.1.weight" }, "",                "mm.a.mlp.2.weight" },   // audio bridge
+        };
     } else if (proj_gen == PROJECTOR_TYPE_MINIMAX_MUSIC3_GEN) {
         what = "the depth decoder and the DiT";
         if (get_bool(KEY_HAS_VISION_ENC) || get_bool(KEY_HAS_AUDIO_ENC)) {
@@ -258,6 +284,21 @@ ggml_backend_dev_t mtmd_split_device(const char * fname, const ggml_backend_dev_
             }
         }
     }
+    for (auto it = mlps.begin(); it != mlps.end();) {
+        const int64_t i_down = gguf_find_tensor(ctx, it->down.c_str());
+        bool ok = i_down >= 0;
+        if (ok) {
+            it->gran = std::lcm((int64_t) 8, (int64_t) ggml_blck_size(gguf_get_tensor_type(ctx, i_down)));
+            const ggml_tensor * down = ggml_get_tensor(meta, it->down.c_str());
+            ok = down->ne[0] / it->gran >= (int64_t) n_devs;
+            for (const auto & u : it->up) {
+                const ggml_tensor * up = ggml_get_tensor(meta, u.c_str());
+                ok = ok && up != nullptr && up->ne[1] == down->ne[0];
+            }
+            ok = ok && (it->up_b.empty() || ggml_get_tensor(meta, it->up_b.c_str()) != nullptr);
+        }
+        it = ok ? it + 1 : mlps.erase(it);
+    }
     for (const auto & g : groups) {
         if (why != nullptr) {
             break;
@@ -289,7 +330,7 @@ ggml_backend_dev_t mtmd_split_device(const char * fname, const ggml_backend_dev_
         }
     }
     // never freed: the meta device is cached for the process and keeps this pointer
-    auto * ud = new mtmd_split_userdata { (int) n_devs, std::move(groups) };
+    auto * ud = new mtmd_split_userdata { (int) n_devs, std::move(groups), std::move(mlps) };
     std::vector<ggml_backend_dev_t> dev_list(devs, devs + n_devs);
     ggml_backend_dev_t dev = ggml_backend_meta_device(dev_list.data(), dev_list.size(), mtmd_split_state, ud);
     if (reduce_f32) {

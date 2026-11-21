@@ -736,6 +736,11 @@ class LongcatNextMmprojModel(Qwen2VLVisionModel):
         # read on the host, or added to activations as is
         if new_name.startswith(("a.gen.hift.m_source.", "a.gen.dec.pos_embd")):
             return gguf.GGMLQuantizationType.F32
+        # the code rows are rows of the LLM's embed_tokens (Q8_0 in the usual text GGUF), looked up and summed; a
+        # split mmproj holds them on every device, so a 16-bit mmproj keeps them in Q8_0 (1.0 -> 0.53 GiB)
+        if new_name in ("mm.code_embd.weight", "mm.a.code_embd.weight", "a.gen.code_embd.weight") and \
+                self.ftype in (gguf.LlamaFileType.MOSTLY_F16, gguf.LlamaFileType.MOSTLY_BF16):
+            return gguf.GGMLQuantizationType.Q8_0
         return super().tensor_force_quant(name, new_name, bid, n_dims)
 
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:

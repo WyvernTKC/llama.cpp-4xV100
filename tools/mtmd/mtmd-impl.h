@@ -235,6 +235,7 @@
 #define TN_A_RVQ_CODEBOOK    "a.rvq.codebook.%s"
 // mimo-v2.5: text-side RVQ code embedding ("text codebook")
 #define TN_MM_A_CODE_EMBD    "mm.a.code_embd.%s"
+#define TN_GEN_CODE_EMBD     "a.gen.code_embd.weight" // longcat-next speech generator; the audio encoder shares it
 
 // longcat-next: vision residual quantizer, its codes index rows of the LLM embedding
 #define TN_V_RVQ_IN_NORM     "v.rvq.in_norm.%s"
