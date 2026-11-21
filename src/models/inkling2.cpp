@@ -237,6 +237,10 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
     const int64_t n_seqs       = ubatch.n_seqs;
 
+    // the input first: the gather of the history below then follows it, also when the input is the all-reduced output of
+    //   a projection split across devices (in the same subgraph as the convolution, which CUDA runs as one kernel)
+    ggml_build_forward_expand(gf, cur);
+
     ggml_tensor * past;
     if (dynamic) {
         past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
