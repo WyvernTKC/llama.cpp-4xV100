@@ -6555,10 +6555,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                     id++;
                 }
+                // the partial sums have one reader each; the full sum is all-reduced before any of its readers runs, so it
+                //   may have more (Inkling 2: its short convolution and the residual add of it)
                 {
                     ggml_tensor * next = cgraph->nodes[id+1];
                     if (next->op != GGML_OP_ADD || next->src[0] != cgraph->nodes[id - (n_used-1)] ||
-                            next->src[1] != cgraph->nodes[id - (n_used-2)] || ggml_node_get_use_count(cgraph, id+1) != 1) {
+                            next->src[1] != cgraph->nodes[id - (n_used-2)] ||
+                            (n_used > 2 && ggml_node_get_use_count(cgraph, id+1) != 1)) {
                         return idr;
                     }
                     id++;
@@ -6566,7 +6569,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 for (int32_t k = 0; k < n_used - 2; k++) {
                     ggml_tensor * next = cgraph->nodes[id+1];
                     if (next->op != GGML_OP_ADD || next->src[0] != cgraph->nodes[id] ||
-                            next->src[1] != cgraph->nodes[id - (n_used-2)] || ggml_node_get_use_count(cgraph, id+1) != 1) {
+                            next->src[1] != cgraph->nodes[id - (n_used-2)] ||
+                            (k < n_used - 3 && ggml_node_get_use_count(cgraph, id+1) != 1)) {
                         return idr;
                     }
                     id++;
