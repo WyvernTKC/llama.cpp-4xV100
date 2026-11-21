@@ -7039,9 +7039,10 @@ static int ggml_cuda_try_fuse_rel_pos_mask(ggml_backend_cuda_context * cuda_ctx,
             !ggml_are_same_shape(mcpy, mask) || !ggml_cuda_should_fuse_rel_pos_mask(gr, cont, mask, out)) {
         return 0;
     }
-    // the index and the mask are read while the output is written; the f32 cast of the mask may have more readers
+    // the index and the mask are read while the output is written; the f32 cast of the mask may have more readers (a
+    //   ggml_cast is its own src[1], which the graph counts as one more use)
     const ggml_tensor * table = sub ? sub->src[0] : gr->src[0];
-    const bool mcpy_runs = ggml_cuda_graph_use_count(cgraph, mcpy) != 1;
+    const bool mcpy_runs = ggml_cuda_graph_use_count(cgraph, mcpy) - (mcpy->src[1] == mcpy ? 1 : 0) != 1;
     if (ggml_cuda_tensors_overlap(out, gr->src[1]) || ggml_cuda_tensors_overlap(out, mask) ||
             (mcpy_runs && ggml_cuda_tensors_overlap(out, mcpy)) || (sinks && ggml_cuda_tensors_overlap(out, sinks))) {
         return 0;
