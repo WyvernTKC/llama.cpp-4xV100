@@ -5122,7 +5122,7 @@ static bool ggml_cuda_ssm_conv_state_fusion_match(
     f.silu     = cgraph->nodes[f.silu_idx];
     // Inkling 2: an ADD of the new tokens (the tensor whose transpose they are) and a SCALE instead of the SILU
     static const bool no_res_conv = getenv("GGML_CUDA_NO_RES_CONV_FUSION") != nullptr;
-    if (d_conv == 4 && !f.long_path && !no_res_conv && f.silu->op == GGML_OP_ADD && f.silu->src[1] == silu_src &&
+    if (d_conv == 4 && !no_res_conv && f.silu->op == GGML_OP_ADD && f.silu->src[1] == silu_src &&
             f.x->op == GGML_OP_TRANSPOSE && f.x->src[0]->op == GGML_OP_RESHAPE && f.x->src[0]->src[0] == f.silu->src[0] &&
             f.silu_idx + 1 < cgraph->n_nodes && ggml_cuda_graph_use_count(cgraph, f.silu) == 1 && !(f.silu->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         ggml_tensor * sc = cgraph->nodes[f.silu_idx + 1];
@@ -10641,7 +10641,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_tensor states = *f.states; // the row from the state of this convolution
             states.data = (char *) f.states->data + f.state_offs;
             if (f.long_path) {
-                ggml_cuda_op_ssm_conv_state_long(*cuda_ctx, &states, f.ids, f.x, f.ssm_conv, f.silu, f.long_slots);
+                ggml_cuda_op_ssm_conv_state_long(*cuda_ctx, &states, f.ids, f.x, f.ssm_conv, f.silu, f.long_slots, f.residual,
+                    f.res_scale, f.res_r);
             } else {
                 ggml_cuda_op_ssm_conv_state(*cuda_ctx, &states, f.ids, f.x, f.ssm_conv, f.silu, f.slots, f.gate, f.x_a, f.x_b,
                     f.residual, f.res_scale, f.res_r, f.dyn);

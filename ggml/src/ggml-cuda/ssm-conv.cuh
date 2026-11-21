@@ -52,4 +52,5 @@ struct ggml_cuda_ssm_conv_state_long_slots {
 // the same for one sequence of more tokens, without the concat in memory; silu may sit on x only with its layout
 void ggml_cuda_op_ssm_conv_state_long(ggml_backend_cuda_context & ctx, const ggml_tensor * states, const ggml_tensor * ids,
                                       const ggml_tensor * x, const ggml_tensor * ssm_conv, ggml_tensor * silu,
-                                      const ggml_cuda_ssm_conv_state_long_slots & slots);
+                                      const ggml_cuda_ssm_conv_state_long_slots & slots,
+                                      bool residual = false, float res_scale = 1.0f, const ggml_tensor * res_r = nullptr);
