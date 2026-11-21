@@ -257,16 +257,45 @@ struct mtmd_graph_chatterbox : mtmd_graph_chatterbox_base {
           vocode_n_mel(vocode_n_mel), vocode_n_stft(vocode_n_stft) {}
     ggml_cgraph * build() override;
 
-  private:
+  protected:
+    // attention mask of the estimator's transformer blocks, nullptr = full attention
+    ggml_tensor * est_mask = nullptr;
+
     ggml_tensor * enc_layer(const mtmd_chatterbox::enc_layer & l, ggml_tensor * x, ggml_tensor * pos, int T);
     ggml_tensor * causal_block(const mtmd_chatterbox::causal_block & b, ggml_tensor * x);
     ggml_tensor * resnet(const mtmd_chatterbox::resnet & r, ggml_tensor * x, ggml_tensor * temb);
     ggml_tensor * tfm_block(const mtmd_chatterbox::tfm_block & b, ggml_tensor * x);
+    // spks and cond are optional
     ggml_tensor * estimator(ggml_tensor * x_noise, ggml_tensor * mu, ggml_tensor * spks,
                             ggml_tensor * cond, ggml_tensor * temb, int T);
     ggml_tensor * hift_resblock(const mtmd_chatterbox::hift_res & r, ggml_tensor * x);
     ggml_cgraph * build_s3tok(int T);
     ggml_cgraph * build_vocoder(int n_mel, int n_stft);
+    // f0 predictor on a mel [80, T], output named out_f0
+    void build_f0(ggml_tensor * mel);
+};
+
+// longcat-next audio generation, the CosyVoice2 parts come from chatterbox
+//   GEN_CODE: depth head, logits of level n_codes (out_feats) given the codes of the levels before it,
+//             and the sum of the LLM rows of the given codes (last node, the input row of the next LLM step)
+//   TTS:      codes of T frames -> mu -> flow matching -> mel (out_mel) and f0 (out_f0), the host and TTS_VOCODE make the waveform
+struct mtmd_graph_longcat_next_gen : mtmd_graph_chatterbox {
+    mtmd_graph_longcat_next_gen(mtmd_subcontext * ctx, const mtmd_image_f32 & img, mtmd_subctx_gen_process gen_process, int n_codes,
+                                int vocode_n_mel, int vocode_n_stft)
+        : mtmd_graph_chatterbox(ctx, img, gen_process, n_codes, 0, vocode_n_mel, vocode_n_stft) {}
+    ggml_cgraph * build() override;
+
+    // the decoder runs at 4 mel frames per code frame minus the causal tail of the transposed conv
+    static int n_mel_frames(int n_frames) { return 4 * n_frames - 1; }
+    // the estimator attends within chunks of this many mel frames and to the chunks before (static_chunk_size)
+    static constexpr int est_chunk = 100;
+    static constexpr int n_steps   = 10;
+    static constexpr float cfg     = 0.7f;
+
+  private:
+    ggml_cgraph * build_depth_head();
+    ggml_cgraph * build_mel();
+    ggml_tensor * dec_layer(const mtmd_layer & l, ggml_tensor * x, norm_type nt, float eps, int n_head, ggml_tensor * mask);
 };
 
 struct mtmd_graph_kokoro : mtmd_graph {

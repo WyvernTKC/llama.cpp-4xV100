@@ -147,7 +147,7 @@ ggml_tensor * mtmd_graph_chatterbox::tfm_block(const mtmd_chatterbox::tfm_block 
     ggml_tensor * q = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, b.attn_q_w, cur), d_head, n_head, T);
     ggml_tensor * k = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, b.attn_k_w, cur), d_head, n_head, T);
     ggml_tensor * v = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, b.attn_v_w, cur), d_head, n_head, T);
-    x = ggml_add(ctx0, x, build_attn(b.attn_out_w, b.attn_out_b, q, k, v, nullptr, 1.0f / sqrtf((float) d_head), -1));
+    x = ggml_add(ctx0, x, build_attn(b.attn_out_w, b.attn_out_b, q, k, v, est_mask, 1.0f / sqrtf((float) d_head), -1));
 
     cur = build_norm(x, b.norm3_w, b.norm3_b, NORM_TYPE_NORMAL, 1e-5f, -1);
     cur = cbx_linear(b.ff_in_w, b.ff_in_b, cur);
@@ -163,9 +163,13 @@ ggml_tensor * mtmd_graph_chatterbox::estimator(ggml_tensor * x_noise, ggml_tenso
 
     // channels live on ne0, time on ne1: pack along ne0
     ggml_tensor * x = ggml_concat(ctx0, x_noise, mu, 0);                   // [160, T]
-    ggml_tensor * spks_b = ggml_repeat(ctx0, ggml_reshape_2d(ctx0, spks, 80, 1), ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 80, T));
-    x = ggml_concat(ctx0, x, spks_b, 0);                                   // [240, T]
-    x = ggml_concat(ctx0, x, cond, 0);                                     // [320, T]
+    if (spks) {
+        ggml_tensor * spks_b = ggml_repeat(ctx0, ggml_reshape_2d(ctx0, spks, 80, 1), ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 80, T));
+        x = ggml_concat(ctx0, x, spks_b, 0);                               // [240, T]
+    }
+    if (cond) {
+        x = ggml_concat(ctx0, x, cond, 0);                                 // [320, T]
+    }
     x = ggml_cont(ctx0, x);
 
     // down
@@ -429,20 +433,23 @@ ggml_cgraph * mtmd_graph_chatterbox::build() {
     ggml_set_output(mel);
     ggml_build_forward_expand(gf, mel);
 
-    // f0 predictor on the trimmed mel: 5x (conv k3 same-pad + elu), abs(linear)
-    {
-        ggml_tensor * fx = mel;
-        for (const auto & fc : c.f0_condnet) {
-            fx = cbx_conv1d(fc.w, fc.b, fx, 1, 1, 1);
-            fx = ggml_elu(ctx0, fx);
-        }
-        fx = cbx_linear(c.f0_classifier_w, c.f0_classifier_b, fx);
-        fx = ggml_abs(ctx0, fx); // [1, T]
-        ggml_set_name(fx, "out_f0");
-        ggml_set_output(fx);
-        ggml_build_forward_expand(gf, fx);
-    }
+    build_f0(mel); // on the trimmed mel
     return gf;
+}
+
+// f0 predictor: 5x (conv k3 same-pad + elu), abs(linear)
+void mtmd_graph_chatterbox::build_f0(ggml_tensor * mel) {
+    const auto & c = model.cbx;
+    ggml_tensor * fx = mel;
+    for (const auto & fc : c.f0_condnet) {
+        fx = cbx_conv1d(fc.w, fc.b, fx, 1, 1, 1);
+        fx = ggml_elu(ctx0, fx);
+    }
+    fx = cbx_linear(c.f0_classifier_w, c.f0_classifier_b, fx);
+    fx = ggml_abs(ctx0, fx); // [1, T]
+    ggml_set_name(fx, "out_f0");
+    ggml_set_output(fx);
+    ggml_build_forward_expand(gf, fx);
 }
 
 // snake activation with per-channel alpha: x + sin^2(alpha x) / alpha

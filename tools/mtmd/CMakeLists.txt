@@ -71,6 +71,7 @@ add_library(mtmd
             models/pixtral.cpp
             models/qwen2vl.cpp
             models/longcat-next-v.cpp
+            models/longcat-next-gen.cpp
             models/sensenova-u1.cpp
             models/minimax-m3.cpp
             models/qwen3vl.cpp

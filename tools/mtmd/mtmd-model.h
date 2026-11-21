@@ -884,6 +884,39 @@ struct mtmd_chatterbox {
     ggml_tensor * spk_affine_b = nullptr;
 };
 
+// longcat-next audio generation: the depth head and the codes -> mel front of the decoder
+// the flow-matching estimator, the f0 predictor and the HiFT vocoder are in mtmd_chatterbox (same CosyVoice2 modules)
+struct mtmd_longcat_gen {
+    // depth head: position 0 is the LLM hidden state, position l the sum of the code rows of levels < l
+    ggml_tensor * code_embd     = nullptr; // [n_embd, sum of codebook sizes + 1], LLM rows of the codes
+    ggml_tensor * hidden_norm_w = nullptr;
+    ggml_tensor * hidden_proj_w = nullptr;
+    std::vector<mtmd_layer> head_layers;   // ff_up_w / ff_down_w are 3D: one FFN per depth position
+    ggml_tensor * out_norm_w    = nullptr;
+    ggml_tensor * out_w         = nullptr; // [n_embd, sum of (codebook size + 1)], the heads of all levels
+    ggml_tensor * out_b         = nullptr;
+
+    // codes -> mu: RVQ rows (a.rvq.codebook), projection, causal transposed conv, causal decoder, prenet
+    ggml_tensor * rvq_codebook  = nullptr;
+    ggml_tensor * proj_w        = nullptr;
+    ggml_tensor * proj_b        = nullptr;
+    ggml_tensor * up_conv_w     = nullptr;
+    ggml_tensor * up_conv_b     = nullptr;
+    ggml_tensor * up_norm_w     = nullptr;
+    ggml_tensor * up_norm_b     = nullptr;
+    ggml_tensor * dec_pos       = nullptr;
+    std::vector<mtmd_layer> dec_layers;
+    ggml_tensor * dec_post_ln_w = nullptr;
+    ggml_tensor * dec_post_ln_b = nullptr;
+    ggml_tensor * pre_in1_w     = nullptr;
+    ggml_tensor * pre_in1_b     = nullptr;
+    ggml_tensor * pre_in2_w     = nullptr;
+    ggml_tensor * pre_in2_b     = nullptr;
+    std::vector<mtmd_layer> pre_layers;
+    ggml_tensor * pre_out_norm_w = nullptr;
+    ggml_tensor * pre_out_w     = nullptr;
+};
+
 // drama3 tower: extra tensors around the generic block
 struct mtmd_drama3_layer {
     ggml_tensor * enorm_w    = nullptr;
@@ -1465,6 +1498,9 @@ struct mtmd_model {
 
     // chatterbox flow encoder, cfm estimator, hift vocoder, s3 tokenizer and CAMPPlus speaker encoder
     mtmd_chatterbox cbx;
+
+    // longcat-next audio generation
+    mtmd_longcat_gen lcn;
 
     // chatterbox tensors read on the host, see cbx_read_tensor()
     std::map<std::string, ggml_tensor *> cbx_tensors;

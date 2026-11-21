@@ -686,6 +686,8 @@ class LongcatNextMmprojModel(Qwen2VLVisionModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._aud_cb = {}
+        self._head_out = {}
+        self._hift_wn = {}
         # the processor is Qwen2VLImageProcessor with its default (CLIP) mean and std
         self.preprocessor_config.setdefault("image_mean", [0.48145466, 0.4578275, 0.40821073])
         self.preprocessor_config.setdefault("image_std", [0.26862954, 0.26130258, 0.27577711])
@@ -714,24 +716,54 @@ class LongcatNextMmprojModel(Qwen2VLVisionModel):
         self.gguf_writer.add_audio_attention_layernorm_eps(1e-5) # nn.LayerNorm default
         self.gguf_writer.add_audio_rvq_codebook_size(self.hparams_audio["vq_config"]["codebook_sizes"])
 
+        # audio generation: the depth head (audio_head) gives the codes of a frame, the decoder turns codes into speech
+        ac = self.hparams_audio
+        self.gguf_writer.add_clip_has_gen_audio_encoder(True)
+        self.gguf_writer.add_clip_gen_audio_projector_type(gguf.VisionProjectorType.LONGCAT_NEXT_GEN)
+        self.gguf_writer.add_gen_audio_projection_dim(self.n_embd_text)
+        self.gguf_writer.add_gen_audio_embedding_length(ac["audio_head_transformer_dims"])
+        self.gguf_writer.add_gen_audio_feed_forward_length(ac["audio_head_transformer_dims"] * ac["audio_head_transformer_ffn_scale"] // len(ac["vq_config"]["codebook_sizes"]))
+        self.gguf_writer.add_gen_audio_block_count(ac["audio_head_transformer_layers"])
+        self.gguf_writer.add_gen_audio_head_count(ac["audio_head_transformer_dims"] // 128)
+        self.gguf_writer.add_gen_audio_attention_layernorm_eps(1e-6) # T5LayerNorm default
+
     def tensor_force_quant(self, name, new_name, bid, n_dims):
         # the codes are an argmin over the codebooks: keep the quantizer path in f32
         if new_name.startswith(("v.rvq.", "a.rvq.")):
             return gguf.GGMLQuantizationType.F32
         if new_name.startswith("a.conv1d.") and new_name.endswith(".weight"):
             return gguf.GGMLQuantizationType.F16
+        # read on the host, or added to activations as is
+        if new_name.startswith(("a.gen.hift.m_source.", "a.gen.dec.pos_embd")):
+            return gguf.GGMLQuantizationType.F32
         return super().tensor_force_quant(name, new_name, bid, n_dims)
+
+    def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        # the vocoder is a separate torch checkpoint (CosyVoice2 HiFT, 24 kHz)
+        path = self.dir_model / "cosy24k_vocoder" / "hift.pt"
+        for k, v in torch.load(path, map_location="cpu", weights_only=True).items():
+            yield "hift:" + k, v
+        yield from super().generate_extra_tensors()
+
+    _hift_wn: dict[str, dict[str, Tensor]]
+    _head_out: dict[str, Tensor]
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, _ = item
-        if name == "model.embed_tokens.weight":
+        if name == "model.embed_tokens.weight" or name.startswith("hift:"):
             return item
+        if name.startswith("audio_head."):
+            # the einsum of the per-position FFN never adds these biases
+            return None if name.endswith((".linear1.bias", ".linear2.bias")) else item
         if name.startswith((cls._at + "audio_model.", cls._at + "audio_bridge_model.")):
-            # proj_decoder only serves the audio decoder
-            if ".proj_decoder." in name or name.endswith((".cluster_size", ".embed_avg")):
-                return None
-            return item
+            return None if name.endswith((".cluster_size", ".embed_avg")) else item
+        if name.startswith(cls._at + "audio_decoder."):
+            # use_hidden_states_before_dconv2: the flow matching reads the hidden states, dconv2 and post_net are unused
+            return None if (".dconv2." in name or ".post_net." in name) else item
+        if name.startswith(cls._at + "audio_flow_matching_decoder."):
+            # the prenet registers sinusoids it never adds
+            return None if name.endswith("prenet.positional_embedding") else item
         if not name.startswith(cls._vt) or name.endswith(("_ema", ".cluster_size")):
             return None
         # the codebook is shared, one copy is enough
@@ -750,8 +782,16 @@ class LongcatNextMmprojModel(Qwen2VLVisionModel):
             off = self.global_config["audio_offset"]
             n_rows = sum(self.hparams_audio["vq_config"]["codebook_sizes"])
             yield self.format_tensor_name(gguf.MODEL_TENSOR.A_MM_CODE_EMBD), data_torch[off:off + n_rows]
+            # the depth head reads these rows by offset id + code; the extra class of the last level lands on the next row
+            yield "a.gen.code_embd.weight", data_torch[off:off + n_rows + 1]
             return
 
+        if name.startswith("hift:"):
+            yield from self._modify_hift(data_torch, name[len("hift:"):])
+            return
+        if name.startswith("audio_head."):
+            yield from self._modify_head(data_torch, name[len("audio_head."):])
+            return
         if name.startswith(self._at):
             yield from self._modify_audio(data_torch, name[len(self._at):], bid)
             return
@@ -808,13 +848,98 @@ class LongcatNextMmprojModel(Qwen2VLVisionModel):
             if len(self._aud_cb) == len(sizes):
                 cbs = [self._aud_cb.pop(i) for i in range(len(sizes))]
                 yield self.format_tensor_name(gguf.MODEL_TENSOR.A_ENC_RVQ_CODEBOOK), torch.cat(cbs, dim=0)
+        elif name.startswith("audio_bridge_model.proj_decoder."):
+            yield f"a.gen.proj.{suffix}", data_torch
+        elif name.startswith("audio_decoder."):
+            # causal transposed conv (12.5 -> 50 Hz) + GroupNorm, sinusoids, causal whisper layers, LayerNorm
+            sub = name[len("audio_decoder."):]
+            if sub.startswith("dconv1.conv."):
+                yield f"a.gen.dec.up.conv.{suffix}", data_torch
+            elif sub.startswith("dconv1.norm."):
+                yield f"a.gen.dec.up.norm.{suffix}", data_torch
+            elif sub == "positional_embedding":
+                yield "a.gen.dec.pos_embd.weight", data_torch
+            elif sub.startswith("layer_norm."):
+                yield f"a.gen.dec.post_ln.{suffix}", data_torch
+            else:
+                yield self._gen_layer_name("a.gen.dec", sub), data_torch
+        elif name.startswith("audio_flow_matching_decoder.prenet."):
+            sub = name[len("audio_flow_matching_decoder.prenet."):]
+            fixed = {"in_mlp.0": "a.gen.pre.in1", "in_mlp.2": "a.gen.pre.in2", "final_norm": "a.gen.pre.out_norm", "out_proj": "a.gen.pre.out"}
+            base = sub.rsplit(".", 1)[0]
+            yield (f"{fixed[base]}.{suffix}" if base in fixed else self._gen_layer_name("a.gen.pre", sub.replace("transformer_layers.", "layers."))), data_torch
+        elif name.startswith("audio_flow_matching_decoder.conditional_decoder."):
+            # the CosyVoice estimator under the names of the chatterbox flow decoder
+            yield "a.gen.est." + name[len("audio_flow_matching_decoder.conditional_decoder."):], data_torch
         else:
             raise ValueError(f"Unexpected tensor {self._at}{name}")
 
+    @staticmethod
+    def _gen_layer_name(prefix: str, sub: str) -> str:
+        # OmniWhisperTransformerLayer: layers.{i}.<module>.<param>
+        m = re.match(r"layers\.(\d+)\.(.+)\.(weight|bias)$", sub)
+        if m is None:
+            raise ValueError(f"Unexpected tensor {prefix} {sub}")
+        part = {
+            "self_attn_layer_norm": "ln1", "final_layer_norm": "ln2", "fc1": "ffn_up", "fc2": "ffn_down",
+            "self_attn.q_proj": "attn_q", "self_attn.k_proj": "attn_k", "self_attn.v_proj": "attn_v", "self_attn.out_proj": "attn_out",
+        }[m.group(2)]
+        return f"{prefix}.blk.{m.group(1)}.{part}.{m.group(3)}"
+
+    def _modify_head(self, data_torch: Tensor, name: str) -> Iterable[tuple[str, Tensor]]:
+        # CasualDepthTransformerHead: position 0 is the LLM hidden state, position l the running sum of the code rows of levels < l
+        depth = len(self.hparams_audio["vq_config"]["codebook_sizes"])
+        suffix = name.rsplit(".", 1)[-1]
+        if name in ("hidden_norm.weight", "hidden_proj.weight"):
+            yield f"a.gen.head.{name}", data_torch
+        elif name == "headnorm.weight":
+            yield "a.gen.head.out_norm.weight", data_torch
+        elif (m := re.match(r"heads\.(\d+)\.(weight|bias)$", name)):
+            # one output head per level (codebook size + 1: the end class), concatenated along the rows
+            self._head_out[f"{m.group(2)}.{m.group(1)}"] = data_torch
+            for kind in ("weight", "bias"):
+                if all(f"{kind}.{i}" in self._head_out for i in range(depth)):
+                    yield f"a.gen.head.out.{kind}", torch.cat([self._head_out.pop(f"{kind}.{i}") for i in range(depth)], dim=0)
+        elif (m := re.match(r"transformer_layers\.(\d+)\.(.+)$", name)):
+            il, sub = m.group(1), m.group(2)
+            p = f"a.gen.head.blk.{il}"
+            if sub == "layernorm1.weight":
+                yield f"{p}.ln1.weight", data_torch
+            elif sub == "layernorm2.weight":
+                yield f"{p}.ln2.weight", data_torch
+            elif sub.startswith("self_attention."):
+                proj = {"q_proj": "q", "k_proj": "k", "v_proj": "v", "out_proj": "out"}[sub.split(".")[1]]
+                yield f"{p}.attn_{proj}.{suffix}", data_torch
+            elif sub == "linear1.weight":
+                # einsum('bld,tld->blt'): position l uses rows t * depth + l -> [depth, n_ff, n_embd]
+                n_ff_all, n_embd = data_torch.shape
+                yield f"{p}.ffn_up.weight", data_torch.reshape(n_ff_all // depth, depth, n_embd).permute(1, 0, 2).contiguous()
+            elif sub == "linear2.weight":
+                # einsum('blt,dlt->bld'): position l uses columns l * n_ff + t -> [depth, n_embd, n_ff]
+                n_embd, n_ff_all = data_torch.shape
+                yield f"{p}.ffn_down.weight", data_torch.reshape(n_embd, depth, n_ff_all // depth).permute(1, 0, 2).contiguous()
+            else:
+                raise ValueError(f"Unexpected tensor audio_head.{name}")
+        else:
+            raise ValueError(f"Unexpected tensor audio_head.{name}")
+
+    def _modify_hift(self, data_torch: Tensor, name: str) -> Iterable[tuple[str, Tensor]]:
+        # torch weight_norm (weight_g, weight_v): weight = g * v / |v| over the dims after the first
+        if name.endswith(("weight_g", "weight_v")):
+            base = name[:-len(".weight_g")]
+            wn = self._hift_wn.setdefault(base, {})
+            wn[name[-1]] = data_torch
+            if len(wn) == 2:
+                g, v = wn["g"].float(), wn["v"].float()
+                del self._hift_wn[base]
+                yield f"a.gen.hift.{base}.weight", g * v / v.norm(dim=tuple(range(1, v.dim())), keepdim=True)
+            return
+        yield f"a.gen.hift.{name}", data_torch
+
     def prepare_tensors(self):
         super().prepare_tensors()
-        if self._aud_cb:
-            raise ValueError(f"Unprocessed audio codebooks: {sorted(self._aud_cb)}")
+        if self._aud_cb or self._head_out or self._hift_wn:
+            raise ValueError(f"Unprocessed tensors: {sorted(self._aud_cb)} {sorted(self._head_out)} {sorted(self._hift_wn)}")
 
 
 @ModelBase.register("DeepseekV32ForCausalLM")

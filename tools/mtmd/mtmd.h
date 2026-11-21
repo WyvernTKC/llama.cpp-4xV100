@@ -493,6 +493,7 @@ enum mtmd_gen_audio_type {
     MTMD_GEN_AUDIO_TYPE_KOKORO,
     MTMD_GEN_AUDIO_TYPE_TINY_VOCA,
     MTMD_GEN_AUDIO_TYPE_VOXCPM2,
+    MTMD_GEN_AUDIO_TYPE_LONGCAT_NEXT,
 };
 
 struct mtmd_gen_audio_info {

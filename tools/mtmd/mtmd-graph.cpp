@@ -1019,6 +1019,14 @@ std::unique_ptr<mtmd_graph> mtmd_get_graph_builder(mtmd_subcontext * ctx, const 
                 const int vns = params ? params->vocode_n_stft : 0;
                 builder = std::make_unique<mtmd_graph_chatterbox>(ctx, img, gen_process, n_tokens, n_prompt_mel, vnm, vns);
             } break;
+        case PROJECTOR_TYPE_LONGCAT_NEXT_GEN:
+            {
+                const auto gen_process = params ? params->gen_process : MTMD_SUBCTX_GEN_PROCESS_GEN_CODE;
+                const int n_codes = params && params->codes ? (int) params->codes->size() : 0;
+                const int vnm = params ? params->vocode_n_mel  : 0;
+                const int vns = params ? params->vocode_n_stft : 0;
+                builder = std::make_unique<mtmd_graph_longcat_next_gen>(ctx, img, gen_process, n_codes, vnm, vns);
+            } break;
         case PROJECTOR_TYPE_LFM3A_GEN:
             {
                 const auto    gen_process = params ? params->gen_process : MTMD_SUBCTX_GEN_PROCESS_GEN_CODE;

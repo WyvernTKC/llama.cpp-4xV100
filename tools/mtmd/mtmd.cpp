@@ -3004,6 +3004,10 @@ mtmd_gen_audio_info mtmd_gen_audio_get_info(const mtmd_context * ctx) {
             info.type = MTMD_GEN_AUDIO_TYPE_CHATTERBOX;
             info.sample_rate = 24000;
             break;
+        case PROJECTOR_TYPE_LONGCAT_NEXT_GEN:
+            info.type = MTMD_GEN_AUDIO_TYPE_LONGCAT_NEXT;
+            info.sample_rate = 24000;
+            break;
         case PROJECTOR_TYPE_DRAMA3_GEN:
             info.type = MTMD_GEN_AUDIO_TYPE_DRAMA3;
             info.sample_rate = 44100;
@@ -3497,6 +3501,14 @@ mtmd_gen_inp mtmd_gen_inp_default(const mtmd_context * ctx) {
             inp.top_k = 50;
             inp.top_p = 1.0f;
             inp.temp  = 0.9f; // TODO: handle this on graph
+            break;
+        case PROJECTOR_TYPE_LONGCAT_NEXT_GEN:
+            // audio_generation_config of generation_config.json; the penalty covers all codes of the response
+            inp.top_k          = 5;
+            inp.top_p          = 0.85f;
+            inp.temp           = 0.5f;
+            inp.penalty_repeat = 1.3f;
+            inp.penalty_last_n = 0;
             break;
         case PROJECTOR_TYPE_POCKETTTS_GEN:
             // https://github.com/kyutai-labs/pocket-tts/blob/main/pocket_tts/default_parameters.py
@@ -4560,6 +4572,41 @@ static int32_t mtmd_gen_audio_process_impl(mtmd_context * ctx, mtmd_gen_state * 
     }
 
     // MTMD_GEN_PROCESS_TYPE_GEN_WAV
+    if (sctx->model.proj_type == PROJECTOR_TYPE_LONGCAT_NEXT_GEN) {
+        // frame-major codes of one segment, the end frame excluded; temp scales the flow-matching noise (< 0 = 1.0)
+        const size_t depth = sctx->model.hparams.rvq_codebook_size.size();
+        if (!inp->codes || inp->n_codes == 0 || inp->n_codes % depth != 0) {
+            LOG_ERR("%s: gen_wav needs whole frames of %zu codes\n", __func__, depth);
+            return 1;
+        }
+        std::vector<int32_t> in_codes(inp->codes, inp->codes + inp->n_codes);
+
+        // the batch entry is unused, present to satisfy the encode interface
+        mtmd_image_f32 dummy;
+        dummy.set_size({1, 1}, false, true);
+        dummy.cpy_buf(std::vector<float>(1, 0.0f));
+        mtmd_image_f32_batch batch;
+        batch.is_audio = true;
+        batch.entries.push_back(std::move(dummy));
+
+        mtmd_subctx_encode_params params;
+        params.imgs        = &batch;
+        params.n_threads   = ctx->n_threads;
+        params.gen_process = MTMD_SUBCTX_GEN_PROCESS_TTS;
+        params.codes       = &in_codes;
+        params.temp        = inp->temp;
+        params.out_audio   = &state->out_audio;
+        params.gen_state   = state->gen_state;
+
+        if (!sctx->encode(&params)) {
+            LOG_ERR("%s: encode failed (gen_wav)\n", __func__);
+            return 1;
+        }
+
+        out->audio     = state->out_audio.data();
+        out->n_samples = state->out_audio.size();
+        return 0;
+    }
     if (sctx->model.proj_type == PROJECTOR_TYPE_CHATTERBOX) {
         if (!inp->codes || inp->n_codes == 0) {
             LOG_ERR("%s: codes required for gen_wav\n", __func__);

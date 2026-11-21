@@ -1192,6 +1192,14 @@ struct mtmd_model_loader {
                         // s3gen output rate
                         hparams.audio_sample_rate = 24000;
                     } break;
+                case PROJECTOR_TYPE_LONGCAT_NEXT_GEN:
+                    {
+                        // 10 euler steps x 2 cfg estimator evaluations, unrolled in one graph like chatterbox
+                        model.max_nodes = 65536;
+                        hparams.audio_sample_rate = 24000;
+                        // the residual quantizer of the audio tokenizer: its rows are the input of the decoder
+                        get_arr_int(KEY_A_RVQ_CODEBOOK_SIZE, hparams.rvq_codebook_size);
+                    } break;
                 case PROJECTOR_TYPE_SOPRANO:
                     {
                         // SopranoDecoder defaults, n_fft comes from the head tensor
@@ -1510,6 +1518,112 @@ struct mtmd_model_loader {
             return cur;
         };
 
+        // CosyVoice2 flow-matching estimator, f0 predictor and HiFT vocoder: chatterbox (s3gen) and longcat-next audio generation
+        auto load_cosyvoice_decoder = [&](mtmd_chatterbox & c) {
+            auto has = [&](const std::string & name) {
+                return gguf_find_tensor(ctx_gguf.get(), name.c_str()) >= 0;
+            };
+            auto load_causal = [&](const std::string & p, mtmd_chatterbox::causal_block & b) {
+                b.conv_w = get_tensor(p + ".block.0.weight");
+                b.conv_b = get_tensor(p + ".block.0.bias");
+                b.norm_w = get_tensor(p + ".block.2.weight");
+                b.norm_b = get_tensor(p + ".block.2.bias");
+            };
+            auto load_resnet = [&](const std::string & p, mtmd_chatterbox::resnet & r) {
+                load_causal(p + ".block1", r.block1);
+                load_causal(p + ".block2", r.block2);
+                r.mlp_w      = get_tensor(p + ".mlp.1.weight");
+                r.mlp_b      = get_tensor(p + ".mlp.1.bias");
+                r.res_conv_w = get_tensor(p + ".res_conv.weight");
+                r.res_conv_b = get_tensor(p + ".res_conv.bias");
+            };
+            auto load_tfm = [&](const std::string & p, mtmd_chatterbox::tfm_block & b) {
+                b.norm1_w    = get_tensor(p + ".norm1.weight");
+                b.norm1_b    = get_tensor(p + ".norm1.bias");
+                b.attn_q_w   = get_tensor(p + ".attn1.to_q.weight");
+                b.attn_k_w   = get_tensor(p + ".attn1.to_k.weight");
+                b.attn_v_w   = get_tensor(p + ".attn1.to_v.weight");
+                b.attn_out_w = get_tensor(p + ".attn1.to_out.0.weight");
+                b.attn_out_b = get_tensor(p + ".attn1.to_out.0.bias");
+                b.norm3_w    = get_tensor(p + ".norm3.weight");
+                b.norm3_b    = get_tensor(p + ".norm3.bias");
+                b.ff_in_w    = get_tensor(p + ".ff.net.0.proj.weight");
+                b.ff_in_b    = get_tensor(p + ".ff.net.0.proj.bias");
+                b.ff_out_w   = get_tensor(p + ".ff.net.2.weight");
+                b.ff_out_b   = get_tensor(p + ".ff.net.2.bias");
+            };
+            auto load_stage = [&](const std::string & p, mtmd_chatterbox::est_stage & s, bool boundary) {
+                load_resnet(p + ".0", s.res);
+                for (int j = 0; has(p + ".1." + std::to_string(j) + ".norm1.weight"); j++) {
+                    mtmd_chatterbox::tfm_block b;
+                    load_tfm(p + ".1." + std::to_string(j), b);
+                    s.tfm.push_back(b);
+                }
+                if (boundary) {
+                    s.conv_w = get_tensor(p + ".2.weight");
+                    s.conv_b = get_tensor(p + ".2.bias");
+                }
+            };
+            auto load_hres = [&](const std::string & p, mtmd_chatterbox::hift_res & r) {
+                for (int j = 0; has(p + ".convs1." + std::to_string(j) + ".weight"); j++) {
+                    const std::string js = std::to_string(j);
+                    mtmd_chatterbox::hift_res_unit u;
+                    u.act1_alpha = get_tensor(p + ".activations1." + js + ".alpha");
+                    u.act2_alpha = get_tensor(p + ".activations2." + js + ".alpha");
+                    u.conv1_w    = get_tensor(p + ".convs1." + js + ".weight");
+                    u.conv1_b    = get_tensor(p + ".convs1." + js + ".bias");
+                    u.conv2_w    = get_tensor(p + ".convs2." + js + ".weight");
+                    u.conv2_b    = get_tensor(p + ".convs2." + js + ".bias");
+                    r.units.push_back(u);
+                }
+            };
+
+            // cfm estimator
+            c.time_mlp_1_w        = get_tensor("a.gen.est.time_mlp.linear_1.weight");
+            c.time_mlp_1_b        = get_tensor("a.gen.est.time_mlp.linear_1.bias");
+            c.time_mlp_2_w        = get_tensor("a.gen.est.time_mlp.linear_2.weight");
+            c.time_mlp_2_b        = get_tensor("a.gen.est.time_mlp.linear_2.bias");
+            c.time_embed_mixer_w  = get_tensor("a.gen.est.time_embed_mixer.weight", false);
+            load_stage("a.gen.est.down_blocks.0", c.est_down, true);
+            for (int i = 0; has("a.gen.est.mid_blocks." + std::to_string(i) + ".0.block1.block.0.weight"); i++) {
+                mtmd_chatterbox::est_stage s;
+                load_stage("a.gen.est.mid_blocks." + std::to_string(i), s, false);
+                c.est_mid.push_back(std::move(s));
+            }
+            load_stage("a.gen.est.up_blocks.0", c.est_up, true);
+            load_causal("a.gen.est.final_block", c.est_final_block);
+            c.est_final_proj_w    = get_tensor("a.gen.est.final_proj.weight");
+            c.est_final_proj_b    = get_tensor("a.gen.est.final_proj.bias");
+
+            // hift vocoder
+            c.hift_pre_w  = get_tensor("a.gen.hift.conv_pre.weight");
+            c.hift_pre_b  = get_tensor("a.gen.hift.conv_pre.bias");
+            c.hift_post_w = get_tensor("a.gen.hift.conv_post.weight");
+            c.hift_post_b = get_tensor("a.gen.hift.conv_post.bias");
+            for (int i = 0; has("a.gen.hift.ups." + std::to_string(i) + ".weight"); i++) {
+                const std::string is = std::to_string(i);
+                mtmd_chatterbox::hift_up up;
+                up.up_w          = get_tensor("a.gen.hift.ups." + is + ".weight");
+                up.up_b          = get_tensor("a.gen.hift.ups." + is + ".bias");
+                up.source_down_w = get_tensor("a.gen.hift.source_downs." + is + ".weight");
+                up.source_down_b = get_tensor("a.gen.hift.source_downs." + is + ".bias");
+                load_hres("a.gen.hift.source_resblocks." + is, up.source_res);
+                load_hres("a.gen.hift.resblocks." + std::to_string(3 * i),     up.res_0);
+                load_hres("a.gen.hift.resblocks." + std::to_string(3 * i + 1), up.res_1);
+                load_hres("a.gen.hift.resblocks." + std::to_string(3 * i + 2), up.res_2);
+                c.hift_ups.push_back(std::move(up));
+            }
+            for (int i = 0; has("a.gen.hift.f0_predictor.condnet." + std::to_string(i) + ".weight"); i += 2) {
+                const std::string is = std::to_string(i);
+                mtmd_chatterbox::f0_conv fc;
+                fc.w = get_tensor("a.gen.hift.f0_predictor.condnet." + is + ".weight");
+                fc.b = get_tensor("a.gen.hift.f0_predictor.condnet." + is + ".bias");
+                c.f0_condnet.push_back(fc);
+            }
+            c.f0_classifier_w = get_tensor("a.gen.hift.f0_predictor.classifier.weight");
+            c.f0_classifier_b = get_tensor("a.gen.hift.f0_predictor.classifier.bias");
+        };
+
         // pocket-tts: the encoder and the decoder share the same layout, only the prefix differs
         auto load_seanet = [&](mtmd_seanet & seanet, bool is_decoder) {
             const char * conv_in  = is_decoder ? TN_A_GEN_WAV_SEANET_CONV_IN    : TN_A_SEANET_CONV_IN;
@@ -1615,6 +1729,7 @@ struct mtmd_model_loader {
             model.proj_type != PROJECTOR_TYPE_MUSE_SPARK_AUDIO &&
             model.proj_type != PROJECTOR_TYPE_VIBEVOICE_ASR &&
             model.proj_type != PROJECTOR_TYPE_CHATTERBOX &&
+            model.proj_type != PROJECTOR_TYPE_LONGCAT_NEXT_GEN &&
             model.proj_type != PROJECTOR_TYPE_CHATTERBOX_SPKENC &&
             model.proj_type != PROJECTOR_TYPE_YUE2_GEN);
 
@@ -3367,60 +3482,6 @@ struct mtmd_model_loader {
                         l.ffn_2_w         = get_tensor(p + ".feed_forward.w_2.weight");
                         l.ffn_2_b         = get_tensor(p + ".feed_forward.w_2.bias");
                     };
-                    auto load_causal = [&](const std::string & p, mtmd_chatterbox::causal_block & b) {
-                        b.conv_w = get_tensor(p + ".block.0.weight");
-                        b.conv_b = get_tensor(p + ".block.0.bias");
-                        b.norm_w = get_tensor(p + ".block.2.weight");
-                        b.norm_b = get_tensor(p + ".block.2.bias");
-                    };
-                    auto load_resnet = [&](const std::string & p, mtmd_chatterbox::resnet & r) {
-                        load_causal(p + ".block1", r.block1);
-                        load_causal(p + ".block2", r.block2);
-                        r.mlp_w      = get_tensor(p + ".mlp.1.weight");
-                        r.mlp_b      = get_tensor(p + ".mlp.1.bias");
-                        r.res_conv_w = get_tensor(p + ".res_conv.weight");
-                        r.res_conv_b = get_tensor(p + ".res_conv.bias");
-                    };
-                    auto load_tfm = [&](const std::string & p, mtmd_chatterbox::tfm_block & b) {
-                        b.norm1_w    = get_tensor(p + ".norm1.weight");
-                        b.norm1_b    = get_tensor(p + ".norm1.bias");
-                        b.attn_q_w   = get_tensor(p + ".attn1.to_q.weight");
-                        b.attn_k_w   = get_tensor(p + ".attn1.to_k.weight");
-                        b.attn_v_w   = get_tensor(p + ".attn1.to_v.weight");
-                        b.attn_out_w = get_tensor(p + ".attn1.to_out.0.weight");
-                        b.attn_out_b = get_tensor(p + ".attn1.to_out.0.bias");
-                        b.norm3_w    = get_tensor(p + ".norm3.weight");
-                        b.norm3_b    = get_tensor(p + ".norm3.bias");
-                        b.ff_in_w    = get_tensor(p + ".ff.net.0.proj.weight");
-                        b.ff_in_b    = get_tensor(p + ".ff.net.0.proj.bias");
-                        b.ff_out_w   = get_tensor(p + ".ff.net.2.weight");
-                        b.ff_out_b   = get_tensor(p + ".ff.net.2.bias");
-                    };
-                    auto load_stage = [&](const std::string & p, mtmd_chatterbox::est_stage & s, bool boundary) {
-                        load_resnet(p + ".0", s.res);
-                        for (int j = 0; has(p + ".1." + std::to_string(j) + ".norm1.weight"); j++) {
-                            mtmd_chatterbox::tfm_block b;
-                            load_tfm(p + ".1." + std::to_string(j), b);
-                            s.tfm.push_back(b);
-                        }
-                        if (boundary) {
-                            s.conv_w = get_tensor(p + ".2.weight");
-                            s.conv_b = get_tensor(p + ".2.bias");
-                        }
-                    };
-                    auto load_hres = [&](const std::string & p, mtmd_chatterbox::hift_res & r) {
-                        for (int j = 0; has(p + ".convs1." + std::to_string(j) + ".weight"); j++) {
-                            const std::string js = std::to_string(j);
-                            mtmd_chatterbox::hift_res_unit u;
-                            u.act1_alpha = get_tensor(p + ".activations1." + js + ".alpha");
-                            u.act2_alpha = get_tensor(p + ".activations2." + js + ".alpha");
-                            u.conv1_w    = get_tensor(p + ".convs1." + js + ".weight");
-                            u.conv1_b    = get_tensor(p + ".convs1." + js + ".bias");
-                            u.conv2_w    = get_tensor(p + ".convs2." + js + ".weight");
-                            u.conv2_b    = get_tensor(p + ".convs2." + js + ".bias");
-                            r.units.push_back(u);
-                        }
-                    };
 
                     // flow encoder
                     c.input_embedding_w = get_tensor("a.gen.flow.input_embedding.weight");
@@ -3455,50 +3516,7 @@ struct mtmd_model_loader {
                     c.encoder_proj_w    = get_tensor("a.gen.flow.encoder_proj.weight");
                     c.encoder_proj_b    = get_tensor("a.gen.flow.encoder_proj.bias");
 
-                    // cfm estimator
-                    c.time_mlp_1_w        = get_tensor("a.gen.est.time_mlp.linear_1.weight");
-                    c.time_mlp_1_b        = get_tensor("a.gen.est.time_mlp.linear_1.bias");
-                    c.time_mlp_2_w        = get_tensor("a.gen.est.time_mlp.linear_2.weight");
-                    c.time_mlp_2_b        = get_tensor("a.gen.est.time_mlp.linear_2.bias");
-                    c.time_embed_mixer_w  = get_tensor("a.gen.est.time_embed_mixer.weight", false);
-                    load_stage("a.gen.est.down_blocks.0", c.est_down, true);
-                    for (int i = 0; has("a.gen.est.mid_blocks." + std::to_string(i) + ".0.block1.block.0.weight"); i++) {
-                        mtmd_chatterbox::est_stage s;
-                        load_stage("a.gen.est.mid_blocks." + std::to_string(i), s, false);
-                        c.est_mid.push_back(std::move(s));
-                    }
-                    load_stage("a.gen.est.up_blocks.0", c.est_up, true);
-                    load_causal("a.gen.est.final_block", c.est_final_block);
-                    c.est_final_proj_w    = get_tensor("a.gen.est.final_proj.weight");
-                    c.est_final_proj_b    = get_tensor("a.gen.est.final_proj.bias");
-
-                    // hift vocoder
-                    c.hift_pre_w  = get_tensor("a.gen.hift.conv_pre.weight");
-                    c.hift_pre_b  = get_tensor("a.gen.hift.conv_pre.bias");
-                    c.hift_post_w = get_tensor("a.gen.hift.conv_post.weight");
-                    c.hift_post_b = get_tensor("a.gen.hift.conv_post.bias");
-                    for (int i = 0; has("a.gen.hift.ups." + std::to_string(i) + ".weight"); i++) {
-                        const std::string is = std::to_string(i);
-                        mtmd_chatterbox::hift_up up;
-                        up.up_w          = get_tensor("a.gen.hift.ups." + is + ".weight");
-                        up.up_b          = get_tensor("a.gen.hift.ups." + is + ".bias");
-                        up.source_down_w = get_tensor("a.gen.hift.source_downs." + is + ".weight");
-                        up.source_down_b = get_tensor("a.gen.hift.source_downs." + is + ".bias");
-                        load_hres("a.gen.hift.source_resblocks." + is, up.source_res);
-                        load_hres("a.gen.hift.resblocks." + std::to_string(3 * i),     up.res_0);
-                        load_hres("a.gen.hift.resblocks." + std::to_string(3 * i + 1), up.res_1);
-                        load_hres("a.gen.hift.resblocks." + std::to_string(3 * i + 2), up.res_2);
-                        c.hift_ups.push_back(std::move(up));
-                    }
-                    for (int i = 0; has("a.gen.hift.f0_predictor.condnet." + std::to_string(i) + ".weight"); i += 2) {
-                        const std::string is = std::to_string(i);
-                        mtmd_chatterbox::f0_conv fc;
-                        fc.w = get_tensor("a.gen.hift.f0_predictor.condnet." + is + ".weight");
-                        fc.b = get_tensor("a.gen.hift.f0_predictor.condnet." + is + ".bias");
-                        c.f0_condnet.push_back(fc);
-                    }
-                    c.f0_classifier_w = get_tensor("a.gen.hift.f0_predictor.classifier.weight");
-                    c.f0_classifier_b = get_tensor("a.gen.hift.f0_predictor.classifier.bias");
+                    load_cosyvoice_decoder(c);
 
                     // s3 tokenizer
                     c.s3tok_conv1_w = get_tensor("a.s3tok.encoder.conv1.weight");
@@ -3593,6 +3611,88 @@ struct mtmd_model_loader {
                         if (v.rows.empty() || v.ref.tokens.empty() || v.ref.feat.size() != 2 * 80 * v.ref.tokens.size() || v.ref.spk.empty()) {
                             throw std::runtime_error(mtmd_format("%s: incomplete voice %s\n", __func__, voice.c_str()));
                         }
+                    }
+                } break;
+            case PROJECTOR_TYPE_LONGCAT_NEXT_GEN:
+                {
+                    auto & g = model.lcn;
+                    auto has = [&](const std::string & name) {
+                        return gguf_find_tensor(ctx_gguf.get(), name.c_str()) >= 0;
+                    };
+                    // whisper-style layer: LayerNorm (or RMSNorm without bias), attention with no k bias, GELU FFN
+                    auto load_layer = [&](const std::string & p, mtmd_layer & l) {
+                        l.ln_1_w    = get_tensor(p + ".ln1.weight");
+                        l.ln_1_b    = get_tensor(p + ".ln1.bias", false);
+                        l.q_w       = get_tensor(p + ".attn_q.weight");
+                        l.q_b       = get_tensor(p + ".attn_q.bias");
+                        l.k_w       = get_tensor(p + ".attn_k.weight");
+                        l.v_w       = get_tensor(p + ".attn_v.weight");
+                        l.v_b       = get_tensor(p + ".attn_v.bias");
+                        l.o_w       = get_tensor(p + ".attn_out.weight");
+                        l.o_b       = get_tensor(p + ".attn_out.bias");
+                        l.ln_2_w    = get_tensor(p + ".ln2.weight");
+                        l.ln_2_b    = get_tensor(p + ".ln2.bias", false);
+                        l.ff_up_w   = get_tensor(p + ".ffn_up.weight");
+                        l.ff_up_b   = get_tensor(p + ".ffn_up.bias", false);
+                        l.ff_down_w = get_tensor(p + ".ffn_down.weight");
+                        l.ff_down_b = get_tensor(p + ".ffn_down.bias", false);
+                    };
+                    auto load_layers = [&](const std::string & p, std::vector<mtmd_layer> & out) {
+                        for (int i = 0; has(p + ".blk." + std::to_string(i) + ".attn_q.weight"); i++) {
+                            mtmd_layer l;
+                            load_layer(p + ".blk." + std::to_string(i), l);
+                            out.push_back(l);
+                        }
+                    };
+
+                    // depth head
+                    g.code_embd     = get_tensor("a.gen.code_embd.weight");
+                    g.hidden_norm_w = get_tensor("a.gen.head.hidden_norm.weight");
+                    g.hidden_proj_w = get_tensor("a.gen.head.hidden_proj.weight");
+                    load_layers("a.gen.head", g.head_layers);
+                    g.out_norm_w    = get_tensor("a.gen.head.out_norm.weight");
+                    g.out_w         = get_tensor("a.gen.head.out.weight");
+                    g.out_b         = get_tensor("a.gen.head.out.bias");
+
+                    // codes -> mu
+                    g.rvq_codebook  = get_tensor(mtmd_format(TN_A_RVQ_CODEBOOK, "weight"));
+                    g.proj_w        = get_tensor("a.gen.proj.weight");
+                    g.proj_b        = get_tensor("a.gen.proj.bias");
+                    g.up_conv_w     = get_tensor("a.gen.dec.up.conv.weight");
+                    g.up_conv_b     = get_tensor("a.gen.dec.up.conv.bias");
+                    g.up_norm_w     = get_tensor("a.gen.dec.up.norm.weight");
+                    g.up_norm_b     = get_tensor("a.gen.dec.up.norm.bias");
+                    g.dec_pos       = get_tensor("a.gen.dec.pos_embd.weight");
+                    load_layers("a.gen.dec", g.dec_layers);
+                    g.dec_post_ln_w = get_tensor("a.gen.dec.post_ln.weight");
+                    g.dec_post_ln_b = get_tensor("a.gen.dec.post_ln.bias");
+                    g.pre_in1_w     = get_tensor("a.gen.pre.in1.weight");
+                    g.pre_in1_b     = get_tensor("a.gen.pre.in1.bias");
+                    g.pre_in2_w     = get_tensor("a.gen.pre.in2.weight");
+                    g.pre_in2_b     = get_tensor("a.gen.pre.in2.bias");
+                    load_layers("a.gen.pre", g.pre_layers);
+                    g.pre_out_norm_w = get_tensor("a.gen.pre.out_norm.weight");
+                    g.pre_out_w     = get_tensor("a.gen.pre.out.weight");
+
+                    // mu -> mel -> waveform
+                    load_cosyvoice_decoder(model.cbx);
+                    for (ggml_tensor * t = ggml_get_first_tensor(ctx_meta.get()); t; t = ggml_get_next_tensor(ctx_meta.get(), t)) {
+                        const std::string name = t->name;
+                        if (name.rfind("a.gen.hift.m_source.", 0) == 0) {
+                            model.cbx_tensors[name] = get_tensor(name); // read on the host
+                        }
+                    }
+
+                    int64_t n_codes = 0, n_out = 0;
+                    for (int32_t n : hparams.rvq_codebook_size) {
+                        n_codes += n;
+                        n_out   += n + 1;
+                    }
+                    const int64_t depth = (int64_t) hparams.rvq_codebook_size.size();
+                    if (g.head_layers.empty() || g.dec_layers.empty() || g.pre_layers.empty() ||
+                            g.code_embd->ne[1] != n_codes + 1 || g.out_w->ne[1] != n_out || g.rvq_codebook->ne[1] != n_codes ||
+                            g.head_layers[0].ff_up_w->ne[2] != depth || g.head_layers[0].ff_down_w->ne[2] != depth) {
+                        throw std::runtime_error(mtmd_format("%s: longcat-next: audio generation tensors do not match the codebooks\n", __func__));
                     }
                 } break;
             case PROJECTOR_TYPE_ZONOS3_SPKENC:
@@ -5071,6 +5171,7 @@ int mtmd_model::n_output_tokens(const mtmd_image_f32 * img) const {
         case PROJECTOR_TYPE_MINIMAX_MUSIC3_GEN:
         case PROJECTOR_TYPE_FISH_S2_GEN:
         case PROJECTOR_TYPE_VOXCPM2_GEN:
+        case PROJECTOR_TYPE_LONGCAT_NEXT_GEN:
             {
                 // one hidden-state vector fed back to the talker per call
                 n_patches = 1;
@@ -5274,6 +5375,8 @@ int mtmd_model::n_mmproj_embd() const {
         case PROJECTOR_TYPE_FISH_S2_GEN:
         case PROJECTOR_TYPE_FISH_S2_SPKENC:
             return gen_code_out_embd_w->ne[0];
+        case PROJECTOR_TYPE_LONGCAT_NEXT_GEN:
+            return lcn.code_embd->ne[0];
         case PROJECTOR_TYPE_YUE2_GEN:
             return yue2.inp_w->ne[1];
         case PROJECTOR_TYPE_VOXCPM2_GEN:

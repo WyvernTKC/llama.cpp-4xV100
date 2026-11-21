@@ -2105,6 +2105,105 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
                 }
                 set_input_f32("inp_temb", temb);
             } break;
+        case PROJECTOR_TYPE_LONGCAT_NEXT_GEN:
+            {
+                if (params->gen_process == MTMD_SUBCTX_GEN_PROCESS_TTS_VOCODE) {
+                    set_input_f32("inp_mel",   *params->mel_in);
+                    set_input_f32("inp_sstft", *params->sstft_in);
+                    break;
+                }
+                const auto & sizes = hparams.rvq_codebook_size;
+                const int depth = (int) sizes.size();
+                std::vector<int32_t> offs(depth, 0); // first row of each level in the code tables
+                for (int l = 1; l < depth; l++) {
+                    offs[(size_t) l] = offs[(size_t) l - 1] + sizes[(size_t) l - 1];
+                }
+                auto causal_mask = [](int n) {
+                    std::vector<float> m((size_t) n * n);
+                    for (int q = 0; q < n; q++) {
+                        for (int k = 0; k < n; k++) {
+                            m[(size_t) q * n + k] = k <= q ? 0.0f : -INFINITY;
+                        }
+                    }
+                    return m;
+                };
+
+                if (params->gen_process == MTMD_SUBCTX_GEN_PROCESS_GEN_CODE) {
+                    // the codes of the levels before the one the depth head predicts; the extra class of a level is the
+                    // first row of the next one, as offset id + code reads it in the reference
+                    const int n = params->codes ? (int) params->codes->size() : 0;
+                    if (n > 0) {
+                        std::vector<int32_t> ids((size_t) n);
+                        for (int j = 0; j < n; j++) {
+                            const int32_t code = (*params->codes)[(size_t) j];
+                            if (code < 0 || code > sizes[(size_t) j]) {
+                                LOG_ERR("%s: code %d out of range at level %d\n", __func__, code, j);
+                                return false;
+                            }
+                            ids[(size_t) j] = offs[(size_t) j] + code;
+                        }
+                        set_input_i32("inp_codes", ids);
+                    }
+                    if (n < depth && n > 0) {
+                        set_input_attn_mask(causal_mask(n + 1));
+                    }
+                    break;
+                }
+                if (params->gen_process != MTMD_SUBCTX_GEN_PROCESS_TTS) {
+                    break;
+                }
+
+                // frame-major codes [T][depth] -> level-major rows of the RVQ codebooks
+                const std::vector<int32_t> & codes = *params->codes;
+                const int T  = (int) (codes.size() / depth);
+                const int T2 = mtmd_graph_longcat_next_gen::n_mel_frames(T);
+                std::vector<int32_t> ids(codes.size());
+                for (int t = 0; t < T; t++) {
+                    for (int l = 0; l < depth; l++) {
+                        const int32_t code = codes[(size_t) t * depth + l];
+                        if (code < 0 || code >= sizes[(size_t) l]) {
+                            LOG_ERR("%s: code %d out of range at frame %d, level %d\n", __func__, code, t, l);
+                            return false;
+                        }
+                        ids[(size_t) l * T + t] = offs[(size_t) l] + code;
+                    }
+                }
+                set_input_i32("inp_codes", ids);
+                set_input_attn_mask(causal_mask(T2), 0);
+
+                // the estimator attends to its own chunk of mel frames and the chunks before it
+                const int chunk = mtmd_graph_longcat_next_gen::est_chunk;
+                std::vector<float> chunk_mask((size_t) T2 * T2);
+                for (int q = 0; q < T2; q++) {
+                    for (int k = 0; k < T2; k++) {
+                        chunk_mask[(size_t) q * T2 + k] = k < (q / chunk + 1) * chunk ? 0.0f : -INFINITY;
+                    }
+                }
+                set_input_attn_mask(chunk_mask, 1);
+
+                // noise of the flow matching (z = randn * temperature) and the sinusoids of the solver steps (scale 1000)
+                const float noise_scale = params->temp < 0.0f ? 1.0f : params->temp;
+                std::vector<float> noise((size_t) 80 * T2);
+                std::normal_distribution<float> nd(0.0f, 1.0f);
+                for (auto & f : noise) {
+                    f = nd(params->gen_state->rng) * noise_scale;
+                }
+                set_input_f32("inp_noise", noise);
+
+                const int n_steps = mtmd_graph_longcat_next_gen::n_steps;
+                const int n_temb  = (int) model.cbx.time_mlp_1_w->ne[0];
+                const int half    = n_temb / 2;
+                std::vector<float> temb((size_t) n_temb * (n_steps + 1));
+                for (int s = 0; s <= n_steps; s++) {
+                    const double t = 1.0 - cos((double) s / n_steps * M_PI / 2.0);
+                    for (int i = 0; i < half; i++) {
+                        const double div = exp(-(double) i * log(10000.0) / (half - 1));
+                        temb[(size_t) s * n_temb + i       ] = (float) sin(1000.0 * t * div);
+                        temb[(size_t) s * n_temb + i + half] = (float) cos(1000.0 * t * div);
+                    }
+                }
+                set_input_f32("inp_temb", temb);
+            } break;
         case PROJECTOR_TYPE_GEMMA3:
         case PROJECTOR_TYPE_GEMMA3NV:
         case PROJECTOR_TYPE_IDEFICS3:
@@ -2950,7 +3049,8 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
         return true;
     }
 
-    if (model.proj_type == PROJECTOR_TYPE_CHATTERBOX && params->gen_process == MTMD_SUBCTX_GEN_PROCESS_TTS_VOCODE) {
+    const bool cosyvoice_vocoder = model.proj_type == PROJECTOR_TYPE_CHATTERBOX || model.proj_type == PROJECTOR_TYPE_LONGCAT_NEXT_GEN;
+    if (cosyvoice_vocoder && params->gen_process == MTMD_SUBCTX_GEN_PROCESS_TTS_VOCODE) {
         ggml_tensor * sp = ggml_graph_get_tensor(gf, "out_spec");
         GGML_ASSERT(sp != nullptr && params->out_spec);
         params->out_spec->resize(ggml_nelements(sp));
@@ -2958,7 +3058,7 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
         return true;
     }
 
-    if (model.proj_type == PROJECTOR_TYPE_CHATTERBOX && params->gen_process == MTMD_SUBCTX_GEN_PROCESS_TTS) {
+    if (cosyvoice_vocoder && params->gen_process == MTMD_SUBCTX_GEN_PROCESS_TTS) {
         ggml_tensor * mel = ggml_graph_get_tensor(gf, "out_mel");
         GGML_ASSERT(mel != nullptr);
         std::vector<float> mel_data(ggml_nelements(mel));
@@ -3083,7 +3183,7 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
         }
 
         // trim_fade of the reference: silence 20 ms then fade in 20 ms, hides the artifact of the prompt boundary
-        const size_t n_trim = 24000 / 50;
+        const size_t n_trim = model.proj_type == PROJECTOR_TYPE_CHATTERBOX ? 24000 / 50 : 0;
         for (size_t i = 0; i < 2 * n_trim && i < out_audio.size(); i++) {
             const double g = i < n_trim ? 0.0
                 : (cos(M_PI * (1.0 - (double) (i - n_trim) / n_trim)) + 1.0) / 2.0;

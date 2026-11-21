@@ -5345,6 +5345,618 @@ private:
     bool   wav_header_sent = false;
 };
 
+// LongCat-Next: the model speaks inside its own decode loop. <longcat_audiogen_start> opens a segment, the transcript
+// comes first as text tokens up to <longcat_audiotext_pad>, then one audio frame per backbone step: the depth head gives
+// the codes of the frame level by level from the hidden state, the sum of their LLM rows is the next input row. A level-0
+// code past the codebook ends the segment and <longcat_audiogen_end> follows; the decoder turns the segment into speech.
+// ref: LongcatNextForCausalLM._sample (modeling_longcat_next.py), audio_parallel_decoding = false
+class longcat_next_gen_audio_pipeline : public mtmd_gen_audio_pipeline {
+public:
+    using mtmd_gen_audio_pipeline::mtmd_gen_audio_pipeline;
+
+    // the reference stops at max_new_tokens = 2048, transcript and frames together; reading a text, every sentence
+    //   may take its transcript and a full segment
+    int32_t max_frames() const override { return max_steps; }
+
+    void reset() override {
+        seq_id = 0;
+        pos = 0;
+        continuing = false;
+        mode = MODE_TEXT;
+        pieces.clear();
+        piece_idx = 0;
+        piece_off = 0;
+        sents.clear();
+        sent_idx = 0;
+        sent_off = 0;
+        max_steps = 2048;
+        hist.clear();
+        seg.clear();
+        transcript.clear();
+        gen_state.reset();
+        audio_pcm.clear();
+        h_state_buf.clear();
+        out_buf.clear();
+        logit_bias.clear();
+        pcm_sent = 0;
+        wav_header_sent = false;
+    }
+
+    int32_t set_input(const mtmd_helper_gen_audio_inp * inp) override {
+        reset();
+        seq_id = inp->seq_id;
+        if (!find_tokens()) {
+            return 1;
+        }
+        continuing = inp->n_past > 0;
+        pos        = continuing ? inp->n_past : 0;
+        const std::string text(inp->prompt, inp->prompt_len);
+
+        if (continuing) {
+            // the next turn of a conversation, rendered by the caller with the chat template of the model
+            if (!add_text(text)) {
+                return 1;
+            }
+            switch (inp->out_mode) {
+                case MTMD_HELPER_GEN_AUDIO_OUT_AUDIO: add_token(tok_gen_start); break;
+                case MTMD_HELPER_GEN_AUDIO_OUT_TEXT:  logit_bias = { { tok_gen_start, -INFINITY } }; break;
+                default: break;
+            }
+        } else {
+            // read the text aloud; with a clip, in its voice (the speech synthesis example of the model card)
+            if (inp->speaker_ref) {
+                std::vector<float> rows;
+                if (!encode_speaker(inp->speaker_ref, rows)) {
+                    return 1;
+                }
+                if (!add_text("<longcat_system>Replicate the voice in the audio clip to formulate an answer:<longcat_audio_start>")) {
+                    return 1;
+                }
+                add_embd(std::move(rows));
+                if (!add_text("<longcat_audio_end><longcat_user>" + std::string(tts_prefix_clip) + text + "<longcat_assistant>")) {
+                    return 1;
+                }
+            } else if (!add_text("<longcat_user>" + std::string(tts_prefix) + text + "<longcat_assistant>")) {
+                return 1;
+            }
+            add_token(tok_gen_start);
+
+            // the transcripts are the sentences of the text, not sampled: left to itself the model may answer the
+            //   text instead of reading it, or keep writing after it (Chinese text often gets a chat reply)
+            int n_steps = 0;
+            for (const std::string & s : split_sentences(text)) {
+                std::vector<llama_token> ids(s.size() + 16);
+                const int n = llama_tokenize(vocab, s.c_str(), (int32_t) s.size(), ids.data(), (int32_t) ids.size(), false, false);
+                if (n < 0) {
+                    LOG_ERR("mtmd_helper_gen_audio: tokenization failed\n");
+                    return 1;
+                }
+                if (n > 0) {
+                    ids.resize((size_t) n);
+                    sents.push_back(std::move(ids));
+                    n_steps += n + 3 + max_seg_frames;
+                }
+            }
+            if (sents.empty()) {
+                LOG_ERR("mtmd_helper_gen_audio: nothing to read\n");
+                return 1;
+            }
+            max_steps = std::max(max_steps, n_steps);
+        }
+        const auto & last = pieces.back();
+        mode = !last.tokens.empty() && last.tokens.back() == tok_gen_start ? MODE_TRANSCRIPT : MODE_TEXT;
+
+        // the sampling defaults of the model, the caller can only override the temperature
+        const mtmd_gen_inp def = mtmd_gen_inp_default(mctx);
+        temp        = inp->temp >= 0.0f ? inp->temp : def.temp;
+        top_k       = def.top_k;
+        top_p       = def.top_p;
+        rep_penalty = def.penalty_repeat;
+
+        out_type = inp->out_type;
+        stream   = inp->stream;
+        rng.seed(inp->seed == UINT32_MAX ? std::random_device{}() : inp->seed);
+        return init_gen_state(inp->seed) ? 0 : 1;
+    }
+
+    int32_t step_prompt(int32_t n_batch) override {
+        GGML_ASSERT(n_batch > 0);
+        if (piece_idx >= pieces.size()) {
+            return 0;
+        }
+        const piece & p = pieces[piece_idx];
+        const bool is_embd = !p.embd.empty();
+        const int  n_piece = is_embd ? (int) (p.embd.size() / n_embd) : (int) p.tokens.size();
+        const int  n       = std::min(n_batch, n_piece - piece_off);
+        const bool last    = piece_idx + 1 == pieces.size() && piece_off + n == n_piece;
+        if (is_embd) {
+            decode_embd_batch batch(p.embd.data() + (size_t) piece_off * n_embd, n, 1, n_embd);
+            batch.set_position_normal(pos, seq_id);
+            batch.logits[(size_t) n - 1] = last;
+            if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.render(lctx, 0, n)) != 0) {
+                LOG_ERR("mtmd_helper_gen_audio: prompt decode failed\n");
+                return -1;
+            }
+        } else {
+            llama_batch_ext_ptr batch(llama_batch_ext_init(lctx));
+            if (!batch_set_tokens(batch.get(), p.tokens.data() + piece_off, n, pos, seq_id)) {
+                return -1;
+            }
+            if (last) {
+                llama_batch_ext_set_output_logits(batch.get(), n - 1, true);
+            }
+            if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+                LOG_ERR("mtmd_helper_gen_audio: prompt decode failed\n");
+                return -1;
+            }
+        }
+        pos       += n;
+        piece_off += n;
+        if (piece_off == n_piece) {
+            piece_idx++;
+            piece_off = 0;
+        }
+        int remaining = 0;
+        for (size_t i = piece_idx; i < pieces.size(); i++) {
+            const int np = pieces[i].embd.empty() ? (int) pieces[i].tokens.size() : (int) (pieces[i].embd.size() / n_embd);
+            remaining += i == piece_idx ? np - piece_off : np;
+        }
+        return remaining;
+    }
+
+    bool supports_continue() const override {
+        return true;
+    }
+
+    bool next_is_text() const override {
+        return mode != MODE_AUDIO;
+    }
+
+    int32_t step_gen(llama_token sampled, const float * h_state_in, const float ** h_state_out, bool * out_stop) override {
+        if (!continuing && mode != MODE_AUDIO) {
+            // reading a text: each sentence is one segment, <longcat_audiogen_start> + its words + the switch row
+            if (mode == MODE_TEXT) {
+                if (sent_idx >= sents.size()) {
+                    *out_stop    = true;
+                    *h_state_out = nullptr;
+                    return 0;
+                }
+                if (!decode_token(tok_gen_start)) {
+                    return 1;
+                }
+                mode = MODE_TRANSCRIPT;
+            } else if (sent_off < sents[sent_idx].size()) {
+                if (!decode_token(sents[sent_idx][sent_off++])) {
+                    return 1;
+                }
+            } else {
+                sent_idx++;
+                sent_off = 0;
+                if (!decode_token(tok_text_start)) {
+                    return 1;
+                }
+                mode = MODE_AUDIO;
+            }
+        } else if (mode != MODE_AUDIO && llama_vocab_is_eog(vocab, sampled)) {
+            *out_stop    = true;
+            *h_state_out = nullptr;
+            return 0;
+        } else if (mode == MODE_TEXT) {
+            if (sampled == tok_gen_start) {
+                mode = MODE_TRANSCRIPT;
+            }
+            if (!decode_token(sampled)) {
+                return 1;
+            }
+        } else if (mode == MODE_TRANSCRIPT) {
+            if (sampled == tok_text_pad) {
+                // the transcript is done, <longcat_audiotext_start> opens the frames. the reference input there is the
+                // n-gram embedding of token 0 plus the row of <longcat_audiotext_start>; the token row alone stands in
+                LOG_DBG("mtmd_helper_gen_audio: speaking \"%s\"\n", transcript.c_str());
+                transcript.clear();
+                if (!decode_token(tok_text_start)) {
+                    return 1;
+                }
+                mode = MODE_AUDIO;
+            } else {
+                char buf[256];
+                const int n = llama_token_to_piece(vocab, sampled, buf, sizeof(buf), 0, false);
+                if (n > 0) {
+                    transcript.append(buf, (size_t) n);
+                }
+                if (!decode_token(sampled)) {
+                    return 1;
+                }
+            }
+        } else {
+            std::vector<int32_t> codes;
+            bool is_eos = false;
+            if (!sample_frame(h_state_in, codes, &is_eos)) {
+                return 1;
+            }
+            // the end frame counts in the penalty history too, as in the reference
+            hist.insert(hist.end(), codes.begin(), codes.end());
+            if (is_eos || seg.size() / depth >= (size_t) max_seg_frames) {
+                // the model speaks a sentence or so per segment, then opens the next one from text mode, until the end of its turn
+                if (!end_segment() || !decode_token(tok_gen_end)) {
+                    return 1;
+                }
+                mode = MODE_TEXT;
+            } else {
+                // the extra class of a level is no codebook row: the decoder reads the last one instead
+                for (size_t l = 0; l < depth; l++) {
+                    seg.push_back(std::min(codes[l], n_class[l] - 2));
+                }
+                decode_embd_batch batch(fb_buf.data(), 1, 1, n_embd);
+                batch.set_position_normal(pos, seq_id);
+                batch.logits[0] = 1;
+                if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.render(lctx, 0, 1)) != 0) {
+                    LOG_ERR("mtmd_helper_gen_audio: decode failed\n");
+                    return 1;
+                }
+                pos++;
+            }
+        }
+
+        const float * he = llama_get_embeddings_ith(lctx, -1);
+        h_state_buf.assign(he, he + n_embd);
+        *h_state_out = h_state_buf.data();
+        return 0;
+    }
+
+    int32_t get_output(int32_t * out_sample_rate, const char ** out_data, size_t * out_data_len, int64_t * out_n_samples) override {
+        *out_sample_rate = info.sample_rate;
+        if (!stream && flush() != 0) {
+            return 1;
+        }
+        // streaming: the audio of the segments finished since the previous call
+        const size_t from = stream ? pcm_sent : 0;
+        const size_t n    = audio_pcm.size() - from;
+        if (out_n_samples) {
+            *out_n_samples = (int64_t) n;
+        }
+        pcm_sent = audio_pcm.size();
+        if (out_type == MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM) {
+            *out_data     = (const char *) (audio_pcm.data() + from);
+            *out_data_len = n * sizeof(float);
+            return 0;
+        }
+        out_buf.clear();
+        if (!stream) {
+            if (!write_wav16(out_buf, audio_pcm, info.sample_rate)) {
+                LOG_ERR("mtmd_helper_gen_audio: output too large for WAV\n");
+                return 1;
+            }
+        } else {
+            if (!wav_header_sent) {
+                write_wav16_header(out_buf, UINT32_MAX, info.sample_rate);
+                wav_header_sent = true;
+            }
+            append_wav16_pcm(out_buf, audio_pcm.data() + from, n);
+        }
+        *out_data     = out_buf.data();
+        *out_data_len = out_buf.size();
+        return 0;
+    }
+
+    // a segment cut short by the caller is decoded as it is
+    int32_t flush() override {
+        return end_segment() ? 0 : 1;
+    }
+
+private:
+    // the reference prompts of the model card: synthesis in the voice of a clip, and plain reading
+    static constexpr const char * tts_prefix_clip = "\xe7\x94\xa8\xe8\xbf\x99\xe4\xb8\xaa\xe5\xa3\xb0\xe9\x9f\xb3\xe5\x90\x88\xe6\x88\x90\xe4\xbb\xa5\xe4\xb8\x8b\xe5\x86\x85\xe5\xae\xb9\xef\xbc\x9a";
+    static constexpr const char * tts_prefix      = "\xe8\xaf\xb7\xe6\x9c\x97\xe8\xaf\xbb\xe4\xbb\xa5\xe4\xb8\x8b\xe5\x86\x85\xe5\xae\xb9\xef\xbc\x9a";
+    // the decoder reads at most 3000 mel frames (its sinusoid table), 4 per frame minus 1
+    static constexpr int max_seg_frames = 750;
+    // segments are joined with a 1200-sample crossfade (wave_concat_overlap)
+    static constexpr size_t concat_overlap = 1200;
+
+    struct piece {
+        std::vector<llama_token> tokens;
+        std::vector<float>       embd;
+    };
+
+    bool add_text(const std::string & s) {
+        std::vector<llama_token> ids(s.size() + 16);
+        const int n = llama_tokenize(vocab, s.c_str(), (int32_t) s.size(), ids.data(), (int32_t) ids.size(), false, true);
+        if (n < 0) {
+            LOG_ERR("mtmd_helper_gen_audio: tokenization failed\n");
+            return false;
+        }
+        ids.resize((size_t) n);
+        for (llama_token t : ids) {
+            add_token(t);
+        }
+        return true;
+    }
+
+    void add_token(llama_token t) {
+        if (pieces.empty() || !pieces.back().embd.empty()) {
+            pieces.emplace_back();
+        }
+        pieces.back().tokens.push_back(t);
+    }
+
+    // the sentences of a text: after . ! ? with a space or the end after them, after the full-width ends, at line
+    //   breaks; runs of ends ("?!", "...") and closing quotes or brackets stay with their sentence
+    static std::vector<std::string> split_sentences(const std::string & text) {
+        static const char * const ends[]    = { "\xe3\x80\x82", "\xef\xbc\x81", "\xef\xbc\x9f" }; // U+3002 U+FF01 U+FF1F
+        static const char * const closers[] = { "\"", "'", ")", "]", "\xe2\x80\x9d", "\xe2\x80\x99", "\xe3\x80\x8d", "\xe3\x80\x8f", "\xef\xbc\x89" };
+        const auto at = [&](size_t i, const char * s) {
+            return text.compare(i, std::strlen(s), s) == 0;
+        };
+        // length of the full-width end at i, 0 if none
+        const auto wide_end = [&](size_t i) -> size_t {
+            for (const char * e : ends) {
+                if (at(i, e)) {
+                    return std::strlen(e);
+                }
+            }
+            return 0;
+        };
+        const auto ascii_end = [&](size_t i) {
+            return text[i] == '.' || text[i] == '!' || text[i] == '?';
+        };
+
+        std::vector<std::string> out;
+        std::string cur;
+        const auto flush = [&]() {
+            const size_t b = cur.find_first_not_of(" \t\r\n");
+            if (b != std::string::npos) {
+                out.push_back(cur.substr(b, cur.find_last_not_of(" \t\r\n") - b + 1));
+            }
+            cur.clear();
+        };
+        size_t i = 0;
+        while (i < text.size()) {
+            if (text[i] == '\n') {
+                flush();
+                i++;
+                continue;
+            }
+            bool   wide = false;
+            size_t n    = ascii_end(i) ? 1 : 0;
+            if (n == 0 && (n = wide_end(i)) > 0) {
+                wide = true;
+            }
+            if (n == 0) {
+                cur += text[i++];
+                continue;
+            }
+            size_t j = i + n;
+            for (bool more = true; more && j < text.size();) {
+                more = false;
+                if (ascii_end(j)) {
+                    j++;
+                    more = true;
+                } else if (const size_t w = wide_end(j)) {
+                    j += w;
+                    wide = more = true;
+                } else {
+                    for (const char * q : closers) {
+                        if (at(j, q)) {
+                            j += std::strlen(q);
+                            more = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            cur.append(text, i, j - i);
+            i = j;
+            // "3.14" or "a.b" do not end a sentence
+            if (wide || i >= text.size() || std::isspace((unsigned char) text[i])) {
+                flush();
+            }
+        }
+        flush();
+        return out;
+    }
+
+    void add_embd(std::vector<float> rows) {
+        pieces.emplace_back();
+        pieces.back().embd = std::move(rows);
+    }
+
+    // the codes of one frame, level by level; the call with every code known returns no logits, only the input row
+    bool sample_frame(const float * h_state, std::vector<int32_t> & codes, bool * is_eos) {
+        codes.clear();
+        mtmd_gen_inp inp = mtmd_gen_inp_default(mctx);
+        inp.type = MTMD_GEN_PROCESS_TYPE_GEN_CODE;
+        inp.embd = const_cast<float *>(h_state);
+        for (size_t l = 0; ; l++) {
+            inp.codes   = codes.empty() ? nullptr : codes.data();
+            inp.n_codes = codes.size();
+            mtmd_gen_out out{};
+            if (mtmd_gen_audio_process(mctx, gen_state.get(), &inp, &out) != 0) {
+                LOG_ERR("mtmd_helper_gen_audio: depth head failed\n");
+                return false;
+            }
+            if (out.n_feats == 0) {
+                fb_buf.assign(out.embd, out.embd + n_embd);
+                break;
+            }
+            if (depth == 0 && n_class.size() == l) {
+                n_class.push_back((int32_t) out.n_feats);
+            }
+            logits.assign(out.feats, out.feats + out.n_feats);
+            apply_rep_penalty(l);
+            codes.push_back(sample());
+        }
+        if (depth == 0) {
+            depth = n_class.size();
+        }
+        if (codes.size() != depth || depth == 0) {
+            LOG_ERR("mtmd_helper_gen_audio: unexpected depth head output\n");
+            return false;
+        }
+        *is_eos = codes[0] == n_class[0] - 1;
+        return true;
+    }
+
+    // RepetitionPenaltyLogitsProcessor over the codes this level took in every frame of the response so far
+    void apply_rep_penalty(size_t l) {
+        if (rep_penalty == 1.0f || depth == 0) {
+            return;
+        }
+        std::vector<bool> seen(logits.size(), false);
+        for (size_t f = 0; f < hist.size() / depth; f++) {
+            const int32_t c = hist[f * depth + l];
+            if (c >= 0 && (size_t) c < logits.size() && !seen[(size_t) c]) {
+                seen[(size_t) c] = true;
+                logits[(size_t) c] = logits[(size_t) c] < 0.0f ? logits[(size_t) c] * rep_penalty : logits[(size_t) c] / rep_penalty;
+            }
+        }
+    }
+
+    // temperature, top-k (ties at the k-th kept), top-p (the most likely codes whose mass before them is below top_p)
+    int32_t sample() {
+        const size_t n = logits.size();
+        if (temp <= 0.0f) {
+            return (int32_t) (std::max_element(logits.begin(), logits.end()) - logits.begin());
+        }
+        std::vector<int32_t> idx(n);
+        for (size_t i = 0; i < n; i++) {
+            idx[i] = (int32_t) i;
+        }
+        std::sort(idx.begin(), idx.end(), [&](int32_t a, int32_t b) { return logits[(size_t) a] > logits[(size_t) b]; });
+        size_t n_keep = n;
+        if (top_k > 0 && (size_t) top_k < n) {
+            const float kth = logits[(size_t) idx[(size_t) top_k - 1]];
+            n_keep = top_k;
+            while (n_keep < n && logits[(size_t) idx[n_keep]] >= kth) {
+                n_keep++;
+            }
+        }
+        const double lmax = logits[(size_t) idx[0]] / temp;
+        std::vector<double> prob(n_keep);
+        double sum = 0.0;
+        for (size_t i = 0; i < n_keep; i++) {
+            prob[i] = std::exp(logits[(size_t) idx[i]] / temp - lmax);
+            sum += prob[i];
+        }
+        if (top_p > 0.0f && top_p < 1.0f) {
+            double cum = 0.0;
+            size_t n_p = 0;
+            while (n_p < n_keep && cum / sum < top_p) {
+                cum += prob[n_p];
+                n_p++;
+            }
+            n_keep = std::max<size_t>(n_p, 1);
+            sum    = cum > 0.0 ? cum : prob[0];
+        }
+        double r = std::uniform_real_distribution<double>(0.0, 1.0)(rng) * sum;
+        for (size_t i = 0; i < n_keep; i++) {
+            r -= prob[i];
+            if (r <= 0.0) {
+                return idx[i];
+            }
+        }
+        return idx[n_keep - 1];
+    }
+
+    // decodes the frames of the segment and joins them to the audio so far
+    bool end_segment() {
+        if (seg.empty()) {
+            return true;
+        }
+        mtmd_gen_inp inp = mtmd_gen_inp_default(mctx);
+        inp.type    = MTMD_GEN_PROCESS_TYPE_GEN_WAV;
+        inp.codes   = seg.data();
+        inp.n_codes = seg.size();
+        inp.temp    = -1.0f; // unit noise of the flow matching
+        mtmd_gen_out out{};
+        if (mtmd_gen_audio_process(mctx, gen_state.get(), &inp, &out) != 0) {
+            LOG_ERR("mtmd_helper_gen_audio: segment decode failed\n");
+            return false;
+        }
+        seg.clear();
+        const size_t ov = concat_overlap;
+        if (!audio_pcm.empty() && audio_pcm.size() > ov && out.n_samples > ov) {
+            // decode_save_concat2: a blend of the previous tail and the new head goes between the two
+            const size_t base = audio_pcm.size() - ov;
+            for (size_t i = 0; i < ov; i++) {
+                const float a = 1.0f - (float) i / (ov - 1);
+                audio_pcm.push_back(audio_pcm[base + i] * a + out.audio[i] * (1.0f - a));
+            }
+        }
+        audio_pcm.insert(audio_pcm.end(), out.audio, out.audio + out.n_samples);
+        return true;
+    }
+
+    bool find_tokens() {
+        tok_gen_start  = find_special_token(vocab, "<longcat_audiogen_start>");
+        tok_gen_end    = find_special_token(vocab, "<longcat_audiogen_end>");
+        tok_text_start = find_special_token(vocab, "<longcat_audiotext_start>");
+        tok_text_pad   = find_special_token(vocab, "<longcat_audiotext_pad>");
+        if (tok_gen_start == LLAMA_TOKEN_NULL || tok_gen_end == LLAMA_TOKEN_NULL ||
+            tok_text_start == LLAMA_TOKEN_NULL || tok_text_pad == LLAMA_TOKEN_NULL) {
+            LOG_ERR("mtmd_helper_gen_audio: missing LongCat-Next audio tokens in vocab\n");
+            return false;
+        }
+        return true;
+    }
+
+    bool decode_token(llama_token token) {
+        llama_batch_ext_ptr batch(llama_batch_ext_init(lctx));
+        if (!batch_set_tokens(batch.get(), &token, 1, pos, seq_id)) {
+            return false;
+        }
+        llama_batch_ext_set_output_logits(batch.get(), 0, true);
+        if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            LOG_ERR("mtmd_helper_gen_audio: decode failed\n");
+            return false;
+        }
+        pos += 1;
+        return true;
+    }
+
+    // MODE_TEXT: text until the model opens a segment; MODE_TRANSCRIPT: the words of the segment; MODE_AUDIO: frames
+    enum gen_mode { MODE_TEXT, MODE_TRANSCRIPT, MODE_AUDIO };
+
+    llama_token tok_gen_start  = LLAMA_TOKEN_NULL;
+    llama_token tok_gen_end    = LLAMA_TOKEN_NULL;
+    llama_token tok_text_start = LLAMA_TOKEN_NULL;
+    llama_token tok_text_pad   = LLAMA_TOKEN_NULL;
+
+    bool     continuing = false;
+    gen_mode mode       = MODE_TEXT;
+
+    llama_seq_id seq_id = 0;
+    int pos = 0;
+    std::vector<piece> pieces;
+    size_t piece_idx = 0;
+    int    piece_off = 0;
+
+    std::vector<std::vector<llama_token>> sents; // reading a text: the transcript of each segment
+    size_t  sent_idx  = 0;
+    size_t  sent_off  = 0;
+    int32_t max_steps = 2048;
+
+    float   temp        = 0.0f;
+    int32_t top_k       = 0;
+    float   top_p       = 1.0f;
+    float   rep_penalty = 1.0f;
+    std::mt19937 rng;
+    size_t depth = 0;             // levels of a frame, learned from the depth head
+    std::vector<int32_t> n_class; // logits per level: codebook size + the extra class
+    std::vector<float>   logits;
+    std::vector<float>   fb_buf;
+    std::vector<int32_t> hist;    // frame-major codes of the response, for the penalty
+    std::vector<int32_t> seg;     // frame-major codes of the open segment
+    std::string          transcript; // words of the segment being written, for the log
+
+    std::vector<float>   audio_pcm;
+    std::vector<float>   h_state_buf;
+    mtmd_helper_gen_audio_outtype out_type = MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
+    std::vector<char> out_buf;
+    bool   stream          = false;
+    size_t pcm_sent        = 0;
+    bool   wav_header_sent = false;
+};
+
 static std::unique_ptr<mtmd_gen_audio_pipeline> make_pipeline(llama_context * lctx, mtmd_context * mctx) {
     switch (mtmd_gen_audio_get_info(mctx).type) {
         case MTMD_GEN_AUDIO_TYPE_QWEN3TTS:
@@ -5373,6 +5985,8 @@ static std::unique_ptr<mtmd_gen_audio_pipeline> make_pipeline(llama_context * lc
             return std::unique_ptr<mtmd_gen_audio_pipeline>(new fish_s2_gen_audio_pipeline(lctx, mctx));
         case MTMD_GEN_AUDIO_TYPE_VOXCPM2:
             return std::unique_ptr<mtmd_gen_audio_pipeline>(new voxcpm2_gen_audio_pipeline(lctx, mctx));
+        case MTMD_GEN_AUDIO_TYPE_LONGCAT_NEXT:
+            return std::unique_ptr<mtmd_gen_audio_pipeline>(new longcat_next_gen_audio_pipeline(lctx, mctx));
         default:
             return nullptr;
     }
