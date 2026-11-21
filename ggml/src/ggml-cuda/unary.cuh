@@ -181,3 +181,9 @@ __device__ __forceinline__ float ggml_cuda_op_glu_single(ggml_glu_op op, float g
             return up * gate;
     }
 }
+
+// UNARY(tanh, f), MUL(., c), SUB(c, .), UNARY(tanh, g), MUL(., m), ADD: out = c - tanh(f)*c + tanh(g)*m in one launch
+bool ggml_cuda_should_fuse_tanh_gate(const ggml_tensor * tf, const ggml_tensor * mul_fc, const ggml_tensor * sub,
+        const ggml_tensor * tg, const ggml_tensor * mul_gm, const ggml_tensor * add);
+void ggml_cuda_op_tanh_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * tf, const ggml_tensor * tg,
+        const ggml_tensor * sub, const ggml_tensor * mul_gm, ggml_tensor * add);

@@ -10348,6 +10348,24 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // the gate of a looped Inkling 2 layer input, out = c - tanh(f)*c + tanh(g)*m
+    if (node->op == GGML_OP_UNARY && !ggml_cuda_fusion_disabled() &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD }, { i + 5 }) &&
+            ggml_cuda_should_fuse_tanh_gate(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3],
+                cgraph->nodes[i + 4], cgraph->nodes[i + 5])) {
+        // element-wise: the output may take the memory of an input of its own layout, not overlap one otherwise
+        const ggml_tensor * out = cgraph->nodes[i + 5];
+        bool mem_ok = true;
+        for (const ggml_tensor * in : { node->src[0], cgraph->nodes[i + 3]->src[0], cgraph->nodes[i + 2]->src[0], cgraph->nodes[i + 4]->src[1] }) {
+            const bool same = in->data == out->data && ggml_is_contiguous(in) && ggml_are_same_shape(in, out);
+            mem_ok = mem_ok && (same || !ggml_cuda_tensors_overlap(in, out));
+        }
+        if (mem_ok) {
+            ggml_cuda_op_tanh_gate(*cuda_ctx, node, cgraph->nodes[i + 3], cgraph->nodes[i + 2], cgraph->nodes[i + 4], cgraph->nodes[i + 5]);
+            return 5;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {

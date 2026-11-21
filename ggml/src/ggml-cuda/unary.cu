@@ -1314,3 +1314,57 @@ void ggml_cuda_op_mul_sigmoid_scale(ggml_backend_cuda_context & ctx, ggml_tensor
         (int) x->ne[0], (int) x->ne[1], (int) x->ne[2], (int) m->ne[0], (int) m->ne[1], (int) m->ne[2], (int) m->ne[3],
         scale, bias, pre_scale, pre_bias);
 }
+
+// out = c - tanh(f)*c + tanh(g)*m (the gate of a looped Inkling 2 layer input): f, g and out contiguous of one shape,
+//   c and m of that shape with any row strides
+static __global__ void tanh_gate_f32(const float * __restrict__ f, const float * __restrict__ g, const char * __restrict__ c,
+        const char * __restrict__ m, float * __restrict__ dst, const int64_t n, const int ne0, const int ne1, const int ne2,
+        const int64_t nbc1, const int64_t nbc2, const int64_t nbc3, const int64_t nbm1, const int64_t nbm2, const int64_t nbm3) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const int64_t i0 = i % ne0;
+    const int64_t i1 = (i/ne0) % ne1;
+    const int64_t i2 = (i/ne0/ne1) % ne2;
+    const int64_t i3 = i/ne0/ne1/ne2;
+    const float cv = *(const float *) (c + i0*sizeof(float) + i1*nbc1 + i2*nbc2 + i3*nbc3);
+    const float mv = *(const float *) (m + i0*sizeof(float) + i1*nbm1 + i2*nbm2 + i3*nbm3);
+    const float kept = cv - tanhf(f[i])*cv;
+    dst[i] = kept + tanhf(g[i])*mv;
+}
+
+bool ggml_cuda_should_fuse_tanh_gate(const ggml_tensor * tf, const ggml_tensor * mul_fc, const ggml_tensor * sub,
+        const ggml_tensor * tg, const ggml_tensor * mul_gm, const ggml_tensor * add) {
+    if (ggml_get_unary_op(tf) != GGML_UNARY_OP_TANH || ggml_get_unary_op(tg) != GGML_UNARY_OP_TANH) {
+        return false;
+    }
+    const ggml_tensor * f = tf->src[0];
+    const ggml_tensor * g = tg->src[0];
+    const ggml_tensor * c = sub->src[0];
+    const ggml_tensor * m = mul_gm->src[1];
+    if (mul_fc->src[0] != tf || mul_fc->src[1] != c || sub->src[1] != mul_fc || mul_gm->src[0] != tg ||
+            add->src[0] != sub || add->src[1] != mul_gm) {
+        return false;
+    }
+    for (const ggml_tensor * t : { f, g, c, m, add }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_are_same_shape(t, add) || t->nb[0] != sizeof(float)) {
+            return false;
+        }
+    }
+    return ggml_is_contiguous(f) && ggml_is_contiguous(g) && ggml_is_contiguous(add);
+}
+
+void ggml_cuda_op_tanh_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * tf, const ggml_tensor * tg,
+        const ggml_tensor * sub, const ggml_tensor * mul_gm, ggml_tensor * add) {
+    const ggml_tensor * f = tf->src[0];
+    const ggml_tensor * g = tg->src[0];
+    const ggml_tensor * c = sub->src[0];
+    const ggml_tensor * m = mul_gm->src[1];
+    const int64_t n = ggml_nelements(add);
+    const int block = 256;
+    tanh_gate_f32<<<(n + block - 1)/block, block, 0, ctx.stream()>>>((const float *) f->data, (const float *) g->data,
+        (const char *) c->data, (const char *) m->data, (float *) add->data, n, add->ne[0], add->ne[1], add->ne[2],
+        c->nb[1], c->nb[2], c->nb[3], m->nb[1], m->nb[2], m->nb[3]);
+    CUDA_CHECK(cudaGetLastError());
+}
