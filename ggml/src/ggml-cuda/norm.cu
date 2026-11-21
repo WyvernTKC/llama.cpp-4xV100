@@ -3919,3 +3919,159 @@ void ggml_cuda_op_l2_clip(ggml_backend_cuda_context & ctx, const ggml_tensor * x
         x->nb[1]/ts, x->nb[2]/ts, x->nb[3]/ts, s ? s->nb[1]/ts : 0, s ? s->ne[1] : 1, scale, bias, t, lo, hi);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// a depth mix (Inkling 2): the states of a token are the rows of x (normed already) and cur, normed here; for query q,
+//   dst[q] = sum_s softmax_s(scale*<state_s, query_q>)*state_s. One block per query and token, in float4 steps.
+template <int max_x>
+static __global__ void __launch_bounds__(1024) depth_mix_f32(
+        const float * __restrict__ x, const float * __restrict__ cur, const float * __restrict__ query, float * __restrict__ dst,
+        const int nc4, const int n_x, const int64_t sx1, const int64_t sx2, const int64_t sc2, const int64_t sq1,
+        const int64_t sd1, const int64_t sd2, const float eps, const float scale) {
+    const int64_t iq = blockIdx.x;
+    const int64_t it = blockIdx.y;
+
+    const float4 * x4 = (const float4 *) (x     + it*sx2);
+    const float4 * c4 = (const float4 *) (cur   + it*sc2);
+    const float4 * q4 = (const float4 *) (query + iq*sq1);
+    float4       * d4 = (float4       *) (dst   + iq*sd1 + it*sd2);
+    const int64_t  s4 = sx1/4;
+
+    // the dot of each row of x with the query, of cur with the query and of cur with itself
+    float dot[max_x];
+#pragma unroll
+    for (int s = 0; s < max_x; ++s) {
+        dot[s] = 0.0f;
+    }
+    float dc = 0.0f;
+    float ss = 0.0f;
+
+    for (int c = threadIdx.x; c < nc4; c += blockDim.x) {
+        const float4 qv = q4[c];
+        const float4 cv = c4[c];
+        dc += cv.x*qv.x + cv.y*qv.y + cv.z*qv.z + cv.w*qv.w;
+        ss += cv.x*cv.x + cv.y*cv.y + cv.z*cv.z + cv.w*cv.w;
+#pragma unroll
+        for (int s = 0; s < max_x; ++s) {
+            if (s < n_x) {
+                const float4 xv = x4[s*s4 + c];
+                dot[s] += xv.x*qv.x + xv.y*qv.y + xv.z*qv.z + xv.w*qv.w;
+            }
+        }
+    }
+
+    __shared__ float red[32][max_x + 2];
+    __shared__ float w[max_x + 1];
+
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+#pragma unroll
+    for (int s = 0; s < max_x; ++s) {
+        if (s < n_x) {
+            dot[s] = warp_reduce_sum(dot[s]);
+        }
+    }
+    dc = warp_reduce_sum(dc);
+    ss = warp_reduce_sum(ss);
+    if (lane == 0) {
+#pragma unroll
+        for (int s = 0; s < max_x; ++s) {
+            if (s < n_x) {
+                red[warp][s] = dot[s];
+            }
+        }
+        red[warp][max_x]     = dc;
+        red[warp][max_x + 1] = ss;
+    }
+    __syncthreads();
+    if (threadIdx.x < max_x + 2 && (threadIdx.x < n_x || threadIdx.x >= max_x)) {
+        float v = 0.0f;
+        for (int k = 0; k < (int) blockDim.x/WARP_SIZE; ++k) {
+            v += red[k][threadIdx.x];
+        }
+        red[0][threadIdx.x] = v;
+    }
+    __syncthreads();
+    // the softmax over the states, the weight of cur times its norm factor
+    if (threadIdx.x == 0) {
+        const float rs = rsqrtf(red[0][max_x + 1]/(4*nc4) + eps);
+        const float lc = red[0][max_x]*rs*scale;
+        float m = lc;
+        for (int s = 0; s < n_x; ++s) {
+            m = fmaxf(m, red[0][s]*scale);
+        }
+        const float ec = expf(lc - m);
+        float sum = 0.0f;
+        for (int s = 0; s < n_x; ++s) {
+            w[s] = expf(red[0][s]*scale - m);
+            sum += w[s];
+        }
+        sum += ec;
+        const float inv = 1.0f/sum;
+        for (int s = 0; s < n_x; ++s) {
+            w[s] *= inv;
+        }
+        w[max_x] = ec*inv*rs;
+    }
+    __syncthreads();
+
+    const float wc = w[max_x];
+    for (int c = threadIdx.x; c < nc4; c += blockDim.x) {
+        float4 o = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+        for (int s = 0; s < max_x; ++s) {
+            if (s < n_x) {
+                const float  ws = w[s];
+                const float4 xv = x4[s*s4 + c];
+                o.x += ws*xv.x;
+                o.y += ws*xv.y;
+                o.z += ws*xv.z;
+                o.w += ws*xv.w;
+            }
+        }
+        const float4 cv = c4[c];
+        o.x += wc*cv.x;
+        o.y += wc*cv.y;
+        o.z += wc*cv.z;
+        o.w += wc*cv.w;
+        d4[c] = o;
+    }
+}
+
+static constexpr int DEPTH_MIX_MAX_X = 15;
+
+static bool depth_mix_aligned(const ggml_tensor * t, int dims) {
+    if (t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float) || ((uintptr_t) t->data) % 16 != 0) {
+        return false;
+    }
+    for (int d = 1; d < dims; ++d) {
+        if (t->nb[d] % 16 != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ggml_cuda_should_fuse_depth_mix(const ggml_tensor * x, const ggml_tensor * cur, const ggml_tensor * query, const ggml_tensor * dst) {
+    const int64_t n  = x->ne[0];
+    const int64_t nt = x->ne[2];
+    return n % 4 == 0 && x->ne[1] >= 1 && x->ne[1] <= DEPTH_MIX_MAX_X && x->ne[3] == 1 &&
+        cur->ne[0] == n && cur->ne[1] == 1 && cur->ne[2] == nt && cur->ne[3] == 1 &&
+        query->ne[0] == n && query->ne[2] == 1 && query->ne[3] == 1 && query->ne[1] <= 65535 &&
+        dst->ne[0] == n && dst->ne[1] == query->ne[1] && dst->ne[2] == nt && dst->ne[3] == 1 && nt <= 65535 &&
+        depth_mix_aligned(x, 3) && depth_mix_aligned(cur, 3) && depth_mix_aligned(query, 2) && depth_mix_aligned(dst, 3);
+}
+
+void ggml_cuda_op_depth_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * cur, const ggml_tensor * query,
+        ggml_tensor * dst, float eps, float scale) {
+    GGML_ASSERT(ggml_cuda_should_fuse_depth_mix(x, cur, query, dst));
+
+    const int64_t ts  = sizeof(float);
+    const int     nc4 = x->ne[0]/4;
+    const int     nth = std::min(1024, (nc4 + WARP_SIZE - 1)/WARP_SIZE*WARP_SIZE);
+    const dim3    grid(query->ne[1], x->ne[2], 1);
+
+    depth_mix_f32<DEPTH_MIX_MAX_X><<<grid, nth, 0, ctx.stream()>>>(
+        (const float *) x->data, (const float *) cur->data, (const float *) query->data, (float *) dst->data, nc4, x->ne[1],
+        x->nb[1]/ts, x->nb[2]/ts, cur->nb[2]/ts, query->nb[1]/ts, dst->nb[1]/ts, dst->nb[2]/ts, eps, scale);
+    CUDA_CHECK(cudaGetLastError());
+}

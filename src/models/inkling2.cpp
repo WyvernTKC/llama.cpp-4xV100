@@ -212,10 +212,14 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
     }
     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
 
-    // the scores first, so that the weighted sum follows the transposed copy of the states (one kernel on CUDA)
+    // the scores first, so that the weighted sum follows the transposed copy of the states, and the weighted sum right
+    //   away: the mix is one run of nodes (one kernel on CUDA)
     ggml_build_forward_expand(gf, scores);
 
-    return ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, states)), scores);
+    ggml_tensor * out = ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, states)), scores);
+    ggml_build_forward_expand(gf, out);
+
+    return out;
 }
 
 // causal short convolution with a residual; dynamic adds input-dependent taps per head

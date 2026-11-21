@@ -7042,6 +7042,84 @@ static int ggml_cuda_try_fuse_cont_small_k(ggml_backend_cuda_context * cuda_ctx,
     return 1;
 }
 
+// The depth mix of Inkling 2 (llama_model_inkling2::graph::mix): RMS_NORM(cur), CONCAT(normed blocks, it), the scores
+//   MUL_MAT (one token: states by queries; a batch: queries by states, RESHAPE, then RESHAPE or PERMUTE + CONT), SOFT_MAX,
+//   TRANSPOSE, CONT and the weighted sum MUL_MAT in one launch (ggml_cuda_op_depth_mix). GGML_CUDA_NO_DEPTH_MIX_FUSION=1 off.
+static int ggml_cuda_try_fuse_depth_mix(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_DEPTH_MIX_FUSION") != nullptr;
+    if (disabled) {
+        return 0;
+    }
+    auto at = [&](int k) -> ggml_tensor * { return k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr; };
+
+    const ggml_tensor * norm = cgraph->nodes[i];
+    const ggml_tensor * cat  = at(i + 1);
+    if (cat == nullptr || cat->op != GGML_OP_CONCAT || cat->src[1] != norm || ggml_get_op_params_i32(cat, 0) != 1 ||
+            norm->type != GGML_TYPE_F32 || cat->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    int j = i + 2;
+    const ggml_tensor * states = cat;
+    if (at(j) && at(j)->op == GGML_OP_RESHAPE && at(j)->src[0] == cat) {
+        states = at(j++);
+    }
+    const ggml_tensor * mm = at(j++);
+    if (mm == nullptr || mm->op != GGML_OP_MUL_MAT) {
+        return 0;
+    }
+    const ggml_tensor * query;
+    const ggml_tensor * scores = mm;
+    if (states == cat && mm->src[0] == cat) {
+        query = mm->src[1];
+    } else if (states != cat && mm->src[1] == states) {
+        query = mm->src[0];
+        const ggml_tensor * rs = at(j++);
+        if (rs == nullptr || rs->op != GGML_OP_RESHAPE || rs->src[0] != mm) {
+            return 0;
+        }
+        const ggml_tensor * n2 = at(j++);
+        if (n2 && n2->op == GGML_OP_RESHAPE && n2->src[0] == rs) {
+            scores = n2;
+        } else if (n2 && n2->op == GGML_OP_PERMUTE && n2->src[0] == rs && n2->op_params[0] == 1 && n2->op_params[1] == 0 &&
+                n2->op_params[2] == 2 && n2->op_params[3] == 3 && at(j) && at(j)->op == GGML_OP_CONT && at(j)->src[0] == n2) {
+            scores = at(j++);
+        } else {
+            return 0;
+        }
+    } else {
+        return 0;
+    }
+    const ggml_tensor * sm   = at(j++);
+    const ggml_tensor * tr   = at(j++);
+    const ggml_tensor * cont = at(j++);
+    ggml_tensor       * out  = at(j);
+    if (sm == nullptr || tr == nullptr || cont == nullptr || out == nullptr || query->op != GGML_OP_NONE ||
+            sm->op != GGML_OP_SOFT_MAX || sm->src[0] != scores || sm->src[1] != nullptr || sm->src[2] != nullptr ||
+            ggml_get_op_params_f32(sm, 1) != 0.0f || tr->op != GGML_OP_TRANSPOSE || tr->src[0] != cat ||
+            cont->op != GGML_OP_CONT || cont->src[0] != tr || out->op != GGML_OP_MUL_MAT || out->src[0] != cont || out->src[1] != sm ||
+            !(out->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+        return 0;
+    }
+    // the views between carry no compute flag in a split graph: the uses are checked here
+    const int n = j - i + 1;
+    for (int k = i; k < j; ++k) {
+        const ggml_tensor * t = cgraph->nodes[k];
+        const bool view = t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
+        if ((!view && !(t->flags & GGML_TENSOR_FLAG_COMPUTE)) || (t->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                ggml_cuda_graph_use_count(cgraph, t) != (t == cat ? 2 : 1)) {
+            return 0;
+        }
+    }
+    const ggml_tensor * x   = cat->src[0];
+    const ggml_tensor * src = norm->src[0];
+    const int out_nodes[] = { j };
+    if (!ggml_cuda_should_fuse_depth_mix(x, src, query, out) || !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n, out_nodes, 1)) {
+        return 0;
+    }
+    ggml_cuda_op_depth_mix(*cuda_ctx, x, src, query, out, ggml_get_op_params_f32(norm, 0), ggml_get_op_params_f32(sm, 0));
+    return n - 1;
+}
+
 // MLA's V up-projection at one token (v_mla in build_attn_mha) is a matvec per head, permuted and made contiguous for the
 //   output projection. With one token the permutation keeps the memory order and the CONT is a plain copy: the matvec
 //   writes its output to the CONT's buffer, with the q8_1 copy for the output projection.
@@ -8663,7 +8741,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (node->op == GGML_OP_RMS_NORM) {
-        const int n_skip = ggml_cuda_try_fuse_mla_kv_row(cuda_ctx, cgraph, i);
+        int n_skip = ggml_cuda_try_fuse_mla_kv_row(cuda_ctx, cgraph, i);
+        if (n_skip == 0) {
+            n_skip = ggml_cuda_try_fuse_depth_mix(cuda_ctx, cgraph, i);
+        }
         if (n_skip > 0) {
             return n_skip;
         }

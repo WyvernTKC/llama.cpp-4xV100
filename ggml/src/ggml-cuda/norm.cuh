@@ -117,3 +117,9 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 // dst = y*clamp(t/(sqrt(sum(y*y))*scale + bias), lo, hi) per row, y = x*s (s: a vector per row of x, or none)
 void ggml_cuda_op_l2_clip(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * s, ggml_tensor * dst,
         float scale, float bias, float t, float lo, float hi);
+
+// a depth mix (Inkling 2): states = the rows of x (already normed, [n, n_x, n_tokens]) and rms_norm(cur) ([n, 1, n_tokens]),
+//   dst[:, q, t] = sum_s softmax_s(scale*<state_s, query[:, q]>)*state_s
+bool ggml_cuda_should_fuse_depth_mix(const ggml_tensor * x, const ggml_tensor * cur, const ggml_tensor * query, const ggml_tensor * dst);
+void ggml_cuda_op_depth_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * cur, const ggml_tensor * query,
+        ggml_tensor * dst, float eps, float scale);
