@@ -2660,6 +2660,10 @@ struct llama_model_inkling2 : public llama_model_base {
 
         ggml_tensor * inp_out_ids = nullptr;
         ggml_tensor * tau         = nullptr; // log-scaled positions
+
+        // the rms norms of the blocks of a mix, [n_embd, n_blocks, n_tokens], and the padded bias tables, built once
+        std::map<std::vector<ggml_tensor *>, ggml_tensor *> blocks_n;
+        std::map<const ggml_tensor *, ggml_tensor *>        rel_bias_padded;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

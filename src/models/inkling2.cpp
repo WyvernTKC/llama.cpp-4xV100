@@ -176,11 +176,27 @@ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor *
 
 // attention over the depth: mix the earlier block outputs and cur with learned queries
 ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
-    ggml_tensor * states = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
-    for (ggml_tensor * block : blocks) {
-        states = ggml_concat(ctx0, ggml_reshape_3d(ctx0, block, n_embd, 1, n_tokens), states, 1);
+    // the normed blocks are the same for every mix until the next block, normed once and grown by one block at a time
+    ggml_tensor * states = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens), 1e-6f);
+    if (!blocks.empty()) {
+        ggml_tensor *& normed = blocks_n[blocks];
+        if (normed == nullptr) {
+            ggml_tensor * last = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, blocks.back(), n_embd, 1, n_tokens), 1e-6f);
+            if (blocks.size() == 1) {
+                normed = last;
+            } else {
+                ggml_tensor * prev = blocks_n[std::vector<ggml_tensor *>(blocks.begin(), blocks.end() - 1)];
+                normed = prev ? ggml_concat(ctx0, prev, last, 1) : nullptr;
+            }
+            if (normed == nullptr) {
+                normed = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, blocks[0], n_embd, 1, n_tokens), 1e-6f);
+                for (size_t ib = 1; ib < blocks.size(); ++ib) {
+                    normed = ggml_concat(ctx0, normed, ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, blocks[ib], n_embd, 1, n_tokens), 1e-6f), 1);
+                }
+            }
+        }
+        states = ggml_concat(ctx0, normed, states, 1);
     }
-    states = ggml_rms_norm(ctx0, states, 1e-6f);
 
     const int64_t n_states  = states->ne[1];
     const int64_t n_queries = query->ne[1];
@@ -394,11 +410,25 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
 
         // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
-        ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
+        // the slots of a looped layer share its bias table, padded with the zero row once
+        ggml_tensor *& rel_bias = rel_bias_padded[layer.attn_rel_bias];
+        if (rel_bias == nullptr) {
+            rel_bias = ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0);
+        }
+        // table [n_head, n_extent + 1, n_tokens]; for a batch, one product over the heads of all tokens (heads outermost,
+        //   which keeps the slice of each device whole under a split by head)
+        ggml_tensor * table;
+        if (n_tokens == 1) {
+            table = ggml_mul_mat(ctx0, ggml_reshape_2d(ctx0, Rcur, Rcur->ne[0], n_head), rel_bias);
+            table = ggml_reshape_3d(ctx0, table, n_head, table->ne[1], 1);
+        } else {
+            ggml_tensor * r = ggml_cont(ctx0, ggml_permute(ctx0, Rcur, 0, 2, 1, 3));
+            table = ggml_mul_mat(ctx0, rel_bias, ggml_reshape_2d(ctx0, r, r->ne[0], n_tokens*n_head));
+            table = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, table, table->ne[0], n_tokens, n_head), 1, 2, 0, 3));
+        }
 
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
-        table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
-        table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
+        table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, n_head, 1, n_tokens));
 
         ggml_tensor * kq_b = ggml_get_rows(ctx0, table, rel_pos);
         kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
