@@ -1260,6 +1260,11 @@ class MODEL_TENSOR(IntEnum):
     V_TOK_IMG_BEGIN      = auto() # hunyuanvl
     V_TOK_IMG_END        = auto() # hunyuanvl
     V_STD_BIAS           = auto() # gemma4
+    V_ENC_RVQ_IN_NORM    = auto() # longcat-next: norm + MLP before the residual quantizer
+    V_ENC_RVQ_IN_FC1     = auto() # longcat-next
+    V_ENC_RVQ_IN_FC2     = auto() # longcat-next
+    V_ENC_RVQ_CODEBOOK   = auto() # longcat-next: residual quantizer codebook, shared by all levels
+    V_MM_CODE_EMBD       = auto() # longcat-next: LLM embedding rows of the codes, merged 3D [n_levels, vocab, dim]
     V_STD_SCALE          = auto() # gemma4
     V_SAM_POS_EMBD       = auto() # Deepseek-OCR
     V_SAM_PATCH_EMBD     = auto() # Deepseek-OCR
@@ -2264,6 +2269,11 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.V_TOK_IMG_BEGIN:           "mm.image_begin",
     MODEL_TENSOR.V_TOK_IMG_END:             "mm.image_end",
     MODEL_TENSOR.V_STD_BIAS:                "v.std_bias", # gemma4
+    MODEL_TENSOR.V_ENC_RVQ_IN_NORM:         "v.rvq.in_norm", # longcat-next
+    MODEL_TENSOR.V_ENC_RVQ_IN_FC1:          "v.rvq.in_fc1",
+    MODEL_TENSOR.V_ENC_RVQ_IN_FC2:          "v.rvq.in_fc2",
+    MODEL_TENSOR.V_ENC_RVQ_CODEBOOK:        "v.rvq.codebook",
+    MODEL_TENSOR.V_MM_CODE_EMBD:            "mm.code_embd",
     MODEL_TENSOR.V_STD_SCALE:               "v.std_scale", # gemma4
     # DeepSeek-OCR SAM
     MODEL_TENSOR.V_SAM_POS_EMBD:            "v.sam.pos_embd",
@@ -2723,6 +2733,11 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.V_TOK_IMG_BEGIN,
         MODEL_TENSOR.V_TOK_IMG_END,
         MODEL_TENSOR.V_STD_BIAS,
+        MODEL_TENSOR.V_ENC_RVQ_IN_NORM,
+        MODEL_TENSOR.V_ENC_RVQ_IN_FC1,
+        MODEL_TENSOR.V_ENC_RVQ_IN_FC2,
+        MODEL_TENSOR.V_ENC_RVQ_CODEBOOK,
+        MODEL_TENSOR.V_MM_CODE_EMBD,
         MODEL_TENSOR.V_STD_SCALE,
         MODEL_TENSOR.V_SAM_POS_EMBD,
         MODEL_TENSOR.V_SAM_PATCH_EMBD,
@@ -7489,6 +7504,7 @@ class VisionProjectorType:
     DEEPSEEKOCR2 = "deepseekocr2"
     DEEPSEEK4V = "deepseek4v"
     DEEPSEEK41V = "deepseek41v"
+    LONGCAT_NEXT_V = "longcatnextv"
     LFM2A = "lfm2a" # audio
     LFM3A = "lfm3a" # audio
     LFM3A_GEN = "lfm3a_gen" # audio generation: MaskGIT depthformer + liquid-codec decoder

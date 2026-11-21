@@ -1377,6 +1377,16 @@ struct mtmd_model {
     // mimo-v2.5: text-side RVQ code embedding ("text codebook")
     ggml_tensor * mm_a_code_embd = nullptr; // merged 3D [n_channels, vocab, dim]
 
+    // longcat-next: vision residual quantizer (one codebook shared by the levels) and the LLM rows of its codes
+    ggml_tensor * v_rvq_in_norm_w = nullptr;
+    ggml_tensor * v_rvq_in_norm_b = nullptr;
+    ggml_tensor * v_rvq_in_fc1_w  = nullptr;
+    ggml_tensor * v_rvq_in_fc1_b  = nullptr;
+    ggml_tensor * v_rvq_in_fc2_w  = nullptr;
+    ggml_tensor * v_rvq_in_fc2_b  = nullptr;
+    ggml_tensor * v_rvq_codebook  = nullptr; // [dim, n_code]
+    ggml_tensor * mm_code_embd    = nullptr; // merged 3D [n_levels, n_code, n_embd]
+
     // mimo-v2.5: LLM-side connector (input_local_transformer, separate from the
     // audio_tokenizer's own encoder `layers`)
     std::vector<mtmd_layer> mm_a_local_layers;

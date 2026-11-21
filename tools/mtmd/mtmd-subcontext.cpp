@@ -1507,13 +1507,15 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
                 set_input_i32("positions", positions);
             } break;
         case PROJECTOR_TYPE_QWEN25VL:
+        case PROJECTOR_TYPE_LONGCAT_NEXT_V:
         case PROJECTOR_TYPE_EXAONE4_5:
         case PROJECTOR_TYPE_YOUTUVL:
             {
                 // pw * ph = number of tokens output by ViT after apply patch merger
                 // ipw * ipw = number of vision token been processed inside ViT
                 const bool use_window_attn =
-                    (model.proj_type == PROJECTOR_TYPE_QWEN25VL || model.proj_type == PROJECTOR_TYPE_EXAONE4_5)
+                    (model.proj_type == PROJECTOR_TYPE_QWEN25VL || model.proj_type == PROJECTOR_TYPE_LONGCAT_NEXT_V ||
+                     model.proj_type == PROJECTOR_TYPE_EXAONE4_5)
                         ? hparams.n_wa_pattern > 0
                         : !hparams.wa_layer_indexes.empty();
                 const int merge_ratio = 2;

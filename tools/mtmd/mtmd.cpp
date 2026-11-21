@@ -1429,6 +1429,13 @@ struct mtmd_context {
                     img_end = "</vision>";
                     image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(models.v.get());
                 } break;
+            case PROJECTOR_TYPE_LONGCAT_NEXT_V:
+                {
+                    // <longcat_img_start> ... (image embeddings) ... <longcat_img_end>
+                    img_beg = "<longcat_img_start>";
+                    img_end = "<longcat_img_end>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(models.v.get());
+                } break;
             case PROJECTOR_TYPE_GRANITE4_VISION:
                 {
                     // ... (image embeddings) \n ...

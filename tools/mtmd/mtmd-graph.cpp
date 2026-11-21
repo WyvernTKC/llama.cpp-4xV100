@@ -793,6 +793,10 @@ std::unique_ptr<mtmd_graph> mtmd_get_graph_builder(mtmd_subcontext * ctx, const 
             {
                 builder = std::make_unique<mtmd_graph_qwen2vl>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_LONGCAT_NEXT_V:
+            {
+                builder = std::make_unique<mtmd_graph_longcat_next_v>(ctx, img);
+            } break;
         case PROJECTOR_TYPE_QWEN3VL:
             {
                 builder = std::make_unique<mtmd_graph_qwen3vl>(ctx, img);

@@ -662,7 +662,9 @@ struct mtmd_model_loader {
                 case PROJECTOR_TYPE_QWEN25VL:
                 case PROJECTOR_TYPE_QWEN3VL:
                 case PROJECTOR_TYPE_LING3VL:
+                case PROJECTOR_TYPE_LONGCAT_NEXT_V:
                     {
+                        const bool is_longcat = model.proj_type == PROJECTOR_TYPE_LONGCAT_NEXT_V;
                         hparams.n_merge = 2; // default value for Qwen 2 and 2.5
                         hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
                         hparams.image_resize_pad  = PAD_NONE; // the HF processor resizes to the smart_resize size, no padding
@@ -672,7 +674,7 @@ struct mtmd_model_loader {
                             // the temporal merge input and the merger use a 2x2 patch grid
                             throw std::runtime_error(mtmd_format("%s: spatial_merge_size (%d) must be 2\n", __func__, hparams.n_merge));
                         }
-                        get_u32(KEY_WIN_ATTN_PATTERN, hparams.n_wa_pattern, model.proj_type == PROJECTOR_TYPE_QWEN25VL); // only 2.5 requires it
+                        get_u32(KEY_WIN_ATTN_PATTERN, hparams.n_wa_pattern, model.proj_type == PROJECTOR_TYPE_QWEN25VL || is_longcat); // only 2.5 requires it
                         // ref: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/blob/main/preprocessor_config.json
                         hparams.set_limit_image_tokens(8, 4096);
                         // optional limits of the model, the custom values take precedence
@@ -684,7 +686,7 @@ struct mtmd_model_loader {
                         }
                         hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
                         const int warn_min_pixels = 1024 * hparams.n_merge * hparams.n_merge * hparams.patch_size * hparams.patch_size;
-                        if (hparams.image_min_pixels < warn_min_pixels) {
+                        if (!is_longcat && hparams.image_min_pixels < warn_min_pixels) {
                             LOG_WRN("%s: Qwen-VL models require at minimum 1024 image tokens to function correctly on grounding tasks\n", __func__);
                             LOG_WRN("%s: if you encounter problems with accuracy, try adding --image-min-tokens 1024\n", __func__);
                             LOG_WRN("%s: more info: https://github.com/ggml-org/llama.cpp/issues/16842\n\n", __func__);
@@ -1990,6 +1992,32 @@ struct mtmd_model_loader {
                     model.mm_0_b = get_tensor(mtmd_format(TN_LLAVA_PROJ, 0, "bias"));
                     model.mm_1_w = get_tensor(mtmd_format(TN_LLAVA_PROJ, 2, "weight"));
                     model.mm_1_b = get_tensor(mtmd_format(TN_LLAVA_PROJ, 2, "bias"));
+                } break;
+            case PROJECTOR_TYPE_LONGCAT_NEXT_V:
+                {
+                    model.mm_0_w = get_tensor(mtmd_format(TN_LLAVA_PROJ, 0, "weight"));
+                    model.mm_0_b = get_tensor(mtmd_format(TN_LLAVA_PROJ, 0, "bias"));
+                    model.mm_1_w = get_tensor(mtmd_format(TN_LLAVA_PROJ, 2, "weight"));
+                    model.mm_1_b = get_tensor(mtmd_format(TN_LLAVA_PROJ, 2, "bias"));
+                    model.v_rvq_in_norm_w = get_tensor(mtmd_format(TN_V_RVQ_IN_NORM, "weight"));
+                    model.v_rvq_in_norm_b = get_tensor(mtmd_format(TN_V_RVQ_IN_NORM, "bias"));
+                    model.v_rvq_in_fc1_w  = get_tensor(mtmd_format(TN_V_RVQ_IN_FC1,  "weight"));
+                    model.v_rvq_in_fc1_b  = get_tensor(mtmd_format(TN_V_RVQ_IN_FC1,  "bias"));
+                    model.v_rvq_in_fc2_w  = get_tensor(mtmd_format(TN_V_RVQ_IN_FC2,  "weight"));
+                    model.v_rvq_in_fc2_b  = get_tensor(mtmd_format(TN_V_RVQ_IN_FC2,  "bias"));
+                    model.v_rvq_codebook  = get_tensor(mtmd_format(TN_V_RVQ_CODEBOOK, "weight"));
+                    model.mm_code_embd    = get_tensor(mtmd_format(TN_MM_CODE_EMBD,   "weight"));
+                    model.mm_input_norm_w = get_tensor(TN_MM_INP_NORM);
+                    model.mm_input_norm_b = get_tensor(TN_MM_INP_NORM_B);
+                    model.mm_ffn_gate_w   = get_tensor(mtmd_format(TN_MM_GATE, "weight"));
+                    model.mm_ffn_up_w     = get_tensor(mtmd_format(TN_MM_UP,   "weight"));
+                    model.mm_ffn_down_w   = get_tensor(mtmd_format(TN_MM_DOWN, "weight"));
+                    // the graph searches the codebook in f32 and indexes the code rows with the found ids
+                    if (model.v_rvq_codebook->type != GGML_TYPE_F32 ||
+                            model.v_rvq_codebook->ne[0] != model.mm_1_w->ne[1] ||
+                            model.v_rvq_codebook->ne[1] != model.mm_code_embd->ne[1]) {
+                        throw std::runtime_error(mtmd_format("%s: longcat-next: codebook and code embedding do not match\n", __func__));
+                    }
                 } break;
             case PROJECTOR_TYPE_MAGEVL:
                 {
@@ -4620,6 +4648,7 @@ int mtmd_model::n_output_tokens_x(const mtmd_image_f32 * img) const {
     switch (proj) {
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
+        case PROJECTOR_TYPE_LONGCAT_NEXT_V:
         case PROJECTOR_TYPE_QWEN3VL:
         case PROJECTOR_TYPE_MAGEVL:
         case PROJECTOR_TYPE_SENSENOVA_U1:
@@ -4655,6 +4684,7 @@ int mtmd_model::n_output_tokens_y(const mtmd_image_f32 * img) const {
     switch (proj) {
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
+        case PROJECTOR_TYPE_LONGCAT_NEXT_V:
         case PROJECTOR_TYPE_QWEN3VL:
         case PROJECTOR_TYPE_MAGEVL:
         case PROJECTOR_TYPE_SENSENOVA_U1:
@@ -4746,6 +4776,7 @@ int mtmd_model::n_output_tokens(const mtmd_image_f32 * img) const {
             } break;
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
+        case PROJECTOR_TYPE_LONGCAT_NEXT_V:
         case PROJECTOR_TYPE_QWEN3VL:
         case PROJECTOR_TYPE_MAGEVL:
         case PROJECTOR_TYPE_SENSENOVA_U1:
@@ -5107,6 +5138,8 @@ int mtmd_model::n_mmproj_embd() const {
         case PROJECTOR_TYPE_MUSE_GLIMMER:
         case PROJECTOR_TYPE_INKLING2V:
             return mm_2_w->ne[1];
+        case PROJECTOR_TYPE_LONGCAT_NEXT_V:
+            return mm_code_embd->ne[0];
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
         case PROJECTOR_TYPE_MAGEVL:

@@ -235,6 +235,13 @@
 #define TN_A_RVQ_CODEBOOK    "a.rvq.codebook.%s"
 // mimo-v2.5: text-side RVQ code embedding ("text codebook")
 #define TN_MM_A_CODE_EMBD    "mm.a.code_embd.%s"
+
+// longcat-next: vision residual quantizer, its codes index rows of the LLM embedding
+#define TN_V_RVQ_IN_NORM     "v.rvq.in_norm.%s"
+#define TN_V_RVQ_IN_FC1      "v.rvq.in_fc1.%s"
+#define TN_V_RVQ_IN_FC2      "v.rvq.in_fc2.%s"
+#define TN_V_RVQ_CODEBOOK    "v.rvq.codebook.%s"
+#define TN_MM_CODE_EMBD      "mm.code_embd.%s"
 // mimo-v2.5: LLM-side connector (input_local_transformer)
 #define TN_MM_A_LOCAL_ATTN_Q   "mm.a.local_blk.%d.attn_q.%s"
 #define TN_MM_A_LOCAL_ATTN_K   "mm.a.local_blk.%d.attn_k.%s"
@@ -588,6 +595,7 @@ enum projector_type {
     PROJECTOR_TYPE_DEEPSEEKOCR2,
     PROJECTOR_TYPE_DEEPSEEK4V,
     PROJECTOR_TYPE_DEEPSEEK41V,
+    PROJECTOR_TYPE_LONGCAT_NEXT_V,
     PROJECTOR_TYPE_LFM2A,
     PROJECTOR_TYPE_D1OMNI_A,
     PROJECTOR_TYPE_LFM3A,
@@ -688,6 +696,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_DEEPSEEKOCR2,      "deepseekocr2"},
     { PROJECTOR_TYPE_DEEPSEEK4V,        "deepseek4v"},
     { PROJECTOR_TYPE_DEEPSEEK41V,       "deepseek41v"},
+    { PROJECTOR_TYPE_LONGCAT_NEXT_V,    "longcatnextv"},
     { PROJECTOR_TYPE_LFM2A,             "lfm2a"},
     { PROJECTOR_TYPE_D1OMNI_A,          "d1omni_a"},
     { PROJECTOR_TYPE_LFM3A,             "lfm3a"},

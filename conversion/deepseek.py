@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 from .base import LazyTorchTensor, MmprojModel, ModelBase, TextModel, gguf, logger
 
 from .qwen import QwenModel
+from .qwenvl import Qwen2VLVisionModel
 
 
 @ModelBase.register("DeepseekOCRForCausalLM")
@@ -651,6 +652,98 @@ class LongcatNextModel(LongcatNgramModel):
         if name == "model.embed_tokens.weight":
             data_torch = data_torch[:self.hparams["vocab_size"]]
         yield from super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("LongcatNextForCausalLM")
+class LongcatNextVisionModel(Qwen2VLVisionModel):
+    # Qwen2.5-VL ViT + merger, then a residual quantizer: the codes of each level index rows of the LLM embedding
+    # ref: modular_longcat_next_visual.py (LongcatNextVisualTokenizer), modeling_longcat_next.py (get_visual_embeddings)
+    _vt = "model.visual_tokenizer."
+
+    def get_vision_config(self) -> dict[str, Any] | None:
+        # config.json keeps only the overrides of Qwen2_5_VLVisionConfig, add its defaults
+        vc = {
+            "depth": 32, "hidden_size": 1280, "intermediate_size": 3420, "num_heads": 16, "patch_size": 14,
+            "spatial_merge_size": 2, "temporal_patch_size": 2, "window_size": 112, "out_hidden_size": 3584,
+            "fullatt_block_indexes": [7, 15, 23, 31],
+        }
+        vc.update(self.global_config["visual_config"])
+        return vc
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # the processor is Qwen2VLImageProcessor with its default (CLIP) mean and std
+        self.preprocessor_config.setdefault("image_mean", [0.48145466, 0.4578275, 0.40821073])
+        self.preprocessor_config.setdefault("image_std", [0.26862954, 0.26130258, 0.27577711])
+        vq = self.hparams_vision["vq_config"]
+        assert vq["quantizer_type"] == "rq" and vq["shared_codebook"] and vq["quant_conv"], vq
+        assert all(n == vq["codebook_size"] for n in vq["codebook_sizes"]), vq
+
+    def set_gguf_parameters(self):
+        MmprojModel.set_gguf_parameters(self)
+        hparams = self.hparams_vision
+        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.LONGCAT_NEXT_V)
+        self.gguf_writer.add_vision_use_silu(True)
+        fullatt = hparams["fullatt_block_indexes"]
+        n_wa_pattern = fullatt[0] + 1
+        if any(b - a != n_wa_pattern for a, b in zip(fullatt, fullatt[1:])):
+            raise ValueError(f"Invalid fullatt_block_indexes: {fullatt}")
+        self.gguf_writer.add_vision_n_wa_pattern(n_wa_pattern)
+        self.gguf_writer.add_vision_attention_layernorm_eps(1e-6) # Qwen2.5-VL vision RMSNorm
+        self.gguf_writer.add_vision_min_pixels(self.preprocessor_config["min_pixels"])
+        self.gguf_writer.add_vision_max_pixels(self.preprocessor_config["max_pixels"])
+
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        # the codes are an argmin over the codebook: keep the quantizer path in f32
+        if new_name.startswith("v.rvq."):
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, _ = item
+        if name == "model.embed_tokens.weight":
+            return item
+        if not name.startswith(cls._vt) or name.endswith(("_ema", ".cluster_size")):
+            return None
+        # the codebook is shared, one copy is enough
+        if ".quantize.codebooks." in name and ".quantize.codebooks.0." not in name:
+            return None
+        return item
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name == "model.embed_tokens.weight":
+            vq = self.hparams_vision["vq_config"]
+            n_lv, n_code = vq["depth"], vq["codebook_size"]
+            off = self.global_config["visual_offset"]
+            rows = data_torch[off:off + n_lv * n_code]
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.V_MM_CODE_EMBD), rows.reshape(n_lv, n_code, rows.shape[-1])
+            return
+
+        name = name[len(self._vt):]
+        suffix = name.rsplit(".", 1)[-1]
+        if name.startswith("visual_model."):
+            yield from super().modify_tensors(data_torch, "visual." + name[len("visual_model."):], bid)
+        elif name.startswith("visual_bridge_model.bridge."):
+            yield from super().modify_tensors(data_torch, "visual.merger." + name[len("visual_bridge_model.bridge."):], bid)
+        elif name.startswith("visual_bridge_model.quantizer.quant_conv."):
+            idx = int(name.split(".")[3])
+            tensor = {0: gguf.MODEL_TENSOR.V_ENC_RVQ_IN_NORM, 1: gguf.MODEL_TENSOR.V_ENC_RVQ_IN_FC1, 3: gguf.MODEL_TENSOR.V_ENC_RVQ_IN_FC2}[idx]
+            yield self.format_tensor_name(tensor, suffix=f".{suffix}"), data_torch
+        elif name == "visual_bridge_model.quantizer.quantize.codebooks.0.embed":
+            # the last row is a padding entry the distance search skips
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.V_ENC_RVQ_CODEBOOK), data_torch[:-1]
+        elif name.startswith("visual_embedding_layer.pre_buffer."):
+            sub = name[len("visual_embedding_layer.pre_buffer."):]
+            tensor = {
+                "pre_layernorm": gguf.MODEL_TENSOR.V_MM_INP_NORM,
+                "mlp.gate_proj": gguf.MODEL_TENSOR.V_MM_GATE,
+                "mlp.up_proj":   gguf.MODEL_TENSOR.V_MM_UP,
+                "mlp.down_proj": gguf.MODEL_TENSOR.V_MM_DOWN,
+            }[sub.rsplit(".", 1)[0]]
+            yield self.format_tensor_name(tensor, suffix=f".{suffix}"), data_torch
+        else:
+            raise ValueError(f"Unexpected tensor {self._vt}{name}")
 
 
 @ModelBase.register("DeepseekV32ForCausalLM")

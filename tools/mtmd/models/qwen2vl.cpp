@@ -1,6 +1,11 @@
 #include "models.h"
 
 ggml_cgraph * mtmd_graph_qwen2vl::build() {
+    ggml_build_forward_expand(gf, build_qwen2vl(FFN_GELU));
+    return gf;
+}
+
+ggml_tensor * mtmd_graph_qwen2vl::build_qwen2vl(ffn_op_type merger_op) {
     GGML_ASSERT(model.patch_bias == nullptr);
     GGML_ASSERT(model.class_embedding == nullptr);
 
@@ -10,7 +15,7 @@ ggml_cgraph * mtmd_graph_qwen2vl::build() {
     const int n_pos            = n_patches;
     const int num_position_ids = n_pos * 4; // m-rope requires 4 dim per position
 
-    norm_type norm_t = proj_type == PROJECTOR_TYPE_QWEN25VL
+    norm_type norm_t = proj_type == PROJECTOR_TYPE_QWEN25VL || proj_type == PROJECTOR_TYPE_LONGCAT_NEXT_V
         ? NORM_TYPE_RMS // qwen 2.5 vl
         : NORM_TYPE_NORMAL; // qwen 2 vl
 
@@ -147,7 +152,7 @@ ggml_cgraph * mtmd_graph_qwen2vl::build() {
                         model.mm_0_w, model.mm_0_b,
                         nullptr, nullptr,
                         model.mm_1_w, model.mm_1_b,
-                        FFN_GELU,
+                        merger_op,
                         -1);
 
     if (use_window_attn) {
@@ -155,15 +160,13 @@ ggml_cgraph * mtmd_graph_qwen2vl::build() {
         ggml_set_name(window_idx, "window_idx");
         ggml_set_input(window_idx);
 
-        // embeddings shape: [n_embd, n_patches_x * n_patches_y, batch_size]
+        // embeddings shape: [n_out, n_patches_x * n_patches_y, batch_size]
         GGML_ASSERT(batch_size == 1);
-        embeddings = ggml_reshape_2d(ctx0, embeddings, hparams.projection_dim, n_patches_x * n_patches_y / 4);
+        const int64_t n_out = embeddings->ne[0];
+        embeddings = ggml_reshape_2d(ctx0, embeddings, n_out, n_patches_x * n_patches_y / 4);
         embeddings = ggml_get_rows(ctx0, embeddings, window_idx);
-        embeddings = ggml_reshape_3d(ctx0, embeddings, hparams.projection_dim, n_patches_x * n_patches_y / 4, batch_size);
+        embeddings = ggml_reshape_3d(ctx0, embeddings, n_out, n_patches_x * n_patches_y / 4, batch_size);
     }
 
-    // build the graph
-    ggml_build_forward_expand(gf, embeddings);
-
-    return gf;
+    return embeddings;
 }

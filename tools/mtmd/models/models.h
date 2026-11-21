@@ -59,6 +59,17 @@ struct mtmd_graph_deepseek4v : mtmd_graph {
 struct mtmd_graph_qwen2vl : mtmd_graph {
     mtmd_graph_qwen2vl(mtmd_subcontext * ctx, const mtmd_image_f32 & img) : mtmd_graph(ctx, img) {}
     ggml_cgraph * build() override;
+
+    // ViT + merger, returns the merged tokens in raster order
+    ggml_tensor * build_qwen2vl(ffn_op_type merger_op);
+};
+
+struct mtmd_graph_longcat_next_v : mtmd_graph_qwen2vl {
+    mtmd_graph_longcat_next_v(mtmd_subcontext * ctx, const mtmd_image_f32 & img) : mtmd_graph_qwen2vl(ctx, img) {}
+    ggml_cgraph * build() override;
+
+    // nn.LayerNorm default of quant_conv, and rms_norm_eps of the LLM config for the embedding layer
+    static constexpr float norm_eps = 1e-5f;
 };
 
 struct mtmd_graph_qwen3vl : mtmd_graph_qwen2vl {
