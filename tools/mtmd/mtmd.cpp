@@ -1469,6 +1469,13 @@ struct mtmd_context {
                     aud_end = "<|audio_eos|>";
                     audio_preproc = std::make_unique<mtmd_audio_preprocessor_whisper>(models.a.get());
                 } break;
+            case PROJECTOR_TYPE_LONGCAT_NEXT_A:
+                {
+                    // <longcat_audio_start> ... (embeddings of all 30 s pieces) ... <longcat_audio_end>
+                    aud_beg = "<longcat_audio_start>";
+                    aud_end = "<longcat_audio_end>";
+                    audio_preproc = std::make_unique<mtmd_audio_preprocessor_longcat_next>(models.a.get());
+                } break;
             case PROJECTOR_TYPE_HIGGS_AUDIO:
                 {
                     // the 4s chunks are joined in one <|audio_bos|> ... <|audio_eos|> span

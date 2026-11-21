@@ -655,10 +655,15 @@ class LongcatNextModel(LongcatNgramModel):
 
 
 @ModelBase.register("LongcatNextForCausalLM")
-class LongcatNextVisionModel(Qwen2VLVisionModel):
-    # Qwen2.5-VL ViT + merger, then a residual quantizer: the codes of each level index rows of the LLM embedding
-    # ref: modular_longcat_next_visual.py (LongcatNextVisualTokenizer), modeling_longcat_next.py (get_visual_embeddings)
+class LongcatNextMmprojModel(Qwen2VLVisionModel):
+    # vision: Qwen2.5-VL ViT + merger, then a residual quantizer whose codes index rows of the LLM embedding
+    # audio: Whisper-style encoder, a 4x downsampling bridge, the same kind of quantizer
+    # ref: modular_longcat_next_visual.py, modular_longcat_next_audio.py (encode), modeling_longcat_next.py (get_*_embeddings)
+    has_vision_encoder = True
+    has_audio_encoder = True
     _vt = "model.visual_tokenizer."
+    _at = "model.audio_tokenizer."
+    _aud_cb: dict[int, Tensor]
 
     def get_vision_config(self) -> dict[str, Any] | None:
         # config.json keeps only the overrides of Qwen2_5_VLVisionConfig, add its defaults
@@ -670,19 +675,30 @@ class LongcatNextVisionModel(Qwen2VLVisionModel):
         vc.update(self.global_config["visual_config"])
         return vc
 
+    def get_audio_config(self) -> dict[str, Any] | None:
+        ac = dict(self.global_config["audio_config"])
+        ac["hidden_size"] = ac["d_model"]
+        ac["intermediate_size"] = ac["encoder_ffn_dim"]
+        ac["num_attention_heads"] = ac["encoder_attention_heads"]
+        ac["num_hidden_layers"] = ac["encoder_layers"]
+        return ac
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._aud_cb = {}
         # the processor is Qwen2VLImageProcessor with its default (CLIP) mean and std
         self.preprocessor_config.setdefault("image_mean", [0.48145466, 0.4578275, 0.40821073])
         self.preprocessor_config.setdefault("image_std", [0.26862954, 0.26130258, 0.27577711])
         vq = self.hparams_vision["vq_config"]
         assert vq["quantizer_type"] == "rq" and vq["shared_codebook"] and vq["quant_conv"], vq
         assert all(n == vq["codebook_size"] for n in vq["codebook_sizes"]), vq
+        ac = self.hparams_audio
+        assert ac["avg_pooler"] == 4 and ac["kernel_size"] == 3 and ac["stride_size"] == 2 and not ac.get("scale_embedding"), ac
 
     def set_gguf_parameters(self):
         MmprojModel.set_gguf_parameters(self)
         hparams = self.hparams_vision
-        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.LONGCAT_NEXT_V)
+        self.gguf_writer.add_clip_vision_projector_type(gguf.VisionProjectorType.LONGCAT_NEXT_V)
         self.gguf_writer.add_vision_use_silu(True)
         fullatt = hparams["fullatt_block_indexes"]
         n_wa_pattern = fullatt[0] + 1
@@ -693,16 +709,28 @@ class LongcatNextVisionModel(Qwen2VLVisionModel):
         self.gguf_writer.add_vision_min_pixels(self.preprocessor_config["min_pixels"])
         self.gguf_writer.add_vision_max_pixels(self.preprocessor_config["max_pixels"])
 
+        self.gguf_writer.add_clip_audio_projector_type(gguf.VisionProjectorType.LONGCAT_NEXT_A)
+        self.gguf_writer.add_audio_num_mel_bins(self.hparams_audio["num_mel_bins"])
+        self.gguf_writer.add_audio_attention_layernorm_eps(1e-5) # nn.LayerNorm default
+        self.gguf_writer.add_audio_rvq_codebook_size(self.hparams_audio["vq_config"]["codebook_sizes"])
+
     def tensor_force_quant(self, name, new_name, bid, n_dims):
-        # the codes are an argmin over the codebook: keep the quantizer path in f32
-        if new_name.startswith("v.rvq."):
+        # the codes are an argmin over the codebooks: keep the quantizer path in f32
+        if new_name.startswith(("v.rvq.", "a.rvq.")):
             return gguf.GGMLQuantizationType.F32
+        if new_name.startswith("a.conv1d.") and new_name.endswith(".weight"):
+            return gguf.GGMLQuantizationType.F16
         return super().tensor_force_quant(name, new_name, bid, n_dims)
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, _ = item
         if name == "model.embed_tokens.weight":
+            return item
+        if name.startswith((cls._at + "audio_model.", cls._at + "audio_bridge_model.")):
+            # proj_decoder only serves the audio decoder
+            if ".proj_decoder." in name or name.endswith((".cluster_size", ".embed_avg")):
+                return None
             return item
         if not name.startswith(cls._vt) or name.endswith(("_ema", ".cluster_size")):
             return None
@@ -718,6 +746,14 @@ class LongcatNextVisionModel(Qwen2VLVisionModel):
             off = self.global_config["visual_offset"]
             rows = data_torch[off:off + n_lv * n_code]
             yield self.format_tensor_name(gguf.MODEL_TENSOR.V_MM_CODE_EMBD), rows.reshape(n_lv, n_code, rows.shape[-1])
+            # audio: the levels have different sizes, their rows stay concatenated
+            off = self.global_config["audio_offset"]
+            n_rows = sum(self.hparams_audio["vq_config"]["codebook_sizes"])
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.A_MM_CODE_EMBD), data_torch[off:off + n_rows]
+            return
+
+        if name.startswith(self._at):
+            yield from self._modify_audio(data_torch, name[len(self._at):], bid)
             return
 
         name = name[len(self._vt):]
@@ -744,6 +780,41 @@ class LongcatNextVisionModel(Qwen2VLVisionModel):
             yield self.format_tensor_name(tensor, suffix=f".{suffix}"), data_torch
         else:
             raise ValueError(f"Unexpected tensor {self._vt}{name}")
+
+    def _modify_audio(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        suffix = name.rsplit(".", 1)[-1]
+        if name == "audio_model.positional_embedding":
+            # the checkpoint keeps the sinusoids rounded to bf16, the reference adds those
+            yield from MmprojModel.modify_tensors(self, data_torch, "audio_tower.embed_positions.weight", bid)
+        elif name.startswith("audio_model."):
+            if name in ("audio_model.conv1.bias", "audio_model.conv2.bias"):
+                data_torch = data_torch.unsqueeze(-1)
+            yield from MmprojModel.modify_tensors(self, data_torch, "audio_tower." + name[len("audio_model."):], bid)
+        elif name in ("audio_bridge_model.gate_proj.weight", "audio_bridge_model.up_proj.weight"):
+            # a conv with kernel = stride = 4 is a linear layer on 4 stacked frames, input index = frame * d_model + channel
+            n_out, n_in, k = data_torch.shape
+            w = data_torch.permute(0, 2, 1).reshape(n_out, k * n_in)
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.A_MMPROJ, 0 if "gate" in name else 1), w
+        elif name == "audio_bridge_model.down_proj.weight":
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.A_MMPROJ, 2), data_torch
+        elif name.startswith("audio_bridge_model.layer_norm."):
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.A_MM_NORM_MID, suffix=f".{suffix}"), data_torch
+        elif (m := re.match(r"audio_bridge_model\.vq_list\.(\d+)\.codebook\.embed$", name)):
+            # the levels have different sizes: concatenated along the rows, split by clip.audio.rvq.codebook_size
+            sizes = self.hparams_audio["vq_config"]["codebook_sizes"]
+            lv = int(m.group(1))
+            assert data_torch.shape[0] == sizes[lv], (name, data_torch.shape)
+            self._aud_cb[lv] = data_torch
+            if len(self._aud_cb) == len(sizes):
+                cbs = [self._aud_cb.pop(i) for i in range(len(sizes))]
+                yield self.format_tensor_name(gguf.MODEL_TENSOR.A_ENC_RVQ_CODEBOOK), torch.cat(cbs, dim=0)
+        else:
+            raise ValueError(f"Unexpected tensor {self._at}{name}")
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+        if self._aud_cb:
+            raise ValueError(f"Unprocessed audio codebooks: {sorted(self._aud_cb)}")
 
 
 @ModelBase.register("DeepseekV32ForCausalLM")

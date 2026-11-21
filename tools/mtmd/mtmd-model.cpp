@@ -945,7 +945,12 @@ struct mtmd_model_loader {
                 case PROJECTOR_TYPE_VOXTRAL:
                 case PROJECTOR_TYPE_MERALION:
                 case PROJECTOR_TYPE_MUSIC_FLAMINGO:
+                case PROJECTOR_TYPE_LONGCAT_NEXT_A:
                     {
+                        if (model.proj_type == PROJECTOR_TYPE_LONGCAT_NEXT_A) {
+                            // the residual quantizer: codebook sizes of the levels, concatenated in a.rvq.codebook
+                            get_arr_int(KEY_A_RVQ_CODEBOOK_SIZE, hparams.rvq_codebook_size);
+                        }
                         bool require_stack = model.proj_type == PROJECTOR_TYPE_ULTRAVOX ||
                                              model.proj_type == PROJECTOR_TYPE_VOXTRAL ||
                                              model.proj_type == PROJECTOR_TYPE_MERALION ||
@@ -2551,6 +2556,33 @@ struct mtmd_model_loader {
                     model.conv1d_2_b = get_tensor(mtmd_format(TN_CONV1D, 2, "bias"));
                     model.mm_fc_w = get_tensor(mtmd_format(TN_MM_AUDIO_FC, "weight"));
                     model.mm_fc_b = get_tensor(mtmd_format(TN_MM_AUDIO_FC, "bias"));
+                } break;
+            case PROJECTOR_TYPE_LONGCAT_NEXT_A:
+                {
+                    model.conv1d_1_w = get_tensor(mtmd_format(TN_CONV1D, 1, "weight"));
+                    model.conv1d_1_b = get_tensor(mtmd_format(TN_CONV1D, 1, "bias"));
+                    model.conv1d_2_w = get_tensor(mtmd_format(TN_CONV1D, 2, "weight"));
+                    model.conv1d_2_b = get_tensor(mtmd_format(TN_CONV1D, 2, "bias"));
+                    // 4x downsampling bridge: gate and up over 4 stacked frames, down, LayerNorm of the residual sum
+                    model.mm_0_w = get_tensor(mtmd_format(TN_MM_AUDIO_MLP, 0, "weight"));
+                    model.mm_1_w = get_tensor(mtmd_format(TN_MM_AUDIO_MLP, 1, "weight"));
+                    model.mm_2_w = get_tensor(mtmd_format(TN_MM_AUDIO_MLP, 2, "weight"));
+                    model.mm_norm_mid_w = get_tensor(mtmd_format(TN_MM_NORM_MID, "weight"));
+                    model.mm_norm_mid_b = get_tensor(mtmd_format(TN_MM_NORM_MID, "bias"));
+                    // the levels of the quantizer and their LLM rows are concatenated: [dim, sum of the codebook sizes]
+                    model.rvq_codebook   = get_tensor(mtmd_format(TN_A_RVQ_CODEBOOK, "weight"));
+                    model.mm_a_code_embd = get_tensor(mtmd_format(TN_MM_A_CODE_EMBD, "weight"));
+                    int64_t n_codes = 0;
+                    for (int32_t n : hparams.rvq_codebook_size) {
+                        if (n <= 0) {
+                            throw std::runtime_error(mtmd_format("%s: longcat-next: invalid %s\n", __func__, KEY_A_RVQ_CODEBOOK_SIZE));
+                        }
+                        n_codes += n;
+                    }
+                    if (model.rvq_codebook->type != GGML_TYPE_F32 || model.rvq_codebook->ne[0] != model.mm_2_w->ne[1] ||
+                            model.rvq_codebook->ne[1] != n_codes || model.mm_a_code_embd->ne[1] != n_codes) {
+                        throw std::runtime_error(mtmd_format("%s: longcat-next: audio codebooks and code embedding do not match\n", __func__));
+                    }
                 } break;
             case PROJECTOR_TYPE_HIGGS_AUDIO:
                 {
@@ -4889,6 +4921,11 @@ int mtmd_model::n_output_tokens(const mtmd_image_f32 * img) const {
             {
                 n_patches = (img->nx() - img->audio_n_ctx) / hparams.audio_samples_per_token();
             } break;
+        case PROJECTOR_TYPE_LONGCAT_NEXT_A:
+            {
+                // conv stride 2, then whole groups of 4 frames
+                n_patches = (img->nx() + 1) / 2 / 4;
+            } break;
         case PROJECTOR_TYPE_VOXTRAL:
         case PROJECTOR_TYPE_ULTRAVOX:
         case PROJECTOR_TYPE_QWEN2A:
@@ -5188,6 +5225,8 @@ int mtmd_model::n_mmproj_embd() const {
         case PROJECTOR_TYPE_QWEN2A:
         case PROJECTOR_TYPE_NEMOTRON_TRANSCRIBE:
             return mm_fc_w->ne[1];
+        case PROJECTOR_TYPE_LONGCAT_NEXT_A:
+            return mm_a_code_embd->ne[0];
         case PROJECTOR_TYPE_QWEN3A:
         case PROJECTOR_TYPE_HIGGS_AUDIO:
             return mm_2_w->ne[1];

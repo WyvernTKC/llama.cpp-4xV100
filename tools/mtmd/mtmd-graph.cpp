@@ -878,6 +878,7 @@ std::unique_ptr<mtmd_graph> mtmd_get_graph_builder(mtmd_subcontext * ctx, const 
         case PROJECTOR_TYPE_GLMA:
         case PROJECTOR_TYPE_MERALION:
         case PROJECTOR_TYPE_MUSIC_FLAMINGO:
+        case PROJECTOR_TYPE_LONGCAT_NEXT_A:
             {
                 builder = std::make_unique<mtmd_graph_whisper_enc>(ctx, img);
             } break;

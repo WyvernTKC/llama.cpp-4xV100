@@ -590,6 +590,58 @@ bool mtmd_audio_preprocessor_whisper::process(const float *                 samp
 }
 
 //
+// mtmd_audio_preprocessor_longcat_next
+//
+// Matches LongcatNextAudioProcessor: the waveform is cut in 30 s pieces, each piece gets the whisper log-mel of
+// itself padded to 30 s, and the frames past min(3000, n / hop + 1) are dropped (the reference zeroes them and
+// the encoder only reads the valid ones). An odd frame count gets one zero frame: the stride 2 conv reads it.
+//
+
+void mtmd_audio_preprocessor_longcat_next::initialize() {
+    mtmd_audio_preprocessor_whisper::initialize();
+    mel_config.mel_floor = 1e-10f; // torch.clamp(mel_spec, min=1e-10)
+}
+
+bool mtmd_audio_preprocessor_longcat_next::process(const float *                 samples,
+                                                   size_t                        n_samples,
+                                                   std::vector<mtmd_audio_mel> & output,
+                                                   bool                          shape_only) const {
+    const size_t n_piece      = (size_t) hparams.audio_chunk_len * hparams.audio_sample_rate;
+    const size_t hop          = (size_t) hparams.audio_hop_len;
+    const size_t n_frames_max = n_piece / hop;
+
+    for (size_t off = 0; off < n_samples; off += n_piece) {
+        const size_t n = std::min(n_piece, n_samples - off);
+        if (n < (size_t) hparams.audio_n_fft) {
+            continue; // the reference drops a piece shorter than one window
+        }
+        const int64_t n_valid = (int64_t) std::min(n_frames_max, n / hop + 1);
+        if ((n_valid + 1) / 2 / 4 == 0) {
+            continue; // no whole group of 4 encoder frames, no token
+        }
+
+        std::vector<mtmd_audio_mel> mel;
+        if (!mtmd_audio_preprocessor_whisper::process(samples + off, n, mel, shape_only) || mel.empty()) {
+            return false;
+        }
+        const mtmd_audio_mel & full = mel[0];
+        GGML_ASSERT(full.n_len >= n_valid);
+
+        mtmd_audio_mel out;
+        out.n_mel     = full.n_mel;
+        out.n_len     = n_valid + (n_valid % 2);
+        out.n_len_org = out.n_len;
+        out.data.assign((size_t) out.n_mel * out.n_len, 0.0f);
+        for (int64_t i = 0; i < out.n_mel; i++) {
+            std::copy_n(full.data.begin() + (size_t) i * full.n_len, n_valid, out.data.begin() + (size_t) i * out.n_len);
+        }
+        output.push_back(std::move(out));
+    }
+
+    return !output.empty();
+}
+
+//
 // mtmd_audio_preprocessor_qwen3a
 //
 // Matches the Python WhisperFeatureExtractor called with truncation=False:

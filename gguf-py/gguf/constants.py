@@ -7505,6 +7505,7 @@ class VisionProjectorType:
     DEEPSEEK4V = "deepseek4v"
     DEEPSEEK41V = "deepseek41v"
     LONGCAT_NEXT_V = "longcatnextv"
+    LONGCAT_NEXT_A = "longcatnexta" # audio
     LFM2A = "lfm2a" # audio
     LFM3A = "lfm3a" # audio
     LFM3A_GEN = "lfm3a_gen" # audio generation: MaskGIT depthformer + liquid-codec decoder

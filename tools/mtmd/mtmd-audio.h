@@ -128,6 +128,13 @@ struct mtmd_audio_preprocessor_whisper : mtmd_audio_preprocessor {
     mtmd_audio_cache cache;
 };
 
+// longcat-next: whisper log-mel of each 30 s piece on its own, cut to the frames of the audio
+struct mtmd_audio_preprocessor_longcat_next : mtmd_audio_preprocessor_whisper {
+    mtmd_audio_preprocessor_longcat_next(const mtmd_model * model) : mtmd_audio_preprocessor_whisper(model) {}
+    void initialize() override;
+    bool process(const float * samples, size_t n_samples, std::vector<mtmd_audio_mel> & output, bool shape_only) const override;
+};
+
 struct mtmd_audio_preprocessor_muse_spark_audio : mtmd_audio_preprocessor {
     mtmd_audio_preprocessor_muse_spark_audio(const mtmd_model * model) : mtmd_audio_preprocessor(model) {}
     void initialize() override {}

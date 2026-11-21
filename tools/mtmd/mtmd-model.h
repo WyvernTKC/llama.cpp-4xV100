@@ -1365,6 +1365,7 @@ struct mtmd_model {
     ggml_tensor * mm_norm_pre_w = nullptr;
     ggml_tensor * mm_norm_pre_b = nullptr;
     ggml_tensor * mm_norm_mid_w = nullptr;
+    ggml_tensor * mm_norm_mid_b = nullptr; // longcat-next audio
 
     // mimo-audio-tokenizer: post-transformer downsample + RVQ codebook
     // higgs-audio: depthwise downsample conv of the projector

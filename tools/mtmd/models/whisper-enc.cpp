@@ -77,6 +77,43 @@ ggml_cgraph * mtmd_graph_whisper_enc::build() {
         cur = build_mm(model.mm_fc_w, cur);
         cur = ggml_add(ctx0, cur, model.mm_fc_b);
 
+    } else if (proj_type == PROJECTOR_TYPE_LONGCAT_NEXT_A) {
+        // bridge over whole groups of 4 frames: LayerNorm(x + down(silu(gate(x)) * up(x)))
+        // ref: LongcatNextAudioVQBridger in modular_longcat_next_audio.py
+        const int64_t n_tok = cur->ne[1] / 4;
+        ggml_tensor * x = ggml_view_2d(ctx0, cur, cur->ne[0], 4 * n_tok, cur->nb[1], 0);
+        x = ggml_reshape_2d(ctx0, x, 4 * cur->ne[0], n_tok);
+        ggml_tensor * h = ggml_swiglu_split(ctx0, build_mm(model.mm_0_w, x), build_mm(model.mm_1_w, x));
+        h = build_mm(model.mm_2_w, h);
+        x = build_norm(ggml_add(ctx0, h, x), model.mm_norm_mid_w, model.mm_norm_mid_b, NORM_TYPE_NORMAL, hparams.eps, -1);
+        cb(x, "bridge", -1);
+
+        // residual quantizer, one codebook per level; the code of each level picks a row of the LLM embedding
+        ggml_tensor * residual = x;
+        ggml_tensor * embd = nullptr;
+        int64_t off = 0;
+        const auto & sizes = hparams.rvq_codebook_size;
+        for (size_t l = 0; l < sizes.size(); l++) {
+            ggml_tensor * codebook = ggml_view_2d(ctx0, model.rvq_codebook, model.rvq_codebook->ne[0], sizes[l],
+                                                  model.rvq_codebook->nb[1], off * model.rvq_codebook->nb[1]);
+            ggml_tensor * code_norm = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, codebook))));
+            // nearest entry: argmin |r - c|^2 = argmax (2 r.c - |c|^2)
+            ggml_tensor * scores = ggml_sub(ctx0, ggml_scale(ctx0, ggml_mul_mat(ctx0, codebook, residual), 2.0f), code_norm);
+            ggml_tensor * idx = ggml_argmax(ctx0, scores);
+            cb(idx, "rvq_code", (int) l);
+
+            if (l + 1 < sizes.size()) {
+                residual = ggml_sub(ctx0, residual, ggml_get_rows(ctx0, codebook, idx));
+            }
+
+            ggml_tensor * rows = ggml_view_2d(ctx0, model.mm_a_code_embd, model.mm_a_code_embd->ne[0], sizes[l],
+                                              model.mm_a_code_embd->nb[1], off * model.mm_a_code_embd->nb[1]);
+            ggml_tensor * e = ggml_get_rows(ctx0, rows, idx);
+            embd = embd ? ggml_add(ctx0, embd, e) : e;
+            off += sizes[l];
+        }
+        cur = embd;
+
     } else if (proj_type == PROJECTOR_TYPE_HIGGS_AUDIO) {
         // depthwise conv (k=3, s=2, p=1) over time, then linear-relu-linear
         cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
