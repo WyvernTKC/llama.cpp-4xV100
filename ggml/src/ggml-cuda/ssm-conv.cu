@@ -297,12 +297,15 @@ static __global__ void ssm_short_conv_state_f32(const float * states, const int3
 }
 
 // The same chain for the Inkling 2 short conv: no silu, the output is (conv + x)*res_scale, x the new token itself, and
-//   with r the residual stream added to it, r + (conv + x)*res_scale, rounded as the separate ADD rounds it.
+//   with r the residual stream added to it, r + (conv + x)*res_scale, rounded as the separate ADD rounds it. With dyn the
+//   conv adds the taps of its head, conv + win[t + d_conv - 1 - lag]*dyn[lag, c/cph, t] for each lag in turn (a dynamic
+//   conv of an Inkling 2 full-attention layer), rounded as the MULs and ADDs apart.
 template <int d_conv, int n_t>
 static __global__ void ssm_conv_state_res_f32(const float * states, const int32_t * ids, const int64_t row_stride,
                                               const float * x, const int64_t x_stride_t, const int64_t x_stride_c,
                                               const float * w, const int64_t w_stride, const float res_scale,
                                               const float * r, const int64_t r_stride_t,
+                                              const ggml_cuda_ssm_conv_dyn dyn,
                                               float * dst, const int64_t dst_stride_t,
                                               const ggml_cuda_ssm_conv_state_slots slots, const int nr) {
     ggml_cuda_pdl_lc();
@@ -348,6 +351,13 @@ static __global__ void ssm_conv_state_res_f32(const float * states, const int32_
         for (int j = 0; j < d_conv; ++j) {
             sumf += win[t + j] * wv[j];
         }
+        if (dyn.taps != nullptr) {
+            const float * tp = dyn.taps + (c/dyn.cph)*dyn.s_head + t*dyn.s_token;
+#pragma unroll
+            for (int lag = 0; lag < d_conv; ++lag) {
+                sumf = __fadd_rn(sumf, __fmul_rn(win[t + d_conv - 1 - lag], tp[lag]));
+            }
+        }
         const float v = __fmul_rn(win[d_conv - 1 + t] + sumf, res_scale);
         dst[t*dst_stride_t + c] = r != nullptr ? __fadd_rn(r[t*r_stride_t + c], v) : v;
     }
@@ -357,7 +367,7 @@ void ggml_cuda_op_ssm_conv_state(ggml_backend_cuda_context & ctx, const ggml_ten
                                  const ggml_tensor * x, const ggml_tensor * ssm_conv, ggml_tensor * silu,
                                  const ggml_cuda_ssm_conv_state_slots & slots, const ggml_tensor * gate,
                                  const ggml_tensor * x_a, const ggml_tensor * x_b, bool residual, float res_scale,
-                                 const ggml_tensor * res_r) {
+                                 const ggml_tensor * res_r, const ggml_cuda_ssm_conv_dyn dyn) {
     const ggml_tensor * w = ssm_conv->src[1];
 
     const int nr  = (int) w->ne[1];
@@ -383,7 +393,7 @@ void ggml_cuda_op_ssm_conv_state(ggml_backend_cuda_context & ctx, const ggml_ten
                 (const float *) x->data, (int64_t) (x->nb[0]/ts), (int64_t) (x->nb[1]/ts),
                 (const float *) w->data, (int64_t) (w->nb[1]/ts), res_scale,
                 res_r ? (const float *) res_r->data : (const float *) nullptr, res_r ? (int64_t) (res_r->nb[1]/ts) : (int64_t) 0,
-                (float *) silu->data, (int64_t) (silu->nb[1]/ts), slots, nr);
+                dyn, (float *) silu->data, (int64_t) (silu->nb[1]/ts), slots, nr);
             return;
         }
         ggml_cuda_kernel_launch(ssm_conv_state_f32<4, decltype(NT)::value>, launch_params,

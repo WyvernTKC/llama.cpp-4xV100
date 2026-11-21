@@ -241,16 +241,13 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     //   a projection split across devices (in the same subgraph as the convolution, which CUDA runs as one kernel)
     ggml_build_forward_expand(gf, cur);
 
-    ggml_tensor * past;
-    if (dynamic) {
-        past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
-    } else {
-        // the history of this convolution alone, gathered from the cache next to it: on CUDA the convolution kernel then
-        //   reads it itself and also stores the new history (the cache rows are those build_rs gathered for the layer)
-        ggml_tensor * cols = ggml_view_2d(ctx0, state, (n_conv - 1)*n_channels, state->ne[1], state->nb[1],
-                offset*(n_conv - 1)*ggml_element_size(state));
-        past = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, cols, inp->s_copy_main), n_conv - 1, n_channels, n_seqs);
-    }
+    // the history of this convolution alone, gathered from the cache next to it: on CUDA the convolution kernel then reads
+    //   it itself and also stores the new history; a dynamic one of a long ubatch reads it from the layer's gather
+    ggml_tensor * cols = ggml_view_2d(ctx0, state, (n_conv - 1)*n_channels, state->ne[1], state->nb[1],
+            offset*(n_conv - 1)*ggml_element_size(state));
+    ggml_tensor * past = dynamic && history ?
+        ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]) :
+        ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, cols, inp->s_copy_main), n_conv - 1, n_channels, n_seqs);
 
     ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
     x = ggml_concat(ctx0, past, x, 0);
@@ -344,9 +341,19 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         return ggml_view_2d(ctx0, m, n_embd, n_tokens, m->nb[2], ctrl*m->nb[1]);
     };
 
+    // the dynamic convolutions of a long ubatch read the states of its sequences from one gather of the whole rows; else
+    //   each convolution gathers its own (convolve) and build_rs only copies the states of sequences copied from another
+    //   (on CUDA the convolution kernel reads the history itself up to 8 tokens of a sequence, dynamic taps included)
     ggml_tensor * state   = recr->mctx->get_r_l(il);
-    ggml_tensor * history = build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs);
-    history = ggml_reshape_3d(ctx0, history, hparams.n_shortconv_l_cache - 1, hparams.n_sconv_channels, ubatch.n_seqs);
+    ggml_tensor * history = nullptr;
+    if (!is_swa && ubatch.n_seq_tokens > 8) {
+        history = build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs);
+        history = ggml_reshape_3d(ctx0, history, hparams.n_shortconv_l_cache - 1, hparams.n_sconv_channels, ubatch.n_seqs);
+    } else {
+        build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs, [](ggml_context * ctx, ggml_tensor * states, ggml_tensor *) {
+            return ggml_view_2d(ctx, states, states->ne[0], 0, states->nb[1], 0);
+        });
+    }
 
     ggml_tensor * inpSA = cur;
 
@@ -458,7 +465,10 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
         cb(kq_b, "kq_b", il);
 
-        sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+        if (sinks_zero == nullptr || sinks_zero->ne[0] != n_head) {
+            sinks_zero = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+        }
+        sinks = sinks_zero;
 
         cur = build_attn(inp,
                 nullptr, nullptr, nullptr,

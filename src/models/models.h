@@ -2635,7 +2635,7 @@ struct llama_model_inkling2 : public llama_model_base {
                 ggml_tensor * weight,
                 ggml_tensor * dynamic,
                 ggml_tensor * state,
-                ggml_tensor * history,
+                ggml_tensor * history, // the layer's gather of the conv states for dynamic convs, or nullptr
                 llm_graph_input_rs * inp,
                 int64_t offset);
         // cur_n and message_n: the rms norms of cur and message
@@ -2664,6 +2664,8 @@ struct llama_model_inkling2 : public llama_model_base {
         // the rms norms of the blocks of a mix, [n_embd, n_blocks, n_tokens], and the padded bias tables, built once
         std::map<std::vector<ggml_tensor *>, ggml_tensor *> blocks_n;
         std::map<const ggml_tensor *, ggml_tensor *>        rel_bias_padded;
+        // the zero sinks of the attention, the sink logits being in the mask, one fill for all layers
+        ggml_tensor * sinks_zero = nullptr;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

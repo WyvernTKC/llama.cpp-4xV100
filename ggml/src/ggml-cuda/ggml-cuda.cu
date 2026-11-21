@@ -4902,6 +4902,8 @@ struct ggml_cuda_ssm_conv_state_fusion {
     bool                residual  = false; // Inkling 2: the output is (conv + x)*res_scale, silu is that SCALE
     float               res_scale = 1.0f;
     const ggml_tensor * res_r     = nullptr; // and the residual stream added to it: silu is that ADD
+    const ggml_tensor * dyn_src   = nullptr; // the dynamic taps (Inkling 2): the tensor the tap views read
+    ggml_cuda_ssm_conv_dyn dyn    = {};
     ggml_cuda_ssm_conv_state_slots      slots      = {};
     ggml_cuda_ssm_conv_state_long_slots long_slots = {};
 };
@@ -5056,6 +5058,67 @@ static bool ggml_cuda_ssm_conv_state_fusion_match(
             f.silu_idx + 1 < cgraph->n_nodes && ggml_cuda_graph_use_count(cgraph, cgraph->nodes[f.silu_idx]) == 1) {
         silu_src = cgraph->nodes[f.silu_idx++];
     }
+    // Inkling 2's dynamic taps (convolve): for each lag, the CONT of the transposed window of the concat at column
+    //   d_conv - 1 - lag, its MUL by the view of the taps at lag, and the ADD to the conv, before the residual ADD
+    //   (GGML_CUDA_NO_DYN_CONV_FUSION=1 turns it off)
+    static const bool no_dyn_conv = getenv("GGML_CUDA_NO_DYN_CONV_FUSION") != nullptr;
+    int n_dyn_views = 0;
+    if (d_conv == 4 && !f.long_path && !no_dyn_conv) {
+        const ggml_tensor * acc = silu_src;
+        const ggml_tensor * taps = nullptr;
+        int j = f.silu_idx;
+        auto next_compute = [&]() -> const ggml_tensor * {
+            while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+                j++;
+            }
+            return j < cgraph->n_nodes ? cgraph->nodes[j++] : nullptr;
+        };
+        bool ok = true;
+        for (int lag = 0; lag < d_conv && ok; ++lag) {
+            const ggml_tensor * c = next_compute();
+            const ggml_tensor * m = next_compute();
+            const ggml_tensor * a = next_compute();
+            ok = c && m && a && c->op == GGML_OP_CONT && m->op == GGML_OP_MUL && a->op == GGML_OP_ADD && a->src[0] == acc;
+            if (!ok) {
+                break;
+            }
+            const ggml_tensor * tr = c->src[0];
+            const ggml_tensor * wv = tr->op == GGML_OP_TRANSPOSE ? tr->src[0] : nullptr;
+            const ggml_tensor * mr = m->src[0];
+            const ggml_tensor * tp = m->src[1];
+            const ggml_tensor * ar = a->src[1];
+            ok = wv && wv->op == GGML_OP_VIEW && wv->src[0] == concat && wv->view_offs == (size_t) (d_conv - 1 - lag)*sizeof(float) &&
+                wv->ne[0] == n_t && wv->ne[1] == nr && wv->nb[1] == concat->nb[1] &&
+                mr->op == GGML_OP_RESHAPE && mr->src[0] == c && ar->op == GGML_OP_RESHAPE && ar->src[0] == m &&
+                tp->op == GGML_OP_VIEW && tp->view_src != nullptr && tp->ne[0] == 1 && tp->type == GGML_TYPE_F32 &&
+                tp->view_offs % sizeof(float) == 0 && tp->ne[2] == n_t && mr->ne[1] == tp->ne[1] && mr->ne[0]*tp->ne[1] == nr &&
+                (taps == nullptr ? tp->view_offs == (size_t) lag*sizeof(float) :
+                    tp->view_src == taps->view_src && tp->view_offs == taps->view_offs + lag*sizeof(float) &&
+                    tp->nb[1] == taps->nb[1] && tp->nb[2] == taps->nb[2]) &&
+                c->type == GGML_TYPE_F32 && m->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32;
+            for (const ggml_tensor * t : { c, mr, m, ar, (const ggml_tensor *) tr, wv }) {
+                ok = ok && !(t->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_cuda_graph_use_count(cgraph, t) == 1;
+            }
+            ok = ok && ggml_cuda_graph_use_count(cgraph, a) == 1 && !(a->flags & GGML_TENSOR_FLAG_OUTPUT);
+            if (ok) {
+                taps = taps == nullptr ? tp : taps;
+                acc  = a;
+            }
+        }
+        if (ok && taps != nullptr) {
+            f.dyn_src     = taps->view_src;
+            f.dyn.taps    = (const float *) ((const char *) taps->view_src->data + taps->view_offs);
+            f.dyn.s_head  = taps->nb[1]/sizeof(float);
+            f.dyn.s_token = taps->nb[2]/sizeof(float);
+            f.dyn.cph     = (int) (nr/taps->ne[1]);
+            n_dyn_views   = d_conv;
+            silu_src      = acc;
+            f.silu_idx    = j;
+            while (f.silu_idx < cgraph->n_nodes - 1 && ggml_cuda_is_view_or_noop(cgraph->nodes[f.silu_idx])) {
+                f.silu_idx++;
+            }
+        }
+    }
     f.silu     = cgraph->nodes[f.silu_idx];
     // Inkling 2: an ADD of the new tokens (the tensor whose transpose they are) and a SCALE instead of the SILU
     static const bool no_res_conv = getenv("GGML_CUDA_NO_RES_CONV_FUSION") != nullptr;
@@ -5103,7 +5166,7 @@ static bool ggml_cuda_ssm_conv_state_fusion_match(
             f.ssm_conv->ne[0] != nr || f.ssm_conv->ne[1] != n_t || f.ssm_conv->ne[2] != 1 ||
             ggml_cuda_graph_use_count(cgraph, f.ssm_conv) != 1 || (f.ssm_conv->flags & GGML_TENSOR_FLAG_OUTPUT) || !silu_ok ||
             f.silu->type != GGML_TYPE_F32 || !ggml_are_same_shape(f.silu, f.ssm_conv) || !ggml_is_contiguous(f.silu) ||
-            ggml_cuda_graph_use_count(cgraph, concat) != n_cpy + 1) {
+            ggml_cuda_graph_use_count(cgraph, concat) != n_cpy + 1 + n_dyn_views || (f.dyn_src != nullptr && !f.residual)) {
         return false;
     }
 
@@ -5144,9 +5207,10 @@ static bool ggml_cuda_ssm_conv_state_fusion_match(
         if (ggml_cuda_is_view_or_noop(n)) {
             continue;
         }
-        // the gate and the residual are read at the concat too
+        // the gate, the residual and the taps are read at the concat too
         if (ggml_cuda_tensors_overlap(n, f.silu) || (f.gate != nullptr && ggml_cuda_tensors_overlap(n, f.gate)) ||
-                (f.res_r != nullptr && ggml_cuda_tensors_overlap(n, f.res_r))) {
+                (f.res_r != nullptr && ggml_cuda_tensors_overlap(n, f.res_r)) ||
+                (f.dyn_src != nullptr && ggml_cuda_tensors_overlap(n, f.dyn_src))) {
             return false;
         }
         for (int k = 0; k < GGML_MAX_SRC; k++) {
@@ -5169,6 +5233,9 @@ static bool ggml_cuda_ssm_conv_state_fusion_match(
         return false;
     }
     if (f.res_r != nullptr && (ggml_cuda_tensors_overlap(f.res_r, f.states) || ggml_cuda_tensors_overlap(f.res_r, f.ids))) {
+        return false;
+    }
+    if (f.dyn_src != nullptr && (ggml_cuda_tensors_overlap(f.silu, f.dyn_src) || ggml_cuda_tensors_overlap(f.dyn_src, f.states))) {
         return false;
     }
     return true;
@@ -10576,7 +10643,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_op_ssm_conv_state_long(*cuda_ctx, &states, f.ids, f.x, f.ssm_conv, f.silu, f.long_slots);
             } else {
                 ggml_cuda_op_ssm_conv_state(*cuda_ctx, &states, f.ids, f.x, f.ssm_conv, f.silu, f.slots, f.gate, f.x_a, f.x_b,
-                    f.residual, f.res_scale, f.res_r);
+                    f.residual, f.res_scale, f.res_r, f.dyn);
             }
             return f.last_cpy - i;
         }
