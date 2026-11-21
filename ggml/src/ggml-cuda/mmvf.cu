@@ -2697,3 +2697,51 @@ void ggml_cuda_mul_mat_small_k(ggml_backend_cuda_context & ctx, const ggml_tenso
 #undef MUL_MAT_SMALL_K_CASE
     CUDA_CHECK(cudaGetLastError());
 }
+
+// One token through a few f32 rows of a long K whose input is the concatenation of two vectors (the down projection of
+//   an Inkling 2 loop gate, W [2*n_embd, rank] by [rms_norm(cur); rms_norm(message)]): one block of 1024 threads per row
+//   reads the halves in place, so the CONCAT does not run. ggml_cuda_mul_mat_vec_f_concat.
+static __global__ void __launch_bounds__(1024) mul_mat_vec_f_concat(const float * __restrict__ x, const float * __restrict__ a,
+        const float * __restrict__ b, float * __restrict__ dst, const int na4, const int k4, const int64_t sx1) {
+    const int      r  = blockIdx.x;
+    const float4 * x4 = (const float4 *) (x + (int64_t) r*sx1);
+    float s = 0.0f;
+    for (int c = threadIdx.x; c < k4; c += blockDim.x) {
+        const float4 xv = x4[c];
+        const float4 yv = c < na4 ? ((const float4 *) a)[c] : ((const float4 *) b)[c - na4];
+        s += xv.x*yv.x + xv.y*yv.y + xv.z*yv.z + xv.w*yv.w;
+    }
+    s = warp_reduce_sum(s);
+    __shared__ float red[32];
+    if (threadIdx.x % WARP_SIZE == 0) {
+        red[threadIdx.x / WARP_SIZE] = s;
+    }
+    __syncthreads();
+    if (threadIdx.x < WARP_SIZE) {
+        s = threadIdx.x < (int) blockDim.x/WARP_SIZE ? red[threadIdx.x] : 0.0f;
+        s = warp_reduce_sum(s);
+        if (threadIdx.x == 0) {
+            dst[r] = s;
+        }
+    }
+}
+
+bool ggml_cuda_should_use_mul_mat_vec_f_concat(const ggml_tensor * w, const ggml_tensor * a, const ggml_tensor * b, const ggml_tensor * dst) {
+    const auto vec = [](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && ggml_nrows(t) == 1 && t->nb[0] == sizeof(float) && t->ne[0] % 4 == 0 &&
+            (uintptr_t) t->data % 16 == 0;
+    };
+    return w->type == GGML_TYPE_F32 && vec(a) && vec(b) && w->ne[0] == a->ne[0] + b->ne[0] && ggml_nrows(w) == w->ne[1] &&
+        w->ne[1] <= 1024 && w->nb[1] % 16 == 0 && (uintptr_t) w->data % 16 == 0 && dst->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(dst) && ggml_nelements(dst) == w->ne[1];
+}
+
+void ggml_cuda_mul_mat_vec_f_concat(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * a, const ggml_tensor * b,
+        ggml_tensor * dst) {
+    GGML_ASSERT(ggml_cuda_should_use_mul_mat_vec_f_concat(w, a, b, dst));
+    const int k4  = (int) w->ne[0]/4;
+    const int nth = std::min(1024, (k4 + WARP_SIZE - 1)/WARP_SIZE*WARP_SIZE);
+    mul_mat_vec_f_concat<<<(int) w->ne[1], nth, 0, ctx.stream()>>>((const float *) w->data, (const float *) a->data,
+        (const float *) b->data, (float *) dst->data, (int) a->ne[0]/4, k4, w->nb[1]/sizeof(float));
+    CUDA_CHECK(cudaGetLastError());
+}

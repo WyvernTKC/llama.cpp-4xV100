@@ -4901,6 +4901,7 @@ struct ggml_cuda_ssm_conv_state_fusion {
     bool                long_path = false; // more than GGML_CUDA_SSM_CONV_STATE_MAX_TOKENS tokens
     bool                residual  = false; // Inkling 2: the output is (conv + x)*res_scale, silu is that SCALE
     float               res_scale = 1.0f;
+    const ggml_tensor * res_r     = nullptr; // and the residual stream added to it: silu is that ADD
     ggml_cuda_ssm_conv_state_slots      slots      = {};
     ggml_cuda_ssm_conv_state_long_slots long_slots = {};
 };
@@ -5067,6 +5068,20 @@ static bool ggml_cuda_ssm_conv_state_fusion_match(
             f.res_scale = ggml_get_op_params_f32(sc, 0);
             f.silu      = sc;
             f.silu_idx += 1;
+            // the residual add after it: r + out, r of the same shape (GGML_CUDA_NO_RES_ADD_CONV_FUSION=1 turns it off)
+            static const bool no_res_add = getenv("GGML_CUDA_NO_RES_ADD_CONV_FUSION") != nullptr;
+            ggml_tensor * add = f.silu_idx + 1 < cgraph->n_nodes ? cgraph->nodes[f.silu_idx + 1] : nullptr;
+            const ggml_tensor * r = add == nullptr || add->op != GGML_OP_ADD ? nullptr :
+                add->src[1] == sc ? add->src[0] : add->src[0] == sc ? add->src[1] : nullptr;
+            if (!no_res_add && r != nullptr && r != sc && r->type == GGML_TYPE_F32 && ggml_are_same_shape(r, sc) &&
+                    r->nb[0] == sizeof(float) && r->nb[1] % sizeof(float) == 0 && r->data != nullptr &&
+                    add->type == GGML_TYPE_F32 && (add->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                    ggml_cuda_graph_use_count(cgraph, sc) == 1 && !(sc->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                    (!ggml_cuda_tensors_overlap(add, r) || (add->data == r->data && add->nb[1] == r->nb[1]))) {
+                f.res_r     = r;
+                f.silu      = add;
+                f.silu_idx += 1;
+            }
         }
     }
     // the LFM2 short conv: a MUL by the gate instead of the SILU
@@ -5129,8 +5144,9 @@ static bool ggml_cuda_ssm_conv_state_fusion_match(
         if (ggml_cuda_is_view_or_noop(n)) {
             continue;
         }
-        // the gate is read at the concat too
-        if (ggml_cuda_tensors_overlap(n, f.silu) || (f.gate != nullptr && ggml_cuda_tensors_overlap(n, f.gate))) {
+        // the gate and the residual are read at the concat too
+        if (ggml_cuda_tensors_overlap(n, f.silu) || (f.gate != nullptr && ggml_cuda_tensors_overlap(n, f.gate)) ||
+                (f.res_r != nullptr && ggml_cuda_tensors_overlap(n, f.res_r))) {
             return false;
         }
         for (int k = 0; k < GGML_MAX_SRC; k++) {
@@ -5150,6 +5166,9 @@ static bool ggml_cuda_ssm_conv_state_fusion_match(
     }
     if (ggml_cuda_tensors_overlap(f.silu, f.states) || ggml_cuda_tensors_overlap(f.silu, w) ||
             ggml_cuda_tensors_overlap(f.silu, f.ids) || ggml_cuda_tensors_overlap(f.x, f.states)) {
+        return false;
+    }
+    if (f.res_r != nullptr && (ggml_cuda_tensors_overlap(f.res_r, f.states) || ggml_cuda_tensors_overlap(f.res_r, f.ids))) {
         return false;
     }
     return true;
@@ -5682,14 +5701,13 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
     }
 
     if (nodes[node_idx]->op == GGML_OP_RESHAPE) {
-        //check RESHAPE->SUM_ROWS->CLAMP->DIV->RESHAPE
-        static const std::vector<ggml_op> norm_ops = { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP };
-
+        //check RESHAPE->SUM_ROWS->CLAMP->DIV->RESHAPE, or SCALE(sum, 1, eps) for the CLAMP
         args.norm = true;
-        for (const ggml_op op : norm_ops) {
-            if (nodes[node_idx]->op == op && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
-                node_idx++;
-            } else {
+        for (int k = 0; k < 3; k++) {
+            const ggml_tensor * n = nodes[node_idx];
+            const bool ok = n->src[0] == nodes[node_idx - 1] && (k == 0 ? n->op == GGML_OP_RESHAPE : k == 1 ? n->op == GGML_OP_SUM_ROWS :
+                n->op == GGML_OP_CLAMP || (n->op == GGML_OP_SCALE && ggml_get_op_params_f32(n, 0) == 1.0f));
+            if (!ok) {
                 args.norm = false;
                 return true;
             }
@@ -6905,8 +6923,27 @@ static bool ggml_cuda_mmvq_q8_1_enabled() {
 
 // The per-head mask of a relative-position bias (Inkling 2): GET_ROWS(table, pos), RESHAPE, PERMUTE, CONT, CPY(mask -> f32),
 //   ADD, CPY(-> f16) in one pass (ggml_cuda_op_rel_pos_mask). GGML_CUDA_NO_REL_POS_MASK_FUSION=1 turns it off.
-static int ggml_cuda_try_fuse_rel_pos_mask(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+//   Entered at the SUB of the sinks from the table right before the GET_ROWS, the kernel subtracts them itself
+//   (GGML_CUDA_NO_REL_POS_SINK_FOLD=1 turns that off).
+static int ggml_cuda_try_fuse_rel_pos_mask(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     static const bool disabled = getenv("GGML_CUDA_NO_REL_POS_MASK_FUSION") != nullptr;
+    static const bool no_sink  = getenv("GGML_CUDA_NO_REL_POS_SINK_FOLD") != nullptr;
+    const ggml_tensor * sub   = nullptr;
+    const ggml_tensor * sinks = nullptr;
+    if (cgraph->nodes[i]->op == GGML_OP_SUB) {
+        sub = cgraph->nodes[i];
+        const ggml_tensor * tb = sub->src[0];
+        const ggml_tensor * sk = sub->src[1];
+        if (no_sink || disabled || i + 1 >= cgraph->n_nodes || cgraph->nodes[i + 1]->op != GGML_OP_GET_ROWS ||
+                cgraph->nodes[i + 1]->src[0] != sub || !(sub->flags & GGML_TENSOR_FLAG_COMPUTE) || (sub->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                ggml_cuda_graph_use_count(cgraph, sub) != 1 || sub->type != GGML_TYPE_F32 || tb->type != GGML_TYPE_F32 ||
+                sk->type != GGML_TYPE_F32 || !ggml_are_same_shape(tb, sub) || !ggml_is_contiguous(tb) || sk->ne[0] != sub->ne[0] ||
+                sk->ne[1] != 1 || sk->ne[2] != sub->ne[2] || sk->ne[3] != 1 || sk->nb[0] != sizeof(float)) {
+            return 0;
+        }
+        sinks = sk;
+        i++;
+    }
     const ggml_tensor * gr = cgraph->nodes[i];
     if (disabled || gr->src[1]->type != GGML_TYPE_I32 || gr->src[1]->ne[2] != 1 || gr->src[0]->type != GGML_TYPE_F32 ||
             i + 6 >= cgraph->n_nodes || cgraph->nodes[i + 1]->op != GGML_OP_RESHAPE) {
@@ -6936,10 +6973,10 @@ static int ggml_cuda_try_fuse_rel_pos_mask(ggml_backend_cuda_context * cuda_ctx,
         return 0;
     }
     // the index and the mask are read while the output is written; the f32 cast of the mask may have more readers
-    const ggml_tensor * table = gr->src[0];
+    const ggml_tensor * table = sub ? sub->src[0] : gr->src[0];
     const bool mcpy_runs = ggml_cuda_graph_use_count(cgraph, mcpy) != 1;
     if (ggml_cuda_tensors_overlap(out, gr->src[1]) || ggml_cuda_tensors_overlap(out, mask) ||
-            (mcpy_runs && ggml_cuda_tensors_overlap(out, mcpy))) {
+            (mcpy_runs && ggml_cuda_tensors_overlap(out, mcpy)) || (sinks && ggml_cuda_tensors_overlap(out, sinks))) {
         return 0;
     }
     // ggml-alloc may place the output over the table, which the elided GET_ROWS read last: the kernel then reads a copy
@@ -6952,12 +6989,12 @@ static int ggml_cuda_try_fuse_rel_pos_mask(ggml_backend_cuda_context * cuda_ctx,
     }
     ggml_tensor gr_staged = *gr;
     gr_staged.src[0] = &table_staged;
-    ggml_cuda_op_rel_pos_mask(*cuda_ctx, &gr_staged, mask, out);
+    ggml_cuda_op_rel_pos_mask(*cuda_ctx, &gr_staged, mask, out, sinks);
     // a cast with other readers runs after the kernel, as ggml-alloc may have put it over the inputs of the elided GET_ROWS
     if (mcpy_runs) {
         ggml_cuda_cpy(*cuda_ctx, mcpy->src[0], mcpy->src[1]);
     }
-    return 6;
+    return sub ? 7 : 6;
 }
 
 // A row clipped to an L2 norm of at most t (Inkling 2): [MUL(x, s)], SQR, SUM_ROWS, SQRT, SCALE, FILL(t), DIV, CLAMP, MUL
@@ -7048,6 +7085,27 @@ static int ggml_cuda_try_fuse_cont_small_k(ggml_backend_cuda_context * cuda_ctx,
     return 1;
 }
 
+// A CONCAT of two vectors along dim 0 that only a one-token f32 MUL_MAT reads (the down projection of an Inkling 2 loop
+//   gate, [rms_norm(cur); rms_norm(message)]): the matvec reads the two halves in place (ggml_cuda_mul_mat_vec_f_concat).
+//   GGML_CUDA_NO_CONCAT_MATVEC=1 turns it off.
+static int ggml_cuda_try_fuse_concat_mul_mat_vec(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_CONCAT_MATVEC") != nullptr;
+    const ggml_tensor * cat = cgraph->nodes[i];
+    if (disabled || i + 1 >= cgraph->n_nodes || ggml_get_op_params_i32(cat, 0) != 0 || (cat->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            ggml_cuda_graph_use_count(cgraph, cat) != 1 || !ggml_is_contiguous(cat)) {
+        return 0;
+    }
+    ggml_tensor * mm = cgraph->nodes[i + 1];
+    if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != cat || !(mm->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+            !ggml_cuda_should_use_mul_mat_vec_f_concat(mm->src[0], cat->src[0], cat->src[1], mm) ||
+            ggml_cuda_tensors_overlap(mm, cat->src[0]) || ggml_cuda_tensors_overlap(mm, cat->src[1]) ||
+            (cuda_ctx->ar_fold.next == mm)) {
+        return 0;
+    }
+    ggml_cuda_mul_mat_vec_f_concat(*cuda_ctx, mm->src[0], cat->src[0], cat->src[1], mm);
+    return 1;
+}
+
 // The SITU activation of Inkling 2's experts (build_moe_ffn): SCALE, TANH, SCALE of the gate, the SIGMOID of the gate and
 //   its MUL, then SCALE, TANH, SCALE of the up view and the MUL of the two, in one launch (ggml_cuda_op_situ) instead of
 //   eight. GGML_CUDA_NO_SITU_FUSION=1 turns it off.
@@ -7095,6 +7153,11 @@ static int ggml_cuda_try_fuse_situ(ggml_backend_cuda_context * cuda_ctx, ggml_cg
         ggml_get_op_params_f32(s1, 0), ggml_get_op_params_f32(s1, 1), ggml_get_op_params_f32(s2, 0), ggml_get_op_params_f32(s2, 1),
         ggml_get_op_params_f32(s3, 0), ggml_get_op_params_f32(s3, 1), ggml_get_op_params_f32(s4, 0), ggml_get_op_params_f32(s4, 1),
     };
+    // the q8_1 copy for the expert down matvec (its rows padded, GGML_CUDA_NO_SITU_Q8_1=1 turns it off)
+    static const bool no_q8 = getenv("GGML_CUDA_NO_SITU_Q8_1") != nullptr;
+    if (!no_q8) {
+        ggml_cuda_q8_1_request(cuda_ctx, cgraph, i + o + 3, /*flat =*/ false, /*padded =*/ true);
+    }
     ggml_cuda_op_situ(*cuda_ctx, g, u, out, sb);
     return o + 3;
 }
@@ -8827,7 +8890,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    if (node->op == GGML_OP_GET_ROWS) {
+    if (node->op == GGML_OP_GET_ROWS || node->op == GGML_OP_SUB) {
         const int n_skip = ggml_cuda_try_fuse_rel_pos_mask(cuda_ctx, cgraph, i);
         if (n_skip > 0) {
             return n_skip;
@@ -8843,6 +8906,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_SCALE) {
         const int n_skip = ggml_cuda_try_fuse_situ(cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
+        }
+    }
+
+    if (node->op == GGML_OP_CONCAT) {
+        const int n_skip = ggml_cuda_try_fuse_concat_mul_mat_vec(cuda_ctx, cgraph, i);
         if (n_skip > 0) {
             return n_skip;
         }
@@ -10506,7 +10576,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_op_ssm_conv_state_long(*cuda_ctx, &states, f.ids, f.x, f.ssm_conv, f.silu, f.long_slots);
             } else {
                 ggml_cuda_op_ssm_conv_state(*cuda_ctx, &states, f.ids, f.x, f.ssm_conv, f.silu, f.slots, f.gate, f.x_a, f.x_b,
-                    f.residual, f.res_scale);
+                    f.residual, f.res_scale, f.res_r);
             }
             return f.last_cpy - i;
         }

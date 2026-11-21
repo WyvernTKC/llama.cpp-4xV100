@@ -31,7 +31,7 @@ void ggml_cuda_op_ssm_conv_state(ggml_backend_cuda_context & ctx, const ggml_ten
                                  const ggml_tensor * x, const ggml_tensor * ssm_conv, ggml_tensor * silu,
                                  const ggml_cuda_ssm_conv_state_slots & slots, const ggml_tensor * gate = nullptr,
                                  const ggml_tensor * x_a = nullptr, const ggml_tensor * x_b = nullptr,
-                                 bool residual = false, float res_scale = 1.0f);
+                                 bool residual = false, float res_scale = 1.0f, const ggml_tensor * res_r = nullptr);
 
 // the rollback slots of a longer batch, at the first column of the window each holds in the concat
 struct ggml_cuda_ssm_conv_state_long_slots {

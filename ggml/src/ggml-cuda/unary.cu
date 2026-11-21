@@ -1371,22 +1371,34 @@ void ggml_cuda_op_tanh_gate(ggml_backend_cuda_context & ctx, const ggml_tensor *
 
 // situ(g, u) = (tanh(g*s1 + b1)*s2 + b2)*sigmoid(g) * (tanh(u*s3 + b3)*s4 + b4), the MoE activation of Inkling 2, with the
 //   values of its SCALE, TANH, SIGMOID and MUL nodes: g and u of one shape with any row strides (the gate and up views of
-//   the gate_up product), dst contiguous
+//   the gate_up product), dst contiguous. With q8 it also writes the q8_1 copy of dst for the matmul that reads it, its
+//   rows at the padded length ne_q8 (zero blocks after each row), ne0 % 32 == 0: a warp quantizes one block.
 static __global__ void situ_f32(const char * __restrict__ g, const char * __restrict__ u, float * __restrict__ dst, const int64_t n,
         const int ne0, const int ne1, const int64_t nbg1, const int64_t nbg2, const int64_t nbu1, const int64_t nbu2,
-        const float s1, const float b1, const float s2, const float b2, const float s3, const float b3, const float s4, const float b4) {
+        const float s1, const float b1, const float s2, const float b2, const float s3, const float b3, const float s4, const float b4,
+        block_q8_1 * __restrict__ q8, const int ne_q8) {
     const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= n) {
         return;
     }
-    const int64_t i0 = i % ne0;
-    const int64_t i1 = (i/ne0) % ne1;
-    const int64_t i2 = i/ne0/ne1;
+    const int     nr  = q8 ? ne_q8 : ne0; // the row length of the index space
+    const int64_t i0  = i % nr;
+    const int64_t row = i/nr;
+    if (i0 >= ne0) {
+        quantize_q8_1_lane(0.0f, q8 + row*(ne_q8/QK8_1) + i0/QK8_1, i0 % QK8_1);
+        return;
+    }
+    const int64_t i1 = row % ne1;
+    const int64_t i2 = row/ne1;
     const float gv = *(const float *) (g + i0*sizeof(float) + i1*nbg1 + i2*nbg2);
     const float uv = *(const float *) (u + i0*sizeof(float) + i1*nbu1 + i2*nbu2);
     const float act = (s2*tanhf(s1*gv + b1) + b2)*op_sigmoid(gv);
     const float up  = s4*tanhf(s3*uv + b3) + b4;
-    dst[i] = act*up;
+    const float v   = act*up;
+    dst[row*ne0 + i0] = v;
+    if (q8) {
+        quantize_q8_1_lane(v, q8 + row*(ne_q8/QK8_1) + i0/QK8_1, i0 % QK8_1);
+    }
 }
 
 bool ggml_cuda_should_fuse_situ(const ggml_tensor * g, const ggml_tensor * u, const ggml_tensor * dst) {
@@ -1401,9 +1413,13 @@ bool ggml_cuda_should_fuse_situ(const ggml_tensor * g, const ggml_tensor * u, co
 void ggml_cuda_op_situ(ggml_backend_cuda_context & ctx, const ggml_tensor * g, const ggml_tensor * u, ggml_tensor * dst,
         const float * sb) {
     GGML_ASSERT(ggml_cuda_should_fuse_situ(g, u, dst));
-    const int64_t n = ggml_nelements(dst);
+    // the q8_1 copy for the expert matmul after it, if requested (ggml_cuda_q8_1_request), one per row of 32 multiples
+    int64_t ne_q8 = 0;
+    block_q8_1 * q8 = dst->ne[0] % QK8_1 == 0 ? (block_q8_1 *) ctx.q8_1_emit_alloc(dst, ne_q8, ggml_nrows(dst)) : nullptr;
+    const int64_t n = q8 ? ggml_nrows(dst)*ne_q8 : ggml_nelements(dst);
     const int block = 256;
     situ_f32<<<(n + block - 1)/block, block, 0, ctx.stream()>>>((const char *) g->data, (const char *) u->data, (float *) dst->data,
-        n, dst->ne[0], dst->ne[1], g->nb[1], g->nb[2], u->nb[1], u->nb[2], sb[0], sb[1], sb[2], sb[3], sb[4], sb[5], sb[6], sb[7]);
+        n, dst->ne[0], dst->ne[1], g->nb[1], g->nb[2], u->nb[1], u->nb[2], sb[0], sb[1], sb[2], sb[3], sb[4], sb[5], sb[6], sb[7],
+        q8, (int) ne_q8);
     CUDA_CHECK(cudaGetLastError());
 }
