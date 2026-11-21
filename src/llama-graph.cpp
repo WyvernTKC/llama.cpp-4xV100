@@ -1876,7 +1876,13 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_base()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
     }
 
-    if (self_rel_pos->buffer) {
+    // the dense distances, or the positions of the cells and of the tokens the graph computes them from
+    //   (build_inp_mem_hybrid_iswa_rel)
+    if (self_rel_kv_pos) {
+        if (self_rel_kv_pos->buffer) {
+            attn_ctx->get_base()->set_input_kq_pos(self_rel_kv_pos, self_rel_q_pos, ubatch);
+        }
+    } else if (self_rel_pos->buffer) {
         attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent);
     }
 
@@ -1890,7 +1896,11 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_swa()->set_input_attn_mask(inp_attn->self_attn_mask_swa, ubatch, cparams.causal_attn);
     }
 
-    if (self_rel_pos_swa->buffer) {
+    if (self_rel_kv_pos_swa) {
+        if (self_rel_kv_pos_swa->buffer) {
+            attn_ctx->get_swa()->set_input_kq_pos(self_rel_kv_pos_swa, self_rel_q_pos, ubatch);
+        }
+    } else if (self_rel_pos_swa->buffer) {
         attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
     }
 
@@ -1925,7 +1935,7 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
 
     res &= can_reuse_kq_mask(inp_attn->self_attn_mask.raw, attn_ctx->get_base(), params.ubatch, params.cparams);
 
-    res &= self_rel_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
+    res &= (self_rel_kv_pos ? self_rel_kv_pos : self_rel_pos)->ne[0] == attn_ctx->get_base()->get_n_kv();
     res &= self_rel_pos->ne[1] == params.ubatch.n_tokens;
 
     // swa tensors may not be allocated if there are no SWA attention layers
@@ -1935,7 +1945,7 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
 
     res &= can_reuse_kq_mask(inp_attn->self_attn_mask_swa.raw, attn_ctx->get_swa(), params.ubatch, params.cparams);
 
-    res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
+    res &= (self_rel_kv_pos_swa ? self_rel_kv_pos_swa : self_rel_pos_swa)->ne[0] == attn_ctx->get_swa()->get_n_kv();
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
@@ -5456,13 +5466,43 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa_rel>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur, extent, extent_swa);
 
-    inp->self_rel_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv(), ubatch.n_tokens);
-    ggml_set_input(inp->self_rel_pos);
-    ggml_set_name(inp->self_rel_pos, "attn_inp_rel_pos");
+    // a long ubatch computes the distances on the device from the positions of the cells and of the tokens: the dense
+    //   [n_kv, n_tokens] table filled on the host took most of the time between two ubatches of a long prompt. A small
+    //   table (a token or a few, the window of the SWA layers) is still filled on the host, which costs the device nothing.
+    const int64_t n_stream = inp->inp_attn->self_attn_mask.raw->ne[3];
+    const int64_t n_tps    = ubatch.n_tokens/n_stream;
 
-    inp->self_rel_pos_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv(), ubatch.n_tokens);
-    ggml_set_input(inp->self_rel_pos_swa);
-    ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
+    ggml_tensor * q_rel = nullptr;
+
+    auto rel_pos = [&](ggml_tensor *& kv_pos, int64_t n_kv, uint32_t ext, const char * name) {
+        if ((int64_t) ubatch.n_tokens*n_kv <= 65536) {
+            ggml_tensor * dense = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, ubatch.n_tokens);
+            ggml_set_input(dense);
+            ggml_set_name(dense, name);
+            return dense;
+        }
+        if (q_rel == nullptr) {
+            inp->self_rel_q_pos = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_tps, 1, 1, n_stream);
+            ggml_set_input(inp->self_rel_q_pos);
+            ggml_set_name(inp->self_rel_q_pos, "attn_inp_rel_q_pos");
+            q_rel = ggml_reshape_3d(ctx0, inp->self_rel_q_pos, 1, n_tps, n_stream);
+        }
+        // per stream the position of each cell its sequence sees, -1 for the others
+        kv_pos = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv, 1, 1, n_stream);
+        ggml_set_input(kv_pos);
+        ggml_set_name(kv_pos, name);
+
+        // the distance pos(token) - pos(cell) clamped to [0, ext], ext the zero row of the bias table: a cell the token sees
+        //   is at a distance >= 0 (causal), the others are masked and take any row
+        ggml_tensor * d = ggml_sub(ctx0, ggml_repeat_4d(ctx0, q_rel, n_kv, n_tps, n_stream, 1),
+                ggml_reshape_3d(ctx0, kv_pos, n_kv, 1, n_stream));
+        d = ggml_clamp(ctx0, d, 0.0f, (float) ext);
+
+        return ggml_reshape_2d(ctx0, ggml_cast(ctx0, d, GGML_TYPE_I32), n_kv, ubatch.n_tokens);
+    };
+
+    inp->self_rel_pos     = rel_pos(inp->self_rel_kv_pos,     attn_ctx->get_base()->get_n_kv(), extent,     "attn_inp_rel_pos");
+    inp->self_rel_pos_swa = rel_pos(inp->self_rel_kv_pos_swa, attn_ctx->get_swa()->get_n_kv(),  extent_swa, "attn_inp_rel_pos_swa");
 
     return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
 }

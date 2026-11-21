@@ -2335,8 +2335,16 @@ void llama_kv_cache::set_input_kq_pos(ggml_tensor * dst_kv, ggml_tensor * dst_q,
         rows_all = (const int32_t *) rows->data;
     }
 
-    int32_t * data_kv = (int32_t *) dst_kv->data;
-    int32_t * data_q  = (int32_t *) dst_q->data;
+    // I32, or F32 for positions the graph does arithmetic on (exact up to 2^24)
+    GGML_ASSERT(dst_kv->type == dst_q->type && (dst_kv->type == GGML_TYPE_I32 || dst_kv->type == GGML_TYPE_F32));
+    const bool f32 = dst_kv->type == GGML_TYPE_F32;
+    auto put = [f32](void * data, int64_t i, int32_t v) {
+        if (f32) {
+            ((float *) data)[i] = (float) v;
+        } else {
+            ((int32_t *) data)[i] = v;
+        }
+    };
 
     for (int64_t s = 0; s < n_stream; ++s) {
         const llama_seq_id seq_id = ubatch->seq_id[s*n_tps][0];
@@ -2346,21 +2354,20 @@ void llama_kv_cache::set_input_kq_pos(ggml_tensor * dst_kv, ggml_tensor * dst_q,
 
         const bool seq_all = cells.seq_has_all(seq_id);
 
-        int32_t * dst = data_kv + s*n_kv;
         if (rows_all) {
             const int32_t * r = rows_all + s*n_kv;
             for (int64_t c = 0; c < n_kv; ++c) {
                 const int32_t j = r[c];
                 const bool seen = j >= 0 && !cells.is_empty(j) && (seq_all || cells.seq_has(j, seq_id));
-                dst[c] = seen ? cells.pos_get(j) : -1;
+                put(dst_kv->data, s*n_kv + c, seen ? cells.pos_get(j) : -1);
             }
         } else
         for (int64_t j = 0; j < n_kv; ++j) {
             const bool seen = !cells.is_empty(j) && (seq_all || cells.seq_has(j, seq_id));
-            dst[j] = seen ? cells.pos_get(j) : -1;
+            put(dst_kv->data, s*n_kv + j, seen ? cells.pos_get(j) : -1);
         }
         for (int64_t i = 0; i < n_tps; ++i) {
-            data_q[s*n_tps + i] = ubatch->pos[s*n_tps + i];
+            put(dst_q->data, s*n_tps + i, ubatch->pos[s*n_tps + i]);
         }
     }
 }

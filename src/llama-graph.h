@@ -849,9 +849,16 @@ public:
     llm_graph_input_attn_kv_iswa * get_attn() const { return inp_attn.get(); }
     llm_graph_input_rs           * get_recr() const { return inp_rs.get(); }
 
-    // distance from the token to the cell, extent for the empty, future and more distant cells
+    // distance from the token to the cell: a dense input for a small table (extent for the empty, future and more distant
+    //   cells), else computed on the device from the inputs below, clamped to [0, extent] (the unseen cells are masked)
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
+
+    // inputs of a computed table: the positions of the tokens and, per stream, of the cells (-1 for those the stream's
+    //   sequence does not see); nullptr for a dense one
+    ggml_tensor * self_rel_q_pos      = nullptr; // F32 [n_batch/n_stream, 1, 1, n_stream]
+    ggml_tensor * self_rel_kv_pos     = nullptr; // F32 [n_kv,     1, 1, n_stream]
+    ggml_tensor * self_rel_kv_pos_swa = nullptr; // F32 [n_kv_swa, 1, 1, n_stream]
 
     const uint32_t extent;
     const uint32_t extent_swa;
