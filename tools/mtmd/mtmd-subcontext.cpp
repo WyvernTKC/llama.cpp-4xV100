@@ -121,6 +121,11 @@ static ggml_backend_meta_split_state mtmd_split_state(const ggml_tensor * tensor
         return name.size() >= n && name.compare(name.size() - n, n, suffix) == 0;
     };
     const ggml_backend_meta_split_state mirrored = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+    // the key/value slots of the LongCat depth head in a gen state, [n_embd, depth], are split by head like its k and v
+    const bool head_kv_slot = name.rfind(std::string("gen_state_") + mtmd_graph_longcat_next_gen::head_kv_slot, 0) == 0;
+    if (head_kv_slot) {
+        name = "a.gen.head.blk.";
+    }
     const mtmd_split_group * group = nullptr;
     for (const auto & g : ud->groups) {
         if (name.rfind(g.prefix, 0) == 0) {
@@ -133,6 +138,9 @@ static ggml_backend_meta_split_state mtmd_split_state(const ggml_tensor * tensor
     }
     const int     n_dev    = ud->n_devices;
     const int64_t ffn_gran = mtmd_split_ffn_gran(*group);
+    if (head_kv_slot) {
+        return mtmd_split_even(GGML_BACKEND_SPLIT_AXIS_0, tensor->ne[0], 1, n_dev, mtmd_split_head_gran(*group, tensor->ne[0]));
+    }
     if (ends_with(".attn_qkv.weight")) {
         const int64_t n = tensor->ne[1] / 3;
         return mtmd_split_even(GGML_BACKEND_SPLIT_AXIS_1, n, 3, n_dev, mtmd_split_head_gran(*group, n));
@@ -644,6 +652,7 @@ static std::vector<c2w_state_slot> list_gen_state_slots(const mtmd_hparams & hpa
         case PROJECTOR_TYPE_LFM3A_GEN:     return list_lfm3a_gen_state_slots(hparams, model);
         case PROJECTOR_TYPE_ZONOS3_GEN:    return list_zonos3_gen_state_slots(hparams, model);
         case PROJECTOR_TYPE_VOXCPM2_GEN:   return list_voxcpm2_state_slots(hparams, model);
+        case PROJECTOR_TYPE_LONGCAT_NEXT_GEN: return list_longcat_next_gen_state_slots(hparams, model);
         default:                           return {};
     }
 }
@@ -2170,9 +2179,7 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
                         }
                         set_input_i32("inp_codes", ids);
                     }
-                    if (n < depth && n > 0) {
-                        set_input_attn_mask(causal_mask(n + 1));
-                    }
+                    // one query over the keys of the positions up to it: no mask
                     break;
                 }
                 if (params->gen_process != MTMD_SUBCTX_GEN_PROCESS_TTS) {

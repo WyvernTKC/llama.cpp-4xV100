@@ -1025,7 +1025,8 @@ std::unique_ptr<mtmd_graph> mtmd_get_graph_builder(mtmd_subcontext * ctx, const 
                 const int n_codes = params && params->codes ? (int) params->codes->size() : 0;
                 const int vnm = params ? params->vocode_n_mel  : 0;
                 const int vns = params ? params->vocode_n_stft : 0;
-                builder = std::make_unique<mtmd_graph_longcat_next_gen>(ctx, img, gen_process, n_codes, vnm, vns);
+                builder = std::make_unique<mtmd_graph_longcat_next_gen>(ctx, img, gen_process, params ? params->gen_state : nullptr,
+                                                                        n_codes, vnm, vns);
             } break;
         case PROJECTOR_TYPE_LFM3A_GEN:
             {

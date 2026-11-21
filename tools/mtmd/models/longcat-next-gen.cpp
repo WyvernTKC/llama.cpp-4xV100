@@ -30,7 +30,20 @@ ggml_tensor * mtmd_graph_longcat_next_gen::dec_layer(const mtmd_layer & l, ggml_
     return ggml_add(ctx0, x, cur);
 }
 
-// one level of the depth head: the logits of level n_codes, given the codes of the levels before it
+std::vector<c2w_state_slot> list_longcat_next_gen_state_slots(const mtmd_hparams & hparams, const mtmd_model & model) {
+    std::vector<c2w_state_slot> slots;
+    const int64_t d     = model.lcn.hidden_proj_w->ne[1];
+    const int64_t depth = (int64_t) hparams.rvq_codebook_size.size();
+    for (size_t il = 0; il < model.lcn.head_layers.size(); il++) {
+        const std::string prefix = mtmd_graph_longcat_next_gen::head_kv_slot;
+        slots.push_back({ prefix + "k_" + std::to_string(il), d, depth, true });
+        slots.push_back({ prefix + "v_" + std::to_string(il), d, depth, true });
+    }
+    return slots;
+}
+
+// one level of the depth head: the logits of level n_codes, given the codes of the levels before it. Only position n_codes
+// runs: its key and value go to the slots, its query reads the slots up to it (the earlier positions of this frame).
 ggml_cgraph * mtmd_graph_longcat_next_gen::build_depth_head() {
     const auto & g     = model.lcn;
     const auto & sizes = hparams.rvq_codebook_size;
@@ -41,8 +54,7 @@ ggml_cgraph * mtmd_graph_longcat_next_gen::build_depth_head() {
 
     ggml_tensor * h = ggml_reshape_2d(ctx0, build_inp_raw(1), n_embd, 1);
 
-    // the LLM rows of the given codes and their running sum
-    ggml_tensor * x   = h;
+    // the sum of the LLM rows of the given codes: the input of position n_codes, and the input row of the next LLM step
     ggml_tensor * acc = nullptr;
     if (n_codes > 0) {
         ggml_tensor * ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_codes);
@@ -52,50 +64,70 @@ ggml_cgraph * mtmd_graph_longcat_next_gen::build_depth_head() {
         for (int j = 0; j < n_codes; j++) {
             ggml_tensor * r = ggml_view_2d(ctx0, rows, n_embd, 1, rows->nb[1], (size_t) j * rows->nb[1]);
             acc = acc ? ggml_add(ctx0, acc, r) : r;
-            if (j + 1 < depth) {
-                x = ggml_concat(ctx0, x, acc, 1);
-            }
         }
     }
 
     if (n_codes < depth) {
-        const int n_pos  = n_codes + 1;
+        const int pos    = n_codes;
         const int n_head = hparams.n_head;
         const int64_t d  = g.hidden_proj_w->ne[1];
         const int64_t d_head = d / n_head;
 
-        ggml_tensor * mask = n_pos > 1 ? build_inp_attn_mask(n_pos, n_pos) : nullptr;
+        std::vector<ggml_tensor *> slots;
+        if (gen_state) {
+            slots = gen_state->slots;
+        } else {
+            // buffer reserve: stand-ins of the slots
+            for (size_t i = 0; i < 2 * g.head_layers.size(); i++) {
+                ggml_tensor * t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, depth);
+                ggml_set_input(t);
+                slots.push_back(t);
+            }
+        }
+        GGML_ASSERT(slots.size() == 2 * g.head_layers.size());
 
-        x = build_norm(x, g.hidden_norm_w, nullptr, NORM_TYPE_RMS, hparams.eps, -1);
-        x = build_mm(g.hidden_proj_w, x); // [d, n_pos]
+        ggml_tensor * x = build_norm(pos == 0 ? h : acc, g.hidden_norm_w, nullptr, NORM_TYPE_RMS, hparams.eps, -1);
+        x = build_mm(g.hidden_proj_w, x); // [d, 1]
         for (size_t il = 0; il < g.head_layers.size(); il++) {
             const auto & l = g.head_layers[il];
-            ggml_tensor * cur = build_norm(x, l.ln_1_w, nullptr, NORM_TYPE_RMS, hparams.eps, (int) il);
-            ggml_tensor * q = ggml_reshape_3d(ctx0, ggml_add(ctx0, build_mm(l.q_w, cur), l.q_b), d_head, n_head, n_pos);
-            ggml_tensor * k = ggml_reshape_3d(ctx0, build_mm(l.k_w, cur), d_head, n_head, n_pos);
-            ggml_tensor * v = ggml_reshape_3d(ctx0, ggml_add(ctx0, build_mm(l.v_w, cur), l.v_b), d_head, n_head, n_pos);
-            x = ggml_add(ctx0, x, build_attn(l.o_w, l.o_b, q, k, v, mask, 1.0f / sqrtf((float) d_head), (int) il));
+            ggml_tensor * k_slot = slots[2 * il];
+            ggml_tensor * v_slot = slots[2 * il + 1];
 
-            // one FFN per depth position: the first n_pos pages of the 3D weights, batched over the positions
+            ggml_tensor * cur = build_norm(x, l.ln_1_w, nullptr, NORM_TYPE_RMS, hparams.eps, (int) il);
+            ggml_tensor * q = ggml_add(ctx0, build_mm(l.q_w, cur), l.q_b);
+            ggml_tensor * k = build_mm(l.k_w, cur);
+            ggml_tensor * v = ggml_add(ctx0, build_mm(l.v_w, cur), l.v_b);
+
+            // this position's key and value for the calls of the later levels; the earlier ones are read from columns
+            // before pos, so the store and the read never touch the same bytes
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, k, ggml_view_2d(ctx0, k_slot, d, 1, k_slot->nb[1], (size_t) pos * k_slot->nb[1])));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, v, ggml_view_2d(ctx0, v_slot, d, 1, v_slot->nb[1], (size_t) pos * v_slot->nb[1])));
+            if (pos > 0) {
+                k = ggml_concat(ctx0, ggml_view_2d(ctx0, k_slot, d, pos, k_slot->nb[1], 0), k, 1);
+                v = ggml_concat(ctx0, ggml_view_2d(ctx0, v_slot, d, pos, v_slot->nb[1], 0), v, 1);
+            }
+            q = ggml_reshape_3d(ctx0, q, d_head, n_head, 1);
+            k = ggml_reshape_3d(ctx0, k, d_head, n_head, pos + 1);
+            v = ggml_reshape_3d(ctx0, v, d_head, n_head, pos + 1);
+            x = ggml_add(ctx0, x, build_attn(l.o_w, l.o_b, q, k, v, nullptr, 1.0f / sqrtf((float) d_head), (int) il));
+
+            // the FFN of this depth position: page pos of the 3D weights
             cur = build_norm(x, l.ln_2_w, nullptr, NORM_TYPE_RMS, hparams.eps, (int) il);
-            cur = ggml_reshape_3d(ctx0, cur, d, 1, n_pos);
-            ggml_tensor * up = ggml_view_3d(ctx0, l.ff_up_w, l.ff_up_w->ne[0], l.ff_up_w->ne[1], n_pos,
-                                            l.ff_up_w->nb[1], l.ff_up_w->nb[2], 0);
-            ggml_tensor * down = ggml_view_3d(ctx0, l.ff_down_w, l.ff_down_w->ne[0], l.ff_down_w->ne[1], n_pos,
-                                              l.ff_down_w->nb[1], l.ff_down_w->nb[2], 0);
+            ggml_tensor * up = ggml_view_2d(ctx0, l.ff_up_w, l.ff_up_w->ne[0], l.ff_up_w->ne[1], l.ff_up_w->nb[1],
+                                            (size_t) pos * l.ff_up_w->nb[2]);
+            ggml_tensor * down = ggml_view_2d(ctx0, l.ff_down_w, l.ff_down_w->ne[0], l.ff_down_w->ne[1], l.ff_down_w->nb[1],
+                                              (size_t) pos * l.ff_down_w->nb[2]);
             cur = ggml_gelu_erf(ctx0, ggml_mul_mat(ctx0, up, cur));
-            cur = ggml_mul_mat(ctx0, down, cur); // [d, 1, n_pos]
-            x = ggml_add(ctx0, x, ggml_reshape_2d(ctx0, cur, d, n_pos));
+            x = ggml_add(ctx0, x, ggml_mul_mat(ctx0, down, cur));
         }
 
-        // the head of level n_codes reads its own position
+        // the head of level n_codes
         int64_t off = 0;
         for (int j = 0; j < n_codes; j++) {
             off += sizes[j] + 1;
         }
         const int64_t n_out = sizes[n_codes] + 1;
-        ggml_tensor * last = ggml_view_2d(ctx0, x, d, 1, x->nb[1], (size_t) n_codes * x->nb[1]);
-        last = build_norm(last, g.out_norm_w, nullptr, NORM_TYPE_RMS, hparams.eps, -1);
+        ggml_tensor * last = build_norm(x, g.out_norm_w, nullptr, NORM_TYPE_RMS, hparams.eps, -1);
         ggml_tensor * w = ggml_view_2d(ctx0, g.out_w, g.out_w->ne[0], n_out, g.out_w->nb[1], (size_t) off * g.out_w->nb[1]);
         ggml_tensor * b = ggml_view_1d(ctx0, g.out_b, n_out, (size_t) off * ggml_element_size(g.out_b));
         ggml_tensor * logits = ggml_add(ctx0, build_mm(w, last), b);

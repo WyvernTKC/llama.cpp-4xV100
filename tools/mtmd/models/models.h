@@ -279,10 +279,12 @@ struct mtmd_graph_chatterbox : mtmd_graph_chatterbox_base {
 //   GEN_CODE: depth head, logits of level n_codes (out_feats) given the codes of the levels before it,
 //             and the sum of the LLM rows of the given codes (last node, the input row of the next LLM step)
 //   TTS:      codes of T frames -> mu -> flow matching -> mel (out_mel) and f0 (out_f0), the host and TTS_VOCODE make the waveform
+// GEN_CODE runs one depth position per call: the keys and values of the earlier positions of the frame are in the gen state
+//   (list_longcat_next_gen_state_slots), written by the calls for the earlier levels
 struct mtmd_graph_longcat_next_gen : mtmd_graph_chatterbox {
-    mtmd_graph_longcat_next_gen(mtmd_subcontext * ctx, const mtmd_image_f32 & img, mtmd_subctx_gen_process gen_process, int n_codes,
-                                int vocode_n_mel, int vocode_n_stft)
-        : mtmd_graph_chatterbox(ctx, img, gen_process, n_codes, 0, vocode_n_mel, vocode_n_stft) {}
+    mtmd_graph_longcat_next_gen(mtmd_subcontext * ctx, const mtmd_image_f32 & img, mtmd_subctx_gen_process gen_process,
+                                mtmd_subctx_gen_state * gen_state, int n_codes, int vocode_n_mel, int vocode_n_stft)
+        : mtmd_graph_chatterbox(ctx, img, gen_process, n_codes, 0, vocode_n_mel, vocode_n_stft), gen_state(gen_state) {}
     ggml_cgraph * build() override;
 
     // the decoder runs at 4 mel frames per code frame minus the causal tail of the transposed conv
@@ -293,8 +295,11 @@ struct mtmd_graph_longcat_next_gen : mtmd_graph_chatterbox {
     static constexpr float cfg     = 0.7f;
     // head size of the decoder and prenet layers (their configs give the width, 1280 and 512)
     static constexpr int dec_d_head = 64;
+    // prefix of the depth head's key/value slots in the gen state, split by head like its k and v (mtmd_split_state)
+    static constexpr const char * head_kv_slot = "lcn_head_kv_";
 
   private:
+    mtmd_subctx_gen_state * gen_state; // nullptr on buffer reserve
     ggml_cgraph * build_depth_head();
     ggml_cgraph * build_mel();
     ggml_tensor * dec_layer(const mtmd_layer & l, ggml_tensor * x, norm_type nt, float eps, int n_head, ggml_tensor * mask);
@@ -647,6 +652,9 @@ std::vector<c2w_state_slot> list_c2w_state_slots(const mtmd_hparams & hparams, c
 
 // drama3: tower KV slots, then list_c2w_state_slots()
 std::vector<c2w_state_slot> list_drama3_state_slots(const mtmd_hparams & hparams, const mtmd_model & model);
+
+// longcat-next gen: the depth head's keys and values of one frame, k then v per layer, [n_embd, depth] each
+std::vector<c2w_state_slot> list_longcat_next_gen_state_slots(const mtmd_hparams & hparams, const mtmd_model & model);
 
 // same, for the streaming mimi decoder (pocket-tts GEN_WAV)
 std::vector<c2w_state_slot> list_pockettts_state_slots(const mtmd_hparams & hparams, const mtmd_model & model);
