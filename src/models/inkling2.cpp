@@ -249,14 +249,25 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 }
 
 // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
-ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl) {
-    ggml_tensor * gate = ggml_concat(ctx0, ggml_rms_norm(ctx0, cur, 1e-6f), ggml_rms_norm(ctx0, message, 1e-6f), 0);
+ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * cur_n, ggml_tensor * message, ggml_tensor * message_n,
+        const loop_layer & loop, int ctrl) {
+    ggml_tensor * gate = ggml_concat(ctx0, cur_n, message_n, 0);
     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
 
-    ggml_tensor * gain   = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_gain[ctrl],   gate));
-    ggml_tensor * forget = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_forget[ctrl], gate));
+    ggml_tensor * gain   = build_lora_mm(loop.ctrl_gain[ctrl],   gate);
+    ggml_tensor * forget = build_lora_mm(loop.ctrl_forget[ctrl], gate);
 
-    return ggml_add(ctx0, ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur)), ggml_mul(ctx0, gain, message));
+    // the products and the message first, so that the gating is one run of element-wise ops (one kernel on CUDA)
+    ggml_build_forward_expand(gf, gain);
+    ggml_build_forward_expand(gf, forget);
+    ggml_build_forward_expand(gf, message);
+
+    forget = ggml_tanh(ctx0, forget);
+    ggml_tensor * keep = ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur));
+
+    gain = ggml_tanh(ctx0, gain);
+
+    return ggml_add(ctx0, keep, ggml_mul(ctx0, gain, message));
 }
 
 ggml_tensor * llama_model_inkling2::graph::build_inputs() {
@@ -294,9 +305,10 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     const int64_t n_embd_head  = hparams.n_embd_head_k(il);
     const int64_t n_embd_k_gqa = n_embd_head*n_head_kv;
 
-    // the message of controller ctrl, [n_embd, n_tokens]
-    auto message = [&](int ctrl) {
-        return ggml_cont(ctx0, ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[2], ctrl*messages->nb[1]));
+    // the message of controller ctrl, [n_embd, n_tokens], and its rms norm
+    ggml_tensor * messages_n = messages ? ggml_rms_norm(ctx0, messages, 1e-6f) : nullptr;
+    auto message = [&](ggml_tensor * m, int ctrl) {
+        return ggml_view_2d(ctx0, m, n_embd, n_tokens, m->nb[2], ctrl*m->nb[1]);
     };
 
     ggml_tensor * state   = recr->mctx->get_r_l(il);
@@ -307,17 +319,24 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     // attention inputs: SWA layers mix one, full-attention layers one each for Q, K and V
     ggml_tensor * inputs[3] = {cur, cur, cur};
-    if (layer.attn_res_query) {
+    if (layer.attn_res_query && is_swa) {
+        inputs[0] = inputs[1] = inputs[2] = ggml_reshape_2d(ctx0, mix(blocks, cur, layer.attn_res_query), n_embd, n_tokens);
+    } else if (layer.attn_res_query) {
         ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
         for (int j = 0; j < 3; ++j) {
-            inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
+            inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], j*mixed->nb[1]));
         }
     }
 
     if (messages) {
         // the messages make the Q, K and V inputs of a SWA layer differ
+        ggml_tensor * inputs_n[3];
         for (int j = 0; j < 3; ++j) {
-            inputs[j] = control(inputs[j], message(LOOP_CTRL_Q + j), *loop, LOOP_CTRL_Q + j);
+            inputs_n[j] = j > 0 && inputs[j] == inputs[j - 1] ? inputs_n[j - 1] : ggml_rms_norm(ctx0, inputs[j], 1e-6f);
+        }
+        for (int j = 0; j < 3; ++j) {
+            inputs[j] = control(inputs[j], inputs_n[j], message(messages, LOOP_CTRL_Q + j), message(messages_n, LOOP_CTRL_Q + j),
+                    *loop, LOOP_CTRL_Q + j);
         }
     }
 
@@ -401,7 +420,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     // MoE
     cur = ggml_reshape_2d(ctx0, mix(blocks, cur, layer.ffn_res_query), n_embd, n_tokens);
     if (messages) {
-        cur = control(cur, message(LOOP_CTRL_FFN), *loop, LOOP_CTRL_FFN);
+        cur = control(cur, ggml_rms_norm(ctx0, cur, 1e-6f), message(messages, LOOP_CTRL_FFN), message(messages_n, LOOP_CTRL_FFN),
+                *loop, LOOP_CTRL_FFN);
     }
     cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
 

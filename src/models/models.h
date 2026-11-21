@@ -2638,7 +2638,9 @@ struct llama_model_inkling2 : public llama_model_base {
                 ggml_tensor * history,
                 llm_graph_input_rs * inp,
                 int64_t offset);
-        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
+        // cur_n and message_n: the rms norms of cur and message
+        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * cur_n, ggml_tensor * message, ggml_tensor * message_n,
+                const loop_layer & loop, int ctrl);
 
     protected:
         // the helpers alone, a derived graph builds its own body
