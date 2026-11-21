@@ -182,10 +182,22 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
     }
     states = ggml_rms_norm(ctx0, states, 1e-6f);
 
-    ggml_tensor * queries = ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
+    const int64_t n_states  = states->ne[1];
+    const int64_t n_queries = query->ne[1];
 
-    ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
+    // scores [n_states, n_queries, n_tokens]; for a batch, one product of the queries with every state of every token
+    ggml_tensor * scores;
+    if (n_tokens == 1) {
+        scores = ggml_mul_mat(ctx0, states, query);
+    } else {
+        scores = ggml_mul_mat(ctx0, query, ggml_reshape_2d(ctx0, states, n_embd, n_states*n_tokens));
+        scores = ggml_reshape_3d(ctx0, scores, n_queries, n_states, n_tokens);
+        scores = n_queries == 1 ? ggml_reshape_3d(ctx0, scores, n_states, 1, n_tokens) : ggml_cont(ctx0, ggml_permute(ctx0, scores, 1, 0, 2, 3));
+    }
     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
+
+    // the scores first, so that the weighted sum follows the transposed copy of the states (one kernel on CUDA)
+    ggml_build_forward_expand(gf, scores);
 
     return ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, states)), scores);
 }
