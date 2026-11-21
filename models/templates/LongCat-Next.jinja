@@ -1,8 +1,12 @@
 {#- LongCat-Next chat template for llama-server (--chat-template-file): the model's own template without
     the thinking switch it does not use (it never generates </longcat_think>; the reference never enables it),
-    so prompts end as the reference does (<longcat_assistant>). With tools and no system message it adds the README's
-    system prompt: tool calls then start with <longcat_tool_call> far more often (without tools it would turn
-    transcriptions into explanations, so it is left out there). -#}
+    so prompts end as the reference does (<longcat_assistant>). With tools:
+    - the format note says in words how a call is written and shows a concrete call, instead of the original
+      {function-name} / {arg-key-1} placeholders, which the model copied into its calls; it also says to call a
+      function only when needed (LongCat-Next, 7 tool cases x 8 seeds: 31 -> 51 of 56 replies right, calls with
+      arguments 0 -> 8 of 8);
+    - with no system message it adds the README's system prompt (without tools it would turn transcriptions
+      into explanations, so it is left out there). -#}
 {%- set tool_choice = tool_choice | default('auto') %}
 {%- set ns = namespace(tool_types = [], suffix_to_move = '') %}
 
@@ -22,7 +26,7 @@
         {{- "Description: " + tool.function.description + "\n\n" }}
         {{- "InputSchema: " + tool.function.parameters | tojson(ensure_ascii=False) + "\n\n" }}
     {%- endfor %}
-    {{- '**Note**: For each function call, output the function name and arguments within the following XML format:\n<longcat_tool_call>{function-name}\n<longcat_arg_key>{arg-key-1}</longcat_arg_key>\n<longcat_arg_value>{arg-value-1}</longcat_arg_value>\n<longcat_arg_key>{arg-key-2}</longcat_arg_key>\n<longcat_arg_value>{arg-value-2}</longcat_arg_value>\n...\n</longcat_tool_call>\n' }}
+    {{- '**Note**: To call a function, write <longcat_tool_call> followed by the function name on the same line, then each argument as <longcat_arg_key>argument name</longcat_arg_key> followed by <longcat_arg_value>argument value</longcat_arg_value> on its own lines, and end with </longcat_tool_call>. For example, a call to a function named get_weather with the argument city set to Paris is written as:\n<longcat_tool_call>get_weather\n<longcat_arg_key>city</longcat_arg_key>\n<longcat_arg_value>Paris</longcat_arg_value>\n</longcat_tool_call>\nCall a function only when it is needed to answer; otherwise reply directly.\n' }}
     {{- "</longcat_tool_declare>"-}}
 {%- endif %}
 
