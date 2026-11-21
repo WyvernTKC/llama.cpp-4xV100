@@ -23,6 +23,7 @@ static __device__ __forceinline__ topk_moe_config mul_mat_vec_f_topk_moe_config(
     config.delayed_softmax   = topk.delayed_softmax;
     config.n_groups          = 1;
     config.n_group_used      = 1;
+    config.norm_bias         = topk.norm_bias;
     return config;
 }
 
@@ -1779,7 +1780,7 @@ static __device__ __forceinline__ void mul_mat_vec_f_router_rank_wait(const ggml
                     }
                 }
                 wt_sum              = warp_reduce_sum(wt_sum);
-                wt_sum              = max(wt_sum, topk.clamp);
+                wt_sum              = max(wt_sum + topk.norm_bias, topk.clamp);
                 const float inv_sum = 1.0f / wt_sum;
 #pragma unroll
                 for (int i = 0; i < n_groups; i++) {
@@ -2094,6 +2095,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             fusion_local.topk.n_expert        = fusion->topk_n_expert;
             fusion_local.topk.n_used          = fusion->topk_n_used;
             fusion_local.topk.clamp           = fusion->topk_clamp;
+            fusion_local.topk.norm_bias       = fusion->topk_norm_bias;
             fusion_local.topk.scale           = fusion->topk_scale;
             fusion_local.topk.sigmoid         = fusion->topk_sigmoid;
             fusion_local.topk.sqrt_softplus   = fusion->topk_sqrt_softplus;

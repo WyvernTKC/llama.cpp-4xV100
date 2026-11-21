@@ -5693,6 +5693,8 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
                 args.norm = false;
                 return true;
             }
+            args.norm_bias = n->op == GGML_OP_SCALE;
+            node_idx++;
         }
 
         // DIV <- CLAMP, RESHAPE
@@ -6631,8 +6633,8 @@ static bool ggml_cuda_topk_moe_plan_at(const ggml_cgraph * cgraph, const int i, 
         p.ids = cgraph->nodes[p.out_nodes[0]];
 
         if (args.norm) {
-            ops.insert(ops.end(),
-                       { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE });
+            ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, args.norm_bias ? GGML_OP_SCALE : GGML_OP_CLAMP, GGML_OP_DIV,
+                                    GGML_OP_RESHAPE });
             p.clamp = cgraph->nodes[i + ops.size() - 3];
         }
         if (args.scale) {
@@ -6828,7 +6830,11 @@ static bool ggml_cuda_topk_moe_fold(ggml_backend_cuda_context * cuda_ctx, const 
     fusion.topk_ticket          = cuda_ctx->block_flags_get() + 2;
     fusion.topk_n_expert        = (int) n_expert;
     fusion.topk_n_used          = (int) p.weights->ne[1];
-    fusion.topk_clamp           = p.clamp ? ggml_get_op_params_f32(p.clamp, 0) : -INFINITY;
+    fusion.topk_clamp           = -INFINITY;
+    fusion.topk_norm_bias       = 0.0f;
+    if (p.clamp) {
+        ggml_cuda_topk_moe_norm_values(p.clamp, fusion.topk_clamp, fusion.topk_norm_bias);
+    }
     fusion.topk_scale           = p.scale ? ggml_get_op_params_f32(p.scale, 0) : 1.0f;
     fusion.topk_sigmoid         = p.args.sigmoid;
     fusion.topk_sqrt_softplus   = p.args.sqrt_softplus;
@@ -12089,8 +12095,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         ids = cgraph->nodes[out_nodes[0]];
 
                         if (args.norm) {
-                            ops.insert(ops.end(),
-                                       { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE });
+                            ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, args.norm_bias ? GGML_OP_SCALE : GGML_OP_CLAMP,
+                                                    GGML_OP_DIV, GGML_OP_RESHAPE });
                         }
                         if (args.scale) {
                             ops.insert(ops.end(), { GGML_OP_SCALE });

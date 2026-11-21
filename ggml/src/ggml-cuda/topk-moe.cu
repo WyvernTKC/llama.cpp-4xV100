@@ -204,8 +204,9 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     const bool with_norm = clamp != nullptr;
 
     float clamp_val = -INFINITY;
+    float norm_bias = 0.0f;
     if (clamp) {
-        clamp_val = ggml_get_op_params_f32(clamp, 0);
+        ggml_cuda_topk_moe_norm_values(clamp, clamp_val, norm_bias);
     }
 
     topk_moe_config config;
@@ -215,6 +216,7 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     config.delayed_softmax   = args.delayed_softmax;
     config.n_groups          = args.n_groups;
     config.n_group_used      = args.n_group_used;
+    config.norm_bias         = norm_bias;
 
     if (bias && args.n_groups > 1) {
         GGML_ASSERT(ggml_cuda_topk_moe_groups_supported(n_experts, args.n_groups, args.n_group_used));

@@ -18,6 +18,7 @@ struct ggml_cuda_topk_moe_args {
     bool delayed_softmax{};
     bool prob_bias{};
     bool norm{};
+    bool norm_bias{}; // the sum of the norm is SCALE(sum, 1, eps) (expert_weights_norm_eps) instead of CLAMP(sum, min)
     bool scale{};
     int  n_groups{1};     // grouped routing (DeepSeek-V3) when > 1
     int  n_group_used{1};
@@ -54,6 +55,17 @@ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
 bool ggml_cuda_topk_moe_groups_supported(int n_expert, int n_groups, int n_group_used);
 
 // Kernel config struct - passed by value to CUDA kernel
+// the clamp and the bias of the sum of a norm from its node: CLAMP(sum, min) or SCALE(sum, 1, eps)
+static inline void ggml_cuda_topk_moe_norm_values(const ggml_tensor * n, float & clamp_val, float & bias) {
+    if (n->op == GGML_OP_CLAMP) {
+        clamp_val = ggml_get_op_params_f32(n, 0);
+        bias      = 0.0f;
+    } else {
+        clamp_val = -INFINITY;
+        bias      = ggml_get_op_params_f32(n, 1);
+    }
+}
+
 struct topk_moe_config {
     bool use_sigmoid;
     bool use_sqrt_softplus;
@@ -61,6 +73,7 @@ struct topk_moe_config {
     bool delayed_softmax;
     int  n_groups;     // grouped routing: groups of n_experts / n_groups experts, a multiple of WARP_SIZE
     int  n_group_used; //   groups kept
+    float norm_bias;   // added to the sum of the norm before the clamp
 };
 
 // Warp-local softmax used for both the pre-top-k logits and the post-top-k delayed path.
@@ -334,7 +347,7 @@ static __device__ __forceinline__ void topk_moe_select(
 
     if (config.with_norm) {
         wt_sum              = warp_reduce_sum(wt_sum);
-        wt_sum              = max(wt_sum, clamp_val);
+        wt_sum              = max(wt_sum + config.norm_bias, clamp_val);
         const float inv_sum = 1.0f / wt_sum;
 
         for (int i = 0; i < experts_per_thread; i++) {

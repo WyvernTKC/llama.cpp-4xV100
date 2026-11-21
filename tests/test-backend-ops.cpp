@@ -18462,6 +18462,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_topk_moe({8, 22, 1, 1}, 4, true, true, GATING_FUNC_SIGMOID, scale_w, 1, 1, true));
         test_cases.emplace_back(new test_topk_moe({384,  1, 1, 1}, 6, true, true, GATING_FUNC_SIGMOID, scale_w, 1, 1, true));
     }
+    // Inkling 2: 128 experts, k = 8, the sum with expert_weights_norm_eps, then the weights scaled by 8
+    test_cases.emplace_back(new test_topk_moe({128,  1, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 8.0f, 1, 1, true));
+    test_cases.emplace_back(new test_topk_moe({128, 22, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 8.0f, 1, 1, true));
 
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
     test_cases.emplace_back(new test_moe_reduce(63,  2, 17));

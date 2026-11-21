@@ -1946,6 +1946,7 @@ struct ggml_cuda_mm_fusion_args_host {
     int topk_n_expert = 0;
     int topk_n_used = 0;
     float topk_clamp = 0.0f;
+    float topk_norm_bias = 0.0f;
     float topk_scale = 1.0f;
     bool topk_sigmoid = false;
     bool topk_sqrt_softplus = false;
@@ -2058,6 +2059,7 @@ struct ggml_cuda_mmvf_topk_args {
     int            n_expert        = 0;
     int            n_used          = 0;
     float          clamp           = 0.0f;
+    float          norm_bias       = 0.0f;
     float          scale           = 1.0f;
     bool           sigmoid         = false;
     bool           sqrt_softplus   = false;
