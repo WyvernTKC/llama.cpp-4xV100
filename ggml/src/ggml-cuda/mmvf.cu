@@ -1900,11 +1900,131 @@ static void mul_mat_vec_f_router_cuda(const float * x, const float * y, const gg
     }
 }
 
+// One token through f32 rows of a few float4s (K = 16 to 128; the gain and forget products of Inkling 2's loop gates,
+//   K = 64): a few lanes per row, so a block of 256 threads takes many rows instead of one, of up to
+//   four matrices of one row stride in one launch (src0 and the sibling rows). GGML_CUDA_NO_MMVF_SHORT_ROWS=1 turns it off.
+struct mmvf_short_rows_args {
+    const float * x0, * x1, * x2, * x3;
+    float       * d0, * d1, * d2, * d3;
+    int           n0, n1, n2;
+};
+
+// G lanes per row, each with two float4s of it (K = 8*G)
+template <int G>
+static __global__ void __launch_bounds__(256) mul_mat_vec_f_short_rows(const mmvf_short_rows_args a, const float * __restrict__ y,
+        const int64_t sx1, const int nrows) {
+    const int lane = threadIdx.x % G;
+    int       r    = (blockIdx.x*blockDim.x + threadIdx.x) / G;
+    const bool valid = r < nrows;
+    // the matrix of the row, selected without indexing the parameters
+    const float * x = a.x0;
+    float       * d = a.d0;
+    if (r >= a.n0) {
+        r -= a.n0;
+        x  = a.x1;
+        d  = a.d1;
+        if (r >= a.n1) {
+            r -= a.n1;
+            x  = a.x2;
+            d  = a.d2;
+            if (r >= a.n2) {
+                r -= a.n2;
+                x  = a.x3;
+                d  = a.d3;
+            }
+        }
+    }
+    float s = 0.0f;
+    if (valid) {
+        const float4 * y4 = (const float4 *) y + 2*lane;
+        const float4 * x4 = (const float4 *) (x + (int64_t) r*sx1) + 2*lane;
+        const float4 xa = x4[0];
+        const float4 xb = x4[1];
+        const float4 ya = y4[0];
+        const float4 yb = y4[1];
+        s = xa.x*ya.x + xa.y*ya.y + xa.z*ya.z + xa.w*ya.w + xb.x*yb.x + xb.y*yb.y + xb.z*yb.z + xb.w*yb.w;
+    }
+#pragma unroll
+    for (int o = G/2; o > 0; o >>= 1) {
+        s += __shfl_xor_sync(0xffffffff, s, o, G);
+    }
+    if (valid && lane == 0) {
+        d[r] = s;
+    }
+}
+
+// whether ggml_cuda_mul_mat_vec_f takes the short rows (see mul_mat_vec_f_short_rows) for this product and fusion
+static bool ggml_cuda_mmvf_short_rows(const ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, const ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion) {
+    static const bool disabled = getenv("GGML_CUDA_NO_MMVF_SHORT_ROWS") != nullptr;
+    const int64_t k = src0->ne[0];
+    if (disabled || ids || src0->type != GGML_TYPE_F32 || (k != 16 && k != 32 && k != 64 && k != 128) || ggml_nrows(src1) != 1 ||
+            ggml_nrows(src0) != src0->ne[1] || !ggml_is_contiguous(dst) || src0->nb[1] % 16 != 0 ||
+            (uintptr_t) src0->data % 16 != 0 || (uintptr_t) src1->data % 16 != 0 || src1->nb[0] != sizeof(float) ||
+            (ctx.ar_fold.next == dst && !ctx.ar_fold.hc)) {
+        return false;
+    }
+    if (fusion == nullptr) {
+        return true;
+    }
+    if (fusion->x_bias || fusion->gate || fusion->gate_bias || fusion->x_scale || fusion->gate_scale || fusion->gdn_beta ||
+            fusion->gdn_x || fusion->sib_y || fusion->sib_gate || fusion->topk_ids || fusion->norm_x || fusion->ar_weights ||
+            (fusion->sib && !fusion->sib_rows)) {
+        return false;
+    }
+    const ggml_tensor * sibs[3] = { fusion->sib, fusion->sib2, fusion->sib3 };
+    for (const ggml_tensor * s : sibs) {
+        if (s && ((uintptr_t) s->data % 16 != 0 || s->nb[1] != src0->nb[1])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void ggml_cuda_mul_mat_vec_f_short_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion) {
+    mmvf_short_rows_args a = {};
+    const float * xs[4] = { (const float *) src0->data, nullptr, nullptr, nullptr };
+    float       * ds[4] = { (float *) dst->data, nullptr, nullptr, nullptr };
+    int           ns[4] = { (int) src0->ne[1], 0, 0, 0 };
+    int nrows = ns[0];
+    if (fusion) {
+        const ggml_tensor * sibs[3] = { fusion->sib,     fusion->sib2,     fusion->sib3     };
+        ggml_tensor       * dsts[3] = { fusion->sib_dst, fusion->sib2_dst, fusion->sib3_dst };
+        for (int k = 0; k < 3 && sibs[k] != nullptr; ++k) {
+            xs[k + 1] = (const float *) sibs[k]->data;
+            ds[k + 1] = (float *) dsts[k]->data;
+            ns[k + 1] = (int) sibs[k]->ne[1];
+            nrows += ns[k + 1];
+        }
+    }
+    a.x0 = xs[0]; a.x1 = xs[1]; a.x2 = xs[2]; a.x3 = xs[3];
+    a.d0 = ds[0]; a.d1 = ds[1]; a.d2 = ds[2]; a.d3 = ds[3];
+    a.n0 = ns[0]; a.n1 = ns[1]; a.n2 = ns[2];
+    const int     g   = (int) src0->ne[0]/8;
+    const int64_t sx1 = src0->nb[1]/sizeof(float);
+    const int     nb  = (int) (((int64_t) nrows*g + 255)/256);
+    const float * y   = (const float *) src1->data;
+    switch (g) {
+        case  2: mul_mat_vec_f_short_rows< 2><<<nb, 256, 0, ctx.stream()>>>(a, y, sx1, nrows); break;
+        case  4: mul_mat_vec_f_short_rows< 4><<<nb, 256, 0, ctx.stream()>>>(a, y, sx1, nrows); break;
+        case  8: mul_mat_vec_f_short_rows< 8><<<nb, 256, 0, ctx.stream()>>>(a, y, sx1, nrows); break;
+        case 16: mul_mat_vec_f_short_rows<16><<<nb, 256, 0, ctx.stream()>>>(a, y, sx1, nrows); break;
+        default: GGML_ABORT("fatal error");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(!ids ||  ids->type == GGML_TYPE_I32);
     GGML_ASSERT(         dst->type == GGML_TYPE_F32);
+
+    if (ggml_cuda_mmvf_short_rows(ctx, src0, src1, ids, dst, fusion)) {
+        ggml_cuda_mul_mat_vec_f_short_rows(ctx, src0, src1, dst, fusion);
+        return;
+    }
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
