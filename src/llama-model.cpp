@@ -481,6 +481,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_attn_norm_2     ("blk\\.\\d*\\.attn_norm_2\\.weight");
     static const std::regex pattern_idx_q_weight    ("blk\\.\\d*\\.indexer\\.q_proj\\.weight");
 
+    // Inkling 2: per-head relative-position bias, sink logits and clip scales
+    static const std::regex pattern_attn_rel_weight ("blk\\.\\d*\\.attn_rel\\.weight");
+    static const std::regex pattern_attn_head_clip  ("blk\\.\\d*\\.attn_(q|rel)_clip\\.weight");
+    static const std::regex pattern_attn_sink_proj  ("blk\\.\\d*\\.attn_sink_proj\\.weight");
+    const bool is_inkling2 = ud->model->arch == LLM_ARCH_INKLING2 || ud->model->arch == LLM_ARCH_INKLING2_LOOP;
+
     // multi-head latent attention
     static const std::regex pattern_q_a_weight      ("blk\\.\\d*\\.attn_q_a\\.weight");
     static const std::regex pattern_q_b_weight      ("blk\\.\\d*\\.attn_q_b\\.weight");
@@ -803,6 +809,19 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a) ||
                     std::regex_match(tensor_name, pattern_r_cache) || std::regex_match(tensor_name, pattern_s_cache)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
+            }
+        }
+        // Inkling 2: the q heads are split, k and v go through short convs whose state is packed with the convs of the
+        //   all-reduced attention and FFN outputs, so the k/v path, its cache and the conv state stay mirrored. The bias,
+        //   sink and clip tensors have one slice per q head and split with them.
+        if (is_inkling2) {
+            if (std::regex_match(tensor_name, pattern_kv_weight) || std::regex_match(tensor_name, pattern_kv_cache) ||
+                    std::regex_match(tensor_name, pattern_r_cache)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+            if (std::regex_match(tensor_name, pattern_attn_rel_weight) || std::regex_match(tensor_name, pattern_attn_head_clip) ||
+                    std::regex_match(tensor_name, pattern_attn_sink_proj)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
             }
         }
 
@@ -1525,6 +1544,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                     return {hparams.n_head(il) / hparams.dsv4_o_group_count};
                 }
                 return {granularity_head};
+            }
+            if (is_inkling2 && (std::regex_match(tensor_name, pattern_attn_head_clip) || std::regex_match(tensor_name, pattern_attn_sink_proj))) {
+                GGML_ASSERT(segments.size() == 1 && tensor->ne[1] == hparams.n_head(il));
+                return {granularity_head};
+            }
+            if (is_inkling2 && std::regex_match(tensor_name, pattern_attn_rel_weight)) {
+                GGML_ASSERT(segments.size() == 1 && tensor->ne[1] == hparams.n_head(il)*hparams.n_relative);
+                return {granularity_head*hparams.n_relative};
             }
 
             if (is_dsv4) {

@@ -441,7 +441,10 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
         cur = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/cap)), cap);
     }
 
-    // drop the padded vocabulary
+    // drop the padded vocabulary; logits split over the vocab cannot be cut by a view, so a multi-device backend gathers
+    //   them first (it fills a mirrored copy with an all-gather instead of running the copy)
+    cur = ggml_cont(ctx0, cur);
+    cur->flags |= GGML_TENSOR_FLAG_MIRRORED;
     cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, hparams.n_vocab_unpadded, cur->ne[1], cur->nb[1], 0));
 
     cb(cur, "result_output", -1);

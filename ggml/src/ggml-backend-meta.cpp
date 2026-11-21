@@ -2738,7 +2738,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_derive_split_state
         // a mask split along dim 3 like q: the problems along dim 3 below, each device made the mask of its own
         const bool mask_split = tensor->src[3] != nullptr && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_3 &&
             split_states_equal(src_ss[3], src_ss[0]);
-        GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || mask_split);
+        // a mask per q head (relative-position bias) split by head like q: each device made the mask of its own heads
+        const bool mask_heads = tensor->src[3] != nullptr && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+            src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_2 && split_states_equal(src_ss[3], src_ss[0]);
+        GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || mask_split || mask_heads);
+        // a replicated mask per q head is cut to the heads of the device in ggml_backend_meta_buffer_init_tensor_impl
+        GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+            tensor->src[3]->ne[2] == 1 || tensor->src[3]->ne[2] == tensor->src[0]->ne[2]);
         // the KV ranges of the mask rows (ggml_flash_attn_ext_set_kv_ranges) go with the mask
         GGML_ASSERT(tensor->src[6] == nullptr || (src_ss[6].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && !mask_split));
         // the chunk lists of page-sparse decode (ggml_flash_attn_ext_set_chunk_list), one row per q head: split like q
@@ -2777,7 +2783,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_derive_split_state
         const bool kv_mirrored = src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
                 src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
         GGML_ASSERT(kv_split || kv_mirrored);
-        GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
+        // the sinks, one per q head: split like q, or replicated and cut to the device's heads (see init_tensor_impl)
+        GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0 ||
+            (src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && tensor->src[4]->ne[0] == tensor->src[0]->ne[2]));
         if (kv_mirrored && tensor->src[1]->ne[2] > 1) {
             // ggml_backend_meta_buffer_init_tensor_impl gives each device only the kv heads of its own q heads
             for (size_t j = 0; j < n_bufs; j++) {
@@ -3950,6 +3958,11 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                 slice_replicated(2, 3); // v
             }
             slice_replicated(3, 3); // mask
+        }
+        // q split by head (dst split along dim 1): a replicated mask per head and replicated sinks
+        if (tensor->op == GGML_OP_FLASH_ATTN_EXT && split_state.axis == GGML_BACKEND_SPLIT_AXIS_1) {
+            slice_replicated(3, 2); // mask
+            slice_replicated(4, 0); // sinks
         }
         if ((tensor->op == GGML_OP_ADD || tensor->op == GGML_OP_SUB || tensor->op == GGML_OP_MUL || tensor->op == GGML_OP_DIV ||
                 tensor->op == GGML_OP_CONCAT) && split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {

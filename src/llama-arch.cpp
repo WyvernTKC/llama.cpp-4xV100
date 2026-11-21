@@ -1615,9 +1615,6 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_ZAYA1:
         case LLM_ARCH_GROK:
         case LLM_ARCH_MPT:
-        // per-head FA mask (relative position bias) is mirrored, not split with the q heads
-        case LLM_ARCH_INKLING2:
-        case LLM_ARCH_INKLING2_LOOP:
         // MLA without the absorption optimization: uses the unsplit attn_kv_b instead of attn_k_b/attn_v_b
         case LLM_ARCH_MINICPM3:
         case LLM_ARCH_OLMO2:

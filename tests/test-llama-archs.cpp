@@ -342,8 +342,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         n_embd = 1024;
         n_head = 8;
     } else if (arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) {
-        n_embd  = 128;
-        n_head  = 4;
+        // GQA 3 like Inkling 2 Mini and a head size that CUDA flash attention has, so that -sm tensor gives a device several q heads of one kv head
+        n_embd  = 768;
+        n_head  = 12;
         n_ff    = 24;
         n_layer = 3;
     }
@@ -378,7 +379,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         n_head_kv = 2;
         n_layer   = 4;
     }
-    if (arch == LLM_ARCH_MINIMAX_M3) {
+    if (arch == LLM_ARCH_MINIMAX_M3 || arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) {
         n_head_kv = 4;
     }
     n_layer = std::max(n_layer, n_layer_min);
