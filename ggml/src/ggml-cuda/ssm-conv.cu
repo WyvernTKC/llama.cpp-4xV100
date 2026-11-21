@@ -296,10 +296,64 @@ static __global__ void ssm_short_conv_state_f32(const float * states, const int3
     }
 }
 
+// The same chain for the Inkling 2 short conv: no silu, the output is (conv + x)*res_scale, x the new token itself.
+template <int d_conv, int n_t>
+static __global__ void ssm_conv_state_res_f32(const float * states, const int32_t * ids, const int64_t row_stride,
+                                              const float * x, const int64_t x_stride_t, const int64_t x_stride_c,
+                                              const float * w, const int64_t w_stride, const float res_scale,
+                                              float * dst, const int64_t dst_stride_t,
+                                              const ggml_cuda_ssm_conv_state_slots slots, const int nr) {
+    ggml_cuda_pdl_lc();
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+    if (c >= nr) {
+        return;
+    }
+
+    float win[d_conv - 1 + n_t];
+    const float * s = states + ids[0]*row_stride + (int64_t) c*(d_conv - 1);
+#pragma unroll
+    for (int k = 0; k < d_conv - 1; ++k) {
+        win[k] = s[k];
+    }
+#pragma unroll
+    for (int t = 0; t < n_t; ++t) {
+        win[d_conv - 1 + t] = x[t*x_stride_t + c*x_stride_c];
+    }
+
+    float wv[d_conv];
+#pragma unroll
+    for (int j = 0; j < d_conv; ++j) {
+        wv[j] = w[c*w_stride + j];
+    }
+
+#pragma unroll
+    for (int i = 0; i <= n_t; ++i) {
+        float * slot = slots.dst[i];
+        if (slot != nullptr) {
+#pragma unroll
+            for (int k = 0; k < d_conv - 1; ++k) {
+                slot[(int64_t) c*(d_conv - 1) + k] = win[i + k];
+            }
+        }
+    }
+
+#pragma unroll
+    for (int t = 0; t < n_t; ++t) {
+        float sumf = 0.0f;
+#pragma unroll
+        for (int j = 0; j < d_conv; ++j) {
+            sumf += win[t + j] * wv[j];
+        }
+        dst[t*dst_stride_t + c] = (win[d_conv - 1 + t] + sumf)*res_scale;
+    }
+}
+
 void ggml_cuda_op_ssm_conv_state(ggml_backend_cuda_context & ctx, const ggml_tensor * states, const ggml_tensor * ids,
                                  const ggml_tensor * x, const ggml_tensor * ssm_conv, ggml_tensor * silu,
                                  const ggml_cuda_ssm_conv_state_slots & slots, const ggml_tensor * gate,
-                                 const ggml_tensor * x_a, const ggml_tensor * x_b) {
+                                 const ggml_tensor * x_a, const ggml_tensor * x_b, bool residual, float res_scale) {
     const ggml_tensor * w = ssm_conv->src[1];
 
     const int nr  = (int) w->ne[1];
@@ -316,6 +370,14 @@ void ggml_cuda_op_ssm_conv_state(ggml_backend_cuda_context & ctx, const ggml_ten
                 (const float *) states->data, (const int32_t *) ids->data, (int64_t) (states->nb[1]/ts),
                 (const float *) x_a->data, (const float *) x_b->data, (int64_t) (x_a->nb[1]/ts),
                 (const float *) w->data, (int64_t) (w->nb[1]/ts), (const float *) gate->data, (int64_t) (gate->nb[1]/ts),
+                (float *) silu->data, (int64_t) (silu->nb[1]/ts), slots, nr);
+            return;
+        }
+        if (residual) {
+            ggml_cuda_kernel_launch(ssm_conv_state_res_f32<4, decltype(NT)::value>, launch_params,
+                (const float *) states->data, (const int32_t *) ids->data, (int64_t) (states->nb[1]/ts),
+                (const float *) x->data, (int64_t) (x->nb[0]/ts), (int64_t) (x->nb[1]/ts),
+                (const float *) w->data, (int64_t) (w->nb[1]/ts), res_scale,
                 (float *) silu->data, (int64_t) (silu->nb[1]/ts), slots, nr);
             return;
         }

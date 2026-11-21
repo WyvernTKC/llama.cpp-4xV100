@@ -4899,6 +4899,8 @@ struct ggml_cuda_ssm_conv_state_fusion {
     int                 conv_idx = -1;
     int                 silu_idx = -1;
     bool                long_path = false; // more than GGML_CUDA_SSM_CONV_STATE_MAX_TOKENS tokens
+    bool                residual  = false; // Inkling 2: the output is (conv + x)*res_scale, silu is that SCALE
+    float               res_scale = 1.0f;
     ggml_cuda_ssm_conv_state_slots      slots      = {};
     ggml_cuda_ssm_conv_state_long_slots long_slots = {};
 };
@@ -5054,6 +5056,19 @@ static bool ggml_cuda_ssm_conv_state_fusion_match(
         silu_src = cgraph->nodes[f.silu_idx++];
     }
     f.silu     = cgraph->nodes[f.silu_idx];
+    // Inkling 2: an ADD of the new tokens (the tensor whose transpose they are) and a SCALE instead of the SILU
+    static const bool no_res_conv = getenv("GGML_CUDA_NO_RES_CONV_FUSION") != nullptr;
+    if (d_conv == 4 && !f.long_path && !no_res_conv && f.silu->op == GGML_OP_ADD && f.silu->src[1] == silu_src &&
+            f.x->op == GGML_OP_TRANSPOSE && f.x->src[0]->op == GGML_OP_RESHAPE && f.x->src[0]->src[0] == f.silu->src[0] &&
+            f.silu_idx + 1 < cgraph->n_nodes && ggml_cuda_graph_use_count(cgraph, f.silu) == 1 && !(f.silu->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        ggml_tensor * sc = cgraph->nodes[f.silu_idx + 1];
+        if (sc->op == GGML_OP_SCALE && sc->src[0] == f.silu && ggml_get_op_params_f32(sc, 1) == 0.0f) {
+            f.residual  = true;
+            f.res_scale = ggml_get_op_params_f32(sc, 0);
+            f.silu      = sc;
+            f.silu_idx += 1;
+        }
+    }
     // the LFM2 short conv: a MUL by the gate instead of the SILU
     if (d_conv == 3 && !f.long_path && silu_src == f.ssm_conv && f.silu->op == GGML_OP_MUL) {
         f.gate = f.silu->src[0] == f.ssm_conv ? f.silu->src[1] : f.silu->src[1] == f.ssm_conv ? f.silu->src[0] : nullptr;
@@ -5066,7 +5081,7 @@ static bool ggml_cuda_ssm_conv_state_fusion_match(
     if (d_conv == 3 && (f.gate == nullptr || f.x_a == nullptr)) {
         return false;
     }
-    const bool silu_ok = f.gate != nullptr ||
+    const bool silu_ok = f.gate != nullptr || f.residual ||
         (f.silu->op == GGML_OP_UNARY && ggml_get_unary_op(f.silu) == GGML_UNARY_OP_SILU && f.silu->src[0] == silu_src);
     const ggml_tensor * w = f.ssm_conv->src[1];
     if (w->type != GGML_TYPE_F32 || w->ne[0] != d_conv || w->ne[1] != nr || w->nb[0] != sizeof(float) ||
@@ -5163,7 +5178,7 @@ static int ggml_cuda_gdn_conv_fold(ggml_backend_cuda_context * cuda_ctx, const g
             break;
         }
     }
-    if (concat_idx < 0 || !ggml_cuda_ssm_conv_state_fusion_match(cuda_ctx, cgraph, concat_idx, f)) {
+    if (concat_idx < 0 || !ggml_cuda_ssm_conv_state_fusion_match(cuda_ctx, cgraph, concat_idx, f) || f.residual) {
         return -1;
     }
     if (f.long_path || f.gr_shared || f.ssm_conv->ne[1] != 1 || f.gr_idx <= qkv_last ||
@@ -10281,7 +10296,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (f.long_path) {
                 ggml_cuda_op_ssm_conv_state_long(*cuda_ctx, &states, f.ids, f.x, f.ssm_conv, f.silu, f.long_slots);
             } else {
-                ggml_cuda_op_ssm_conv_state(*cuda_ctx, &states, f.ids, f.x, f.ssm_conv, f.silu, f.slots, f.gate, f.x_a, f.x_b);
+                ggml_cuda_op_ssm_conv_state(*cuda_ctx, &states, f.ids, f.x, f.ssm_conv, f.silu, f.slots, f.gate, f.x_a, f.x_b,
+                    f.residual, f.res_scale);
             }
             return f.last_cpy - i;
         }
