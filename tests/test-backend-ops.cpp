@@ -13672,22 +13672,24 @@ struct test_mla_up : public test_case {
     const int64_t n_head;
     const int64_t n_cell;
     const int64_t n_pe; // 0: no shared part
+    const ggml_type type_kv;
 
     std::string vars() override {
-        return VARS_TO_STR5(n_lat, m, n_head, n_cell, n_pe);
+        return VARS_TO_STR6(n_lat, m, n_head, n_cell, n_pe, type_kv);
     }
 
     double max_nmse_err() override {
         return 5e-6; // f16 output, f32 sums in another order
     }
 
-    test_mla_up(int64_t n_lat = 512, int64_t m = 128, int64_t n_head = 8, int64_t n_cell = 256, int64_t n_pe = 64)
-        : n_lat(n_lat), m(m), n_head(n_head), n_cell(n_cell), n_pe(n_pe) {}
+    test_mla_up(int64_t n_lat = 512, int64_t m = 128, int64_t n_head = 8, int64_t n_cell = 256, int64_t n_pe = 64,
+            ggml_type type_kv = GGML_TYPE_F16)
+        : n_lat(n_lat), m(m), n_head(n_head), n_cell(n_cell), n_pe(n_pe), type_kv(type_kv) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_lat, m, n_head);
         ggml_set_name(w, "w");
-        ggml_tensor * kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_lat + n_pe, n_cell);
+        ggml_tensor * kv = ggml_new_tensor_2d(ctx, type_kv, n_lat + n_pe, n_cell);
         ggml_set_name(kv, "kv");
         ggml_tensor * c  = ggml_view_2d(ctx, kv, n_lat, n_cell, kv->nb[1], 0);
         ggml_tensor * pe = n_pe > 0 ? ggml_view_2d(ctx, kv, n_pe, n_cell, kv->nb[1], ggml_row_size(kv->type, n_lat)) : nullptr;
@@ -14776,6 +14778,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mla_up(512, 128, 8, 256, 64));
     test_cases.emplace_back(new test_mla_up(512, 128, 8, 1000, 0));
     test_cases.emplace_back(new test_mla_up(64, 32, 3, 77, 16));
+    test_cases.emplace_back(new test_mla_up(512, 128, 8, 256, 64, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_mla_up(512, 192, 8, 1000, 0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_mla_up(64, 32, 3, 77, 32, GGML_TYPE_Q8_0));
 
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         // blocks with extra cells and scores (k-pool)
@@ -17899,6 +17904,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (bool ranges : { false, true }) {
             test_cases.emplace_back(new test_flash_attn_ext_window(576, 512, 1, {8, 1}, 32768, 1, 20000, offset, GGML_TYPE_F16, ranges, 0, true));
         }
+    }
+    // the same kernel on a q8_0 cache
+    for (int64_t kv : {256, 4096, 32768, 131072}) {
+        test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 2, {8, 2}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext_large_logits(576, 512, 1, {8, 1}, 32768, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
+    for (bool ranges : { false, true }) {
+        test_cases.emplace_back(new test_flash_attn_ext_window(576, 512, 1, {8, 1}, 32768, 1, 20000, 7001, GGML_TYPE_Q8_0, ranges, 0, true));
     }
 
     // sliding window in a ring cache (gemma-4 SWA: D 256, gqa 2; muse-glimmer SWA: D 128, gqa 16): the vec and tile

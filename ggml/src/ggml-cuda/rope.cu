@@ -1562,7 +1562,8 @@ static __device__ __forceinline__ void mla_rope_pair(
 
 // The latent cache row of a token: RMS_NORM of the latent a, MUL by the norm weight and an optional SCALE, the ROPE of
 //   the rope part b, their CONCAT and its SET_ROWS into the cache, in one launch: one block of 256 per token, the norm
-//   reduced as rms_norm_f32<256> reduces it and every product in the order of the separate kernels.
+//   reduced as rms_norm_f32<256> reduces it and every product in the order of the separate kernels. A q8_0 cache: the
+//   row goes to shared memory first, then a warp per block quantizes it as set_rows does (quantize_f32_q8_0_group).
 template <typename D>
 static __global__ void __launch_bounds__(256) mla_kv_row_f32(
         const float * a, const int64_t sa, const float * b, const int64_t sb, const float * w,
@@ -1587,19 +1588,50 @@ static __global__ void __launch_bounds__(256) mla_kv_row_f32(
     const float scale = rsqrtf(mean + eps);
 
     D * y = dst + idx[t]*s_dst;
-    for (int c = tid; c < na; c += 256) {
-        float v = scale * a[c] * w[c];
-        if (has_scale) {
-            v = s * v;
+    if constexpr (std::is_same_v<D, block_q8_0>) {
+        float * row = s_sum + 32;
+        for (int c = tid; c < na; c += 256) {
+            float v = scale * a[c] * w[c];
+            if (has_scale) {
+                v = s * v;
+            }
+            row[c] = v;
         }
-        y[c] = ggml_cuda_cast<D>(v);
-    }
-    for (int i0 = 2*tid; i0 < nb; i0 += 2*256) {
-        int   ix0, ix1;
-        float y0, y1;
-        mla_rope_pair(b, i0, r.pos[t], r, ix0, ix1, y0, y1);
-        y[na + ix0] = ggml_cuda_cast<D>(y0);
-        y[na + ix1] = ggml_cuda_cast<D>(y1);
+        for (int i0 = 2*tid; i0 < nb; i0 += 2*256) {
+            int   ix0, ix1;
+            float y0, y1;
+            mla_rope_pair(b, i0, r.pos[t], r, ix0, ix1, y0, y1);
+            row[na + ix0] = y0;
+            row[na + ix1] = y1;
+        }
+        __syncthreads();
+
+        const int lane = tid % WARP_SIZE;
+        for (int ib = tid/WARP_SIZE; ib < (na + nb)/QK8_0; ib += 256/WARP_SIZE) {
+            const float x    = row[ib*QK8_0 + lane];
+            const float amax = warp_reduce_max(fabsf(x));
+            const float d    = amax / ((1 << 7) - 1);
+            const float id   = d ? 1.0f/d : 0.0f;
+            y[ib].qs[lane] = roundf(x*id);
+            if (lane == 0) {
+                y[ib].d = d;
+            }
+        }
+    } else {
+        for (int c = tid; c < na; c += 256) {
+            float v = scale * a[c] * w[c];
+            if (has_scale) {
+                v = s * v;
+            }
+            y[c] = ggml_cuda_cast<D>(v);
+        }
+        for (int i0 = 2*tid; i0 < nb; i0 += 2*256) {
+            int   ix0, ix1;
+            float y0, y1;
+            mla_rope_pair(b, i0, r.pos[t], r, ix0, ix1, y0, y1);
+            y[na + ix0] = ggml_cuda_cast<D>(y0);
+            y[na + ix1] = ggml_cuda_cast<D>(y1);
+        }
     }
 }
 
@@ -1629,6 +1661,12 @@ void ggml_cuda_op_mla_kv_row(ggml_backend_cuda_context & ctx, const ggml_tensor 
         ggml_cuda_kernel_launch(mla_kv_row_f32<half>, launch_params, (const float *) a->data, (int64_t) (a->nb[1]/sizeof(float)),
             (const float *) b->data, (int64_t) (b->nb[2]/sizeof(float)), (const float *) w->data, na, nb, eps, s, scale != nullptr,
             r, (half *) set_rows->data, (const int64_t *) set_rows->src[1]->data, s_dst);
+    } else if (set_rows->type == GGML_TYPE_Q8_0) {
+        GGML_ASSERT((na + nb) % QK8_0 == 0);
+        const ggml_cuda_kernel_launch_params launch_params_q(blocks, dim3(256, 1, 1), (32 + na + nb)*sizeof(float), ctx.stream());
+        ggml_cuda_kernel_launch(mla_kv_row_f32<block_q8_0>, launch_params_q, (const float *) a->data, (int64_t) (a->nb[1]/sizeof(float)),
+            (const float *) b->data, (int64_t) (b->nb[2]/sizeof(float)), (const float *) w->data, na, nb, eps, s, scale != nullptr,
+            r, (block_q8_0 *) set_rows->data, (const int64_t *) set_rows->src[1]->data, s_dst);
     } else {
         ggml_cuda_kernel_launch(mla_kv_row_f32<float>, launch_params, (const float *) a->data, (int64_t) (a->nb[1]/sizeof(float)),
             (const float *) b->data, (int64_t) (b->nb[2]/sizeof(float)), (const float *) w->data, na, nb, eps, s, scale != nullptr,

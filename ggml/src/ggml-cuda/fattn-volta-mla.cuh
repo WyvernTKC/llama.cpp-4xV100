@@ -3,15 +3,16 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 
-// One token of MLA's absorbed attention on Volta tensor cores (mma.m8n8k4): K rows of 576 halves (the 512-dim latent
-// and the 64-dim rope part), V the first 512 dims of the same rows, 8 Q heads on a K/V head. LongCat-Next under
+// One token of MLA's absorbed attention on Volta tensor cores (mma.m8n8k4): K rows of 576 values (the 512-dim latent
+// and the 64-dim rope part) in F16 or q8_0, V the first 512 dims of the same rows, 8 Q heads on a K/V head. LongCat-Next under
 // -sm tensor has exactly this per device: 8 of its 32 heads on the one latent head. The tile kernel does the same work
 // on the FP16 FMA units at ~13% of their peak (compute/latency bound), well above the time to read the cache.
 //
 // A block of 8 warps takes the 8 heads and walks 32-cell tiles of its share of the cells; the shares of the parallel
 // blocks are merged by flash_attn_combine_results (launch_fattn). Per tile:
 //   1. The tile (32 x 576 halves) is stored to shared memory; the loads of the next tile are issued right after and
-//      land in registers while this one is computed (Volta has no cp.async).
+//      land in registers while this one is computed (Volta has no cp.async). A q8_0 cache is converted to F16 on the
+//      way to shared memory, each value q*d rounded once (bitwise the conversion of the cache to F16).
 //   2. S = Q K^T (8 heads x 32 cells): warp w takes 72 of the 576 dims (64 of the latent, 8 of the rope part); quad
 //      pair q takes half of them (q & 1) for 16 of the cells (q >> 1), in two rounds of 8, and keeps its Q fragments in
 //      registers. The two halves are summed with a shuffle, the 8 warps in shared memory. Scores are F32.
@@ -62,8 +63,7 @@ static __device__ __forceinline__ uint32_t pack_half2(const float lo, const floa
 }
 #endif // VOLTA_MMA_AVAILABLE
 
-// The template parameter only keeps the kernel out of translation units that never launch it.
-template <int dummy>
+template <ggml_type type_K>
 __launch_bounds__(THREADS, 2)
 static __global__ void flash_attn_volta_mla(
         const char * __restrict__ Q,
@@ -156,24 +156,67 @@ static __global__ void flash_attn_volta_mla(
         }
     }
 
-    // thread tid loads row tid/8 of a tile, 16-byte pieces tid%8 + 8*i: one base address, constant offsets, and the 8
-    //     threads of a row read (and store) 128 contiguous bytes per piece
+    // thread tid loads row tid/8 of a tile, pieces of 8 values tid%8 + 8*i: one base address, constant offsets, and the
+    //     8 threads of a row read (and store) 128 contiguous bytes per piece in F16
+    // q8_0: piece tid%8 + 8*i is the quarter tid%4 of block 2*i + (tid%8)/4 of the row. The rows (612 bytes) and the
+    //     block pairs (68) start 4-byte aligned, the odd block of a pair at 2 mod 4, so a piece is 4 aligned words:
+    //     three from 12 bytes that hold its 8 quants (at byte 2 of them in an even block, 4 in an odd one) and the word
+    //     holding d (its low half in an even block, high in an odd one). The 3 + 1 words stay in the 16 bytes of stage.
     static_assert(THREADS == 8*NC && CHUNKS*8 == PIECES, "one row per 8 threads");
+    static_assert(type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_Q8_0, "bad type_K");
+    static_assert(DKQ % QK8_0 == 0 && sizeof(block_q8_0) == 34, "bad q8_0 row");
     uint4 stage[CHUNKS];
     const int    ld_row = tid / 8;
     const int    ld_col = (tid % 8)*8; // halves
     half * const st_ptr = tile_k + ld_row*PITCH + ld_col;
+    const int      q_odd = (tid % 8) / 4;
+    const int      q_off = 32*q_odd + 8*(tid % 4);         // bytes: the first of the 3 quant words, block pair 0
+    const uint32_t sel_q = q_odd ? 0x7654 : 0x5432;        // the 8 quants out of the 3 words, 4 by 4
+    const uint32_t sel_d = q_odd ? 0x3232 : 0x1010;        // d twice out of its word
     const auto load_tile = [&](const int k0) {
-        const uint4 * src = (const uint4 *) (K_rows + int64_t(k0 + ld_row)*nb11 + ld_col*sizeof(half));
+        const char * row = K_rows + int64_t(k0 + ld_row)*nb11;
+        if constexpr (type_K == GGML_TYPE_F16) {
+            const uint4 * src = (const uint4 *) (row + ld_col*sizeof(half));
 #pragma unroll
-        for (int i = 0; i < CHUNKS; ++i) {
-            stage[i] = src[8*i];
+            for (int i = 0; i < CHUNKS; ++i) {
+                stage[i] = src[8*i];
+            }
+        } else {
+            const uint32_t * src_q = (const uint32_t *) (row + q_off);
+            const uint32_t * src_d = (const uint32_t *) (row + 32*q_odd);
+#pragma unroll
+            for (int i = 0; i < CHUNKS; ++i) {
+                stage[i] = make_uint4(src_q[17*i], src_q[17*i + 1], src_q[17*i + 2], src_d[17*i]);
+            }
         }
     };
     const auto store_tile = [&]() {
 #pragma unroll
         for (int i = 0; i < CHUNKS; ++i) {
-            *(uint4 *) (st_ptr + 64*i) = stage[i];
+            if constexpr (type_K == GGML_TYPE_F16) {
+                *(uint4 *) (st_ptr + 64*i) = stage[i];
+            } else {
+                // 0x6400 | u is exactly 1024 + u in FP16: subtracting 1024 + 128 is exact, the product rounds once
+                const uint32_t q[2] = {
+                    __byte_perm(stage[i].x, stage[i].y, sel_q) ^ 0x80808080,
+                    __byte_perm(stage[i].y, stage[i].z, sel_q) ^ 0x80808080,
+                };
+                const uint32_t dd   = __byte_perm(stage[i].w, 0, sel_d);
+                const half2    d2   = *(const half2 *) &dd;
+                const half2    bias = make_half2(1152.0f, 1152.0f);
+                uint4 out;
+                uint32_t * outp = (uint32_t *) &out;
+#pragma unroll
+                for (int l = 0; l < 2; ++l) {
+                    const uint32_t lo  = __byte_perm(q[l], 0x64646464, 0x5140);
+                    const uint32_t hi  = __byte_perm(q[l], 0x64646464, 0x7362);
+                    const half2    vlo = __hmul2(__hsub2(*(const half2 *) &lo, bias), d2);
+                    const half2    vhi = __hmul2(__hsub2(*(const half2 *) &hi, bias), d2);
+                    outp[2*l + 0] = *(const uint32_t *) &vlo;
+                    outp[2*l + 1] = *(const uint32_t *) &vhi;
+                }
+                *(uint4 *) (st_ptr + 64*i) = out;
+            }
         }
     };
 
@@ -331,8 +374,8 @@ static __global__ void flash_attn_volta_mla(
 
 } // namespace fattn_volta_mla
 
-// The FLASH_ATTN_EXT cases the kernel above takes: Volta, one token, 576/512 with V a view of K, F16 cache, 8 Q heads on
-//     each K/V head, a mask without a head dimension, no sinks, softcap or ALiBi. GGML_CUDA_FATTN_VOLTA_MLA = the fewest
+// The FLASH_ATTN_EXT cases the kernel above takes: Volta, one token, 576/512 with V a view of K, F16 or q8_0 cache, 8 Q
+//     heads on each K/V head, a mask without a head dimension, no sinks, softcap or ALiBi. GGML_CUDA_FATTN_VOLTA_MLA = the fewest
 //     cells for it, 0 = off.
 static bool ggml_cuda_fattn_volta_mla_applies(const int cc, const ggml_tensor * dst) {
     static const int64_t min_kv = [] {
@@ -356,7 +399,7 @@ static bool ggml_cuda_fattn_volta_mla_applies(const int cc, const ggml_tensor * 
     if (max_bias != 0.0f || logit_softcap != 0.0f) {
         return false;
     }
-    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16) {
+    if (Q->type != GGML_TYPE_F32 || (K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_Q8_0) || V->type != K->type) {
         return false;
     }
     if (Q->ne[0] != fattn_volta_mla::DKQ || K->ne[0] != fattn_volta_mla::DKQ || V->ne[0] != fattn_volta_mla::DV) {
@@ -371,11 +414,12 @@ static bool ggml_cuda_fattn_volta_mla_applies(const int cc, const ggml_tensor * 
         return false;
     }
     for (const ggml_tensor * t : {Q, K}) {
-        if ((uintptr_t) t->data % 16 != 0 || t->nb[0] != ggml_type_size(t->type)) {
+        const size_t align = t->type == GGML_TYPE_Q8_0 ? 4 : 16; // q8_0: words, see load_tile
+        if ((uintptr_t) t->data % align != 0 || t->nb[0] != ggml_type_size(t->type)) {
             return false;
         }
         for (int i = 1; i < GGML_MAX_DIMS; ++i) {
-            if (t->nb[i] % 16 != 0) {
+            if (t->nb[i] % align != 0) {
                 return false;
             }
         }
@@ -383,9 +427,11 @@ static bool ggml_cuda_fattn_volta_mla_applies(const int cc, const ggml_tensor * 
     return K->ne[1]*K->nb[1] <= INT_MAX;
 }
 
+template <ggml_type type_K>
 static void ggml_cuda_flash_attn_ext_volta_mla(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     using namespace fattn_volta_mla;
-    fattn_kernel_t kernel = flash_attn_volta_mla<0>;
+    GGML_ASSERT(dst->src[1]->type == type_K);
+    fattn_kernel_t kernel = flash_attn_volta_mla<type_K>;
 
     // two blocks of ~46 KiB per SM need the largest shared memory carveout
     static bool carveout_set[GGML_CUDA_MAX_DEVICES] = {false};

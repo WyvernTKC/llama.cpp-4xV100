@@ -12039,13 +12039,23 @@ void ggml_compute_forward_mla_up(
     const int64_t r0     = dr*params->ith;
     const int64_t r1     = std::min(r0 + dr, n_rows);
 
+    // a q8_0 c or pe: its values rounded to f16, as the CUDA op reads them
+    const auto to_float = ggml_get_type_traits(c->type)->to_float;
     std::vector<float> cv(n_lat);
+    std::vector<float> pv(n_pe);
     for (int64_t r = r0; r < r1; r++) {
         const int64_t h = r / n_cell;
         const int64_t j = r % n_cell;
-        const ggml_fp16_t * cj = (const ggml_fp16_t *) ((const char *) c->data + j*c->nb[1]);
-        for (int64_t k = 0; k < n_lat; k++) {
-            cv[k] = GGML_CPU_FP16_TO_FP32(cj[k]);
+        if (c->type == GGML_TYPE_F16) {
+            const ggml_fp16_t * cj = (const ggml_fp16_t *) ((const char *) c->data + j*c->nb[1]);
+            for (int64_t k = 0; k < n_lat; k++) {
+                cv[k] = GGML_CPU_FP16_TO_FP32(cj[k]);
+            }
+        } else {
+            to_float((const char *) c->data + j*c->nb[1], cv.data(), n_lat);
+            for (int64_t k = 0; k < n_lat; k++) {
+                cv[k] = GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(cv[k]));
+            }
         }
         ggml_fp16_t * y = (ggml_fp16_t *) ((char *) dst->data + j*dst->nb[1] + h*dst->nb[2]);
         for (int64_t i = 0; i < m; i++) {
@@ -12056,10 +12066,15 @@ void ggml_compute_forward_mla_up(
             }
             y[i] = GGML_CPU_FP32_TO_FP16(s);
         }
-        if (pe != nullptr) {
+        if (pe != nullptr && pe->type == GGML_TYPE_F16) {
             const ggml_fp16_t * pj = (const ggml_fp16_t *) ((const char *) pe->data + j*pe->nb[1]);
             for (int64_t k = 0; k < n_pe; k++) {
                 y[m + k] = pj[k];
+            }
+        } else if (pe != nullptr) {
+            to_float((const char *) pe->data + j*pe->nb[1], pv.data(), n_pe);
+            for (int64_t k = 0; k < n_pe; k++) {
+                y[m + k] = GGML_CPU_FP32_TO_FP16(pv[k]);
             }
         }
     }

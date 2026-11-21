@@ -3420,7 +3420,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
 // MLA's up-projection to f16 keys or values (ggml_mla_up): one strided-batched GEMM over the heads, the latents shared
 //   by all of them (stride 0), f32 accumulation, f16 output straight into the rows of the result; then the shared part
-//   (the rope part of the keys) copied after the projected rows of each head
+//   (the rope part of the keys) copied after the projected rows of each head. A q8_0 cache is converted to f16 rows in
+//   the pool first (the latents of 131072 cells: 128 MiB).
 static __global__ void ggml_cuda_mla_up_pe(const half * pe, const int64_t s_pe, half * dst, const int64_t s1, const int64_t s2,
         const int m, const int n_pe) {
     const int64_t j = blockIdx.x;
@@ -3434,9 +3435,11 @@ static bool ggml_cuda_mla_up_supported(const ggml_tensor * op) {
     const ggml_tensor * w  = op->src[0];
     const ggml_tensor * c  = op->src[1];
     const ggml_tensor * pe = op->src[2];
+    const auto rows_ok = [](const ggml_tensor * t) {
+        return (t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_Q8_0) && t->nb[1] % ggml_type_size(t->type) == 0;
+    };
     return op->type == GGML_TYPE_F16 && ggml_is_contiguous(op) && w->type == GGML_TYPE_F16 && ggml_is_contiguous(w) &&
-        c->type == GGML_TYPE_F16 && c->nb[1] % ggml_type_size(c->type) == 0 &&
-        (pe == nullptr || (pe->type == GGML_TYPE_F16 && pe->nb[1] % ggml_type_size(pe->type) == 0));
+        rows_ok(c) && (pe == nullptr || rows_ok(pe));
 }
 
 static void ggml_cuda_op_mla_up(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -3454,6 +3457,24 @@ static void ggml_cuda_op_mla_up(ggml_backend_cuda_context & ctx, ggml_tensor * d
     cublasHandle_t cublas_h = ctx.cublas_handle();
     CUBLAS_CHECK(cublasSetStream(cublas_h, stream));
 
+    // the rows of c and pe as f16 and their stride in halves: in place, or a q8_0 cache converted to contiguous rows
+    ggml_cuda_pool_alloc<half> c_f16(ctx.pool());
+    ggml_cuda_pool_alloc<half> pe_f16(ctx.pool());
+    const auto f16_rows = [&](const ggml_tensor * t, ggml_cuda_pool_alloc<half> & buf, int64_t & ld) -> const half * {
+        if (t->type == GGML_TYPE_F16) {
+            ld = t->nb[1]/ts;
+            return (const half *) t->data;
+        }
+        const size_t tts = ggml_type_size(t->type);
+        buf.alloc(t->ne[0]*t->ne[1]);
+        ggml_get_to_fp16_nc_cuda(t->type)(t->data, buf.get(), t->ne[0], t->ne[1], 1, 1,
+            t->nb[1]/tts, t->nb[2]/tts, t->nb[3]/tts, stream);
+        ld = t->ne[0];
+        return buf.get();
+    };
+    int64_t ld_c = 0;
+    const half * c_rows = f16_rows(c, c_f16, ld_c);
+
     const float alpha = 1.0f;
     const float beta  = 0.0f;
     // column-major: w_h is n_lat x m (lda n_lat), c is n_lat x n_cell (ldb its row stride), the result of head h is
@@ -3462,13 +3483,15 @@ static void ggml_cuda_op_mla_up(ggml_backend_cuda_context & ctx, ggml_tensor * d
     cublasGemmStridedBatchedEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
             m, n_cell, n_lat,
             &alpha, w->data,   CUDA_R_16F, w->nb[1]/ts,   w->nb[2]/ts,
-                    c->data,   CUDA_R_16F, c->nb[1]/ts,   0,
+                    c_rows,    CUDA_R_16F, ld_c,          0,
             &beta,  dst->data, CUDA_R_16F, dst->nb[1]/ts, dst->nb[2]/ts,
             n_head, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
     if (pe != nullptr) {
+        int64_t ld_pe = 0;
+        const half * pe_rows = f16_rows(pe, pe_f16, ld_pe);
         const dim3 blocks(n_cell, n_head, 1);
-        ggml_cuda_mla_up_pe<<<blocks, 64, 0, stream>>>((const half *) pe->data, pe->nb[1]/ts, (half *) dst->data,
+        ggml_cuda_mla_up_pe<<<blocks, 64, 0, stream>>>(pe_rows, ld_pe, (half *) dst->data,
             dst->nb[1]/ts, dst->nb[2]/ts, (int) m, (int) pe->ne[0]);
         CUDA_CHECK(cudaGetLastError());
     }
@@ -8381,8 +8404,11 @@ static int ggml_cuda_try_fuse_mla_kv_row(ggml_backend_cuda_context * cuda_ctx, g
             concat->type != GGML_TYPE_F32 || ggml_get_op_params_i32(concat, 0) != 0 || concat->src[1] != rope ||
             ggml_cuda_mla_unview(concat->src[0]) != normed || concat->ne[0] != na + rope->ne[0] || concat->ne[1] != 1 ||
             concat->ne[2] != nt || ggml_cuda_mla_unview(set_rows->src[0]) != concat ||
-            (set_rows->type != GGML_TYPE_F16 && set_rows->type != GGML_TYPE_F32) || set_rows->ne[0] != concat->ne[0] ||
-            set_rows->nb[0] != ggml_type_size(set_rows->type) ||
+            (set_rows->type != GGML_TYPE_F16 && set_rows->type != GGML_TYPE_F32 &&
+                // q8_0: the row in shared memory, whole blocks
+                (set_rows->type != GGML_TYPE_Q8_0 || concat->ne[0] % QK8_0 != 0 || concat->ne[0] > 8192)) ||
+            set_rows->ne[0] != concat->ne[0] ||
+            set_rows->nb[0] != ggml_type_size(set_rows->type) || set_rows->nb[1] % ggml_type_size(set_rows->type) != 0 ||
             idx->type != GGML_TYPE_I64 || !ggml_is_contiguous(idx) || ggml_nelements(idx) != nt) {
         return 0;
     }

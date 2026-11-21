@@ -6852,10 +6852,10 @@ struct ggml_tensor * ggml_mla_up(
         struct ggml_tensor  * c,
         struct ggml_tensor  * pe) {
     GGML_ASSERT(w->type == GGML_TYPE_F16 && ggml_is_contiguous(w) && w->ne[3] == 1);
-    GGML_ASSERT(c->type == GGML_TYPE_F16 && c->ne[0] == w->ne[0] && c->nb[0] == ggml_type_size(c->type) &&
-        c->ne[2] == 1 && c->ne[3] == 1);
-    GGML_ASSERT(pe == NULL || (pe->type == GGML_TYPE_F16 && pe->nb[0] == ggml_type_size(pe->type) &&
-        pe->ne[1] == c->ne[1] && pe->ne[2] == 1 && pe->ne[3] == 1));
+    GGML_ASSERT((c->type == GGML_TYPE_F16 || c->type == GGML_TYPE_Q8_0) && c->ne[0] == w->ne[0] &&
+        c->ne[0] % ggml_blck_size(c->type) == 0 && c->nb[0] == ggml_type_size(c->type) && c->ne[2] == 1 && c->ne[3] == 1);
+    GGML_ASSERT(pe == NULL || (pe->type == c->type && pe->ne[0] % ggml_blck_size(pe->type) == 0 &&
+        pe->nb[0] == ggml_type_size(pe->type) && pe->ne[1] == c->ne[1] && pe->ne[2] == 1 && pe->ne[3] == 1));
 
     const int64_t m = w->ne[1] + (pe != NULL ? pe->ne[0] : 0);
 

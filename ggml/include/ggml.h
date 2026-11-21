@@ -2355,10 +2355,11 @@ extern "C" {
             struct ggml_tensor * sinks);
 
     // MLA's up-projection of the cached latents of all cells to per-head keys or values, in f16:
-    //   w [n_lat, m, n_head] f16, c [n_lat, n_cell] f16 (rows at any stride), pe [n_pe, n_cell] f16 or NULL (rows at any
-    //   stride) -> [m + n_pe, n_cell, n_head] f16 with result[i, j, h] = sum_r w[r, i, h]*c[r, j] for i < m, and
-    //   pe[i - m, j] after that (a part each head shares, as MLA's rope part of the keys). ggml_mul_mat(w, c) with c over
-    //   all the matrices of w and an f16 result, without the f32 one in between.
+    //   w [n_lat, m, n_head] f16, c [n_lat, n_cell] f16 or q8_0 (rows at any stride), pe [n_pe, n_cell] of c's type or
+    //   NULL (rows at any stride) -> [m + n_pe, n_cell, n_head] f16 with result[i, j, h] = sum_r w[r, i, h]*c[r, j] for
+    //   i < m, and pe[i - m, j] after that (a part each head shares, as MLA's rope part of the keys). ggml_mul_mat(w, c)
+    //   with c over all the matrices of w and an f16 result, without the f32 one in between. A q8_0 c or pe is read as
+    //   f16 (each value q*d rounded once).
     GGML_API struct ggml_tensor * ggml_mla_up(
             struct ggml_context * ctx,
             struct ggml_tensor  * w,

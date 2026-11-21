@@ -4141,8 +4141,8 @@ bool llm_graph_context::mla_mha_applies(const llm_graph_input_attn_k * inp) cons
     const int64_t n_head_dev  = std::max<int64_t>(1, hparams.n_head(0) / std::max<int64_t>(1, cparams.n_tp_dev));
     const int64_t cell_bytes  = n_head_dev*(hparams.n_embd_head_k_mla() + hparams.n_embd_head_v_mla())*2;
     const int64_t max_kv      = max_kv_env >= 0 ? max_kv_env : max_mib*1024*1024/std::max<int64_t>(1, cell_bytes);
-    if (inp->mctx->type_k() != GGML_TYPE_F16) {
-        return false; // ggml_mla_up reads f16 latents
+    if (inp->mctx->type_k() != GGML_TYPE_F16 && inp->mctx->type_k() != GGML_TYPE_Q8_0) {
+        return false; // ggml_mla_up reads f16 or q8_0 latents
     }
     // the CUDA kernel for one Q head per K/V head at 192/128 takes at least 32 queries (Volta has no device code below)
     if (min_tokens <= 0 || max_mib <= 0 || max_kv <= 0 || !cparams.flash_attn || n_tokens < std::max<int64_t>(min_tokens, 32) ||
