@@ -665,6 +665,48 @@ MAKE_TEST(test_audio_preprocessor_whisper_chunks) {
     }
 }
 
+MAKE_TEST(test_audio_preprocessor_whisper_quiet) {
+    mtmd_hparams hparams;
+    hparams.n_mel_bins        = 128;
+    hparams.audio_sample_rate = 16000;
+    hparams.audio_n_fft       = 400;
+    hparams.audio_window_len  = 400;
+    hparams.audio_hop_len     = 160;
+
+    // 1 s of a quiet tone: the max - 8 floor is below log10(2^-24), so the mel floor must be 1e-10 to reach it
+    const double pi = 3.14159265358979323846;
+    std::vector<float> samples(hparams.audio_sample_rate);
+    for (size_t i = 0; i < samples.size(); i++) {
+        samples[i] = (float) (0.01 * std::sin(2 * pi * 440 * i / hparams.audio_sample_rate));
+    }
+
+    // reference values from transformers WhisperFeatureExtractor(feature_size=128)
+    // { mel bin, frame, value }
+    const std::vector<std::tuple<int, int, float>> cases = {
+        {  18,   50,  0.6359f }, // tone
+        {  20,   50,  0.4379f }, // tone, next bin
+        {  18,  101, -0.4604f }, // tone end
+        {  30,   50, -1.3641f }, // max - 8 floor
+        {  10, 1000, -1.3641f }, // padding
+    };
+
+    ggml_backend_ptr backend(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+    ggml_backend_t backends[] = { backend.get() };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, nullptr, 1, 256, false, true));
+
+    mtmd_audio_preprocessor_whisper preproc(hparams, sched.get());
+    preproc.initialize();
+    mtmd_audio_preproc_out out = preproc.preprocess(samples.data(), samples.size());
+    if (!t.assert_true("preprocess", !out.entries.empty() && preproc.compute(out))) {
+        return;
+    }
+    const mtmd_image_f32 & mel = out.entries[0];
+    for (const auto & [bin, frame, expected] : cases) {
+        const float actual = mel.get_ro_buf()[bin * mel.nx() + frame];
+        t.assert_true("mel[" + std::to_string(bin) + "][" + std::to_string(frame) + "] = " + std::to_string(actual) + ", expected " + std::to_string(expected), std::fabs(actual - expected) < 1e-3f);
+    }
+}
+
 MAKE_TEST(test_audio_preprocessor_conformer) {
     mtmd_hparams hparams;
     hparams.n_mel_bins        = 128;

@@ -72,7 +72,7 @@ struct mtmd_audio_mel_config {
     bool    use_natural_log  = false;
     bool    norm_per_feature = false;
     bool    use_magnitude    = false;  // |X| instead of |X|^2
-    float   mel_floor        = 5.960464477539063e-08f;
+    float   mel_floor        = 1e-10f;  // whisper: log10(max(x, 1e-10))
     bool    mel_floor_add    = false;  // log(x + floor) instead of log(max(x, floor))
     bool    std_eps_after_sqrt = false;  // std + eps instead of sqrt(var + eps)
     int     n_threads        = 1;

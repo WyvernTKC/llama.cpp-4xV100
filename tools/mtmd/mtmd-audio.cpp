@@ -1487,6 +1487,7 @@ void mtmd_audio_preprocessor_conformer::initialize() {
     mel_config.preemph          = 0.97f;
     mel_config.use_natural_log  = true;
     mel_config.norm_per_feature = true;
+    mel_config.mel_floor        = 5.960464477539063e-08f; // 2^-24, NeMo log_zero_guard_value
     mel_config.mel_floor_add    = true;
     mel_config.std_eps_after_sqrt = true;
     mel_config.cache            = &cache;
@@ -1819,6 +1820,7 @@ void mtmd_audio_preprocessor_parakeet::initialize() {
     mel_config.sample_rate      = hparams.audio_sample_rate;
     mel_config.no_padding       = true; // preemphasis and padding already applied in log_mel()
     mel_config.use_natural_log  = true;
+    mel_config.mel_floor        = 5.960464477539063e-08f; // 2^-24, NeMo log_zero_guard_value
     mel_config.mel_floor_add    = true;
     mel_config.cache            = &cache;
 }
