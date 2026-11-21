@@ -217,7 +217,16 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
     const int64_t n_seqs       = ubatch.n_seqs;
 
-    ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
+    ggml_tensor * past;
+    if (dynamic) {
+        past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
+    } else {
+        // the history of this convolution alone, gathered from the cache next to it: on CUDA the convolution kernel then
+        //   reads it itself and also stores the new history (the cache rows are those build_rs gathered for the layer)
+        ggml_tensor * cols = ggml_view_2d(ctx0, state, (n_conv - 1)*n_channels, state->ne[1], state->nb[1],
+                offset*(n_conv - 1)*ggml_element_size(state));
+        past = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, cols, inp->s_copy_main), n_conv - 1, n_channels, n_seqs);
+    }
 
     ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
     x = ggml_concat(ctx0, past, x, 0);
