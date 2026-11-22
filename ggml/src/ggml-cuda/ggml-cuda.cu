@@ -4907,9 +4907,55 @@ struct ggml_cuda_ssm_conv_state_fusion {
     const ggml_tensor * res_r     = nullptr; // and the residual stream added to it: silu is that ADD
     const ggml_tensor * dyn_src   = nullptr; // the dynamic taps (Inkling 2): the tensor the tap views read
     ggml_cuda_ssm_conv_dyn dyn    = {};
+    ggml_cuda_ssm_conv_epi epi    = {};      // Inkling 2: the L2 clip or RMS norm of each head of the output, see below
     ggml_cuda_ssm_conv_state_slots      slots      = {};
     ggml_cuda_ssm_conv_state_long_slots long_slots = {};
 };
+
+// an L2 clip chain (ggml_cuda_l2_clip_chain, with ggml_cuda_try_fuse_l2_clip)
+struct ggml_cuda_l2_clip_match {
+    const ggml_tensor * x   = nullptr;
+    const ggml_tensor * sv  = nullptr; // the per-channel scale, or nullptr
+    ggml_tensor       * out = nullptr;
+    float scale = 1.0f, bias = 0.0f, t = 0.0f, lo = 0.0f, hi = 0.0f;
+};
+static int ggml_cuda_l2_clip_chain(const ggml_cgraph * cgraph, const int i, ggml_cuda_l2_clip_match & m);
+
+// The norm of each head of an Inkling 2 K or V conv output, from node j on: a RESHAPE of out into rows of
+//   GGML_CUDA_SSM_CONV_EPI_ROW, then the unscaled L2 clip chain or an RMS_NORM of it, the output read only there. Fills epi
+//   and returns the index of the norm's output, -1 if none. GGML_CUDA_NO_CONV_NORM_FUSION=1 turns it off.
+static int ggml_cuda_ssm_conv_epi_match(const ggml_cgraph * cgraph, const int j, const ggml_tensor * out, ggml_cuda_ssm_conv_epi & epi) {
+    static const bool disabled = getenv("GGML_CUDA_NO_CONV_NORM_FUSION") != nullptr;
+    if (disabled || j + 1 >= cgraph->n_nodes) {
+        return -1;
+    }
+    const ggml_tensor * rs = cgraph->nodes[j];
+    if (rs->op != GGML_OP_RESHAPE || rs->src[0] != out || rs->ne[0] != GGML_CUDA_SSM_CONV_EPI_ROW ||
+            ggml_cuda_graph_use_count(cgraph, out) != 1 || (out->flags & GGML_TENSOR_FLAG_OUTPUT) || !ggml_is_contiguous(out)) {
+        return -1;
+    }
+    const ggml_tensor * nn = cgraph->nodes[j + 1];
+    if (nn->op == GGML_OP_RMS_NORM && nn->src[0] == rs && nn->type == GGML_TYPE_F32 && ggml_is_contiguous(nn) &&
+            ggml_are_same_shape(nn, rs) && ggml_cuda_graph_use_count(cgraph, rs) == 1 && !(rs->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        epi.mode = GGML_CUDA_SSM_CONV_EPI_RMS_NORM;
+        epi.out  = (float *) nn->data;
+        epi.eps  = ggml_get_op_params_f32(nn, 0);
+        return j + 1;
+    }
+    ggml_cuda_l2_clip_match m;
+    const int n = nn->op == GGML_OP_SQR ? ggml_cuda_l2_clip_chain(cgraph, j + 1, m) : 0;
+    if (n == 0 || m.x != rs || m.sv != nullptr || ggml_cuda_graph_use_count(cgraph, rs) != 2 || (rs->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return -1;
+    }
+    epi.mode  = GGML_CUDA_SSM_CONV_EPI_L2_CLIP;
+    epi.out   = (float *) m.out->data;
+    epi.scale = m.scale;
+    epi.bias  = m.bias;
+    epi.t     = m.t;
+    epi.lo    = m.lo;
+    epi.hi    = m.hi;
+    return j + n;
+}
 
 static bool ggml_cuda_ssm_conv_state_fusion_match(
         ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int concat_idx, ggml_cuda_ssm_conv_state_fusion & f) {
@@ -5240,6 +5286,34 @@ static bool ggml_cuda_ssm_conv_state_fusion_match(
     }
     if (f.dyn_src != nullptr && (ggml_cuda_tensors_overlap(f.silu, f.dyn_src) || ggml_cuda_tensors_overlap(f.dyn_src, f.states))) {
         return false;
+    }
+
+    // Inkling 2: the norm of each head after the output, written in its place (the output is then not written); its output
+    //   is written at the concat too, under the same rules as the output
+    if (f.residual && f.res_r == nullptr && f.gate == nullptr && !f.long_path && nr % GGML_CUDA_SSM_CONV_EPI_ROW == 0) {
+        ggml_cuda_ssm_conv_epi epi;
+        const int e = ggml_cuda_ssm_conv_epi_match(cgraph, f.silu_idx + 1, f.silu, epi);
+        if (e >= 0) {
+            const ggml_tensor * eo = cgraph->nodes[e];
+            bool ok = ggml_nbytes(eo) == ggml_nbytes(f.silu) && !ggml_cuda_tensors_overlap(eo, f.states) &&
+                !ggml_cuda_tensors_overlap(eo, w) && !ggml_cuda_tensors_overlap(eo, f.ids) &&
+                (f.dyn_src == nullptr || !ggml_cuda_tensors_overlap(eo, f.dyn_src)) &&
+                (!ggml_cuda_tensors_overlap(eo, f.x) || (eo->data == f.x->data && x_same_layout));
+            for (int j = f.last_cpy + 1; ok && j < f.conv_idx; j++) {
+                const ggml_tensor * n = cgraph->nodes[j];
+                if (ggml_cuda_is_view_or_noop(n)) {
+                    continue;
+                }
+                ok = !ggml_cuda_tensors_overlap(n, eo);
+                for (int k = 0; ok && k < GGML_MAX_SRC; k++) {
+                    ok = n->src[k] == nullptr || !ggml_cuda_tensors_overlap(n->src[k], eo);
+                }
+            }
+            if (ok) {
+                f.epi      = epi;
+                f.silu_idx = e;
+            }
+        }
     }
     return true;
 }
@@ -6992,8 +7066,9 @@ static bool ggml_cuda_mmvq_q8_1_enabled() {
 }
 
 // A row clipped to an L2 norm of at most t (Inkling 2): [MUL(x, s)], SQR, SUM_ROWS, SQRT, SCALE, FILL(t), DIV, CLAMP, MUL
-//   in one launch (ggml_cuda_op_l2_clip) instead of eight or nine. GGML_CUDA_NO_L2_CLIP_FUSION=1 turns it off.
-static int ggml_cuda_try_fuse_l2_clip(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+//   in one launch (ggml_cuda_op_l2_clip) instead of eight or nine (ggml_cuda_l2_clip_match). GGML_CUDA_NO_L2_CLIP_FUSION=1
+//   turns it off. The chain from i; returns its node count, 0 if none
+static int ggml_cuda_l2_clip_chain(const ggml_cgraph * cgraph, const int i, ggml_cuda_l2_clip_match & m) {
     static const bool disabled = getenv("GGML_CUDA_NO_L2_CLIP_FUSION") != nullptr;
     const bool scaled = cgraph->nodes[i]->op == GGML_OP_MUL;
     const int  o      = scaled ? 1 : 0; // index of the SQR from i
@@ -7039,15 +7114,27 @@ static int ggml_cuda_try_fuse_l2_clip(ggml_backend_cuda_context * cuda_ctx, ggml
         return 0;
     }
     const int out_nodes[] = { i + n - 1 };
-    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, n, out_nodes, 1)) {
+    if (!ggml_cuda_check_fusion_memory_ranges(const_cast<ggml_cgraph *>(cgraph), i, n, out_nodes, 1)) {
         return 0;
     }
-    const float scale = ggml_get_op_params_f32(sc, 0);
-    const float bias  = ggml_get_op_params_f32(sc, 1);
-    const float t     = ggml_get_op_params_f32(fill, 0);
-    const float lo    = ggml_get_op_params_f32(clp, 0);
-    const float hi    = ggml_get_op_params_f32(clp, 1);
-    ggml_cuda_op_l2_clip(*cuda_ctx, x, sv, out, scale, bias, t, lo, hi);
+    m.x     = x;
+    m.sv    = sv;
+    m.out   = out;
+    m.scale = ggml_get_op_params_f32(sc, 0);
+    m.bias  = ggml_get_op_params_f32(sc, 1);
+    m.t     = ggml_get_op_params_f32(fill, 0);
+    m.lo    = ggml_get_op_params_f32(clp, 0);
+    m.hi    = ggml_get_op_params_f32(clp, 1);
+    return n;
+}
+
+static int ggml_cuda_try_fuse_l2_clip(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    ggml_cuda_l2_clip_match m;
+    const int n = ggml_cuda_l2_clip_chain(cgraph, i, m);
+    if (n == 0) {
+        return 0;
+    }
+    ggml_cuda_op_l2_clip(*cuda_ctx, m.x, m.sv, m.out, m.scale, m.bias, m.t, m.lo, m.hi);
     return n - 1;
 }
 
@@ -10604,7 +10691,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     f.res_scale, f.res_r);
             } else {
                 ggml_cuda_op_ssm_conv_state(*cuda_ctx, &states, f.ids, f.x, f.ssm_conv, f.silu, f.slots, f.gate, f.x_a, f.x_b,
-                    f.residual, f.res_scale, f.res_r, f.dyn);
+                    f.residual, f.res_scale, f.res_r, f.dyn, f.epi);
+                if (f.epi.mode != GGML_CUDA_SSM_CONV_EPI_NONE) {
+                    ggml_tensor * eo = cgraph->nodes[f.silu_idx];
+                    cuda_ctx->q8_1_input_invalidate(eo);
+                    cuda_ctx->cublas_input_invalidate(eo);
+                }
             }
             return f.last_cpy - i;
         }

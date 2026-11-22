@@ -430,12 +430,15 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             }
         }
 
+        // the clip of K and the norm of V right after their convolutions (CUDA runs each in the convolution's launch)
         ggml_tensor * Kcur = convolve(Kproj, layer.attn_k_conv, Kdyn, state_kv, history, recr, 0);
+        Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr, hparams.f_qk_clip);
+        ggml_build_forward_expand(gf, Kcur);
         ggml_tensor * Vcur = convolve(Vproj, layer.attn_v_conv, Vdyn, state_kv, history, recr, n_embd_k_gqa);
-
-        Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, hparams.f_qk_clip);
-        Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr,           hparams.f_qk_clip);
         Vcur = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens), hparams.f_norm_rms_eps);
+        ggml_build_forward_expand(gf, Vcur);
+
+        Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), layer.attn_q_clip, hparams.f_qk_clip);
         Rcur = clip(ggml_reshape_3d(ctx0, Rcur, hparams.n_relative, n_head, n_tokens), layer.attn_rel_clip, hparams.f_relative_clip);
 
         if (!is_swa) {

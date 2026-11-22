@@ -300,14 +300,17 @@ static __global__ void ssm_short_conv_state_f32(const float * states, const int3
 //   with r the residual stream added to it, r + (conv + x)*res_scale, rounded as the separate ADD rounds it. With dyn the
 //   conv adds the taps of its head, conv + win[t + d_conv - 1 - lag]*dyn[lag, c/cph, t] for each lag in turn (a dynamic
 //   conv of an Inkling 2 full-attention layer), rounded as the MULs and ADDs apart.
-template <int d_conv, int n_t>
+// epi: a norm of each head (ggml_cuda_ssm_conv_epi), a block being one head of GGML_CUDA_SSM_CONV_EPI_ROW channels, r null:
+//   the sums of squares of each token over the block, then epi.out[t*nr + c] instead of dst
+template <int d_conv, int n_t, bool epi>
 static __global__ void ssm_conv_state_res_f32(const float * states, const int32_t * ids, const int64_t row_stride,
                                               const float * x, const int64_t x_stride_t, const int64_t x_stride_c,
                                               const float * w, const int64_t w_stride, const float res_scale,
                                               const float * r, const int64_t r_stride_t,
                                               const ggml_cuda_ssm_conv_dyn dyn,
                                               float * dst, const int64_t dst_stride_t,
-                                              const ggml_cuda_ssm_conv_state_slots slots, const int nr) {
+                                              const ggml_cuda_ssm_conv_state_slots slots, const int nr,
+                                              const ggml_cuda_ssm_conv_epi ep) {
     ggml_cuda_pdl_lc();
     const int c = blockIdx.x*blockDim.x + threadIdx.x;
 
@@ -359,7 +362,39 @@ static __global__ void ssm_conv_state_res_f32(const float * states, const int32_
             }
         }
         const float v = __fmul_rn(win[d_conv - 1 + t] + sumf, res_scale);
-        dst[t*dst_stride_t + c] = r != nullptr ? __fadd_rn(r[t*r_stride_t + c], v) : v;
+        if constexpr (epi) {
+            win[t] = v; // the window columns of token t are no longer read
+        } else {
+            dst[t*dst_stride_t + c] = r != nullptr ? __fadd_rn(r[t*r_stride_t + c], v) : v;
+        }
+    }
+
+    if constexpr (epi) {
+        static_assert(GGML_CUDA_SSM_CONV_EPI_ROW % WARP_SIZE == 0, "a head in whole warps");
+        constexpr int nwarps = GGML_CUDA_SSM_CONV_EPI_ROW/WARP_SIZE;
+        __shared__ float red[nwarps][n_t];
+        const int lane = threadIdx.x % WARP_SIZE;
+        const int warp = threadIdx.x / WARP_SIZE;
+#pragma unroll
+        for (int t = 0; t < n_t; ++t) {
+            const float ss = warp_reduce_sum(win[t]*win[t]);
+            if (lane == 0) {
+                red[warp][t] = ss;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int t = 0; t < n_t; ++t) {
+            float ss = 0.0f;
+#pragma unroll
+            for (int k = 0; k < nwarps; ++k) {
+                ss += red[k][t];
+            }
+            const float f = ep.mode == GGML_CUDA_SSM_CONV_EPI_L2_CLIP ?
+                fminf(fmaxf(ep.t/(sqrtf(ss)*ep.scale + ep.bias), ep.lo), ep.hi) :
+                rsqrtf(ss/GGML_CUDA_SSM_CONV_EPI_ROW + ep.eps);
+            ep.out[(int64_t) t*nr + c] = win[t]*f;
+        }
     }
 }
 
@@ -367,7 +402,7 @@ void ggml_cuda_op_ssm_conv_state(ggml_backend_cuda_context & ctx, const ggml_ten
                                  const ggml_tensor * x, const ggml_tensor * ssm_conv, ggml_tensor * silu,
                                  const ggml_cuda_ssm_conv_state_slots & slots, const ggml_tensor * gate,
                                  const ggml_tensor * x_a, const ggml_tensor * x_b, bool residual, float res_scale,
-                                 const ggml_tensor * res_r, const ggml_cuda_ssm_conv_dyn dyn) {
+                                 const ggml_tensor * res_r, const ggml_cuda_ssm_conv_dyn dyn, const ggml_cuda_ssm_conv_epi epi) {
     const ggml_tensor * w = ssm_conv->src[1];
 
     const int nr  = (int) w->ne[1];
@@ -375,6 +410,8 @@ void ggml_cuda_op_ssm_conv_state(ggml_backend_cuda_context & ctx, const ggml_ten
     GGML_ASSERT(n_t >= 1 && n_t <= GGML_CUDA_SSM_CONV_STATE_MAX_TOKENS);
 
     const int threads = 128;
+    static_assert(threads == GGML_CUDA_SSM_CONV_EPI_ROW, "a block is a head of the epilogue");
+    GGML_ASSERT(epi.mode == GGML_CUDA_SSM_CONV_EPI_NONE || (residual && res_r == nullptr && nr % threads == 0));
     const ggml_cuda_kernel_launch_params launch_params((nr + threads - 1) / threads, threads, 0, ctx.stream());
 
     const size_t ts = sizeof(float);
@@ -388,12 +425,19 @@ void ggml_cuda_op_ssm_conv_state(ggml_backend_cuda_context & ctx, const ggml_ten
             return;
         }
         if (residual) {
-            ggml_cuda_kernel_launch(ssm_conv_state_res_f32<4, decltype(NT)::value>, launch_params,
-                (const float *) states->data, (const int32_t *) ids->data, (int64_t) (states->nb[1]/ts),
-                (const float *) x->data, (int64_t) (x->nb[0]/ts), (int64_t) (x->nb[1]/ts),
-                (const float *) w->data, (int64_t) (w->nb[1]/ts), res_scale,
-                res_r ? (const float *) res_r->data : (const float *) nullptr, res_r ? (int64_t) (res_r->nb[1]/ts) : (int64_t) 0,
-                dyn, (float *) silu->data, (int64_t) (silu->nb[1]/ts), slots, nr);
+            const auto launch_res = [&](auto kernel) {
+                ggml_cuda_kernel_launch(kernel, launch_params,
+                    (const float *) states->data, (const int32_t *) ids->data, (int64_t) (states->nb[1]/ts),
+                    (const float *) x->data, (int64_t) (x->nb[0]/ts), (int64_t) (x->nb[1]/ts),
+                    (const float *) w->data, (int64_t) (w->nb[1]/ts), res_scale,
+                    res_r ? (const float *) res_r->data : (const float *) nullptr, res_r ? (int64_t) (res_r->nb[1]/ts) : (int64_t) 0,
+                    dyn, (float *) silu->data, (int64_t) (silu->nb[1]/ts), slots, nr, epi);
+            };
+            if (epi.mode != GGML_CUDA_SSM_CONV_EPI_NONE) {
+                launch_res(ssm_conv_state_res_f32<4, decltype(NT)::value, true>);
+            } else {
+                launch_res(ssm_conv_state_res_f32<4, decltype(NT)::value, false>);
+            }
             return;
         }
         ggml_cuda_kernel_launch(ssm_conv_state_f32<4, decltype(NT)::value>, launch_params,

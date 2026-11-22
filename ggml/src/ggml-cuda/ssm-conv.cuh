@@ -35,12 +35,30 @@ struct ggml_cuda_ssm_conv_dyn {
     int           cph     = 1;
 };
 
+// a norm of each head of 128 channels of the residual output (Inkling 2's K and V), written to out instead of the output:
+//   mode GGML_CUDA_SSM_CONV_EPI_L2_CLIP scales a head to an L2 norm of at most t as ggml_cuda_op_l2_clip does, f =
+//   clamp(t/(sqrt(sum v^2)*scale + bias), lo, hi); GGML_CUDA_SSM_CONV_EPI_RMS_NORM is ggml_rms_norm with eps
+#define GGML_CUDA_SSM_CONV_EPI_NONE     0
+#define GGML_CUDA_SSM_CONV_EPI_L2_CLIP  1
+#define GGML_CUDA_SSM_CONV_EPI_RMS_NORM 2
+#define GGML_CUDA_SSM_CONV_EPI_ROW      128
+struct ggml_cuda_ssm_conv_epi {
+    int     mode  = GGML_CUDA_SSM_CONV_EPI_NONE;
+    float * out   = nullptr;
+    float   eps   = 0.0f;
+    float   scale = 1.0f;
+    float   bias  = 0.0f;
+    float   t     = 0.0f;
+    float   lo    = 0.0f;
+    float   hi    = 0.0f;
+};
+
 void ggml_cuda_op_ssm_conv_state(ggml_backend_cuda_context & ctx, const ggml_tensor * states, const ggml_tensor * ids,
                                  const ggml_tensor * x, const ggml_tensor * ssm_conv, ggml_tensor * silu,
                                  const ggml_cuda_ssm_conv_state_slots & slots, const ggml_tensor * gate = nullptr,
                                  const ggml_tensor * x_a = nullptr, const ggml_tensor * x_b = nullptr,
                                  bool residual = false, float res_scale = 1.0f, const ggml_tensor * res_r = nullptr,
-                                 const ggml_cuda_ssm_conv_dyn dyn = {});
+                                 const ggml_cuda_ssm_conv_dyn dyn = {}, const ggml_cuda_ssm_conv_epi epi = {});
 
 // the rollback slots of a longer batch, at the first column of the window each holds in the concat
 struct ggml_cuda_ssm_conv_state_long_slots {
