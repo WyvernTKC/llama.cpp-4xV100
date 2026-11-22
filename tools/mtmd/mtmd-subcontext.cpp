@@ -219,12 +219,14 @@ ggml_backend_dev_t mtmd_split_device(const char * fname, const ggml_backend_dev_
     // sum the partial results in F32 also where the backend would use 16 bits for large tensors
     bool reduce_f32 = false;
     const projector_type proj_v = projector_type_from_string(proj);
-    if (proj_v == PROJECTOR_TYPE_QWEN3VL || proj_v == PROJECTOR_TYPE_GEMMA4V) {
+    if (proj_v == PROJECTOR_TYPE_QWEN3VL || proj_v == PROJECTOR_TYPE_GEMMA4V || proj_v == PROJECTOR_TYPE_INKLING2V) {
         what = "the vision encoder";
         if (get_bool(KEY_HAS_AUDIO_ENC) || get_bool(KEY_HAS_GEN_AUDIO_ENC)) {
             why = "the mmproj has an audio encoder";
         }
         groups.push_back({ "v.blk.", get_u32(mtmd_format(KEY_N_HEAD, "vision")) });
+        // (Inkling 2's projector after the merge stays mirrored: split like an FFN, its last matmul is the graph's output,
+        //   a partial sum no op after it reduces)
     } else if (proj_v == PROJECTOR_TYPE_LONGCAT_NEXT_V ||
                projector_type_from_string(get_str(KEY_AUDIO_PROJ_TYPE)) == PROJECTOR_TYPE_LONGCAT_NEXT_A ||
                proj_gen == PROJECTOR_TYPE_LONGCAT_NEXT_GEN) {
@@ -260,7 +262,7 @@ ggml_backend_dev_t mtmd_split_device(const char * fname, const ggml_backend_dev_
         groups.push_back({ "a.gen.code.blk.", get_u32(mtmd_format(KEY_N_HEAD, "gen.audio")) });
         groups.push_back({ "a.gen.flow.blk.", n_rows("a.gen.flow.blk.0.attn_q.weight") / mtmd_graph_music3_gen::dit_d_head });
     } else {
-        why = "only the qwen3vl_merger and gemma4v vision encoders, LongCat-Next and the minimax_music3 generator have split rules";
+        why = "only the qwen3vl_merger, gemma4v and inkling2v vision encoders, LongCat-Next and the minimax_music3 generator have split rules";
     }
     // attn_out and ffn_down are split along their rows: a quantized one needs the device boundaries in whole blocks
     auto ends_with = [](const std::string & s, const char * suffix) {
