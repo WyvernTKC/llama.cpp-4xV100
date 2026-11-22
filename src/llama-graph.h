@@ -1666,8 +1666,9 @@ struct llm_graph_context {
             uint32_t extent,
             uint32_t extent_swa) const;
 
-    // the bias of each head at each distance from the cell to the token, minus the sink logit of the token, is added to
-    //   the KQ mask, after the KQ scale (ggml_rel_pos_mask); a distance beyond the table takes a zero bias
+    // the bias of each head at each distance from the cell to the token, sum_j r[j, h, t]*rel_bias[j, d], minus the sink
+    //   logit of the token, is added to the KQ mask, after the KQ scale (ggml_rel_pos_mask_factored); a distance beyond the
+    //   extent takes a zero bias
     ggml_tensor * build_attn(
             llm_graph_input_mem_hybrid_iswa_rel * inp,
             ggml_tensor * wo,
@@ -1676,7 +1677,8 @@ struct llm_graph_context {
             ggml_tensor * q_cur,       // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k_cur,       // [n_embd_head_k, n_head_k, n_tokens]
             ggml_tensor * v_cur,       // [n_embd_head_v, n_head_v, n_tokens]
-            ggml_tensor * table,       // [n_head_q, n_extent, n_tokens], any strides
+            ggml_tensor * r,           // [n_rel, n_head_q, n_tokens], any strides
+            ggml_tensor * rel_bias,    // [n_rel, n_extent]
             ggml_tensor * table_sinks, // [n_head_q, n_tokens] or nullptr: subtracted from the bias
             ggml_tensor * sinks,       // [n_head_q]
                   float   kq_scale,

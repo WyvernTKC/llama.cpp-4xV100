@@ -12935,17 +12935,20 @@ void ggml_compute_forward_lightning_indexer(
 void ggml_compute_forward_rel_pos_mask(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
-    const ggml_tensor * table  = dst->src[0];
+    const ggml_tensor * table  = dst->src[0]; // or r, with bias
     const ggml_tensor * kv_pos = dst->src[1];
     const ggml_tensor * q_pos  = dst->src[2];
     const ggml_tensor * mask   = dst->src[3];
     const ggml_tensor * sinks  = dst->src[4];
+    const ggml_tensor * bias   = dst->src[5];
 
     const int64_t n_kv   = dst->ne[0];
     const int64_t n_tps  = dst->ne[1];
     const int64_t n_head = dst->ne[2];
     const int64_t n_s    = dst->ne[3];
-    const int64_t n_ext  = table->ne[1];
+    const int64_t n_ext  = bias ? bias->ne[1] : table->ne[1];
+    const int64_t n_rel  = bias ? bias->ne[0] : 0;
+    const float * bw     = bias ? (const float *) bias->data : nullptr;
 
     const int64_t n_rows = n_tps*n_head*n_s;
     const int64_t dr     = (n_rows + params->nth - 1)/params->nth;
@@ -12962,15 +12965,30 @@ void ggml_compute_forward_rel_pos_mask(
         const int64_t t = i + s*n_tps;
 
         const int32_t q  = qp[t];
-        const char *  tb = (const char *) table->data + h*table->nb[0] + t*table->nb[2];
+        const char *  tb = (const char *) table->data + (bias ? h*table->nb[1] : h*table->nb[0]) + t*table->nb[2];
         const float   sk = sinks ? *(const float *) ((const char *) sinks->data + h*sinks->nb[0] + t*sinks->nb[1]) : 0.0f;
+        // with bias: r of the head and token
+        float rv[64];
+        for (int64_t j = 0; j < n_rel; ++j) {
+            rv[j] = *(const float *) (tb + j*table->nb[0]);
+        }
         const char *  mr = (const char *) mask->data + i*mask->nb[1] + s*mask->nb[3];
         char *        dr_ = (char *) dst->data + i*dst->nb[1] + h*dst->nb[2] + s*dst->nb[3];
 
         for (int64_t c = 0; c < n_kv; ++c) {
             const int32_t k = kp[c + s*n_kv];
             const int64_t d = (int64_t) q - k;
-            const float   b = k >= 0 && d >= 0 && d < n_ext ? *(const float *) (tb + d*table->nb[1]) : 0.0f;
+            float b = 0.0f;
+            if (k >= 0 && d >= 0 && d < n_ext) {
+                if (bias) {
+                    const float * bc = bw + d*n_rel;
+                    for (int64_t j = 0; j < n_rel; ++j) {
+                        b += rv[j]*bc[j];
+                    }
+                } else {
+                    b = *(const float *) (tb + d*table->nb[1]);
+                }
+            }
             const float   m = mask->type == GGML_TYPE_F16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) mr)[c]) : ((const float *) mr)[c];
             const float   v = (sinks ? b - sk : b) + m;
             if (dst->type == GGML_TYPE_F16) {

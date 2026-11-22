@@ -1179,15 +1179,21 @@ void ggml_cuda_op_get_rows_dot_max(ggml_backend_cuda_context & ctx, const ggml_t
 //   (b - sinks[h, t]) + mask[c, i, 0, s], t = i + s*n_tps, d = q_pos[t] - kv_pos[c + s*n_kv], b = table[h*sh + d*sd + t*st]
 //   for a seen cell at 0 <= d < n_ext, else 0. A thread takes kv_per_thread cells of a token for heads [h0, h1): the
 //   distance and the mask are read once for all of them.
-template <int kv_per_thread, typename T_m, typename T_d>
+// n_rel > 0, the table as a product (ggml_rel_pos_mask_factored): table is r, element j of head h r[j*sd + h*sh + t*st],
+//   b = sum_j r_j*bias[j + d*n_rel]; the r of the block's heads in shared memory, the bias column of each cell in range read
+//   once (float4) for all the heads.
+template <int kv_per_thread, typename T_m, typename T_d, int n_rel>
 static __global__ void rel_pos_mask_kernel(const float * __restrict__ table, const int32_t * __restrict__ kv_pos,
         const int32_t * __restrict__ q_pos, const T_m * __restrict__ mask, T_d * __restrict__ dst,
         const int n_kv, const int n_tps, const int n_head, const int n_ext,
         const int64_t sh, const int64_t sd, const int64_t st, const int64_t sm1, const int64_t sm3,
-        const float * __restrict__ sinks, const int64_t ssh, const int64_t sst, const int heads_per_block) {
+        const float * __restrict__ sinks, const int64_t ssh, const int64_t sst, const int heads_per_block,
+        const float * __restrict__ bias) {
     const int kv0 = (blockIdx.x*blockDim.x + threadIdx.x)*kv_per_thread;
-    if (kv0 >= n_kv) {
-        return;
+    if constexpr (n_rel == 0) {
+        if (kv0 >= n_kv) {
+            return;
+        }
     }
     const int n_hb = (n_head + heads_per_block - 1)/heads_per_block;
     const int i  = blockIdx.y;        // token in its stream
@@ -1196,6 +1202,19 @@ static __global__ void rel_pos_mask_kernel(const float * __restrict__ table, con
     const int h1 = min(n_head, h0 + heads_per_block);
     const int t  = i + s*n_tps;
     const int q  = q_pos[t];
+    const float * tt = table + t*st;
+
+    // n_rel: the r of the block's heads
+    extern __shared__ float rs[];
+    if constexpr (n_rel > 0) {
+        for (int k = threadIdx.x; k < (h1 - h0)*n_rel; k += blockDim.x) {
+            rs[k] = tt[(k % n_rel)*sd + (h0 + k/n_rel)*sh];
+        }
+        __syncthreads();
+        if (kv0 >= n_kv) {
+            return;
+        }
+    }
 
     int   d[kv_per_thread];
     float m[kv_per_thread];
@@ -1205,14 +1224,39 @@ static __global__ void rel_pos_mask_kernel(const float * __restrict__ table, con
         d[k] = kp >= 0 && q - kp >= 0 && q - kp < n_ext ? q - kp : -1;
         m[k] = ggml_cuda_cast<float>(mask[kv0 + k + i*sm1 + s*sm3]);
     }
-    const float * tt = table + t*st;
+    // n_rel: the bias column of each cell in range
+    constexpr int nr = n_rel > 0 ? n_rel : 1;
+    float bc[kv_per_thread][nr];
+    if constexpr (n_rel > 0) {
+#pragma unroll
+        for (int k = 0; k < kv_per_thread; ++k) {
+            const float4 * b4 = (const float4 *) (bias + (int64_t) max(d[k], 0)*n_rel);
+#pragma unroll
+            for (int j = 0; j < n_rel/4; ++j) {
+                const float4 v = d[k] >= 0 ? b4[j] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                bc[k][4*j + 0] = v.x;
+                bc[k][4*j + 1] = v.y;
+                bc[k][4*j + 2] = v.z;
+                bc[k][4*j + 3] = v.w;
+            }
+        }
+    }
     T_d * out = dst + kv0 + (int64_t) n_kv*(i + (int64_t) n_tps*n_head*s);
     for (int h = h0; h < h1; ++h) {
         const float sk = sinks ? sinks[h*ssh + t*sst] : 0.0f;
         T_d o[kv_per_thread];
 #pragma unroll
         for (int k = 0; k < kv_per_thread; ++k) {
-            const float b = d[k] >= 0 ? tt[h*sh + d[k]*sd] : 0.0f;
+            float b = 0.0f;
+            if constexpr (n_rel > 0) {
+                const float * rh = rs + (h - h0)*n_rel;
+#pragma unroll
+                for (int j = 0; j < n_rel; ++j) {
+                    b += rh[j]*bc[k][j];
+                }
+            } else {
+                b = d[k] >= 0 ? tt[h*sh + d[k]*sd] : 0.0f;
+            }
             o[k] = ggml_cuda_cast<T_d>((sinks ? b - sk : b) + m[k]);
         }
         T_d * oh = out + (int64_t) n_kv*n_tps*h;
@@ -1225,19 +1269,21 @@ static __global__ void rel_pos_mask_kernel(const float * __restrict__ table, con
 
 template <typename T_m, typename T_d>
 static void rel_pos_mask_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
-    const ggml_tensor * table  = dst->src[0];
+    const ggml_tensor * table  = dst->src[0]; // or r, with bias
     const ggml_tensor * kv_pos = dst->src[1];
     const ggml_tensor * q_pos  = dst->src[2];
     const ggml_tensor * mask   = dst->src[3];
     const ggml_tensor * sinks  = dst->src[4];
+    const ggml_tensor * bias   = dst->src[5];
 
     const int n_kv   = dst->ne[0];
     const int n_tps  = dst->ne[1];
     const int n_head = dst->ne[2];
     const int n_s    = dst->ne[3];
-    const int n_ext  = table->ne[1];
+    const int n_ext  = bias ? bias->ne[1] : table->ne[1];
     const size_t tf  = sizeof(float);
     const size_t tm  = sizeof(T_m);
+    GGML_ASSERT(bias == nullptr || (uintptr_t) bias->data % 16 == 0);
 
     const float * sk  = sinks ? (const float *) sinks->data : nullptr;
     const int64_t ssh = sinks ? (int64_t) (sinks->nb[0]/tf) : 0;
@@ -1249,16 +1295,24 @@ static void rel_pos_mask_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int  kpt  = many ? 2 : 1;
     const int  hpb  = many ? n_head : 1;
     const dim3 grid((n_kv/kpt + block.x - 1)/block.x, n_tps, n_s*((n_head + hpb - 1)/hpb));
+    // with bias the head stride is that of dim 1 of r, the element stride (sd) that of dim 0
+    const int64_t sh   = (int64_t) ((bias ? table->nb[1] : table->nb[0])/tf);
+    const int64_t sd   = (int64_t) ((bias ? table->nb[0] : table->nb[1])/tf);
+    const size_t  smem = bias ? hpb*bias->ne[0]*tf : 0;
     auto launch = [&](auto kernel) {
-        kernel<<<grid, block, 0, ctx.stream()>>>((const float *) table->data, (const int32_t *) kv_pos->data,
+        kernel<<<grid, block, smem, ctx.stream()>>>((const float *) table->data, (const int32_t *) kv_pos->data,
             (const int32_t *) q_pos->data, (const T_m *) mask->data, (T_d *) dst->data, n_kv, n_tps, n_head, n_ext,
-            (int64_t) (table->nb[0]/tf), (int64_t) (table->nb[1]/tf), (int64_t) (table->nb[2]/tf),
-            (int64_t) (mask->nb[1]/tm), (int64_t) (mask->nb[3]/tm), sk, ssh, sst, hpb);
+            sh, sd, (int64_t) (table->nb[2]/tf),
+            (int64_t) (mask->nb[1]/tm), (int64_t) (mask->nb[3]/tm), sk, ssh, sst, hpb,
+            bias ? (const float *) bias->data : nullptr);
     };
-    if (many) {
-        launch(rel_pos_mask_kernel<2, T_m, T_d>);
-    } else {
-        launch(rel_pos_mask_kernel<1, T_m, T_d>);
+    const int n_rel = bias ? (int) bias->ne[0] : 0;
+    switch (n_rel) {
+        case 0:  many ? launch(rel_pos_mask_kernel<2, T_m, T_d, 0>)  : launch(rel_pos_mask_kernel<1, T_m, T_d, 0>);  break;
+        case 8:  many ? launch(rel_pos_mask_kernel<2, T_m, T_d, 8>)  : launch(rel_pos_mask_kernel<1, T_m, T_d, 8>);  break;
+        case 16: many ? launch(rel_pos_mask_kernel<2, T_m, T_d, 16>) : launch(rel_pos_mask_kernel<1, T_m, T_d, 16>); break;
+        case 32: many ? launch(rel_pos_mask_kernel<2, T_m, T_d, 32>) : launch(rel_pos_mask_kernel<1, T_m, T_d, 32>); break;
+        default: GGML_ABORT("unsupported n_rel %d", n_rel);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -1267,6 +1321,11 @@ bool ggml_cuda_supports_rel_pos_mask(const ggml_tensor * dst) {
     const ggml_tensor * table = dst->src[0];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * bias  = dst->src[5];
+    // with bias: n_rel 8, 16 or 32 (see rel_pos_mask_cuda), the columns of the bias in float4
+    if (bias != nullptr && !(bias->ne[0] == 8 || bias->ne[0] == 16 || bias->ne[0] == 32)) {
+        return false;
+    }
     return table->nb[0] % sizeof(float) == 0 && table->nb[1] % sizeof(float) == 0 && table->nb[2] % sizeof(float) == 0 &&
         mask->nb[0] == ggml_type_size(mask->type) && ggml_is_contiguous(dst) &&
         (sinks == nullptr || (sinks->nb[0] % sizeof(float) == 0 && sinks->nb[1] % sizeof(float) == 0)) &&

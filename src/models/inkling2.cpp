@@ -448,20 +448,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         cb(Vcur, "Vcur", il);
         cb(Rcur, "Rcur", il);
 
-        // project r on the bias table, then the attention gathers it by distance into its per-head mask (ggml_rel_pos_mask):
-        //   table [n_head, n_extent, n_tokens], a distance beyond the extent takes a zero bias. For a batch, one product
-        //   over the heads of all tokens (heads outermost, which keeps the slice of each device whole under a split by
-        //   head), read through the permuted view
-        ggml_tensor * table;
-        if (n_tokens == 1) {
-            table = ggml_mul_mat(ctx0, ggml_reshape_2d(ctx0, Rcur, Rcur->ne[0], n_head), layer.attn_rel_bias);
-            table = ggml_reshape_3d(ctx0, table, n_head, table->ne[1], 1);
-        } else {
-            ggml_tensor * r = ggml_cont(ctx0, ggml_permute(ctx0, Rcur, 0, 2, 1, 3));
-            table = ggml_mul_mat(ctx0, layer.attn_rel_bias, ggml_reshape_2d(ctx0, r, r->ne[0], n_tokens*n_head));
-            table = ggml_permute(ctx0, ggml_reshape_3d(ctx0, table, table->ne[0], n_tokens, n_head), 1, 2, 0, 3);
-        }
-        cb(table, "rel_table", il);
+        // the attention projects r on the bias table for the cells within its extent as it builds its per-head mask
+        //   (ggml_rel_pos_mask_factored): no [n_head, n_extent, n_tokens] table, a distance beyond the extent takes a zero bias
 
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink:
         //   the mask takes the bias minus t, the attention a zero sink
@@ -471,7 +459,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
         cur = build_attn(inp,
                 nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, table, sinks, sinks_zero, 1.0f/sqrtf(n_embd_head), il);
+                Qcur, Kcur, Vcur, Rcur, layer.attn_rel_bias, sinks, sinks_zero, 1.0f/sqrtf(n_embd_head), il);
 
         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, nullptr, recr, 0);

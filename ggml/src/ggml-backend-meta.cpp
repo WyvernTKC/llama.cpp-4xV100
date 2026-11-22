@@ -3165,6 +3165,22 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_derive_split_state
             case GGML_OP_REL_POS_MASK: {
                 GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
                     src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                // the table as a product: r [n_rel, n_head, n_tokens] split by head (dim 1) or mirrored, the bias mirrored
+                if (tensor->src[5] != nullptr) {
+                    GGML_ASSERT(src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                    if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1) {
+                        ggml_backend_meta_split_state heads = src_ss[0];
+                        heads.axis = GGML_BACKEND_SPLIT_AXIS_0;
+                        GGML_ASSERT(tensor->src[4] == nullptr || split_states_equal(heads, src_ss[4]));
+                        split_state = src_ss[0];
+                        split_state.axis = GGML_BACKEND_SPLIT_AXIS_2;
+                    } else {
+                        GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                        GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                        split_state = src_ss[0];
+                    }
+                    break;
+                }
                 if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
                     GGML_ASSERT(tensor->src[4] == nullptr || split_states_equal(src_ss[0], src_ss[4]));
                     split_state = src_ss[0];

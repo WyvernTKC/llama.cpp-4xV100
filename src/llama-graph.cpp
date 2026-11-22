@@ -5484,7 +5484,8 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * q_cur,
         ggml_tensor * k_cur,
         ggml_tensor * v_cur,
-        ggml_tensor * table,
+        ggml_tensor * r,
+        ggml_tensor * rel_bias,
         ggml_tensor * table_sinks,
         ggml_tensor * sinks,
             float     kq_scale,
@@ -5501,8 +5502,8 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
     ggml_tensor * kv_pos  = is_swa ? inp->self_rel_kv_pos_swa : inp->self_rel_kv_pos;
-    ggml_tensor * kq_mask = ggml_rel_pos_mask(ctx0, table, kv_pos, inp->self_rel_q_pos, attn_mask.raw, table_sinks,
-            cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32);
+    ggml_tensor * kq_mask = ggml_rel_pos_mask_factored(ctx0, r, rel_bias, kv_pos, inp->self_rel_q_pos, attn_mask.raw,
+            table_sinks, cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32);
     cb(kq_mask, "kq_mask_rel_pos", il);
 
     return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il);

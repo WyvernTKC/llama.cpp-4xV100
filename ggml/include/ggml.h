@@ -2385,6 +2385,20 @@ extern "C" {
             struct ggml_tensor  * sinks,
             enum ggml_type        type);
 
+    // ggml_rel_pos_mask with the table as a product, b = sum_j r[j, h, t]*bias[j, d] (n_rel <= 64), computed for the
+    //   cells in range only: no [n_head, n_ext, n_tokens] table is built
+    //   r    F32 [n_rel, n_head, n_tokens] (any strides)
+    //   bias F32 [n_rel, n_ext], contiguous
+    GGML_API struct ggml_tensor * ggml_rel_pos_mask_factored(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * r,
+            struct ggml_tensor  * bias,
+            struct ggml_tensor  * kv_pos,
+            struct ggml_tensor  * q_pos,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * sinks,
+            enum ggml_type        type);
+
     // Partial attention over a share of the K/V cells, to be combined with other shares: the result gets one more row
     //   after the heads of each token, whose element h is the log-sum-exp of the scaled scores of head h (-INF if all
     //   masked, the head output is then 0). Call it right after ggml_flash_attn_ext, before any use of the result.

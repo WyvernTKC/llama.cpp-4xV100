@@ -6873,6 +6873,43 @@ struct ggml_tensor * ggml_mla_up(
 
 // ggml_rel_pos_mask
 
+static struct ggml_tensor * ggml_rel_pos_mask_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * table,
+        struct ggml_tensor  * bias,
+        struct ggml_tensor  * kv_pos,
+        struct ggml_tensor  * q_pos,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * sinks,
+        enum ggml_type        type) {
+    // the heads: dim 0 of the table, dim 1 of r
+    const int64_t n_head = bias ? table->ne[1] : table->ne[0];
+    GGML_ASSERT(table->type == GGML_TYPE_F32 && table->ne[3] == 1);
+    GGML_ASSERT(bias == NULL || (bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) && bias->ne[0] == table->ne[0] &&
+        bias->ne[0] <= 64 && bias->ne[2] == 1 && bias->ne[3] == 1));
+    GGML_ASSERT(kv_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(kv_pos) && kv_pos->ne[1] == 1 && kv_pos->ne[2] == 1);
+    GGML_ASSERT(q_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(q_pos) && q_pos->ne[1] == 1 && q_pos->ne[2] == 1);
+    GGML_ASSERT(kv_pos->ne[3] == q_pos->ne[3]);
+    GGML_ASSERT(table->ne[2] == q_pos->ne[0]*q_pos->ne[3]);
+    GGML_ASSERT((mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32) && mask->ne[0] == kv_pos->ne[0] &&
+        mask->ne[1] == q_pos->ne[0] && mask->ne[2] == 1 && mask->ne[3] == q_pos->ne[3]);
+    GGML_ASSERT(sinks == NULL || (sinks->type == GGML_TYPE_F32 && sinks->ne[0] == n_head &&
+        sinks->ne[1] == table->ne[2] && sinks->ne[2] == 1 && sinks->ne[3] == 1));
+    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, kv_pos->ne[0], q_pos->ne[0], n_head, q_pos->ne[3]);
+
+    result->op     = GGML_OP_REL_POS_MASK;
+    result->src[0] = table;
+    result->src[1] = kv_pos;
+    result->src[2] = q_pos;
+    result->src[3] = mask;
+    result->src[4] = sinks;
+    result->src[5] = bias;
+
+    return result;
+}
+
 struct ggml_tensor * ggml_rel_pos_mask(
         struct ggml_context * ctx,
         struct ggml_tensor  * table,
@@ -6881,27 +6918,20 @@ struct ggml_tensor * ggml_rel_pos_mask(
         struct ggml_tensor  * mask,
         struct ggml_tensor  * sinks,
         enum ggml_type        type) {
-    GGML_ASSERT(table->type == GGML_TYPE_F32 && table->ne[3] == 1);
-    GGML_ASSERT(kv_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(kv_pos) && kv_pos->ne[1] == 1 && kv_pos->ne[2] == 1);
-    GGML_ASSERT(q_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(q_pos) && q_pos->ne[1] == 1 && q_pos->ne[2] == 1);
-    GGML_ASSERT(kv_pos->ne[3] == q_pos->ne[3]);
-    GGML_ASSERT(table->ne[2] == q_pos->ne[0]*q_pos->ne[3]);
-    GGML_ASSERT((mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32) && mask->ne[0] == kv_pos->ne[0] &&
-        mask->ne[1] == q_pos->ne[0] && mask->ne[2] == 1 && mask->ne[3] == q_pos->ne[3]);
-    GGML_ASSERT(sinks == NULL || (sinks->type == GGML_TYPE_F32 && sinks->ne[0] == table->ne[0] &&
-        sinks->ne[1] == table->ne[2] && sinks->ne[2] == 1 && sinks->ne[3] == 1));
-    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
+    return ggml_rel_pos_mask_impl(ctx, table, NULL, kv_pos, q_pos, mask, sinks, type);
+}
 
-    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, kv_pos->ne[0], q_pos->ne[0], table->ne[0], q_pos->ne[3]);
-
-    result->op     = GGML_OP_REL_POS_MASK;
-    result->src[0] = table;
-    result->src[1] = kv_pos;
-    result->src[2] = q_pos;
-    result->src[3] = mask;
-    result->src[4] = sinks;
-
-    return result;
+struct ggml_tensor * ggml_rel_pos_mask_factored(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * r,
+        struct ggml_tensor  * bias,
+        struct ggml_tensor  * kv_pos,
+        struct ggml_tensor  * q_pos,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * sinks,
+        enum ggml_type        type) {
+    GGML_ASSERT(bias != NULL);
+    return ggml_rel_pos_mask_impl(ctx, r, bias, kv_pos, q_pos, mask, sinks, type);
 }
 
 // ggml_page_stats
