@@ -281,11 +281,18 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
 ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * cur_n, ggml_tensor * message, ggml_tensor * message_n,
         const loop_layer & loop, int ctrl) {
-    ggml_tensor * gate = ggml_concat(ctx0, cur_n, message_n, 0);
-    gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
+    // a prompt multiplies f16 copies of the gate weights (BF16 values stored as F32, so exact but for a few subnormals):
+    //   tensor-core GEMMs instead of f32 ones; one token keeps the f32 matvecs
+    const bool f16 = n_tokens >= 64;
+    auto mm = [&](ggml_tensor * w, ggml_tensor * x) {
+        return f16 ? ggml_mul_mat(ctx0, ggml_cast(ctx0, w, GGML_TYPE_F16), x) : build_lora_mm(w, x);
+    };
 
-    ggml_tensor * gain   = build_lora_mm(loop.ctrl_gain[ctrl],   gate);
-    ggml_tensor * forget = build_lora_mm(loop.ctrl_forget[ctrl], gate);
+    ggml_tensor * gate = ggml_concat(ctx0, cur_n, message_n, 0);
+    gate = mm(loop.ctrl_down[ctrl], gate);
+
+    ggml_tensor * gain   = mm(loop.ctrl_gain[ctrl],   gate);
+    ggml_tensor * forget = mm(loop.ctrl_forget[ctrl], gate);
 
     // the products and the message first, so that the gating is one run of element-wise ops (one kernel on CUDA)
     ggml_build_forward_expand(gf, gain);
