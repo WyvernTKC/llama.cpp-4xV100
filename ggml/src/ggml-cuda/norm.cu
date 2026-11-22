@@ -3872,52 +3872,113 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 // rows clipped to an L2 norm of at most t after an optional per-row scale vector (Inkling 2): y = x*s,
 //   f = clamp(t/(sqrt(sum(y*y))*scale + bias), lo, hi), dst = y*f. One warp per row.
-static __global__ void l2_clip_f32(const float * __restrict__ x, const float * __restrict__ s, float * __restrict__ dst,
-        const int ncols, const int nrows, const int ne1, const int ne2, const int64_t sx1, const int64_t sx2, const int64_t sx3,
-        const int64_t ss1, const int s_ne1, const float scale, const float bias, const float t, const float lo, const float hi) {
-    const int row  = blockIdx.x*(blockDim.x/WARP_SIZE) + threadIdx.x/WARP_SIZE;
-    const int lane = threadIdx.x % WARP_SIZE;
-    if (row >= nrows) {
+// the arguments of a row set of l2_clip_f32
+struct l2_clip_args {
+    const float * x;
+    const float * s;
+    const float * tau;
+    float *       dst;
+    int ncols, nrows, ne1, ne2;
+    int64_t sx1, sx2, sx3, ss1;
+    int s_ne1;
+    float scale, bias, t, lo, hi;
+};
+
+static __device__ __forceinline__ void l2_clip_row(const l2_clip_args & p, const int row, const int lane) {
+    if (row >= p.nrows) {
         return;
     }
-    const int i1 = row % ne1;
-    const int i2 = (row/ne1) % ne2;
-    const int i3 = row/(ne1*ne2);
+    const int i1 = row % p.ne1;
+    const int i2 = (row/p.ne1) % p.ne2;
+    const int i3 = row/(p.ne1*p.ne2);
 
-    const float * xr = x + i1*sx1 + i2*sx2 + i3*sx3;
-    const float * sr = s ? s + (s_ne1 == 1 ? 0 : i1)*ss1 : nullptr;
+    const float * xr = p.x + i1*p.sx1 + i2*p.sx2 + i3*p.sx3;
+    const float * sr = p.s ? p.s + (p.s_ne1 == 1 ? 0 : i1)*p.ss1 : nullptr;
 
     float sum = 0.0f;
-    for (int c = lane; c < ncols; c += WARP_SIZE) {
+    for (int c = lane; c < p.ncols; c += WARP_SIZE) {
         const float v = sr ? xr[c]*sr[c] : xr[c];
         sum += v*v;
     }
     sum = warp_reduce_sum(sum);
 
-    const float f = fminf(fmaxf(t/(sqrtf(sum)*scale + bias), lo), hi);
+    const float f  = fminf(fmaxf(p.t/(sqrtf(sum)*p.scale + p.bias), p.lo), p.hi);
+    const float tf = p.tau ? p.tau[i2] : 1.0f;
 
-    float * dr = dst + (int64_t) row*ncols;
-    for (int c = lane; c < ncols; c += WARP_SIZE) {
+    float * dr = p.dst + (int64_t) row*p.ncols;
+    for (int c = lane; c < p.ncols; c += WARP_SIZE) {
         const float v = sr ? xr[c]*sr[c] : xr[c];
-        dr[c] = v*f;
+        dr[c] = p.tau ? __fmul_rn(__fmul_rn(v, f), tf) : v*f;
     }
+}
+
+// a warp per row; the blocks from nb_a on take the rows of b
+static __global__ void l2_clip_f32(const l2_clip_args a, const l2_clip_args b, const int nb_a) {
+    const int warp = threadIdx.x/WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    if ((int) blockIdx.x < nb_a) {
+        l2_clip_row(a, blockIdx.x*(blockDim.x/WARP_SIZE) + warp, lane);
+    } else {
+        l2_clip_row(b, (blockIdx.x - nb_a)*(blockDim.x/WARP_SIZE) + warp, lane);
+    }
+}
+
+static l2_clip_args l2_clip_args_of(const ggml_cuda_l2_clip_set & c) {
+    const ggml_tensor * x = c.x;
+    const ggml_tensor * s = c.s;
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && c.dst->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && ggml_is_contiguous(c.dst));
+    GGML_ASSERT(ggml_are_same_shape(x, c.dst));
+    GGML_ASSERT(s == nullptr || (s->type == GGML_TYPE_F32 && ggml_is_contiguous(s) && s->ne[0] == x->ne[0] &&
+        (s->ne[1] == 1 || s->ne[1] == x->ne[1]) && s->ne[2] == 1 && s->ne[3] == 1));
+    GGML_ASSERT(c.tau == nullptr || (c.tau->type == GGML_TYPE_F32 && ggml_is_contiguous(c.tau) && c.tau->ne[0] == 1 &&
+        c.tau->ne[1] == 1 && c.tau->ne[2] == x->ne[2] && c.tau->ne[3] == 1));
+
+    const int64_t ts = sizeof(float);
+    l2_clip_args p;
+    p.x     = (const float *) x->data;
+    p.s     = s ? (const float *) s->data : nullptr;
+    p.tau   = c.tau ? (const float *) c.tau->data : nullptr;
+    p.dst   = (float *) c.dst->data;
+    p.ncols = (int) x->ne[0];
+    p.nrows = (int) ggml_nrows(x);
+    p.ne1   = (int) x->ne[1];
+    p.ne2   = (int) x->ne[2];
+    p.sx1   = x->nb[1]/ts;
+    p.sx2   = x->nb[2]/ts;
+    p.sx3   = x->nb[3]/ts;
+    p.ss1   = s ? s->nb[1]/ts : 0;
+    p.s_ne1 = s ? (int) s->ne[1] : 1;
+    p.scale = c.scale;
+    p.bias  = c.bias;
+    p.t     = c.t;
+    p.lo    = c.lo;
+    p.hi    = c.hi;
+    return p;
+}
+
+void ggml_cuda_op_l2_clip_sets(ggml_backend_cuda_context & ctx, const ggml_cuda_l2_clip_set & a, const ggml_cuda_l2_clip_set & b) {
+    const int rows_per_block = 4;
+    const l2_clip_args pa = l2_clip_args_of(a);
+    const l2_clip_args pb = b.x ? l2_clip_args_of(b) : pa;
+    const int nb_a = (pa.nrows + rows_per_block - 1)/rows_per_block;
+    const int nb_b = b.x ? (pb.nrows + rows_per_block - 1)/rows_per_block : 0;
+
+    l2_clip_f32<<<nb_a + nb_b, rows_per_block*WARP_SIZE, 0, ctx.stream()>>>(pa, pb, nb_a);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void ggml_cuda_op_l2_clip(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * s, ggml_tensor * dst,
         float scale, float bias, float t, float lo, float hi) {
-    GGML_ASSERT(x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && ggml_is_contiguous(dst));
-    GGML_ASSERT(ggml_are_same_shape(x, dst));
-    GGML_ASSERT(s == nullptr || (s->type == GGML_TYPE_F32 && ggml_is_contiguous(s) && s->ne[0] == x->ne[0] &&
-        (s->ne[1] == 1 || s->ne[1] == x->ne[1]) && s->ne[2] == 1 && s->ne[3] == 1));
-
-    const int64_t ts    = sizeof(float);
-    const int     nrows = ggml_nrows(x);
-    const int     rows_per_block = 4;
-
-    l2_clip_f32<<<(nrows + rows_per_block - 1)/rows_per_block, rows_per_block*WARP_SIZE, 0, ctx.stream()>>>(
-        (const float *) x->data, s ? (const float *) s->data : nullptr, (float *) dst->data, x->ne[0], nrows, x->ne[1], x->ne[2],
-        x->nb[1]/ts, x->nb[2]/ts, x->nb[3]/ts, s ? s->nb[1]/ts : 0, s ? s->ne[1] : 1, scale, bias, t, lo, hi);
-    CUDA_CHECK(cudaGetLastError());
+    ggml_cuda_l2_clip_set a;
+    a.x     = x;
+    a.s     = s;
+    a.dst   = dst;
+    a.scale = scale;
+    a.bias  = bias;
+    a.t     = t;
+    a.lo    = lo;
+    a.hi    = hi;
+    ggml_cuda_op_l2_clip_sets(ctx, a, {});
 }
 
 // a depth mix (Inkling 2): the states of a token are the rows of x (normed already) and cur, normed here; for query q,

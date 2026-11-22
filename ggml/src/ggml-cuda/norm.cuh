@@ -114,9 +114,21 @@ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
-// dst = y*clamp(t/(sqrt(sum(y*y))*scale + bias), lo, hi) per row, y = x*s (s: a vector per row of x, or none)
+// dst = y*clamp(t/(sqrt(sum(y*y))*scale + bias), lo, hi) per row, y = x*s (s: a vector per row of x, or none); with tau
+//   ([1, 1, ne2, 1]) dst times tau of the row's dim-2 index after that, as a MUL apart
+struct ggml_cuda_l2_clip_set {
+    const ggml_tensor * x   = nullptr;
+    const ggml_tensor * s   = nullptr;
+    const ggml_tensor * tau = nullptr;
+    ggml_tensor       * dst = nullptr;
+    float scale = 1.0f, bias = 0.0f, t = 0.0f, lo = 0.0f, hi = 0.0f;
+};
+
 void ggml_cuda_op_l2_clip(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * s, ggml_tensor * dst,
         float scale, float bias, float t, float lo, float hi);
+
+// one or two row sets of ggml_cuda_op_l2_clip in one launch (b.x nullptr: a alone)
+void ggml_cuda_op_l2_clip_sets(ggml_backend_cuda_context & ctx, const ggml_cuda_l2_clip_set & a, const ggml_cuda_l2_clip_set & b);
 
 // a depth mix (Inkling 2): states = the rows of x (already normed, [n, n_x, n_tokens]) and rms_norm(cur) ([n, 1, n_tokens]),
 //   dst[:, q, t] = sum_s softmax_s(scale*<state_s, query[:, q]>)*state_s

@@ -445,6 +445,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             Qcur = ggml_mul(ctx0, Qcur, tau);
             Rcur = ggml_mul(ctx0, Rcur, tau);
         }
+        // the clips of Q and R next to each other (CUDA runs both, with the log-position scale, in one launch)
+        ggml_build_forward_expand(gf, Qcur);
+        ggml_build_forward_expand(gf, Rcur);
 
         cb(Qcur, "Qcur", il);
         cb(Kcur, "Kcur", il);

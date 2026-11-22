@@ -7219,14 +7219,70 @@ static int ggml_cuda_l2_clip_chain(const ggml_cgraph * cgraph, const int i, ggml
     return n;
 }
 
-static int ggml_cuda_try_fuse_l2_clip(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+// the chain from i as a row set, with the MUL by a scalar per index of dim 2 after it ([1, 1, ne2, 1], Inkling 2's
+//   log-position scale of Q and R) if one follows; returns the index of the set's output, -1 if none
+static int ggml_cuda_l2_clip_set_at(const ggml_cgraph * cgraph, const int i, ggml_cuda_l2_clip_set & set) {
     ggml_cuda_l2_clip_match m;
     const int n = ggml_cuda_l2_clip_chain(cgraph, i, m);
     if (n == 0) {
+        return -1;
+    }
+    set.x     = m.x;
+    set.s     = m.sv;
+    set.dst   = m.out;
+    set.scale = m.scale;
+    set.bias  = m.bias;
+    set.t     = m.t;
+    set.lo    = m.lo;
+    set.hi    = m.hi;
+    int end = i + n - 1;
+    if (end + 1 < cgraph->n_nodes) {
+        ggml_tensor * mul = cgraph->nodes[end + 1];
+        const ggml_tensor * tau = mul->op != GGML_OP_MUL ? nullptr : mul->src[0] == m.out ? mul->src[1] : mul->src[1] == m.out ? mul->src[0] : nullptr;
+        if (tau != nullptr && tau != m.out && tau->type == GGML_TYPE_F32 && ggml_is_contiguous(tau) && tau->ne[0] == 1 &&
+                tau->ne[1] == 1 && tau->ne[2] == m.out->ne[2] && tau->ne[3] == 1 && m.out->ne[3] == 1 &&
+                mul->type == GGML_TYPE_F32 && ggml_is_contiguous(mul) && ggml_are_same_shape(mul, m.out) &&
+                ggml_cuda_graph_use_count(cgraph, m.out) == 1 && !(m.out->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                !ggml_cuda_tensors_overlap(mul, tau) && (!ggml_cuda_tensors_overlap(mul, m.x) ||
+                    (mul->data == m.x->data && ggml_is_contiguous(m.x))) && (m.sv == nullptr || !ggml_cuda_tensors_overlap(mul, m.sv))) {
+            set.tau = tau;
+            set.dst = mul;
+            end++;
+        }
+    }
+    return end;
+}
+
+// one launch for the row sets of two chains in a row (Inkling 2's clips of Q and R), views between them skipped, when
+//   neither's output sits on what the other reads. GGML_CUDA_NO_L2_CLIP_PAIR=1 keeps them apart.
+static int ggml_cuda_try_fuse_l2_clip(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    static const bool no_pair = getenv("GGML_CUDA_NO_L2_CLIP_PAIR") != nullptr;
+    ggml_cuda_l2_clip_set a;
+    const int end_a = ggml_cuda_l2_clip_set_at(cgraph, i, a);
+    if (end_a < 0) {
         return 0;
     }
-    ggml_cuda_op_l2_clip(*cuda_ctx, m.x, m.sv, m.out, m.scale, m.bias, m.t, m.lo, m.hi);
-    return n - 1;
+    ggml_cuda_l2_clip_set b;
+    int end_b = -1;
+    int j = end_a + 1;
+    while (j < cgraph->n_nodes && j <= end_a + 4 && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+        j++;
+    }
+    if (!no_pair && j < cgraph->n_nodes && (cgraph->nodes[j]->op == GGML_OP_MUL || cgraph->nodes[j]->op == GGML_OP_SQR)) {
+        end_b = ggml_cuda_l2_clip_set_at(cgraph, j, b);
+        const auto reads = [](const ggml_cuda_l2_clip_set & s, const ggml_tensor * t) {
+            return ggml_cuda_tensors_overlap(t, s.x) || (s.s && ggml_cuda_tensors_overlap(t, s.s)) ||
+                (s.tau && ggml_cuda_tensors_overlap(t, s.tau)) || ggml_cuda_tensors_overlap(t, s.dst);
+        };
+        if (end_b >= 0 && (reads(a, b.dst) || reads(b, a.dst))) {
+            end_b = -1;
+        }
+    }
+    if (end_b < 0) {
+        b = {};
+    }
+    ggml_cuda_op_l2_clip_sets(*cuda_ctx, a, b);
+    return (end_b >= 0 ? end_b : end_a) - i;
 }
 
 // A CONT of a transposed view that only a MUL_MAT with rows of a few values reads (the weighted sum of a depth mix):
