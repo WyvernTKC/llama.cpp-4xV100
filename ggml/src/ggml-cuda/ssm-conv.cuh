@@ -42,6 +42,8 @@ struct ggml_cuda_ssm_conv_dyn {
 #define GGML_CUDA_SSM_CONV_EPI_L2_CLIP  1
 #define GGML_CUDA_SSM_CONV_EPI_RMS_NORM 2
 #define GGML_CUDA_SSM_CONV_EPI_ROW      128
+//   With cache the rows go into the rows of a KV cache instead (llama_kv_cache::cpy_k/cpy_v's SET_ROWS), cache[idx[t]*
+//   cache_row + c] in f16 or f32, and out is not written.
 struct ggml_cuda_ssm_conv_epi {
     int     mode  = GGML_CUDA_SSM_CONV_EPI_NONE;
     float * out   = nullptr;
@@ -51,6 +53,11 @@ struct ggml_cuda_ssm_conv_epi {
     float   t     = 0.0f;
     float   lo    = 0.0f;
     float   hi    = 0.0f;
+    void *       cache     = nullptr;
+    int64_t      cache_row = 0;
+    bool         cache_f16 = false;
+    const void * idx       = nullptr;
+    bool         idx_i64   = true;
 };
 
 void ggml_cuda_op_ssm_conv_state(ggml_backend_cuda_context & ctx, const ggml_tensor * states, const ggml_tensor * ids,

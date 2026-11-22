@@ -4908,6 +4908,7 @@ struct ggml_cuda_ssm_conv_state_fusion {
     const ggml_tensor * dyn_src   = nullptr; // the dynamic taps (Inkling 2): the tensor the tap views read
     ggml_cuda_ssm_conv_dyn dyn    = {};
     ggml_cuda_ssm_conv_epi epi    = {};      // Inkling 2: the L2 clip or RMS norm of each head of the output, see below
+    int                 set_rows_idx = -1;   // and the SET_ROWS that stores it into the KV cache, run in the same launch
     ggml_cuda_ssm_conv_state_slots      slots      = {};
     ggml_cuda_ssm_conv_state_long_slots long_slots = {};
 };
@@ -4956,6 +4957,14 @@ static int ggml_cuda_ssm_conv_epi_match(const ggml_cgraph * cgraph, const int j,
     epi.hi    = m.hi;
     return j + n;
 }
+
+// The SET_ROWS a few nodes after a conv norm (ggml_cuda_ssm_conv_epi_match) that stores the norm's rows into a KV cache
+//   (llama_kv_cache::cpy_k/cpy_v: a view of all of eo, rows of the conv's channels, the cells' indices): the launch at the
+//   concat then writes the cache rows itself (sets f.set_rows_idx and the cache of f.epi). eo must be read only there,
+//   and no node run between the concat and the SET_ROWS may touch the cache or the indices (the conv's own chain does
+//   not run). GGML_CUDA_NO_CONV_SET_ROWS_FUSION=1 turns it off.
+struct ggml_cuda_ssm_conv_state_fusion;
+static void ggml_cuda_ssm_conv_epi_set_rows(const ggml_cgraph * cgraph, ggml_cuda_ssm_conv_state_fusion & f, const ggml_tensor * eo);
 
 static bool ggml_cuda_ssm_conv_state_fusion_match(
         ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int concat_idx, ggml_cuda_ssm_conv_state_fusion & f) {
@@ -5312,6 +5321,7 @@ static bool ggml_cuda_ssm_conv_state_fusion_match(
             if (ok) {
                 f.epi      = epi;
                 f.silu_idx = e;
+                ggml_cuda_ssm_conv_epi_set_rows(cgraph, f, eo);
             }
         }
     }
@@ -5394,6 +5404,87 @@ static int ggml_cuda_gdn_conv_fold(ggml_backend_cuda_context * cuda_ctx, const g
 
 // whether node i, the GET_ROWS of a convolution state, the MUL of its new tokens or the SSM_CONV after it, belongs to a
 //   fused build_conv_state; n_skip: the nodes after the SSM_CONV up to its SILU
+static void ggml_cuda_ssm_conv_epi_set_rows(const ggml_cgraph * cgraph, ggml_cuda_ssm_conv_state_fusion & f, const ggml_tensor * eo) {
+    static const bool disabled = getenv("GGML_CUDA_NO_CONV_SET_ROWS_FUSION") != nullptr;
+    if (disabled || ggml_cuda_graph_use_count(cgraph, eo) != 1 || (eo->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return;
+    }
+    const int64_t nr  = f.ssm_conv->ne[0];
+    const int64_t n_t = f.ssm_conv->ne[1];
+    int s = -1;
+    for (int j = f.silu_idx + 1; j < cgraph->n_nodes && j <= f.silu_idx + 64; j++) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_SET_ROWS && n->src[0]->op == GGML_OP_VIEW && n->src[0]->src[0] == eo) {
+            s = j;
+            break;
+        }
+    }
+    if (s < 0) {
+        return;
+    }
+    const ggml_tensor * sr  = cgraph->nodes[s];
+    const ggml_tensor * v   = sr->src[0];
+    const ggml_tensor * idx = sr->src[1];
+    if (v->data != eo->data || !ggml_is_contiguous(v) || v->ne[0] != nr || v->ne[1] != n_t || ggml_nelements(v) != nr*n_t ||
+            ggml_cuda_graph_use_count(cgraph, v) != 1 || (v->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            (sr->type != GGML_TYPE_F16 && sr->type != GGML_TYPE_F32) || sr->nb[0] != ggml_type_size(sr->type) ||
+            sr->ne[0] != nr || sr->nb[1] % ggml_type_size(sr->type) != 0 ||
+            (idx->type != GGML_TYPE_I64 && idx->type != GGML_TYPE_I32) || !ggml_is_contiguous(idx) || idx->ne[0] != n_t ||
+            ggml_nelements(idx) != n_t) {
+        return;
+    }
+    // the nodes that run between the concat and the SET_ROWS, the conv's own chain apart
+    for (int j = f.last_cpy + 1; j < s; j++) {
+        if (j >= f.conv_idx && j <= f.silu_idx) {
+            continue;
+        }
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        if (ggml_cuda_tensors_overlap(n, sr) || ggml_cuda_tensors_overlap(n, idx)) {
+            return;
+        }
+        for (int k = 0; k < GGML_MAX_SRC; k++) {
+            if (n->src[k] != nullptr && ggml_cuda_tensors_overlap(n->src[k], sr)) {
+                return;
+            }
+        }
+    }
+    f.set_rows_idx    = s;
+    f.epi.cache       = sr->data;
+    f.epi.cache_row   = (int64_t) (sr->nb[1]/ggml_type_size(sr->type));
+    f.epi.cache_f16   = sr->type == GGML_TYPE_F16;
+    f.epi.idx         = idx->data;
+    f.epi.idx_i64     = idx->type == GGML_TYPE_I64;
+}
+
+// a SET_ROWS run in the launch of the conv whose norm it stores (ggml_cuda_ssm_conv_epi_set_rows)
+static bool ggml_cuda_ssm_conv_set_rows_is_folded(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i) {
+    const ggml_tensor * sr = cgraph->nodes[i];
+    if (sr->op != GGML_OP_SET_ROWS || sr->src[0]->op != GGML_OP_VIEW) {
+        return false;
+    }
+    const ggml_tensor * eo = sr->src[0]->src[0];
+    if (eo->op != GGML_OP_RMS_NORM && eo->op != GGML_OP_MUL) {
+        return false;
+    }
+    for (int e = i - 1; e >= 0 && e >= i - 64; e--) {
+        if (cgraph->nodes[e] != eo) {
+            continue;
+        }
+        for (int j = e - 1; j >= 0 && j >= e - 192; j--) {
+            if (cgraph->nodes[j]->op != GGML_OP_CONCAT) {
+                continue;
+            }
+            ggml_cuda_ssm_conv_state_fusion f;
+            return ggml_cuda_ssm_conv_state_fusion_match(cuda_ctx, cgraph, j, f) && f.silu_idx == e && f.set_rows_idx == i;
+        }
+        return false;
+    }
+    return false;
+}
+
 static bool ggml_cuda_ssm_conv_state_is_folded(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i,
                                                int * n_skip = nullptr) {
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -10693,7 +10784,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_op_ssm_conv_state(*cuda_ctx, &states, f.ids, f.x, f.ssm_conv, f.silu, f.slots, f.gate, f.x_a, f.x_b,
                     f.residual, f.res_scale, f.res_r, f.dyn, f.epi);
                 if (f.epi.mode != GGML_CUDA_SSM_CONV_EPI_NONE) {
-                    ggml_tensor * eo = cgraph->nodes[f.silu_idx];
+                    ggml_tensor * eo = cgraph->nodes[f.set_rows_idx >= 0 ? f.set_rows_idx : f.silu_idx];
                     cuda_ctx->q8_1_input_invalidate(eo);
                     cuda_ctx->cublas_input_invalidate(eo);
                 }
@@ -11221,6 +11312,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
                 if (node->op == GGML_OP_MUL && ggml_cuda_ssm_conv_state_is_folded(cuda_ctx, cgraph, i)) {
+                    continue;
+                }
+                // the KV store of an Inkling 2 K or V conv norm, run in the conv's launch
+                if (node->op == GGML_OP_SET_ROWS && ggml_cuda_ssm_conv_set_rows_is_folded(cuda_ctx, cgraph, i)) {
                     continue;
                 }
 

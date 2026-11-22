@@ -393,7 +393,17 @@ static __global__ void ssm_conv_state_res_f32(const float * states, const int32_
             const float f = ep.mode == GGML_CUDA_SSM_CONV_EPI_L2_CLIP ?
                 fminf(fmaxf(ep.t/(sqrtf(ss)*ep.scale + ep.bias), ep.lo), ep.hi) :
                 rsqrtf(ss/GGML_CUDA_SSM_CONV_EPI_ROW + ep.eps);
-            ep.out[(int64_t) t*nr + c] = win[t]*f;
+            const float o = win[t]*f;
+            if (ep.cache != nullptr) {
+                const int64_t row = ep.idx_i64 ? ((const int64_t *) ep.idx)[t] : (int64_t) ((const int32_t *) ep.idx)[t];
+                if (ep.cache_f16) {
+                    ((half *) ep.cache)[row*ep.cache_row + c] = __float2half(o);
+                } else {
+                    ((float *) ep.cache)[row*ep.cache_row + c] = o;
+                }
+            } else {
+                ep.out[(int64_t) t*nr + c] = o;
+            }
         }
     }
 }
