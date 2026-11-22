@@ -9114,6 +9114,22 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
 
+        // the relative-position bias of the head and token (ggml_flash_attn_ext_set_rel_pos), added to the mask
+        const ggml_tensor * rel_table = dst->src[8];
+        const ggml_tensor * rel_pos   = dst->src[9];
+        const float   * rtab   = nullptr;
+        const int32_t * rkv    = nullptr;
+        int32_t         rq     = 0;
+        int64_t         rn_ext = 0;
+        float           rt     = 0.0f;
+        if (rel_table) {
+            rn_ext = rel_table->ne[0] - 1;
+            rtab   = (const float *) rel_table->data + (iq1 + iq3*neq1 + iq2*rel_table->ne[1])*rel_table->ne[0];
+            rkv    = (const int32_t *) rel_pos->data + iq3*nek1;
+            rq     = ((const int32_t *) rel_pos->data)[nek1*neq3 + iq3*neq1 + iq1];
+            rt     = rtab[rn_ext];
+        }
+
         // k indices
         const int ik3 = iq3 / rk3;
         const int ik2 = iq2 / rk2;
@@ -9137,7 +9153,13 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            if (rtab && mv != -INFINITY) {
+                const int32_t kp = rkv[ic];
+                const int64_t d  = (int64_t) rq - kp;
+                const float   b  = kp >= 0 && d >= 0 && d < rn_ext ? rtab[d] : 0.0f;
+                mv += b - rt;
+            }
             if (mv == -INFINITY) {
                 continue;
             }
@@ -9715,7 +9737,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref && !dst->src[7] &&
+        bool use_tiled = !use_ref && !dst->src[7] && !dst->src[8] &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&

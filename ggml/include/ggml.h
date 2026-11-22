@@ -2351,6 +2351,17 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * list);
 
+    // Inkling 2: the relative-position bias of each head, added to the mask (then one for all heads) by the kernel instead of
+    //   a mask per head: key c of stream s for query i of head h (t = i + s*n_tps, the queries of all streams in order) gets
+    //   table[d, t, h] - table[n_ext, t, h], d = pos[n_kv*n_stream + t] - pos[c + s*n_kv] for a seen cell (pos >= 0) at
+    //   0 <= d < n_ext, else -table[n_ext, t, h] (the last row is the sink logit of the token, as in ggml_rel_pos_mask)
+    //   table F32 [n_ext + 1, n_tokens, n_head], pos I32 [(n_kv + n_tps)*n_stream]: the positions of the cells of each
+    //   stream, then of the tokens of each stream; NULL removes it
+    GGML_API void ggml_flash_attn_ext_set_rel_pos(
+            struct ggml_tensor * a,
+            struct ggml_tensor * table,
+            struct ggml_tensor * pos);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

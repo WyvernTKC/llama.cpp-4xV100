@@ -854,6 +854,10 @@ public:
     ggml_tensor * self_rel_q_pos      = nullptr; // I32 [n_batch/n_stream, 1, 1, n_stream]
     ggml_tensor * self_rel_kv_pos     = nullptr; // I32 [n_kv,     1, 1, n_stream]
     ggml_tensor * self_rel_kv_pos_swa = nullptr; // I32 [n_kv_swa, 1, 1, n_stream]
+    // the same in one tensor for a flash attention that adds the bias itself (ggml_flash_attn_ext_set_rel_pos): the cells
+    //   of each stream, then the tokens of each stream
+    ggml_tensor * self_rel_pos        = nullptr; // I32 [(n_kv     + n_batch/n_stream)*n_stream]
+    ggml_tensor * self_rel_pos_swa    = nullptr; // I32 [(n_kv_swa + n_batch/n_stream)*n_stream]
 
     const uint32_t extent;
     const uint32_t extent_swa;
@@ -1178,6 +1182,11 @@ struct llm_graph_amax_src1 {
 
 struct llm_graph_context {
     const llama_model & model;
+
+    // the relative-position bias of the next flash attention of build_attn_mha (ggml_flash_attn_ext_set_rel_pos), set by
+    //   the build_attn of the relative-position input for a prompt and consumed there
+    mutable ggml_tensor * attn_rel_table = nullptr;
+    mutable ggml_tensor * attn_rel_pos   = nullptr;
 
     const llama_hparams & hparams;
     const llama_cparams & cparams;

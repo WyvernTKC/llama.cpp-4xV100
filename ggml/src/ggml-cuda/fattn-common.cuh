@@ -19,6 +19,79 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+// the relative-position bias of ggml_flash_attn_ext_set_rel_pos, read by the MMA kernel only (ggml_cuda_flash_attn_ext
+//   materializes it into a mask per head for the others): key c of stream s for token i of head h gets
+//   table[d] - table[n_row - 1] of row (h*n_q + s*n_tps + i), d = q_pos[s*n_tps + i] - kv_pos[s*n_kv + c], 0 <= d < n_row - 1 and
+//   kv_pos >= 0, else -table[n_row - 1]. The kernel adds table[d] to the mask of the cells in range and the sink logit
+//   table[n_row - 1] of the token to its sink (softmax(x - t) with sink S = softmax(x) with sink S + t; without a sink t
+//   cancels), so a block of cells out of range of all the tokens of its stream (outside near[s], see
+//   fattn_rel_pos_near_range) loads the mask as without the bias.
+struct fattn_rel_pos {
+    const float   * table;  // [n_row, n_q, n_head]
+    const int32_t * kv_pos; // [n_kv, n_stream]
+    const int32_t * q_pos;  // [n_tps, n_stream]
+    const int2    * near;   // [n_stream]: the cells [x, y) hold all those within the extent of a token of the stream
+    int32_t n_row;          // n_ext + 1, the last row is the sink logit of the token
+    int32_t n_q;            // the tokens of all streams
+    int32_t n_kv;           // the cells of a stream
+};
+
+// near[s] of fattn_rel_pos: the smallest range of the cells of stream s that holds every seen cell within the extent of a
+//   token of the stream, kv_pos in (q_min - n_ext, q_max], one block per stream
+static __global__ void fattn_rel_pos_near_range(const int32_t * __restrict__ kv_pos, const int32_t * __restrict__ q_pos,
+        int2 * __restrict__ near, const int n_kv, const int n_tps, const int n_ext) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    __shared__ int red[4][32];
+    const int s = blockIdx.x;
+    const int lane = threadIdx.x % warp_size;
+    const int warp = threadIdx.x / warp_size;
+    const int n_warps = blockDim.x / warp_size;
+
+    auto block_reduce = [&](int v, const bool is_min, const int slot) -> int {
+#pragma unroll
+        for (int offset = warp_size/2; offset > 0; offset >>= 1) {
+            const int o = __shfl_xor_sync(0xFFFFFFFF, v, offset, warp_size);
+            v = is_min ? min(v, o) : max(v, o);
+        }
+        if (lane == 0) {
+            red[slot][warp] = v;
+        }
+        __syncthreads();
+        v = lane < n_warps ? red[slot][lane] : (is_min ? 0x7FFFFFFF : -0x7FFFFFFF);
+#pragma unroll
+        for (int offset = warp_size/2; offset > 0; offset >>= 1) {
+            const int o = __shfl_xor_sync(0xFFFFFFFF, v, offset, warp_size);
+            v = is_min ? min(v, o) : max(v, o);
+        }
+        return v;
+    };
+
+    int q_min =  0x7FFFFFFF;
+    int q_max = -0x7FFFFFFF;
+    for (int i = threadIdx.x; i < n_tps; i += blockDim.x) {
+        const int qp = q_pos[int64_t(s)*n_tps + i];
+        q_min = min(q_min, qp);
+        q_max = max(q_max, qp);
+    }
+    q_min = block_reduce(q_min, true,  0);
+    q_max = block_reduce(q_max, false, 1);
+
+    int c_lo =  0x7FFFFFFF;
+    int c_hi = -1;
+    for (int c = threadIdx.x; c < n_kv; c += blockDim.x) {
+        const int kp = kv_pos[int64_t(s)*n_kv + c];
+        if (kp >= 0 && int64_t(kp) > int64_t(q_min) - n_ext && kp <= q_max) {
+            c_lo = min(c_lo, c);
+            c_hi = max(c_hi, c);
+        }
+    }
+    c_lo = block_reduce(c_lo, true,  2);
+    c_hi = block_reduce(c_hi, false, 3);
+    if (threadIdx.x == 0) {
+        near[s] = c_hi >= 0 ? make_int2(c_lo, c_hi + 1) : make_int2(0, 0);
+    }
+}
+
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -42,7 +115,8 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int64_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int64_t nb32, const int64_t nb33,
+        const fattn_rel_pos rel_pos);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -1844,6 +1918,24 @@ void launch_fattn(
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
 
+    fattn_rel_pos rel_pos = {nullptr, nullptr, nullptr, nullptr, 0, 0, 0};
+    ggml_cuda_pool_alloc<int2> rel_near(pool);
+    if (const ggml_tensor * rel_table = dst->src[8]) {
+        const ggml_tensor * rel_p = dst->src[9];
+        GGML_ASSERT(!kv_rows && !use_sparse && !chunk_list);
+        rel_pos.table  = (const float *) rel_table->data;
+        rel_pos.kv_pos = (const int32_t *) rel_p->data;
+        rel_pos.q_pos  = rel_pos.kv_pos + K->ne[1]*Q->ne[3];
+        rel_pos.n_row  = rel_table->ne[0];
+        rel_pos.n_q    = rel_table->ne[1];
+        rel_pos.n_kv   = K->ne[1];
+        rel_near.alloc(Q->ne[3]);
+        fattn_rel_pos_near_range<<<Q->ne[3], 128, 0, main_stream>>>(rel_pos.kv_pos, rel_pos.q_pos, rel_near.get(),
+            rel_pos.n_kv, Q->ne[1], rel_pos.n_row - 1);
+        CUDA_CHECK(cudaGetLastError());
+        rel_pos.near = rel_near.get();
+    }
+
     ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
     ggml_cuda_kernel_launch(fattn_kernel, launch_params,
         (const char *) Q->data,
@@ -1861,7 +1953,8 @@ void launch_fattn(
         K->ne[0], chunk_list ? (int64_t) (chunk_list->ne[0] - 1)*FATTN_PAGED_CHUNK : n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        rel_pos
     );
     CUDA_CHECK(cudaGetLastError());
 

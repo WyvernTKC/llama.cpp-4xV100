@@ -5655,6 +5655,30 @@ void ggml_flash_attn_ext_set_chunk_list(
     ggml_set_op_params_i32(a, 6, 32); // listed chunks are whole chunks
 }
 
+void ggml_flash_attn_ext_set_rel_pos(
+        struct ggml_tensor * a,
+        struct ggml_tensor * table,
+        struct ggml_tensor * pos) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    if (table == NULL) {
+        a->src[8] = NULL;
+        a->src[9] = NULL;
+        return;
+    }
+    const struct ggml_tensor * q    = a->src[0];
+    const struct ggml_tensor * k    = a->src[1];
+    const struct ggml_tensor * mask = a->src[3];
+    GGML_ASSERT(mask != NULL && mask->ne[2] == 1);
+    GGML_ASSERT(ggml_get_op_params_f32(a, 1) == 0.0f && "not with ALiBi");
+    GGML_ASSERT(a->src[5] == NULL && a->src[7] == NULL && "not with kv_rows or chunk lists");
+    GGML_ASSERT(table->type == GGML_TYPE_F32 && ggml_is_contiguous(table) && table->ne[0] >= 1 &&
+        table->ne[1] == q->ne[1]*q->ne[3] && table->ne[2] == q->ne[2] && table->ne[3] == 1);
+    GGML_ASSERT(pos != NULL && pos->type == GGML_TYPE_I32 && ggml_is_contiguous(pos) &&
+        pos->ne[0] == (k->ne[1] + q->ne[1])*q->ne[3] && pos->ne[1] == 1 && pos->ne[2] == 1 && pos->ne[3] == 1);
+    a->src[8] = table;
+    a->src[9] = pos;
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {

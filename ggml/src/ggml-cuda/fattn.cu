@@ -277,7 +277,8 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     // Edge cases like no mask, ALiBi, unpadded K/V, or misaligned addresses for large data transfers
     //     are put into the template specialization without GQA optimizations.
     // a mask with a head dimension is not shared by the Q heads of a K/V head
-    bool use_gqa_opt = mask && mask->ne[2] == 1 && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
+    // as is the relative-position bias of each head (ggml_flash_attn_ext_set_rel_pos)
+    bool use_gqa_opt = mask && mask->ne[2] == 1 && !dst->src[8] && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -674,7 +675,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // The effective batch size for the kernel can be increased by gqa_ratio.
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, if the mask has a head dimension,
     //     or if the KV cache is not padded,
-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && mask->ne[2] == 1 && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
+    // the relative-position bias of ggml_flash_attn_ext_set_rel_pos is per head, as is the mask it replaces
+    bool gqa_opt_applies = gqa_ratio >= 2 && mask && mask->ne[2] == 1 && !dst->src[8] && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -770,7 +772,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     }
 
-    if (mask && mask->ne[2] != 1) {
+    // a relative-position bias (ggml_flash_attn_ext_set_rel_pos) chooses as the mask of each head it replaces
+    const bool mask_per_head = mask && (mask->ne[2] != 1 || dst->src[8] != nullptr);
+    if (mask_per_head) {
         // the kv_rows mask is compacted per sequence, it has no head dimension
         if (kv_rows) {
             return BEST_FATTN_KERNEL_NONE;
@@ -831,7 +835,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     const int ncols2_max = Q->ne[0] == 320 ? 32 : ((Q->ne[0] == 576 || Q->ne[0] == 192) ? 16 : 8);
     int gqa_ratio_eff = 1;
-    while (max_bias == 0.0f && (!mask || mask->ne[2] == 1) && gqa_ratio % (2*gqa_ratio_eff) == 0 && gqa_ratio_eff < ncols2_max) {
+    while (max_bias == 0.0f && !mask_per_head && gqa_ratio % (2*gqa_ratio_eff) == 0 && gqa_ratio_eff < ncols2_max) {
         gqa_ratio_eff *= 2;
     }
 
@@ -962,9 +966,87 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+// ggml_flash_attn_ext_set_rel_pos: the MMA kernel adds the bias to the shared mask as it loads it (head size 128, one Q head
+//   per tile, ggml_cuda_fattn_mma_may_use_rel), the other kernels get the mask of each head first
+static bool ggml_cuda_flash_attn_ext_rel_pos_in_kernel(const ggml_tensor * dst, const best_fattn_kernel kernel) {
+    static const bool off = getenv("GGML_CUDA_NO_FATTN_REL_POS") != nullptr;
+    return !off && kernel == BEST_FATTN_KERNEL_MMA_F16 && dst->src[0]->ne[0] == 128 && dst->src[2]->ne[0] == 128 &&
+        dst->src[3]->type == GGML_TYPE_F16;
+}
+
+// the mask of each head, mask[c, i, h, s] = mask[c, i, 0, s] + (b - t) as ggml_rel_pos_mask makes it (F16), the rows past
+//   the tokens (padding) as they are
+static __global__ void fattn_rel_pos_mask_f16(const half * __restrict__ mask, const float * __restrict__ table,
+        const int32_t * __restrict__ kv_pos, const int32_t * __restrict__ q_pos, half * __restrict__ dst,
+        const int n_kv, const int n_tps, const int n_rows, const int n_head, const int n_row, const int n_q,
+        const int64_t sm1, const int64_t sm3, const int nm3) {
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= n_kv) {
+        return;
+    }
+    const int i = blockIdx.y;
+    const int h = blockIdx.z % n_head;
+    const int s = blockIdx.z / n_head;
+    float v = __half2float(mask[c + i*sm1 + (s % nm3)*sm3]);
+    if (i < n_tps) {
+        const int     t  = i + s*n_tps;
+        const float * tr = table + (int64_t(h)*n_q + t)*n_row;
+        const int     kp = kv_pos[c + int64_t(s)*n_kv];
+        const int     d  = q_pos[t] - kp;
+        const float   b  = kp >= 0 && d >= 0 && d < n_row - 1 ? tr[d] : 0.0f;
+        v += b - tr[n_row - 1];
+    }
+    dst[c + int64_t(n_kv)*(i + int64_t(n_rows)*(h + int64_t(n_head)*s))] = __float2half(v);
+}
+
+static void ggml_cuda_flash_attn_ext_rel_pos_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q     = dst->src[0];
+    const ggml_tensor * K     = dst->src[1];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * table = dst->src[8];
+    const ggml_tensor * pos   = dst->src[9];
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 && mask->ne[2] == 1 && mask->nb[0] == sizeof(half));
+
+    const int n_kv   = K->ne[1];
+    const int n_tps  = Q->ne[1];
+    const int n_rows = mask->ne[1];
+    const int n_head = Q->ne[2];
+    const int n_s    = Q->ne[3];
+    GGML_ASSERT(mask->ne[0] == n_kv && n_rows >= n_tps && n_rows <= 65535 && n_head*n_s <= 65535);
+
+    ggml_cuda_pool_alloc<half> buf(ctx.pool(), (size_t) n_kv*n_rows*n_head*n_s);
+    const int32_t * kv_pos = (const int32_t *) pos->data;
+    const dim3 block(256, 1, 1);
+    const dim3 grid((n_kv + block.x - 1)/block.x, n_rows, n_head*n_s);
+    fattn_rel_pos_mask_f16<<<grid, block, 0, ctx.stream()>>>((const half *) mask->data, (const float *) table->data,
+        kv_pos, kv_pos + (int64_t) n_kv*n_s, buf.get(), n_kv, n_tps, n_rows, n_head, (int) table->ne[0], (int) table->ne[1],
+        (int64_t) (mask->nb[1]/sizeof(half)), (int64_t) (mask->nb[3]/sizeof(half)), (int) mask->ne[3]);
+    CUDA_CHECK(cudaGetLastError());
+
+    ggml_tensor mask_h = *mask;
+    mask_h.data     = buf.get();
+    mask_h.view_src = nullptr;
+    mask_h.ne[2]    = n_head;
+    mask_h.ne[3]    = n_s;
+    mask_h.nb[1]    = (size_t) n_kv*sizeof(half);
+    mask_h.nb[2]    = mask_h.nb[1]*n_rows;
+    mask_h.nb[3]    = mask_h.nb[2]*n_head;
+
+    ggml_tensor dst_h = *dst;
+    dst_h.src[3] = &mask_h;
+    dst_h.src[8] = nullptr;
+    dst_h.src[9] = nullptr;
+    ggml_cuda_flash_attn_ext(ctx, &dst_h);
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    if (dst->src[8] != nullptr && !ggml_cuda_flash_attn_ext_rel_pos_in_kernel(dst, kernel)) {
+        ggml_cuda_flash_attn_ext_rel_pos_mask(ctx, dst);
+        return;
+    }
+    switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:

@@ -2728,7 +2728,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_derive_split_state
             for (int i = 0; i < 4; i++) {
                 GGML_ASSERT(tensor->src[i] == nullptr || src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
-            GGML_ASSERT(tensor->src[4] == nullptr && tensor->src[5] == nullptr && tensor->src[6] == nullptr && tensor->src[7] == nullptr);
+            GGML_ASSERT(tensor->src[4] == nullptr && tensor->src[5] == nullptr && tensor->src[6] == nullptr && tensor->src[7] == nullptr &&
+                tensor->src[8] == nullptr);
             ggml_backend_meta_split_state ret = {GGML_BACKEND_SPLIT_AXIS_3, {0}, {1}, 1};
             for (size_t j = 0; j < n_bufs; j++) {
                 ret.ne[j] = 1;
@@ -2754,6 +2755,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_derive_split_state
             (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 && src_ss[7].axis == GGML_BACKEND_SPLIT_AXIS_1));
         // the cell rows of a unified cache (ggml_flash_attn_ext_rows) are not used under -sm tensor (auto_fkvr)
         GGML_ASSERT(tensor->src[5] == nullptr);
+        // the relative-position bias of each q head (ggml_flash_attn_ext_set_rel_pos): the table split by head like q (dim 2
+        //   of both), the positions replicated
+        GGML_ASSERT(tensor->src[8] == nullptr || (src_ss[9].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && (
+            (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[8].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) ||
+            (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 && split_states_equal(src_ss[8], src_ss[0])))));
 
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);

@@ -2930,6 +2930,110 @@ struct test_rel_pos_mask_factored : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT with the relative-position bias of ggml_flash_attn_ext_set_rel_pos (Inkling 2): the shared mask
+//   (causal + random bias, fully masked cells), cells out of position order and unseen, tokens at and away from the end
+struct test_flash_attn_ext_rel_pos : public test_case {
+    const int64_t hs;
+    const int64_t n_head;
+    const int64_t n_head_kv;
+    const int64_t n_ext;
+    const int64_t n_kv;
+    const int64_t n_tps;
+    const int64_t n_stream;
+    const ggml_type type_KV;
+    const bool with_sinks;
+    const bool q_spread; // some tokens anywhere in the cells, else all at the end: the cells far from them skip the bias
+    const bool ordered;  // the cells in position order, as one sequence fills them (else the newer half shuffled)
+
+    std::string vars() override {
+        return VARS_TO_STR11(hs, n_head, n_head_kv, n_ext, n_kv, n_tps, n_stream, type_KV, with_sinks, q_spread, ordered);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2*n_head*n_tps*n_stream*2*hs*n_kv;
+    }
+
+    test_flash_attn_ext_rel_pos(int64_t hs = 128, int64_t n_head = 6, int64_t n_head_kv = 2, int64_t n_ext = 64,
+            int64_t n_kv = 512, int64_t n_tps = 64, int64_t n_stream = 1, ggml_type type_KV = GGML_TYPE_F16, bool with_sinks = true,
+            bool q_spread = true, bool ordered = false)
+        : hs(hs), n_head(n_head), n_head_kv(n_head_kv), n_ext(n_ext), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream),
+          type_KV(type_KV), with_sinks(with_sinks), q_spread(q_spread), ordered(ordered) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, n_tps, n_head, n_stream);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_KV, hs, n_kv, n_head_kv, n_stream);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV, hs, n_kv, n_head_kv, n_stream);
+        ggml_set_name(v, "v");
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
+        ggml_set_name(m, "m");
+        ggml_tensor * table = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_ext + 1, n_tps*n_stream, n_head);
+        ggml_set_name(table, "table");
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (n_kv + n_tps)*n_stream);
+        ggml_set_name(pos, "pos");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) hs), 0.0f, 0.0f);
+        if (with_sinks) {
+            ggml_tensor * sk = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_head);
+            ggml_set_name(sk, "sk");
+            ggml_flash_attn_ext_add_sinks(out, sk);
+        }
+        ggml_flash_attn_ext_set_rel_pos(out, table, pos);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(7);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "pos") == 0) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t s = 0; s < n_stream; ++s) {
+                    int32_t * row = data.data() + s*n_kv;
+                    for (int64_t j = 0; j < n_kv; ++j) {
+                        row[j] = (int32_t) j;
+                    }
+                    if (!ordered) {
+                        std::shuffle(row + n_kv/2, row + n_kv, rng); // the old cells in order, the newer ones not
+                    }
+                    for (int64_t j = 0; j < n_kv; j += 11) {
+                        row[(j + s) % n_kv] = -1;
+                    }
+                    for (int64_t i = 0; i < n_tps; ++i) {
+                        data[n_kv*n_stream + s*n_tps + i] = q_spread && i % 5 == 0 ? (int32_t) (rng() % n_kv) : (int32_t) (n_kv - n_tps + i);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "m") == 0) {
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                for (int64_t s = 0; s < n_stream; ++s) {
+                    for (int64_t i = 0; i < n_tps; ++i) {
+                        for (int64_t c = 0; c < n_kv; ++c) {
+                            const bool masked = c > n_kv - n_tps + i || (c + 3*i + 5*s) % 13 == 0;
+                            const float b = 0.125f*((c + 3*i + 7*s) % 17 - 8);
+                            data[(s*n_tps + i)*n_kv + c] = ggml_fp32_to_fp16(masked ? -INFINITY : b);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "table") == 0) {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else if (strcmp(t->name, "sk") == 0) {
+                init_tensor_uniform(t, -2.0f, 2.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_KQ_MASK of ggml_kq_mask_prefix
 struct test_kq_mask_prefix : public test_case {
     const ggml_type type;
@@ -15095,6 +15199,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_kq_mask_prefix(type, 777,  16, 3, 8));
         test_cases.emplace_back(new test_kq_mask_prefix(type, 70000, 3, 1));
     }
+    // the in-kernel bias (MMA, head size 128) and the per-head mask fallback (other head sizes, a token)
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 6, 2, 64,   512,  64, 1, type_KV, true));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 6, 2, 1024, 2048, 256, 1, type_KV, true));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 4, 4, 100,  768,  96, 2, type_KV, true));  // 2 streams
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 6, 2, 64,   300,  70, 1, type_KV, false)); // unpadded KV
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 6, 2, 64,   512,   1, 1, type_KV, true));  // one token
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos( 64, 6, 2, 64,   512,  64, 1, type_KV, true));  // fallback
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 6, 2, 64,   2048, 128, 1, type_KV, true,  false)); // far cells
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 6, 2, 1024, 4096, 256, 1, type_KV, true,  false));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 4, 4, 100,  1536,  96, 2, type_KV, true,  false));
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 6, 2, 64,   1000,  70, 1, type_KV, false, false));
+    }
     test_cases.emplace_back(new test_kq_block_bias(300, 64, 1, 4, false));
     test_cases.emplace_back(new test_kq_block_bias(513, 37, 2, 4, false));
     test_cases.emplace_back(new test_kq_block_bias(513, 37, 2, 4, true));
@@ -19441,6 +19558,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 65536, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // Inkling-2-Mini prompt attention on one of 4 devices (-sm tensor): 6 q / 2 kv heads, the relative-position bias in the
+    //   kernel (GGML_CUDA_NO_FATTN_REL_POS=1: a mask per head first), a 2048-token ubatch at 8k / 32k / 128k cells
+    for (int64_t n_kv : {8192, 32768, 131072}) {
+        test_cases.emplace_back(new test_flash_attn_ext_rel_pos(128, 6, 2, 1024, n_kv, 2048, 1, GGML_TYPE_F16, true, false, true));
+    }
+    // the same with the mask per head as an input, as the attention got it from ggml_rel_pos_mask_factored
+    for (int64_t n_kv : {8192, 32768, 131072}) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {3, 1}, n_kv, 2048, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16,
+            {0, 1, 2, 3}, true, false, 0, 0, 6));
+    }
 
 
     for (int kv : { 4096, 8192, 16384,32768, 65536, }) {

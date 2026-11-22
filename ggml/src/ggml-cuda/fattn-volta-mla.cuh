@@ -88,7 +88,9 @@ static __global__ void flash_attn_volta_mla(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int64_t nb32, const int64_t nb33) {
+                            const int32_t nb31, const int64_t nb32, const int64_t nb33,
+        const fattn_rel_pos rel_pos) {
+    GGML_UNUSED(rel_pos);
 #ifdef VOLTA_MMA_AVAILABLE
     GGML_UNUSED_VARS(V, sinks, KV_rows, max_bias, m0, m1, n_head_log2, logit_softcap, ne00, nb01, ne10, ne13,
         nb21, nb22, nb23, ne32, nb31, nb32);
