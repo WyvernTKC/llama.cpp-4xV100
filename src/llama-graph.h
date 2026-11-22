@@ -849,16 +849,11 @@ public:
     llm_graph_input_attn_kv_iswa * get_attn() const { return inp_attn.get(); }
     llm_graph_input_rs           * get_recr() const { return inp_rs.get(); }
 
-    // distance from the token to the cell: a dense input for a small table (extent for the empty, future and more distant
-    //   cells), else computed on the device from the inputs below, clamped to [0, extent] (the unseen cells are masked)
-    ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
-    ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
-
-    // inputs of a computed table: the positions of the tokens and, per stream, of the cells (-1 for those the stream's
-    //   sequence does not see); nullptr for a dense one
-    ggml_tensor * self_rel_q_pos      = nullptr; // F32 [n_batch/n_stream, 1, 1, n_stream]
-    ggml_tensor * self_rel_kv_pos     = nullptr; // F32 [n_kv,     1, 1, n_stream]
-    ggml_tensor * self_rel_kv_pos_swa = nullptr; // F32 [n_kv_swa, 1, 1, n_stream]
+    // the positions of the tokens and, per stream, of the cells (-1 for those the sequence of the stream does not see),
+    //   from which the attention builds the distances of its per-head mask (ggml_rel_pos_mask)
+    ggml_tensor * self_rel_q_pos      = nullptr; // I32 [n_batch/n_stream, 1, 1, n_stream]
+    ggml_tensor * self_rel_kv_pos     = nullptr; // I32 [n_kv,     1, 1, n_stream]
+    ggml_tensor * self_rel_kv_pos_swa = nullptr; // I32 [n_kv_swa, 1, 1, n_stream]
 
     const uint32_t extent;
     const uint32_t extent_swa;
@@ -1671,17 +1666,19 @@ struct llm_graph_context {
             uint32_t extent,
             uint32_t extent_swa) const;
 
-    // kq_b is added to the KQ mask, after the KQ scale
+    // the bias of each head at each distance from the cell to the token, minus the sink logit of the token, is added to
+    //   the KQ mask, after the KQ scale (ggml_rel_pos_mask); a distance beyond the table takes a zero bias
     ggml_tensor * build_attn(
             llm_graph_input_mem_hybrid_iswa_rel * inp,
             ggml_tensor * wo,
             ggml_tensor * wo_b,
             ggml_tensor * wo_s,
-            ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
-            ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
-            ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
-            ggml_tensor * kq_b,  // [n_kv, n_tokens/n_stream, n_head_q, n_stream]
-            ggml_tensor * sinks, // [n_head_q]
+            ggml_tensor * q_cur,       // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * k_cur,       // [n_embd_head_k, n_head_k, n_tokens]
+            ggml_tensor * v_cur,       // [n_embd_head_v, n_head_v, n_tokens]
+            ggml_tensor * table,       // [n_head_q, n_extent, n_tokens], any strides
+            ggml_tensor * table_sinks, // [n_head_q, n_tokens] or nullptr: subtracted from the bias
+            ggml_tensor * sinks,       // [n_head_q]
                   float   kq_scale,
                     int   il) const;
 

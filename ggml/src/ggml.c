@@ -1102,6 +1102,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "PAGE_TOP_K",
     "PAGE_STATS",
     "MLA_UP",
+    "REL_POS_MASK",
 
     "UNARY",
 
@@ -1119,7 +1120,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1220,6 +1221,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "page_top_k(q, stats, pmask)",
     "page_stats(k, ps, upd)",
     "mla_up(w, c, pe)",
+    "rel_pos_mask(table, kv_pos, q_pos, mask, sinks)",
 
     "unary(x)",
 
@@ -1237,7 +1239,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6865,6 +6867,39 @@ struct ggml_tensor * ggml_mla_up(
     result->src[0] = w;
     result->src[1] = c;
     result->src[2] = pe;
+
+    return result;
+}
+
+// ggml_rel_pos_mask
+
+struct ggml_tensor * ggml_rel_pos_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * table,
+        struct ggml_tensor  * kv_pos,
+        struct ggml_tensor  * q_pos,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * sinks,
+        enum ggml_type        type) {
+    GGML_ASSERT(table->type == GGML_TYPE_F32 && table->ne[3] == 1);
+    GGML_ASSERT(kv_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(kv_pos) && kv_pos->ne[1] == 1 && kv_pos->ne[2] == 1);
+    GGML_ASSERT(q_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(q_pos) && q_pos->ne[1] == 1 && q_pos->ne[2] == 1);
+    GGML_ASSERT(kv_pos->ne[3] == q_pos->ne[3]);
+    GGML_ASSERT(table->ne[2] == q_pos->ne[0]*q_pos->ne[3]);
+    GGML_ASSERT((mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32) && mask->ne[0] == kv_pos->ne[0] &&
+        mask->ne[1] == q_pos->ne[0] && mask->ne[2] == 1 && mask->ne[3] == q_pos->ne[3]);
+    GGML_ASSERT(sinks == NULL || (sinks->type == GGML_TYPE_F32 && sinks->ne[0] == table->ne[0] &&
+        sinks->ne[1] == table->ne[2] && sinks->ne[2] == 1 && sinks->ne[3] == 1));
+    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, kv_pos->ne[0], q_pos->ne[0], table->ne[0], q_pos->ne[3]);
+
+    result->op     = GGML_OP_REL_POS_MASK;
+    result->src[0] = table;
+    result->src[1] = kv_pos;
+    result->src[2] = q_pos;
+    result->src[3] = mask;
+    result->src[4] = sinks;
 
     return result;
 }

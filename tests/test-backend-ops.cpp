@@ -2750,6 +2750,95 @@ struct test_kq_mask : public test_case {
     }
 };
 
+// GGML_OP_REL_POS_MASK: the per-head mask of a relative-position bias (Inkling 2), the table as one batch builds it (a
+//   permuted view of a product, heads outermost) or contiguous, the sinks subtracted or not
+struct test_rel_pos_mask : public test_case {
+    const ggml_type type;
+    const ggml_type type_mask;
+    const int64_t n_head;
+    const int64_t n_ext;
+    const int64_t n_kv;
+    const int64_t n_tps;
+    const int64_t n_stream;
+    const bool permuted;
+    const bool with_sinks;
+
+    std::string vars() override {
+        return VARS_TO_STR9(type, type_mask, n_head, n_ext, n_kv, n_tps, n_stream, permuted, with_sinks);
+    }
+
+    test_rel_pos_mask(ggml_type type = GGML_TYPE_F16, ggml_type type_mask = GGML_TYPE_F16, int64_t n_head = 6,
+            int64_t n_ext = 64, int64_t n_kv = 256, int64_t n_tps = 16, int64_t n_stream = 1, bool permuted = true,
+            bool with_sinks = true)
+        : type(type), type_mask(type_mask), n_head(n_head), n_ext(n_ext), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream),
+          permuted(permuted), with_sinks(with_sinks) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_tokens = n_tps*n_stream;
+        ggml_tensor * table;
+        if (permuted) {
+            ggml_tensor * prod = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_ext, n_tokens, n_head);
+            ggml_set_name(prod, "prod");
+            table = ggml_permute(ctx, prod, 1, 2, 0, 3);
+        } else {
+            table = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_head, n_ext, n_tokens);
+            ggml_set_name(table, "table");
+        }
+
+        ggml_tensor * kv_pos = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_kv, 1, 1, n_stream);
+        ggml_set_name(kv_pos, "kv_pos");
+
+        ggml_tensor * q_pos = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_tps, 1, 1, n_stream);
+        ggml_set_name(q_pos, "q_pos");
+
+        ggml_tensor * mask = ggml_new_tensor_4d(ctx, type_mask, n_kv, n_tps, 1, n_stream);
+        ggml_set_name(mask, "mask");
+
+        ggml_tensor * sinks = nullptr;
+        if (with_sinks) {
+            sinks = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, n_tokens);
+            ggml_set_name(sinks, "sinks");
+        }
+
+        ggml_tensor * out = ggml_rel_pos_mask(ctx, table, kv_pos, q_pos, mask, sinks, type);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(42);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "kv_pos") == 0) {
+                // positions 0..n_kv-1 in a shuffled cell order, some cells the stream does not see: distances inside and
+                //   beyond the table, and negative ones (future cells)
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t s = 0; s < n_stream; ++s) {
+                    int32_t * row = data.data() + s*n_kv;
+                    for (int64_t j = 0; j < n_kv; ++j) {
+                        row[j] = (int32_t) j;
+                    }
+                    std::shuffle(row, row + n_kv, rng);
+                    for (int64_t j = 0; j < n_kv; j += 7) {
+                        row[(j + s) % n_kv] = -1;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "q_pos") == 0) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t s = 0; s < n_stream; ++s) {
+                    for (int64_t i = 0; i < n_tps; ++i) {
+                        data[s*n_tps + i] = i % 3 == 0 ? (int32_t) (rng() % n_kv) : (int32_t) (n_kv - n_tps + i);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t); // finite values, the mask too
+            }
+        }
+    }
+};
+
 // GGML_OP_KQ_MASK of ggml_kq_mask_prefix
 struct test_kq_mask_prefix : public test_case {
     const ggml_type type;
@@ -14880,6 +14969,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
         test_cases.emplace_back(new test_kq_mask(type, 512, 64, 1));
+        for (ggml_type type_mask : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+            for (bool permuted : { true, false }) {
+                for (bool with_sinks : { true, false }) {
+                    test_cases.emplace_back(new test_rel_pos_mask(type, type_mask, 6, 64, 256, 16, 1, permuted, with_sinks));
+                }
+            }
+            test_cases.emplace_back(new test_rel_pos_mask(type, type_mask, 6, 1024, 2048, 1, 1, false, true));  // one token
+            test_cases.emplace_back(new test_rel_pos_mask(type, type_mask, 4, 100, 300, 70, 2, true, true));    // 2 streams
+            test_cases.emplace_back(new test_rel_pos_mask(type, type_mask, 3, 64, 511, 65, 1, true, false));    // odd n_kv
+        }
         test_cases.emplace_back(new test_kq_mask(type, 1000, 37, 2));
         test_cases.emplace_back(new test_kq_mask(type, 1000, 37, 2, GGML_KQ_MASK_SWA_STANDARD,  128));
         test_cases.emplace_back(new test_kq_mask(type, 777,  65, 1, GGML_KQ_MASK_SWA_CHUNKED,   64));

@@ -441,45 +441,30 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         cb(Vcur, "Vcur", il);
         cb(Rcur, "Rcur", il);
 
-        ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
-
-        const int64_t n_stream = (is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3];
-        const int64_t n_kv     = rel_pos->ne[0];
-
-        // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
-        // the slots of a looped layer share its bias table, padded with the zero row once
-        ggml_tensor *& rel_bias = rel_bias_padded[layer.attn_rel_bias];
-        if (rel_bias == nullptr) {
-            rel_bias = ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0);
-        }
-        // table [n_head, n_extent + 1, n_tokens]; for a batch, one product over the heads of all tokens (heads outermost,
-        //   which keeps the slice of each device whole under a split by head)
+        // project r on the bias table, then the attention gathers it by distance into its per-head mask (ggml_rel_pos_mask):
+        //   table [n_head, n_extent, n_tokens], a distance beyond the extent takes a zero bias. For a batch, one product
+        //   over the heads of all tokens (heads outermost, which keeps the slice of each device whole under a split by
+        //   head), read through the permuted view
         ggml_tensor * table;
         if (n_tokens == 1) {
-            table = ggml_mul_mat(ctx0, ggml_reshape_2d(ctx0, Rcur, Rcur->ne[0], n_head), rel_bias);
+            table = ggml_mul_mat(ctx0, ggml_reshape_2d(ctx0, Rcur, Rcur->ne[0], n_head), layer.attn_rel_bias);
             table = ggml_reshape_3d(ctx0, table, n_head, table->ne[1], 1);
         } else {
             ggml_tensor * r = ggml_cont(ctx0, ggml_permute(ctx0, Rcur, 0, 2, 1, 3));
-            table = ggml_mul_mat(ctx0, rel_bias, ggml_reshape_2d(ctx0, r, r->ne[0], n_tokens*n_head));
-            table = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, table, table->ne[0], n_tokens, n_head), 1, 2, 0, 3));
+            table = ggml_mul_mat(ctx0, layer.attn_rel_bias, ggml_reshape_2d(ctx0, r, r->ne[0], n_tokens*n_head));
+            table = ggml_permute(ctx0, ggml_reshape_3d(ctx0, table, table->ne[0], n_tokens, n_head), 1, 2, 0, 3);
         }
+        cb(table, "rel_table", il);
 
-        // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
-        table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, n_head, 1, n_tokens));
-
-        ggml_tensor * kq_b = ggml_get_rows(ctx0, table, rel_pos);
-        kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
-        kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
-        cb(kq_b, "kq_b", il);
-
+        // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink:
+        //   the mask takes the bias minus t, the attention a zero sink
         if (sinks_zero == nullptr || sinks_zero->ne[0] != n_head) {
             sinks_zero = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
         }
-        sinks = sinks_zero;
 
         cur = build_attn(inp,
                 nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il);
+                Qcur, Kcur, Vcur, table, sinks, sinks_zero, 1.0f/sqrtf(n_embd_head), il);
 
         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);

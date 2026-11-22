@@ -3160,6 +3160,21 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_derive_split_state
                 GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
                 split_state = src_ss[0];
             } break;
+            // the per-head mask of a relative-position bias: the table split by head (dim 0) or replicated, the sinks
+            //   likewise, the positions and the KQ mask replicated; the result has the heads in dim 2
+            case GGML_OP_REL_POS_MASK: {
+                GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                    src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+                    GGML_ASSERT(tensor->src[4] == nullptr || split_states_equal(src_ss[0], src_ss[4]));
+                    split_state = src_ss[0];
+                    split_state.axis = GGML_BACKEND_SPLIT_AXIS_2;
+                } else {
+                    GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                    GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                    split_state = src_ss[0];
+                }
+            } break;
             // page statistics, refreshed in place: k [d, n_kv_h, n_kv] and ps [4d, n_kv_h, n_page] split by kv head
             //   (dim 1) or both mirrored, the page list replicated
             case GGML_OP_PAGE_STATS: {

@@ -12929,3 +12929,55 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+// ggml_compute_forward_rel_pos_mask: the rows (token, head, stream) of the result split over the threads
+
+void ggml_compute_forward_rel_pos_mask(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * table  = dst->src[0];
+    const ggml_tensor * kv_pos = dst->src[1];
+    const ggml_tensor * q_pos  = dst->src[2];
+    const ggml_tensor * mask   = dst->src[3];
+    const ggml_tensor * sinks  = dst->src[4];
+
+    const int64_t n_kv   = dst->ne[0];
+    const int64_t n_tps  = dst->ne[1];
+    const int64_t n_head = dst->ne[2];
+    const int64_t n_s    = dst->ne[3];
+    const int64_t n_ext  = table->ne[1];
+
+    const int64_t n_rows = n_tps*n_head*n_s;
+    const int64_t dr     = (n_rows + params->nth - 1)/params->nth;
+    const int64_t r0     = dr*params->ith;
+    const int64_t r1     = std::min(r0 + dr, n_rows);
+
+    const int32_t * kp = (const int32_t *) kv_pos->data;
+    const int32_t * qp = (const int32_t *) q_pos->data;
+
+    for (int64_t r = r0; r < r1; ++r) {
+        const int64_t i = r % n_tps;
+        const int64_t h = (r/n_tps) % n_head;
+        const int64_t s = r/(n_tps*n_head);
+        const int64_t t = i + s*n_tps;
+
+        const int32_t q  = qp[t];
+        const char *  tb = (const char *) table->data + h*table->nb[0] + t*table->nb[2];
+        const float   sk = sinks ? *(const float *) ((const char *) sinks->data + h*sinks->nb[0] + t*sinks->nb[1]) : 0.0f;
+        const char *  mr = (const char *) mask->data + i*mask->nb[1] + s*mask->nb[3];
+        char *        dr_ = (char *) dst->data + i*dst->nb[1] + h*dst->nb[2] + s*dst->nb[3];
+
+        for (int64_t c = 0; c < n_kv; ++c) {
+            const int32_t k = kp[c + s*n_kv];
+            const int64_t d = (int64_t) q - k;
+            const float   b = k >= 0 && d >= 0 && d < n_ext ? *(const float *) (tb + d*table->nb[1]) : 0.0f;
+            const float   m = mask->type == GGML_TYPE_F16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) mr)[c]) : ((const float *) mr)[c];
+            const float   v = (sinks ? b - sk : b) + m;
+            if (dst->type == GGML_TYPE_F16) {
+                ((ggml_fp16_t *) dr_)[c] = GGML_CPU_FP32_TO_FP16(v);
+            } else {
+                ((float *) dr_)[c] = v;
+            }
+        }
+    }
+}

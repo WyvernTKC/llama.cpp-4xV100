@@ -2155,6 +2155,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_mla_up(params, tensor);
             } break;
+        case GGML_OP_REL_POS_MASK:
+            {
+                ggml_compute_forward_rel_pos_mask(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2343,6 +2347,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_PAGE_TOP_K:
         case GGML_OP_PAGE_STATS:
         case GGML_OP_MLA_UP:
+        case GGML_OP_REL_POS_MASK:
             {
                 n_tasks = n_threads;
             } break;

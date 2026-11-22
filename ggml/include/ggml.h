@@ -418,6 +418,7 @@ extern "C" {
         GGML_OP_PAGE_TOP_K,
         GGML_OP_PAGE_STATS,
         GGML_OP_MLA_UP,
+        GGML_OP_REL_POS_MASK,
 
         GGML_OP_UNARY,
 
@@ -2365,6 +2366,24 @@ extern "C" {
             struct ggml_tensor  * w,
             struct ggml_tensor  * c,
             struct ggml_tensor  * pe);
+
+    // The per-head attention mask of a relative-position bias, from positions (Inkling 2):
+    //   table F32 [n_head, n_ext, n_tokens] (any strides): the bias of each head at each distance d < n_ext for each token
+    //   kv_pos I32 [n_kv, 1, 1, n_stream]: the position of each cell (negative: the stream does not see it)
+    //   q_pos  I32 [n_tps, 1, 1, n_stream]: the position of each token, n_tokens = n_tps*n_stream
+    //   mask   F16 or F32 [n_kv, n_tps, 1, n_stream]: the KQ mask
+    //   sinks  F32 [n_head, n_tokens] or NULL: subtracted from the bias (a per-token sink logit folded into the mask)
+    // -> type (F16 or F32) [n_kv, n_tps, n_head, n_stream]:
+    //   result[c, i, h, s] = (b - sinks[h, t]) + mask[c, i, 0, s], t = i + s*n_tps, d = q_pos[i, s] - kv_pos[c, s],
+    //   b = table[h, d, t] for a seen cell at 0 <= d < n_ext, else 0
+    GGML_API struct ggml_tensor * ggml_rel_pos_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * table,
+            struct ggml_tensor  * kv_pos,
+            struct ggml_tensor  * q_pos,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * sinks,
+            enum ggml_type        type);
 
     // Partial attention over a share of the K/V cells, to be combined with other shares: the result gets one more row
     //   after the heads of each token, whose element h is the log-sum-exp of the scaled scores of head h (-INF if all

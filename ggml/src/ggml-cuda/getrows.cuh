@@ -38,9 +38,6 @@ void ggml_cuda_op_get_rows_dot_max(ggml_backend_cuda_context & ctx, const ggml_t
 bool ggml_cuda_can_pair_get_rows_set_rows(const ggml_tensor * get_rows0, const ggml_tensor * set_rows0,
         const ggml_tensor * get_rows1, const ggml_tensor * set_rows1);
 
-// the f16 per-head mask table[h, pos[kv, t], t] + mask[kv, t] of a relative-position bias in one pass (see getrows.cu)
-bool ggml_cuda_should_fuse_rel_pos_mask(const ggml_tensor * get_rows, const ggml_tensor * cont, const ggml_tensor * mask,
-        const ggml_tensor * dst);
-void ggml_cuda_op_rel_pos_mask(ggml_backend_cuda_context & ctx, const ggml_tensor * get_rows, const ggml_tensor * mask,
-        ggml_tensor * dst, const ggml_tensor * sinks = nullptr,
-        const int64_t * table_strides = nullptr);
+// GGML_OP_REL_POS_MASK: the per-head attention mask of a relative-position bias from positions (see getrows.cu)
+bool ggml_cuda_supports_rel_pos_mask(const ggml_tensor * dst);
+void ggml_cuda_op_rel_pos_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

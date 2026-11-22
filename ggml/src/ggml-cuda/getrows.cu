@@ -1175,94 +1175,109 @@ void ggml_cuda_op_get_rows_dot_max(ggml_backend_cuda_context & ctx, const ggml_t
     CUDA_CHECK(cudaGetLastError());
 }
 
-// The per-head flash attention mask of a relative-position bias (Inkling 2): out[kv, t', h, s] = table(h, pos[kv, t], t) +
-//   mask[kv, t', 0, s], t = t' + s*n_tps, in f16, table(h, d, t) = table[h*sh + d*sd + t*st] (- sinks[h + t*ss2]). The
-//   GET_ROWS, the CONT of its permute, the cast of the mask, the ADD and the cast of the sum in one pass, without the f32
-//   bias [n_kv, n_tokens, n_head] in memory. A thread takes kv_per_thread cells of a token for every head: the distance
-//   and the mask are read once.
-template <int kv_per_thread>
-static __global__ void rel_pos_mask_f16(const float * __restrict__ table, const int32_t * __restrict__ pos,
-        const half * __restrict__ mask, half * __restrict__ dst, const int n_kv, const int n_tps, const int n_head,
-        const int64_t sh, const int64_t sd, const int64_t st, const int64_t sp1, const int64_t sm1, const int64_t sm3,
-        const float * __restrict__ sinks, const int64_t ss2, const int heads_per_block) {
+// GGML_OP_REL_POS_MASK, the per-head attention mask of a relative-position bias (Inkling 2): dst[c, i, h, s] =
+//   (b - sinks[h, t]) + mask[c, i, 0, s], t = i + s*n_tps, d = q_pos[t] - kv_pos[c + s*n_kv], b = table[h*sh + d*sd + t*st]
+//   for a seen cell at 0 <= d < n_ext, else 0. A thread takes kv_per_thread cells of a token for heads [h0, h1): the
+//   distance and the mask are read once for all of them.
+template <int kv_per_thread, typename T_m, typename T_d>
+static __global__ void rel_pos_mask_kernel(const float * __restrict__ table, const int32_t * __restrict__ kv_pos,
+        const int32_t * __restrict__ q_pos, const T_m * __restrict__ mask, T_d * __restrict__ dst,
+        const int n_kv, const int n_tps, const int n_head, const int n_ext,
+        const int64_t sh, const int64_t sd, const int64_t st, const int64_t sm1, const int64_t sm3,
+        const float * __restrict__ sinks, const int64_t ssh, const int64_t sst, const int heads_per_block) {
     const int kv0 = (blockIdx.x*blockDim.x + threadIdx.x)*kv_per_thread;
     if (kv0 >= n_kv) {
         return;
     }
     const int n_hb = (n_head + heads_per_block - 1)/heads_per_block;
-    const int tq = blockIdx.y;        // token in its stream
+    const int i  = blockIdx.y;        // token in its stream
     const int s  = blockIdx.z / n_hb; // stream
     const int h0 = (blockIdx.z % n_hb)*heads_per_block;
     const int h1 = min(n_head, h0 + heads_per_block);
-    const int t  = tq + s*n_tps;
+    const int t  = i + s*n_tps;
+    const int q  = q_pos[t];
 
     int   d[kv_per_thread];
     float m[kv_per_thread];
 #pragma unroll
     for (int k = 0; k < kv_per_thread; ++k) {
-        d[k] = pos[kv0 + k + t*sp1];
-        m[k] = __half2float(mask[kv0 + k + tq*sm1 + s*sm3]);
+        const int kp = kv_pos[kv0 + k + (int64_t) s*n_kv];
+        d[k] = kp >= 0 && q - kp >= 0 && q - kp < n_ext ? q - kp : -1;
+        m[k] = ggml_cuda_cast<float>(mask[kv0 + k + i*sm1 + s*sm3]);
     }
     const float * tt = table + t*st;
-    half * out = dst + kv0 + (int64_t) n_kv*(tq + (int64_t) n_tps*n_head*s);
+    T_d * out = dst + kv0 + (int64_t) n_kv*(i + (int64_t) n_tps*n_head*s);
     for (int h = h0; h < h1; ++h) {
-        const float sk = sinks ? sinks[h + t*ss2] : 0.0f;
-        half o[kv_per_thread];
+        const float sk = sinks ? sinks[h*ssh + t*sst] : 0.0f;
+        T_d o[kv_per_thread];
 #pragma unroll
         for (int k = 0; k < kv_per_thread; ++k) {
-            const float b = sinks ? tt[h*sh + d[k]*sd] - sk : tt[h*sh + d[k]*sd];
-            o[k] = __float2half(b + m[k]);
+            const float b = d[k] >= 0 ? tt[h*sh + d[k]*sd] : 0.0f;
+            o[k] = ggml_cuda_cast<T_d>((sinks ? b - sk : b) + m[k]);
         }
-        half * oh = out + (int64_t) n_kv*n_tps*h;
-        if constexpr (kv_per_thread == 2) {
-            *(half2 *) oh = make_half2(o[0], o[1]);
-        } else {
+        T_d * oh = out + (int64_t) n_kv*n_tps*h;
 #pragma unroll
-            for (int k = 0; k < kv_per_thread; ++k) {
-                oh[k] = o[k];
-            }
+        for (int k = 0; k < kv_per_thread; ++k) {
+            oh[k] = o[k];
         }
     }
 }
 
-bool ggml_cuda_should_fuse_rel_pos_mask(const ggml_tensor * get_rows, const ggml_tensor * cont, const ggml_tensor * mask,
-        const ggml_tensor * dst) {
-    const ggml_tensor * table = get_rows->src[0];
-    const ggml_tensor * pos   = get_rows->src[1];
-    return table->type == GGML_TYPE_F32 && table->nb[0] == sizeof(float) && pos->type == GGML_TYPE_I32 && ggml_is_contiguous(pos) &&
-        mask->type == GGML_TYPE_F16 && mask->nb[0] == sizeof(half) && mask->ne[2] == 1 && dst->type == GGML_TYPE_F16 &&
-        ggml_is_contiguous(dst) && cont->type == GGML_TYPE_F32 && ggml_are_same_shape(cont, dst) &&
-        get_rows->ne[0] == table->ne[0] && pos->ne[0] == dst->ne[0] && mask->ne[0] == dst->ne[0] && mask->ne[1] == dst->ne[1] &&
-        mask->ne[3] == dst->ne[3] && dst->ne[2] == table->ne[0] && pos->ne[1] == table->ne[2] &&
-        pos->ne[1] == dst->ne[1]*dst->ne[3] && dst->ne[1] <= 65535 && dst->ne[2]*dst->ne[3] <= 65535;
-}
+template <typename T_m, typename T_d>
+static void rel_pos_mask_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    const ggml_tensor * table  = dst->src[0];
+    const ggml_tensor * kv_pos = dst->src[1];
+    const ggml_tensor * q_pos  = dst->src[2];
+    const ggml_tensor * mask   = dst->src[3];
+    const ggml_tensor * sinks  = dst->src[4];
 
-void ggml_cuda_op_rel_pos_mask(ggml_backend_cuda_context & ctx, const ggml_tensor * get_rows, const ggml_tensor * mask,
-        ggml_tensor * dst, const ggml_tensor * sinks, const int64_t * table_strides) {
-    const ggml_tensor * table = get_rows->src[0];
-    const ggml_tensor * pos   = get_rows->src[1];
     const int n_kv   = dst->ne[0];
     const int n_tps  = dst->ne[1];
     const int n_head = dst->ne[2];
     const int n_s    = dst->ne[3];
-    // the strides of the table in floats for (head, distance, token): its own, or those of the view it is a copy of
-    const int64_t sh = table_strides ? table_strides[0] : 1;
-    const int64_t sd = table_strides ? table_strides[1] : (int64_t) (table->nb[1]/sizeof(float));
-    const int64_t st = table_strides ? table_strides[2] : (int64_t) (table->nb[2]/sizeof(float));
+    const int n_ext  = table->ne[1];
+    const size_t tf  = sizeof(float);
+    const size_t tm  = sizeof(T_m);
+
     const float * sk  = sinks ? (const float *) sinks->data : nullptr;
-    const int64_t ss2 = sinks ? (int64_t) (sinks->nb[2]/sizeof(float)) : 0;
+    const int64_t ssh = sinks ? (int64_t) (sinks->nb[0]/tf) : 0;
+    const int64_t sst = sinks ? (int64_t) (sinks->nb[1]/tf) : 0;
+
     const dim3 block(128, 1, 1);
     // a prompt: two cells per thread and every head; a token or a few: one cell and one head per thread, for more blocks
-    if (n_kv % 2 == 0 && n_tps*n_s >= 64) {
-        const dim3 grid((n_kv/2 + block.x - 1)/block.x, n_tps, n_s);
-        rel_pos_mask_f16<2><<<grid, block, 0, ctx.stream()>>>((const float *) table->data, (const int32_t *) pos->data,
-            (const half *) mask->data, (half *) dst->data, n_kv, n_tps, n_head, sh, sd, st, pos->nb[1]/sizeof(int32_t),
-            mask->nb[1]/sizeof(half), mask->nb[3]/sizeof(half), sk, ss2, n_head);
+    const bool many = n_kv % 2 == 0 && n_tps*n_s >= 64;
+    const int  kpt  = many ? 2 : 1;
+    const int  hpb  = many ? n_head : 1;
+    const dim3 grid((n_kv/kpt + block.x - 1)/block.x, n_tps, n_s*((n_head + hpb - 1)/hpb));
+    auto launch = [&](auto kernel) {
+        kernel<<<grid, block, 0, ctx.stream()>>>((const float *) table->data, (const int32_t *) kv_pos->data,
+            (const int32_t *) q_pos->data, (const T_m *) mask->data, (T_d *) dst->data, n_kv, n_tps, n_head, n_ext,
+            (int64_t) (table->nb[0]/tf), (int64_t) (table->nb[1]/tf), (int64_t) (table->nb[2]/tf),
+            (int64_t) (mask->nb[1]/tm), (int64_t) (mask->nb[3]/tm), sk, ssh, sst, hpb);
+    };
+    if (many) {
+        launch(rel_pos_mask_kernel<2, T_m, T_d>);
     } else {
-        const dim3 grid((n_kv + block.x - 1)/block.x, n_tps, n_s*n_head);
-        rel_pos_mask_f16<1><<<grid, block, 0, ctx.stream()>>>((const float *) table->data, (const int32_t *) pos->data,
-            (const half *) mask->data, (half *) dst->data, n_kv, n_tps, n_head, sh, sd, st, pos->nb[1]/sizeof(int32_t),
-            mask->nb[1]/sizeof(half), mask->nb[3]/sizeof(half), sk, ss2, 1);
+        launch(rel_pos_mask_kernel<1, T_m, T_d>);
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+bool ggml_cuda_supports_rel_pos_mask(const ggml_tensor * dst) {
+    const ggml_tensor * table = dst->src[0];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+    return table->nb[0] % sizeof(float) == 0 && table->nb[1] % sizeof(float) == 0 && table->nb[2] % sizeof(float) == 0 &&
+        mask->nb[0] == ggml_type_size(mask->type) && ggml_is_contiguous(dst) &&
+        (sinks == nullptr || (sinks->nb[0] % sizeof(float) == 0 && sinks->nb[1] % sizeof(float) == 0)) &&
+        dst->ne[1] <= 65535 && dst->ne[2]*dst->ne[3] <= 65535;
+}
+
+void ggml_cuda_op_rel_pos_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_type tm = dst->src[3]->type;
+    if (tm == GGML_TYPE_F16) {
+        dst->type == GGML_TYPE_F16 ? rel_pos_mask_cuda<half, half>(ctx, dst) : rel_pos_mask_cuda<half, float>(ctx, dst);
+    } else {
+        dst->type == GGML_TYPE_F16 ? rel_pos_mask_cuda<float, half>(ctx, dst) : rel_pos_mask_cuda<float, float>(ctx, dst);
+    }
 }
