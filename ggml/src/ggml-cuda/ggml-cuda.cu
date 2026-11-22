@@ -6997,6 +6997,28 @@ static int ggml_cuda_try_fuse_rel_pos_mask(ggml_backend_cuda_context * cuda_ctx,
     static const bool no_sink  = getenv("GGML_CUDA_NO_REL_POS_SINK_FOLD") != nullptr;
     const ggml_tensor * sub   = nullptr;
     const ggml_tensor * sinks = nullptr;
+    // a prompt's table is the CONT of a permuted view (heads outermost in the product): the kernel reads the view itself
+    //   (GGML_CUDA_NO_REL_POS_TABLE_VIEW=1 turns that off)
+    static const bool no_view = getenv("GGML_CUDA_NO_REL_POS_TABLE_VIEW") != nullptr;
+    const ggml_tensor * tview = nullptr;
+    int n_pre = 0;
+    if (cgraph->nodes[i]->op == GGML_OP_CONT) {
+        const ggml_tensor * tc = cgraph->nodes[i];
+        const ggml_tensor * pv = tc->src[0];
+        int j = i + 1;
+        while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j]) && j <= i + 3) {
+            j++;
+        }
+        if (no_view || disabled || j >= cgraph->n_nodes || cgraph->nodes[j]->op != GGML_OP_SUB || cgraph->nodes[j]->src[0] != tc ||
+                pv == nullptr || pv->op != GGML_OP_PERMUTE || pv->type != GGML_TYPE_F32 || tc->type != GGML_TYPE_F32 ||
+                !ggml_are_same_shape(pv, tc) || (tc->flags & GGML_TENSOR_FLAG_OUTPUT) || !(tc->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+                ggml_cuda_graph_use_count(cgraph, tc) != 1 || tc->ne[3] != 1) {
+            return 0;
+        }
+        tview = pv;
+        n_pre = j - i;
+        i = j;
+    }
     if (cgraph->nodes[i]->op == GGML_OP_SUB) {
         sub = cgraph->nodes[i];
         const ggml_tensor * tb = sub->src[0];
@@ -7041,7 +7063,7 @@ static int ggml_cuda_try_fuse_rel_pos_mask(ggml_backend_cuda_context * cuda_ctx,
     }
     // the index and the mask are read while the output is written; the f32 cast of the mask may have more readers (a
     //   ggml_cast is its own src[1], which the graph counts as one more use)
-    const ggml_tensor * table = sub ? sub->src[0] : gr->src[0];
+    const ggml_tensor * table = tview ? tview : sub ? sub->src[0] : gr->src[0];
     const bool mcpy_runs = ggml_cuda_graph_use_count(cgraph, mcpy) - (mcpy->src[1] == mcpy ? 1 : 0) != 1;
     if (ggml_cuda_tensors_overlap(out, gr->src[1]) || ggml_cuda_tensors_overlap(out, mask) ||
             (mcpy_runs && ggml_cuda_tensors_overlap(out, mcpy)) || (sinks && ggml_cuda_tensors_overlap(out, sinks))) {
@@ -7050,19 +7072,27 @@ static int ggml_cuda_try_fuse_rel_pos_mask(ggml_backend_cuda_context * cuda_ctx,
     // ggml-alloc may place the output over the table, which the elided GET_ROWS read last: the kernel then reads a copy
     ggml_cuda_pool_alloc<char> table_copy(cuda_ctx->pool());
     ggml_tensor table_staged = *table;
-    if (ggml_cuda_tensors_overlap(out, table)) {
+    if (tview) {
+        // the view's own memory: the product it permutes, read with the view's strides
+        const ggml_tensor * base = tview->view_src ? tview->view_src : tview;
+        if (ggml_cuda_tensors_overlap(out, base)) {
+            return 0;
+        }
+    } else if (ggml_cuda_tensors_overlap(out, table)) {
         table_copy.alloc(ggml_nbytes(table));
         CUDA_CHECK(cudaMemcpyAsync(table_copy.get(), table->data, ggml_nbytes(table), cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
         table_staged.data = table_copy.get();
     }
     ggml_tensor gr_staged = *gr;
     gr_staged.src[0] = &table_staged;
-    ggml_cuda_op_rel_pos_mask(*cuda_ctx, &gr_staged, mask, out, sinks);
+    // (head, distance, token) strides of the table: the CONT's dims 0, 1, 2 are the view's
+    const int64_t tstr[3] = { (int64_t) (table->nb[0]/sizeof(float)), (int64_t) (table->nb[1]/sizeof(float)), (int64_t) (table->nb[2]/sizeof(float)) };
+    ggml_cuda_op_rel_pos_mask(*cuda_ctx, &gr_staged, mask, out, sinks, tview ? tstr : nullptr);
     // a cast with other readers runs after the kernel, as ggml-alloc may have put it over the inputs of the elided GET_ROWS
     if (mcpy_runs) {
         ggml_cuda_cpy(*cuda_ctx, mcpy->src[0], mcpy->src[1]);
     }
-    return sub ? 7 : 6;
+    return n_pre + (sub ? 7 : 6);
 }
 
 // A row clipped to an L2 norm of at most t (Inkling 2): [MUL(x, s)], SQR, SUM_ROWS, SQRT, SCALE, FILL(t), DIV, CLAMP, MUL
@@ -8958,7 +8988,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    if (node->op == GGML_OP_GET_ROWS || node->op == GGML_OP_SUB) {
+    if (node->op == GGML_OP_GET_ROWS || node->op == GGML_OP_SUB || node->op == GGML_OP_CONT) {
         const int n_skip = ggml_cuda_try_fuse_rel_pos_mask(cuda_ctx, cgraph, i);
         if (n_skip > 0) {
             return n_skip;

@@ -42,4 +42,5 @@ bool ggml_cuda_can_pair_get_rows_set_rows(const ggml_tensor * get_rows0, const g
 bool ggml_cuda_should_fuse_rel_pos_mask(const ggml_tensor * get_rows, const ggml_tensor * cont, const ggml_tensor * mask,
         const ggml_tensor * dst);
 void ggml_cuda_op_rel_pos_mask(ggml_backend_cuda_context & ctx, const ggml_tensor * get_rows, const ggml_tensor * mask,
-        ggml_tensor * dst, const ggml_tensor * sinks = nullptr);
+        ggml_tensor * dst, const ggml_tensor * sinks = nullptr,
+        const int64_t * table_strides = nullptr);
