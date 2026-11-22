@@ -2768,18 +2768,48 @@ void ggml_cuda_mul_mat_small_k(ggml_backend_cuda_context & ctx, const ggml_tenso
 // One token through a few f32 rows of a long K whose input is the concatenation of two vectors (the down projection of
 //   an Inkling 2 loop gate, W [2*n_embd, rank] by [rms_norm(cur); rms_norm(message)]): one block of 1024 threads per row
 //   reads the halves in place, so the CONCAT does not run. ggml_cuda_mul_mat_vec_f_concat.
+// norm_a: a is the raw vector of a weightless RMS norm (eps), each block sums its squares and scales it as it reads it
+template <bool norm_a>
 static __global__ void __launch_bounds__(1024) mul_mat_vec_f_concat(const float * __restrict__ x, const float * __restrict__ a,
-        const float * __restrict__ b, float * __restrict__ dst, const int na4, const int k4, const int64_t sx1) {
+        const float * __restrict__ b, float * __restrict__ dst, const int na4, const int k4, const int64_t sx1, const float eps) {
     const int      r  = blockIdx.x;
     const float4 * x4 = (const float4 *) (x + (int64_t) r*sx1);
+    __shared__ float red[32];
+    float ra = 1.0f;
+    if constexpr (norm_a) {
+        float ss = 0.0f;
+        for (int c = threadIdx.x; c < na4; c += blockDim.x) {
+            const float4 v = ((const float4 *) a)[c];
+            ss += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
+        }
+        ss = warp_reduce_sum(ss);
+        if (threadIdx.x % WARP_SIZE == 0) {
+            red[threadIdx.x / WARP_SIZE] = ss;
+        }
+        __syncthreads();
+        ss = threadIdx.x % WARP_SIZE < (int) blockDim.x/WARP_SIZE ? red[threadIdx.x % WARP_SIZE] : 0.0f;
+        ss = warp_reduce_sum(ss);
+        ra = rsqrtf(ss/(4*na4) + eps);
+        __syncthreads(); // red is reused below
+    }
     float s = 0.0f;
     for (int c = threadIdx.x; c < k4; c += blockDim.x) {
         const float4 xv = x4[c];
-        const float4 yv = c < na4 ? ((const float4 *) a)[c] : ((const float4 *) b)[c - na4];
+        float4 yv;
+        if (c < na4) {
+            yv = ((const float4 *) a)[c];
+            if constexpr (norm_a) {
+                yv.x *= ra;
+                yv.y *= ra;
+                yv.z *= ra;
+                yv.w *= ra;
+            }
+        } else {
+            yv = ((const float4 *) b)[c - na4];
+        }
         s += xv.x*yv.x + xv.y*yv.y + xv.z*yv.z + xv.w*yv.w;
     }
     s = warp_reduce_sum(s);
-    __shared__ float red[32];
     if (threadIdx.x % WARP_SIZE == 0) {
         red[threadIdx.x / WARP_SIZE] = s;
     }
@@ -2804,11 +2834,18 @@ bool ggml_cuda_should_use_mul_mat_vec_f_concat(const ggml_tensor * w, const ggml
 }
 
 void ggml_cuda_mul_mat_vec_f_concat(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * a, const ggml_tensor * b,
-        ggml_tensor * dst) {
+        ggml_tensor * dst, const bool norm_a, const float eps) {
     GGML_ASSERT(ggml_cuda_should_use_mul_mat_vec_f_concat(w, a, b, dst));
     const int k4  = (int) w->ne[0]/4;
     const int nth = std::min(1024, (k4 + WARP_SIZE - 1)/WARP_SIZE*WARP_SIZE);
-    mul_mat_vec_f_concat<<<(int) w->ne[1], nth, 0, ctx.stream()>>>((const float *) w->data, (const float *) a->data,
-        (const float *) b->data, (float *) dst->data, (int) a->ne[0]/4, k4, w->nb[1]/sizeof(float));
+    const auto launch = [&](auto kernel) {
+        kernel<<<(int) w->ne[1], nth, 0, ctx.stream()>>>((const float *) w->data, (const float *) a->data,
+            (const float *) b->data, (float *) dst->data, (int) a->ne[0]/4, k4, w->nb[1]/sizeof(float), eps);
+    };
+    if (norm_a) {
+        launch(mul_mat_vec_f_concat<true>);
+    } else {
+        launch(mul_mat_vec_f_concat<false>);
+    }
     CUDA_CHECK(cudaGetLastError());
 }

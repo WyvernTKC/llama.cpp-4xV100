@@ -46,7 +46,7 @@ bool ggml_cuda_mul_mat_vec_f_norm_gated(const ggml_tensor * src0, const ggml_ten
 // one token through f32 rows whose input is CONCAT(a, b, dim 0) of two vectors, the concat not computed
 bool ggml_cuda_should_use_mul_mat_vec_f_concat(const ggml_tensor * w, const ggml_tensor * a, const ggml_tensor * b, const ggml_tensor * dst);
 void ggml_cuda_mul_mat_vec_f_concat(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * a, const ggml_tensor * b,
-        ggml_tensor * dst);
+        ggml_tensor * dst, bool norm_a = false, float eps = 0.0f);
 
 // f32 matrix products with rows of at most MMF_SMALL_K_MAX: one thread per row of src0, which can be a transposed view
 bool ggml_cuda_should_use_mul_mat_small_k(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);

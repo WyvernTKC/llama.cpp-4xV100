@@ -7334,6 +7334,38 @@ static int ggml_cuda_try_fuse_concat_mul_mat_vec(ggml_backend_cuda_context * cud
     return 1;
 }
 
+// The weightless RMS norm of the first half of such a CONCAT, read only there (an Inkling 2 loop gate's rms_norm(cur)): the
+//   matvec norms cur itself (ggml_cuda_mul_mat_vec_f_concat with norm_a), the norm and the CONCAT do not run.
+//   GGML_CUDA_NO_NORM_CONCAT_MATVEC=1 turns it off.
+static int ggml_cuda_try_fuse_norm_concat_mul_mat_vec(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_NORM_CONCAT_MATVEC") != nullptr || getenv("GGML_CUDA_NO_CONCAT_MATVEC") != nullptr;
+    const ggml_tensor * nrm = cgraph->nodes[i];
+    if (disabled || nrm->op != GGML_OP_RMS_NORM || nrm->type != GGML_TYPE_F32 || (nrm->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            ggml_cuda_graph_use_count(cgraph, nrm) != 1) {
+        return 0;
+    }
+    int j = i + 1;
+    while (j < cgraph->n_nodes && j <= i + 4 && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+        j++;
+    }
+    if (j + 1 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * cat = cgraph->nodes[j];
+    ggml_tensor       * mm  = cgraph->nodes[j + 1];
+    const ggml_tensor * src = nrm->src[0];
+    if (cat->op != GGML_OP_CONCAT || cat->src[0] != nrm || ggml_get_op_params_i32(cat, 0) != 0 || (cat->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            ggml_cuda_graph_use_count(cgraph, cat) != 1 || !ggml_is_contiguous(cat) ||
+            mm->op != GGML_OP_MUL_MAT || mm->src[1] != cat || !(mm->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+            src->type != GGML_TYPE_F32 || !ggml_are_same_shape(src, nrm) ||
+            !ggml_cuda_should_use_mul_mat_vec_f_concat(mm->src[0], src, cat->src[1], mm) ||
+            ggml_cuda_tensors_overlap(mm, src) || ggml_cuda_tensors_overlap(mm, cat->src[1]) || cuda_ctx->ar_fold.next == mm) {
+        return 0;
+    }
+    ggml_cuda_mul_mat_vec_f_concat(*cuda_ctx, mm->src[0], src, cat->src[1], mm, true, ggml_get_op_params_f32(nrm, 0));
+    return j + 1 - i;
+}
+
 // The SITU activation of Inkling 2's experts (build_moe_ffn): SCALE, TANH, SCALE of the gate, the SIGMOID of the gate and
 //   its MUL, then SCALE, TANH, SCALE of the up view and the MUL of the two, in one launch (ggml_cuda_op_situ) instead of
 //   eight. GGML_CUDA_NO_SITU_FUSION=1 turns it off.
@@ -9174,6 +9206,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_CONCAT) {
         const int n_skip = ggml_cuda_try_fuse_concat_mul_mat_vec(cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
+        }
+    }
+    if (node->op == GGML_OP_RMS_NORM) {
+        const int n_skip = ggml_cuda_try_fuse_norm_concat_mul_mat_vec(cuda_ctx, cgraph, i);
         if (n_skip > 0) {
             return n_skip;
         }
