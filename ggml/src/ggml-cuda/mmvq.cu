@@ -1716,6 +1716,80 @@ static __global__ void mul_mat_vec_q_short_ar_moe(
     }
 }
 
+// One token, q8_0 rows of 9 to 16 blocks (K 288..512, e.g. the expert down projection of a MoE split 4 ways: mul_mat_vec_q_short
+//   takes 8 blocks a row at most, mul_mat_vec_q keeps a few threads of a block busy on 4 rows each). A warp stages
+//   MMVQ_STAGED_ROWS rows of one matrix, stored one after the other, in shared memory with 16-byte loads (every 8 rows of
+//   q8_0 blocks start on a 16-byte boundary), then 4 lanes sum each row over its blocks lane, lane + 4, ... and the xor
+//   tree of the 4 lanes adds them. y is the q8_1 copy, as for mul_mat_vec_q. Inkling-2-Mini's down projection per device,
+//   2304 x 288 x 8 experts: 13.7 -> 11.6 us in situ (one test-backend-ops run with the experts in L2: 13.3 -> 8.2 us); 16, 32
+//   or 64 rows a block 12.1-12.2 us.
+#define MMVQ_STAGED_ROWS       8
+#define MMVQ_STAGED_MAX_BLOCKS 16
+
+static __global__ void __launch_bounds__(MMVQ_STAGED_ROWS/8*WARP_SIZE) mul_mat_vec_q8_0_staged(
+        const void * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ ids, float * __restrict__ dst,
+        const int nb, const int nrows_x, const uint3 nchannels_y, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
+        const uint32_t stride_channel_dst) {
+    extern __shared__ int4 xs[]; // MMVQ_STAGED_ROWS rows of nb blocks: the blocks of the launch resident at once
+
+    const uint32_t channel   = blockIdx.y;
+    const uint32_t channel_x = ids ? ids[channel] : channel;
+    const uint32_t channel_y = ids ? fastmodulo(channel, nchannels_y) : channel;
+
+    const int row0 = blockIdx.x*MMVQ_STAGED_ROWS;
+    const int nr   = min(MMVQ_STAGED_ROWS, nrows_x - row0); // a multiple of 8
+    const int tid  = threadIdx.y*WARP_SIZE + threadIdx.x;
+
+    const int4 * src = (const int4 *) ((const block_q8_0 *) vx + (int64_t) channel_x*stride_channel_x + (int64_t) row0*nb);
+    const int    n16 = nr*nb*(int) sizeof(block_q8_0)/(int) sizeof(int4);
+    for (int i = tid; i < n16; i += MMVQ_STAGED_ROWS/8*WARP_SIZE) {
+        xs[i] = src[i];
+    }
+    __syncthreads();
+
+    // warp w takes rows 8w..8w+7 of the chunk, 4 lanes a row
+    const int r   = threadIdx.y*8 + threadIdx.x/4;
+    const int sub = threadIdx.x % 4;
+    const block_q8_1 * y  = (const block_q8_1 *) vy + channel_y*stride_channel_y;
+    const block_q8_0 * xr = (const block_q8_0 *) xs + r*nb;
+
+    float sum = 0.0f;
+    if (r < nr) {
+        for (int kb = sub; kb < nb; kb += 4) {
+            int v[QI8_0];
+            int u[QI8_0];
+#pragma unroll
+            for (int l = 0; l < QI8_0; ++l) {
+                v[l] = get_int_b2(xr[kb].qs, l);
+                u[l] = get_int_b4(y[kb].qs, l);
+            }
+            sum += vec_dot_q8_0_q8_1_impl<float, QI8_0>(v, u, __half2float(xr[kb].d), __low2float(y[kb].ds));
+        }
+    }
+    sum = warp_reduce_sum<4>(sum);
+    if (sub == 0 && r < nr) {
+        dst[channel*stride_channel_dst + row0 + r] = sum;
+    }
+}
+
+// whether mul_mat_vec_q8_0_staged takes the matmul: one token, rows of 9..16 q8_0 blocks one after the other, a multiple of
+//   8 of them, the matrices 16-byte aligned, no fused op and no fold offered; measured on Volta only.
+//   GGML_CUDA_NO_MMVQ_STAGED=1 off.
+template <ggml_type type>
+static bool mmvq_staged(const mmvq_parameter_table_id table_id, const void * vx, const int ncols_x, const int nrows_x,
+        const int stride_row_x, const int stride_channel_x, const int nsamples_dst, const bool has_ids, const int nchannels_dst,
+        const ggml_cuda_mm_fusion_args_launch & fusion) {
+    static const bool disabled = getenv("GGML_CUDA_NO_MMVQ_STAGED") != nullptr;
+    const int nb = ncols_x / QK8_0;
+    return type == GGML_TYPE_Q8_0 && !disabled && table_id == MMVQ_PARAMETERS_VOLTA && nsamples_dst == 1 && nb >= 9 &&
+        nb <= MMVQ_STAGED_MAX_BLOCKS && stride_row_x == nb && nrows_x % 8 == 0 && (uintptr_t) vx % 16 == 0 &&
+        ((int64_t) stride_channel_x*(int64_t) sizeof(block_q8_0)) % 16 == 0 && (has_ids || nchannels_dst == 1) &&
+        fusion.x_bias == nullptr && fusion.gate == nullptr && fusion.gate_bias == nullptr && fusion.x_scale == nullptr &&
+        fusion.gate_scale == nullptr && fusion.gdn_beta == nullptr && fusion.gdn_x == nullptr && fusion.sib_x == nullptr &&
+        fusion.sib2_x == nullptr && fusion.x_sigmoid == nullptr && fusion.shared_up == nullptr && fusion.conv.w == nullptr &&
+        fusion.ar_pushed == nullptr && !fusion.ar_moe && fusion.q8.dst == nullptr;
+}
+
 // the lanes of a row in the one-token kernel for short rows (MMVQ_SHORT_LANES, or a warp for K up to MMVQ_SHORT_MAX_LANES
 //   lanes), 0 when it does not take the matmul; the same rule for all of its callers
 template <ggml_type type>
@@ -2517,6 +2591,19 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
                     stream);
             };
+
+            if constexpr (type == GGML_TYPE_Q8_0) {
+                if (mmvq_staged<type>(table_id, vx, ncols_x, nrows_x, stride_row_x, stride_channel_x, nsamples_dst, has_ids,
+                        nchannels_dst, fusion)) {
+                    const dim3   block_nums((nrows_x + MMVQ_STAGED_ROWS - 1)/MMVQ_STAGED_ROWS, nchannels_dst, 1);
+                    const dim3   block_dims(WARP_SIZE, MMVQ_STAGED_ROWS/8, 1);
+                    const size_t smem = MMVQ_STAGED_ROWS*(ncols_x/QK8_0)*sizeof(block_q8_0);
+                    mul_mat_vec_q8_0_staged<<<block_nums, block_dims, smem, stream>>>(vx, vy, ids, dst, ncols_x/QK8_0, nrows_x,
+                        nchannels_y_fd, stride_channel_x, stride_channel_y, stride_channel_dst);
+                    CUDA_CHECK(cudaGetLastError());
+                    break;
+                }
+            }
 
             if (const int short_lanes = mmvq_short_lanes<type>(table_id, ncols_x, c_ncols_dst, nsamples_dst, has_ids, fusion)) {
                 mul_mat_vec_q_short_launch<type, false, sign_dp4a>(short_lanes, vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd, stride_row_x,

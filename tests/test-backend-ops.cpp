@@ -14777,6 +14777,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
 
+    // one token, q8_0 rows of 9 to 16 blocks (CUDA on Volta: mul_mat_vec_q8_0_staged), experts and dense, a last chunk of
+    //   8 rows
+    for (int k : {288, 352, 512}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 16, 4, false, 64, 1, k));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 72, 1, k, {1, 1}, {1, 1}));
+    }
+
     // unary ops
     // TODO: add GGML_UNARY_OP_SOFTPLUS test that is sensitive to using `log1p(exp(x))` vs `log(exp(x) + 1)`
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
@@ -18861,6 +18868,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Inkling-2-Mini's expert down projection of one token per device under -sm tensor (K 288 = 9 q8_0 blocks)
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 8, false, 2304, 1, 288));
 
     // LongCat-Next one-token MLA decode attention per device under -sm tensor: 8 Q heads on the latent, V a view of K;
     //   32 heads over a quarter of the cells with a cell split
