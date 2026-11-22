@@ -8465,6 +8465,46 @@ static int ggml_cuda_try_fuse_fattn_gate(ggml_backend_cuda_context * cuda_ctx, g
     if (j + 2 >= cgraph->n_nodes) {
         return 0;
     }
+    // Inkling 2: the gate is a contiguous product, no CONT: sigmoid(gate) * attn in the UNARY and MUL after the attention,
+    //   the gate read as rows of one head as the CONT's source would be
+    {
+        ggml_tensor * unary = cgraph->nodes[j];
+        ggml_tensor * mul   = cgraph->nodes[j + 1];
+        const ggml_tensor * gate = unary->src[0];
+        const ggml_tensor * attn = mul->op != GGML_OP_MUL ? nullptr : mul->src[1] == unary ? mul->src[0] : mul->src[0] == unary ? mul->src[1] : nullptr;
+        if (unary->op == GGML_OP_UNARY && ggml_get_unary_op(unary) == GGML_UNARY_OP_SIGMOID && attn != nullptr &&
+                ggml_can_fuse_subgraph(cgraph, j, { GGML_OP_UNARY, GGML_OP_MUL }, { j + 1 }) &&
+                gate->type == GGML_TYPE_F32 && ggml_is_contiguous(gate) && ggml_nelements(gate) == ggml_nelements(fa) &&
+                (attn->op == GGML_OP_RESHAPE || attn->op == GGML_OP_VIEW) && attn->view_src == fa && attn->view_offs == 0 &&
+                !(attn->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_cuda_graph_use_count(cgraph, attn) == 1 &&
+                mul->type == GGML_TYPE_F32 && ggml_is_contiguous(mul) && ggml_are_same_shape(mul, attn) &&
+                ggml_cuda_same_or_disjoint(mul, gate) && ggml_cuda_same_or_disjoint(mul, attn)) {
+            // the gate as [head dim, heads x tokens], and a CONT of it for the combine and the gate kernel to read; each thread
+            //   reads the gate and the attention at the element it writes, so the output may sit on either
+            ggml_tensor gate_rows = *gate;
+            gate_rows.ne[0] = fa->ne[0];
+            gate_rows.ne[1] = ggml_nelements(gate) / fa->ne[0];
+            gate_rows.ne[2] = gate_rows.ne[3] = 1;
+            gate_rows.nb[1] = gate_rows.ne[0]*sizeof(float);
+            gate_rows.nb[2] = gate_rows.nb[3] = gate_rows.ne[1]*gate_rows.nb[1];
+            ggml_tensor cont_rows = gate_rows;
+            cont_rows.op     = GGML_OP_CONT;
+            cont_rows.src[0] = &gate_rows;
+
+            static const bool no_gate_q8_1 = getenv("GGML_CUDA_NO_GATE_Q8_1") != nullptr;
+            if (!no_gate_q8_1) {
+                ggml_cuda_q8_1_request(cuda_ctx, cgraph, j + 1);
+            }
+            cuda_ctx->fattn_gate = { &cont_rows, mul, false };
+            ggml_cuda_flash_attn_ext(*cuda_ctx, fa);
+            const bool done = cuda_ctx->fattn_gate.done;
+            cuda_ctx->fattn_gate = {};
+            if (!done) {
+                ggml_cuda_op_cont_unary_mul(*cuda_ctx, &cont_rows, unary, mul);
+            }
+            return j + 1 - i;
+        }
+    }
     ggml_tensor * cont  = cgraph->nodes[j];
     ggml_tensor * unary = cgraph->nodes[j + 1];
     ggml_tensor * mul   = cgraph->nodes[j + 2];
