@@ -258,6 +258,9 @@ static ggml_tensor * inkling2_head_step(llm_graph_context & g, const llama_model
     ggml_prec_set_acc(base, GGML_PREC_F32);
     ggml_prec_set_acc(bias, GGML_PREC_F32);
     auto * logits = ggml_add(g.ctx0, base, bias);
+    // logits split over the vocab cannot be cut by a view: a multi-device backend gathers them first (as inkling2's output)
+    logits = ggml_cont(g.ctx0, logits);
+    logits->flags |= GGML_TENSOR_FLAG_MIRRORED;
     logits = ggml_cont(g.ctx0, ggml_view_2d(g.ctx0, logits, model.hparams.n_vocab_unpadded, hidden->ne[1], logits->nb[1], 0));
     const float cap = model.hparams.f_final_logit_softcapping;
     return ggml_scale(g.ctx0, ggml_tanh(g.ctx0, ggml_scale(g.ctx0, logits, 1.0f/cap)), cap);

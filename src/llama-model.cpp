@@ -456,7 +456,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const bool is_glm5_next = ud->model->arch == LLM_ARCH_GLM5_NEXT;
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
-    static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
+    // (attn_k_ctx / attn_v_ctx: the K/V of the target context in Inkling 2's DSpark head, split like K/V)
+    static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v)(_ctx)?\\.weight");
     static const std::regex pattern_v_exps_weight   ("blk\\.\\d*\\.attn_v_exps.weight"); // K2 Horizon MoVA
     static const std::regex pattern_qkv_weight      ("blk\\.\\d*\\.attn_qkv.weight");
     static const std::regex pattern_qkv_gate_weight ("blk\\.\\d*\\.attn_qkv_gate.weight");
