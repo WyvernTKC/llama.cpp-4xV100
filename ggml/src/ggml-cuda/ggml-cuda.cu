@@ -10383,6 +10383,40 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
             return false;
         };
+        // Inkling 2's loop gate: the gain product (node), the forget product next and the tanh gate of their rows after it
+        //   (llama_model_inkling2::graph::control), one launch (ggml_cuda_mul_mat_vec_f_gate_rows); each product read only
+        //   by the gate. GGML_CUDA_NO_LOOP_GATE_ROWS=1 turns it off.
+        static const bool no_gate_rows = getenv("GGML_CUDA_NO_LOOP_GATE_ROWS") != nullptr;
+        if (node_sibling_kernel == 2 && !no_gate_rows) {
+            const int j  = next_node(i);
+            const int g0 = j < cgraph->n_nodes ? next_node(j) : cgraph->n_nodes;
+            ggml_tensor * fm = j < cgraph->n_nodes ? cgraph->nodes[j] : nullptr;
+            if (fm != nullptr && g0 + 5 < cgraph->n_nodes && fm->op == GGML_OP_MUL_MAT && fm->src[1] == node->src[1] &&
+                    cgraph->nodes[g0]->op == GGML_OP_UNARY && cgraph->nodes[g0]->src[0] == fm &&
+                    ggml_can_fuse_subgraph(cgraph, g0, { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD }, { g0 + 5 }) &&
+                    ggml_cuda_should_fuse_tanh_gate(cgraph->nodes[g0], cgraph->nodes[g0 + 1], cgraph->nodes[g0 + 2], cgraph->nodes[g0 + 3],
+                        cgraph->nodes[g0 + 4], cgraph->nodes[g0 + 5]) &&
+                    cgraph->nodes[g0 + 3]->src[0] == node && ggml_cuda_graph_use_count(cgraph, node) == 1 &&
+                    ggml_cuda_graph_use_count(cgraph, fm) == 1 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                    !(fm->flags & GGML_TENSOR_FLAG_OUTPUT) && (fm->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                    ggml_nrows(cgraph->nodes[g0 + 5]) == 1 &&
+                    ggml_cuda_mul_mat_vec_f_gate_rows_supported(*cuda_ctx, node->src[0], fm->src[0], node->src[1], node, fm)) {
+                ggml_tensor * out = cgraph->nodes[g0 + 5];
+                const ggml_tensor * c = cgraph->nodes[g0 + 2]->src[0];
+                const ggml_tensor * m = cgraph->nodes[g0 + 4]->src[1];
+                // element-wise in the rows: out may take the memory of c or m in their layout, not overlap the rest
+                bool mem_ok = !ggml_cuda_tensors_overlap(out, node->src[1]) && !ggml_cuda_tensors_overlap(out, node->src[0]) &&
+                    !ggml_cuda_tensors_overlap(out, fm->src[0]);
+                for (const ggml_tensor * in : { c, m }) {
+                    const bool same = in->data == out->data && ggml_is_contiguous(in) && ggml_are_same_shape(in, out);
+                    mem_ok = mem_ok && (same || !ggml_cuda_tensors_overlap(in, out));
+                }
+                if (mem_ok) {
+                    ggml_cuda_mul_mat_vec_f_gate_rows(*cuda_ctx, node->src[0], fm->src[0], node->src[1], c, m, out);
+                    return g0 + 5 - i;
+                }
+            }
+        }
         // mmvf takes a third sibling
         const int max_sibs = no_sibling_rows3 ? 1 : (node_sibling_kernel == 2 || node_sibling_kernel == 3) && !no_sibling_rows4 ? 3 : 2;
         ggml_tensor * sibs[3] = { nullptr, nullptr, nullptr };

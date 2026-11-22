@@ -51,3 +51,11 @@ void ggml_cuda_mul_mat_vec_f_concat(ggml_backend_cuda_context & ctx, const ggml_
 // f32 matrix products with rows of at most MMF_SMALL_K_MAX: one thread per row of src0, which can be a transposed view
 bool ggml_cuda_should_use_mul_mat_small_k(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 void ggml_cuda_mul_mat_small_k(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
+// Inkling 2's loop gate of one token in the launch of its gain and forget products (the short rows of
+//   mul_mat_vec_f_short_rows): out = (c - tanh(wf*y)*c) + tanh(wg*y)*m per row, as the tanh gate after them computes it.
+//   Whether it takes them, then the launch.
+bool ggml_cuda_mul_mat_vec_f_gate_rows_supported(const ggml_backend_cuda_context & ctx, const ggml_tensor * wg, const ggml_tensor * wf,
+        const ggml_tensor * y, const ggml_tensor * g, const ggml_tensor * f);
+void ggml_cuda_mul_mat_vec_f_gate_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * wg, const ggml_tensor * wf,
+        const ggml_tensor * y, const ggml_tensor * c, const ggml_tensor * m, ggml_tensor * out);

@@ -298,17 +298,22 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
     ggml_tensor * gain   = mm(loop.ctrl_gain[ctrl],   gate);
     ggml_tensor * forget = mm(loop.ctrl_forget[ctrl], gate);
 
-    // the products and the message first, so that the gating is one run of element-wise ops (one kernel on CUDA)
+    // the message, then the products, so that the gating is one run of element-wise ops right after them (CUDA runs the
+    //   gating of one token in the launch of the products, and else in one kernel)
+    ggml_build_forward_expand(gf, message);
     ggml_build_forward_expand(gf, gain);
     ggml_build_forward_expand(gf, forget);
-    ggml_build_forward_expand(gf, message);
 
     forget = ggml_tanh(ctx0, forget);
     ggml_tensor * keep = ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur));
 
     gain = ggml_tanh(ctx0, gain);
 
-    return ggml_add(ctx0, keep, ggml_mul(ctx0, gain, message));
+    // the gating right after the products, also for the controls of Q, K and V built one after the other
+    ggml_tensor * out = ggml_add(ctx0, keep, ggml_mul(ctx0, gain, message));
+    ggml_build_forward_expand(gf, out);
+
+    return out;
 }
 
 ggml_tensor * llama_model_inkling2::graph::build_inputs() {

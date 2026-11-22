@@ -2015,6 +2015,73 @@ static void ggml_cuda_mul_mat_vec_f_short_rows(ggml_backend_cuda_context & ctx, 
     CUDA_CHECK(cudaGetLastError());
 }
 
+// G lanes per row as mul_mat_vec_f_short_rows, for both products of row r, then the gate of tanh_gate_f32
+template <int G>
+static __global__ void __launch_bounds__(256) mul_mat_vec_f_gate_rows(const float * __restrict__ xg, const float * __restrict__ xf,
+        const float * __restrict__ y, const int64_t sx1, const int nrows, const float * __restrict__ c, const float * __restrict__ m,
+        float * __restrict__ out) {
+    const int  lane  = threadIdx.x % G;
+    const int  r     = (blockIdx.x*blockDim.x + threadIdx.x) / G;
+    const bool valid = r < nrows;
+    float sg = 0.0f;
+    float sf = 0.0f;
+    if (valid) {
+        const float4 * y4 = (const float4 *) y + 2*lane;
+        const float4 ya = y4[0];
+        const float4 yb = y4[1];
+        {
+            const float4 * x4 = (const float4 *) (xg + (int64_t) r*sx1) + 2*lane;
+            const float4 xa = x4[0];
+            const float4 xb = x4[1];
+            sg = xa.x*ya.x + xa.y*ya.y + xa.z*ya.z + xa.w*ya.w + xb.x*yb.x + xb.y*yb.y + xb.z*yb.z + xb.w*yb.w;
+        }
+        {
+            const float4 * x4 = (const float4 *) (xf + (int64_t) r*sx1) + 2*lane;
+            const float4 xa = x4[0];
+            const float4 xb = x4[1];
+            sf = xa.x*ya.x + xa.y*ya.y + xa.z*ya.z + xa.w*ya.w + xb.x*yb.x + xb.y*yb.y + xb.z*yb.z + xb.w*yb.w;
+        }
+    }
+#pragma unroll
+    for (int o = G/2; o > 0; o >>= 1) {
+        sg += __shfl_xor_sync(0xffffffff, sg, o, G);
+        sf += __shfl_xor_sync(0xffffffff, sf, o, G);
+    }
+    if (valid && lane == 0) {
+        const float cv   = c[r];
+        const float mv   = m[r];
+        const float kept = cv - tanhf(sf)*cv;
+        out[r] = kept + tanhf(sg)*mv;
+    }
+}
+
+bool ggml_cuda_mul_mat_vec_f_gate_rows_supported(const ggml_backend_cuda_context & ctx, const ggml_tensor * wg, const ggml_tensor * wf,
+        const ggml_tensor * y, const ggml_tensor * g, const ggml_tensor * f) {
+    return ggml_cuda_mmvf_short_rows(ctx, wg, y, nullptr, g, nullptr) && ggml_cuda_mmvf_short_rows(ctx, wf, y, nullptr, f, nullptr) &&
+        ggml_are_same_shape(wg, wf) && wg->nb[1] == wf->nb[1];
+}
+
+void ggml_cuda_mul_mat_vec_f_gate_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * wg, const ggml_tensor * wf,
+        const ggml_tensor * y, const ggml_tensor * c, const ggml_tensor * m, ggml_tensor * out) {
+    GGML_ASSERT(c->nb[0] == sizeof(float) && m->nb[0] == sizeof(float) && ggml_nrows(out) == 1 && ggml_is_contiguous(out));
+    const int     nrows = (int) wg->ne[1];
+    const int     g     = (int) wg->ne[0]/8;
+    const int64_t sx1   = wg->nb[1]/sizeof(float);
+    const int     nb    = (int) (((int64_t) nrows*g + 255)/256);
+    const auto launch = [&](auto kernel) {
+        kernel<<<nb, 256, 0, ctx.stream()>>>((const float *) wg->data, (const float *) wf->data, (const float *) y->data, sx1, nrows,
+            (const float *) c->data, (const float *) m->data, (float *) out->data);
+    };
+    switch (g) {
+        case  2: launch(mul_mat_vec_f_gate_rows< 2>); break;
+        case  4: launch(mul_mat_vec_f_gate_rows< 4>); break;
+        case  8: launch(mul_mat_vec_f_gate_rows< 8>); break;
+        case 16: launch(mul_mat_vec_f_gate_rows<16>); break;
+        default: GGML_ABORT("fatal error");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
