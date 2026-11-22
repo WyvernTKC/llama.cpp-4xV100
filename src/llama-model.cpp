@@ -485,6 +485,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_attn_rel_weight ("blk\\.\\d*\\.attn_rel\\.weight");
     static const std::regex pattern_attn_head_clip  ("blk\\.\\d*\\.attn_(q|rel)_clip\\.weight");
     static const std::regex pattern_attn_sink_proj  ("blk\\.\\d*\\.attn_sink_proj\\.weight");
+    static const std::regex pattern_kv_conv         ("blk\\.\\d*\\.attn_(k|v)_conv(_proj)?\\.weight");
     const bool is_inkling2 = ud->model->arch == LLM_ARCH_INKLING2 || ud->model->arch == LLM_ARCH_INKLING2_LOOP;
 
     // multi-head latent attention
@@ -616,6 +617,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             const size_t layer_index_start = tensor_name.find("_l", 6);
             GGML_ASSERT(layer_index_start != std::string::npos);
             il = std::stoull(tensor_name.substr(layer_index_start + 2));
+            // Inkling 2 loop: the cache slots after the stored layers are split like the layer whose weights they use
+            if (is_inkling2) {
+                il = (uint32_t) static_cast<const llama_model_inkling2 *>(ud->model)->layer_phys((int) il);
+            }
             prefix = "blk." + std::to_string(il) + ".";
         } else {
             il = 0;
@@ -811,13 +816,18 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
             }
         }
-        // Inkling 2: the q heads are split, k and v go through short convs whose state is packed with the convs of the
-        //   all-reduced attention and FFN outputs, so the k/v path, its cache and the conv state stay mirrored. The bias,
-        //   sink and clip tensors have one slice per q head and split with them.
+        // Inkling 2: the q heads and the kv heads are split (k/v, their cache and the short convs of k and v by kv head, with
+        //   the conv history of k and v in the s state, two segments). The conv history of the all-reduced attention and FFN
+        //   outputs (the r state) is mirrored. The bias, sink and clip tensors have one slice per q head and split with them.
         if (is_inkling2) {
-            if (std::regex_match(tensor_name, pattern_kv_weight) || std::regex_match(tensor_name, pattern_kv_cache) ||
-                    std::regex_match(tensor_name, pattern_r_cache)) {
+            if (std::regex_match(tensor_name, pattern_r_cache)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+            if (std::regex_match(tensor_name, pattern_kv_conv)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_s_cache)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
             }
             if (std::regex_match(tensor_name, pattern_attn_rel_weight) || std::regex_match(tensor_name, pattern_attn_head_clip) ||
                     std::regex_match(tensor_name, pattern_attn_sink_proj)) {
@@ -1112,6 +1122,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
     // if a model has fused tensors they need to be separated into "segments", see the comments on ggml_backend_meta_split_state struct
     auto get_split_segments = [&](int axis, uint32_t il) -> std::vector<std::pair<int64_t, uint32_t>> {
+        if (is_inkling2 && std::regex_match(tensor_name, pattern_s_cache)) {
+            // the conv history of k, then that of v
+            const int64_t kv_state_size = (hparams.n_shortconv_l_cache - 1) * hparams.n_embd_k_gqa(il);
+            GGML_ASSERT(tensor->ne[axis] == 2*kv_state_size);
+            return {{kv_state_size, 2}};
+        }
         if (is_glm5_next && std::regex_match(tensor_name, pattern_r_cache)) {
             // the conv state holds the q, k and v windows one after the other
             const int64_t conv_state_size = (hparams.ssm_d_conv - 1) * hparams.n_head(il) * hparams.n_embd_head_kda;
@@ -1597,6 +1613,17 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
 
             const int64_t granularity_kv = granularity_q / n_gqa;
+            // Inkling 2: the k/v short convs [n_conv, n_embd_k_gqa] per channel, their dynamic-tap projections
+            //   [n_embd, n_conv*n_head_kv] per kv head, the conv history of k and v (the s state) per channel and column
+            if (is_inkling2 && std::regex_match(tensor_name, pattern_kv_conv)) {
+                GGML_ASSERT(segments.size() == 1);
+                const int64_t n_conv = hparams.n_shortconv_l_cache;
+                return {tensor_name.find("_proj") != std::string::npos ? granularity_kv / hparams.n_embd_head_k(il) * n_conv : granularity_kv};
+            }
+            if (is_inkling2 && std::regex_match(tensor_name, pattern_s_cache)) {
+                GGML_ASSERT(segments.size() == 1 && segments[0].second == 2); // k and v, see get_split_segments
+                return {granularity_kv * (hparams.n_shortconv_l_cache - 1)};
+            }
             // page statistics: one row per kv head, the same heads as the K cache
             if (std::regex_match(tensor_name, pattern_ps_cache)) {
                 GGML_ASSERT(segments.size() == 1);

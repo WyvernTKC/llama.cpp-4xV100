@@ -212,7 +212,8 @@ uint32_t llama_hparams::n_embd_r() const {
     }
 
     if (n_sconv_channels != 0) {
-        // for Inkling2 models, checked before LFM2 as they set n_shortconv_l_cache too
+        // for Inkling2 models (the history of the attention and FFN output convs), checked before LFM2 as they set
+        //   n_shortconv_l_cache too
         return n_sconv_channels * (n_shortconv_l_cache - 1);
     }
 
@@ -244,6 +245,11 @@ uint32_t llama_hparams::n_embd_r() const {
 }
 
 uint32_t llama_hparams::n_embd_s() const {
+    if (n_sconv_channels_s != 0) {
+        // for Inkling2 models: the history of the K and V convs, apart from the r state so that it can be split by kv head
+        return n_sconv_channels_s * (n_shortconv_l_cache - 1);
+    }
+
     if (wkv_head_size != 0) {
         // corresponds to RWKV's wkv_states size
         return n_embd * wkv_head_size;

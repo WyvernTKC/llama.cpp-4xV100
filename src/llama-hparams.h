@@ -107,7 +107,8 @@ struct llama_hparams {
     struct llama_hparams_convnext convnext;
 
     uint32_t n_shortconv_l_cache  = 0;
-    uint32_t n_sconv_channels     = 0;
+    uint32_t n_sconv_channels     = 0;      // Inkling 2: the channels of the conv history in the r state
+    uint32_t n_sconv_channels_s   = 0;      //   and in the s state
 
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv_arr;

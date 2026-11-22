@@ -59,7 +59,8 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     // no RoPE, the relative-position bias carries the positions
     hparams.rope_pattern.fill(false);
 
-    // the convolution state keeps K, V, the attention output and the FFN output of the widest layer
+    // the convolution states: K and V of the widest layer in the s state, the attention and FFN outputs in the r state
+    //   (under a split by head the first is split with the kv heads, the second mirrored like the outputs)
     uint64_t n_channels_max = 0;
 
     for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
@@ -69,14 +70,15 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
             throw std::runtime_error("inkling2: invalid attention or expert dimensions");
         }
 
-        n_channels_max = std::max<uint64_t>(n_channels_max, 2ull * hparams.n_embd_k_gqa(il) + 2ull * hparams.n_embd);
+        n_channels_max = std::max<uint64_t>(n_channels_max, 2ull * hparams.n_embd_k_gqa(il));
     }
 
-    if (n_channels_max * (hparams.n_shortconv_l_cache - 1) > UINT32_MAX) {
+    if (std::max<uint64_t>(n_channels_max, 2ull * hparams.n_embd) * (hparams.n_shortconv_l_cache - 1) > UINT32_MAX) {
         throw std::runtime_error("inkling2: convolution state is too large");
     }
 
-    hparams.n_sconv_channels = n_channels_max;
+    hparams.n_sconv_channels   = 2 * hparams.n_embd;
+    hparams.n_sconv_channels_s = n_channels_max;
 
     type = LLM_TYPE_UNKNOWN;
 }
@@ -242,11 +244,13 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     ggml_build_forward_expand(gf, cur);
 
     // the history of this convolution alone, gathered from the cache next to it: on CUDA the convolution kernel then reads
-    //   it itself and also stores the new history; a dynamic one of a long ubatch reads it from the layer's gather
+    //   it itself and also stores the new history; a dynamic one of a long ubatch reads it from the layer's gather of the
+    //   rows of its state, history [n_state, n_seqs]
+    const size_t esize = ggml_element_size(state);
     ggml_tensor * cols = ggml_view_2d(ctx0, state, (n_conv - 1)*n_channels, state->ne[1], state->nb[1],
-            offset*(n_conv - 1)*ggml_element_size(state));
+            offset*(n_conv - 1)*esize);
     ggml_tensor * past = dynamic && history ?
-        ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]) :
+        ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, (n_conv - 1)*esize, history->nb[1], offset*(n_conv - 1)*esize) :
         ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, cols, inp->s_copy_main), n_conv - 1, n_channels, n_seqs);
 
     ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
@@ -348,19 +352,22 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         return ggml_view_2d(ctx0, m, n_embd, n_tokens, m->nb[2], ctrl*m->nb[1]);
     };
 
-    // the dynamic convolutions of a long ubatch read the states of its sequences from one gather of the whole rows; else
-    //   each convolution gathers its own (convolve) and build_rs only copies the states of sequences copied from another
-    //   (on CUDA the convolution kernel reads the history itself up to 8 tokens of a sequence, dynamic taps included)
-    ggml_tensor * state   = recr->mctx->get_r_l(il);
-    ggml_tensor * history = nullptr;
+    // the conv history of K and V (the s state, split with the kv heads under a split by head) and of the attention and FFN
+    //   outputs (the r state). Each convolution gathers its own history (convolve) and build_rs only copies the states of
+    //   sequences copied from another, but the dynamic convolutions of a long ubatch read theirs from one gather of the
+    //   rows (on CUDA the convolution kernel reads the history itself up to 8 tokens of a sequence, dynamic taps included)
+    auto no_rows = [](ggml_context * ctx, ggml_tensor * states, ggml_tensor *) {
+        return ggml_view_2d(ctx, states, states->ne[0], 0, states->nb[1], 0);
+    };
+    ggml_tensor * state_kv = recr->mctx->get_s_l(il);
+    ggml_tensor * state    = recr->mctx->get_r_l(il);
+    ggml_tensor * history  = nullptr;
     if (!is_swa && ubatch.n_seq_tokens > 8) {
-        history = build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs);
-        history = ggml_reshape_3d(ctx0, history, hparams.n_shortconv_l_cache - 1, hparams.n_sconv_channels, ubatch.n_seqs);
+        history = build_rs(recr, state_kv, hparams.n_embd_s(), ubatch.n_seqs);
     } else {
-        build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs, [](ggml_context * ctx, ggml_tensor * states, ggml_tensor *) {
-            return ggml_view_2d(ctx, states, states->ne[0], 0, states->nb[1], 0);
-        });
+        build_rs(recr, state_kv, hparams.n_embd_s(), ubatch.n_seqs, no_rows);
     }
+    build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs, no_rows);
 
     ggml_tensor * inpSA = cur;
 
@@ -423,8 +430,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             }
         }
 
-        ggml_tensor * Kcur = convolve(Kproj, layer.attn_k_conv, Kdyn, state, history, recr, 0);
-        ggml_tensor * Vcur = convolve(Vproj, layer.attn_v_conv, Vdyn, state, history, recr, n_embd_k_gqa);
+        ggml_tensor * Kcur = convolve(Kproj, layer.attn_k_conv, Kdyn, state_kv, history, recr, 0);
+        ggml_tensor * Vcur = convolve(Vproj, layer.attn_v_conv, Vdyn, state_kv, history, recr, n_embd_k_gqa);
 
         Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, hparams.f_qk_clip);
         Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr,           hparams.f_qk_clip);
@@ -467,7 +474,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                 Qcur, Kcur, Vcur, table, sinks, sinks_zero, 1.0f/sqrtf(n_embd_head), il);
 
         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
-        cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
+        cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, nullptr, recr, 0);
         cb(cur, "attn_out", il);
     }
 
@@ -507,7 +514,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             layer.ffn_gate_exps_s,
             layer.ffn_down_exps_s);
 
-    cur = convolve(cur, layer.ffn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa + n_embd);
+    cur = convolve(cur, layer.ffn_post_conv, nullptr, state, nullptr, recr, n_embd);
     cb(cur, "ffn_out", il);
 
     cur = ggml_add(ctx0, ffn_inp, cur);
