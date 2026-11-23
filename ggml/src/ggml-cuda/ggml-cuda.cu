@@ -7321,7 +7321,12 @@ static int ggml_cuda_try_fuse_cont_small_k(ggml_backend_cuda_context * cuda_ctx,
     for (int d = 0; d < GGML_MAX_DIMS; ++d) {
         x.nb[d] = view->nb[d];
     }
-    if (!ggml_cuda_should_use_mul_mat_small_k(&x, mm->src[1], mm) || !ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
+    // ggml-alloc may have put mm over the view: the CONT was its last reader. The range check below skips a source of op
+    //   NONE, which is what the view is when the states come from another device (-sm layer): the scheduler's copy of the
+    //   view, which a scheduler without pipeline copies (llama's graph slots) frees after the CONT. The kernel would then
+    //   overwrite rows of x that other blocks have not read yet. Same for y.
+    if (ggml_cuda_tensors_overlap(mm, view) || ggml_cuda_tensors_overlap(mm, mm->src[1]) ||
+            !ggml_cuda_should_use_mul_mat_small_k(&x, mm->src[1], mm) || !ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
         return 0;
     }
     ggml_cuda_mul_mat_small_k(*cuda_ctx, &x, mm->src[1], mm);
