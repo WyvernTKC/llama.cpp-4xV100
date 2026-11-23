@@ -102,8 +102,6 @@ using llama_memory_ranges = std::vector<llama_memory_range>;
 // Prefetch the host pages covering these memory ranges.
 void llama_prefetch(llama_memory_ranges mr);
 
-size_t llama_path_max();
-
 // ask the OS to make several possibly unaligned ranges resident. the ranges are page-aligned,
 // sorted and merged first. this is only a hint, demand paging stays the fallback
 void llama_prefetch_ranges(const void * const * addrs, const size_t * sizes, size_t n);

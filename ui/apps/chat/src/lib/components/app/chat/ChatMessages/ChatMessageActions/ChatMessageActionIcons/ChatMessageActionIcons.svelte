@@ -124,7 +124,7 @@
 
 	{#if showRawOutputSwitch}
 		<div class="flex items-center gap-2">
-			<span class="text-xs text-muted-foreground">Show raw output</span>
+			<span class="text-caption text-muted-foreground">Show raw output</span>
 
 			<Switch
 				checked={rawOutputEnabled}
@@ -182,7 +182,7 @@
 				}}
 			/>
 
-			<Label class="cursor-pointer text-sm font-normal" for="fork-attachments">
+			<Label class="cursor-pointer text-body-sm font-normal" for="fork-attachments">
 				Include all attachments
 			</Label>
 		</div>

@@ -50,7 +50,6 @@ enum llm_graph_type {
 enum llm_fused_op {
     LLM_FUSED_OP_FLASH_ATTN,
     LLM_FUSED_OP_FLASH_ATTN_KV_ROWS,
-    LLM_FUSED_OP_LIGHTNING_INDEXER,
     LLM_FUSED_OP_DSV4_HC_PRE,
     LLM_FUSED_OP_DSV4_HC_COMB,
     LLM_FUSED_OP_DSV4_HC_POST,
@@ -914,7 +913,6 @@ struct llama_spec_states_tensors {
 struct llm_graph_params {
     const llama_model * model = nullptr;
 
-    llama_hparams hparams;
     llama_cparams cparams;
 
     llama_ubatch ubatch; // note: intentionally make a copy
@@ -929,10 +927,6 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
-
-    const llama_prec_policy * prec_policy = nullptr;
-
-    const llama_hadamard * hdmd = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1192,6 +1186,8 @@ struct llm_graph_context {
     const llama_cparams & cparams;
     const llama_ubatch  & ubatch;
 
+    const llama_prec_policy & prec_policy;
+
     const int64_t n_embd;
     const int64_t n_layer;
     const int64_t n_layer_nextn;
@@ -1231,8 +1227,6 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
-
-    const llama_prec_policy * prec_policy;
 
     const llama_hadamard * hdmd;
 
@@ -1277,6 +1271,7 @@ struct llm_graph_context {
               ggml_tensor * cur) const;
 
     // do mat_mul, while optionally apply lora and per-tensor scale
+    // w_s defaults to the weight scale of w
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,
               ggml_tensor * cur,
@@ -1288,7 +1283,6 @@ struct llm_graph_context {
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * w_s    = nullptr,
               ggml_tensor * slots  = nullptr,
                      bool   cached = true) const;
 
@@ -1361,9 +1355,6 @@ struct llm_graph_context {
                      int   il,
              ggml_tensor * probs_in = nullptr,
              ggml_tensor * gate_up_exps = nullptr,
-             ggml_tensor * up_exps_s = nullptr,
-             ggml_tensor * gate_exps_s = nullptr,
-             ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
                    float   post_exp_norm_eps = 1e-5f) const;
@@ -1389,9 +1380,6 @@ struct llm_graph_context {
              ggml_tensor * probs_in = nullptr,
              ggml_tensor * gate_up_exps = nullptr,
              ggml_tensor * gate_up_exps_b = nullptr,
-             ggml_tensor * up_exps_s = nullptr,
-             ggml_tensor * gate_exps_s = nullptr,
-             ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
                    float   post_exp_norm_eps = 1e-5f) const;

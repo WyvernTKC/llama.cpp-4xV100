@@ -64,6 +64,10 @@ export { toolsStore } from './tools.svelte';
 // WAKE-UPS (schedule_wakeup timers)
 export { wakeupsStore } from './wakeups.svelte';
 
+// VOICE (which model does what, and transcripts of voice messages on their way)
+export { voiceStore } from './voice.svelte';
+export { voiceTranscriptsStore } from './voice-transcripts.svelte';
+
 // ENVIRONMENT / META
 export { versionStore } from './version.svelte';
 

@@ -104,16 +104,16 @@
 <ToolCallBlock {isStreaming} {meta} {onToggle} {open} {section} {title}>
 	{#snippet children(_meta, ctx)}
 		{#if args.task}
-			<div class="mb-1.5 text-xs text-muted-foreground/70">Task</div>
+			<div class="mb-1.5 text-caption text-muted-foreground/70">Task</div>
 
-			<div class="max-h-48 overflow-auto rounded bg-muted/20 p-2 text-sm">
+			<div class="max-h-48 overflow-auto rounded bg-muted/20 p-2 text-body-sm">
 				<MarkdownContent content={args.task} />
 			</div>
 		{/if}
 
 		{#if chatId}
 			<a
-				class="mt-2 inline-flex items-center gap-1.5 text-xs text-primary hover:underline"
+				class="mt-2 inline-flex items-center gap-1.5 text-caption text-primary hover:underline"
 				href={RouterService.chat(chatId)}
 			>
 				<ExternalLink class="h-3 w-3" />
@@ -122,19 +122,19 @@
 		{/if}
 
 		{#if working || ctx.isPending}
-			<div class="mt-3 flex items-center gap-2 text-xs text-muted-foreground/70">
+			<div class="mt-3 flex items-center gap-2 text-caption text-muted-foreground/70">
 				<Loader2 class="h-3 w-3 animate-spin" />
 
 				<span>{visiblePermission ? 'Waiting for your permission' : 'Working on the task...'}</span>
 			</div>
 		{:else if meta.answer}
-			<div class="mt-4 mb-1.5 text-xs text-muted-foreground/70">Answer</div>
+			<div class="mt-4 mb-1.5 text-caption text-muted-foreground/70">Answer</div>
 
 			<MarkdownContent content={meta.answer} />
 		{/if}
 
 		{#if meta.note || meta.errorMessage}
-			<div class="mt-2 text-xs text-muted-foreground italic">
+			<div class="mt-2 text-caption text-muted-foreground italic">
 				{meta.note ?? meta.errorMessage}
 			</div>
 		{/if}

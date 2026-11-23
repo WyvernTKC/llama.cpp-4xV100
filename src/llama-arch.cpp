@@ -176,6 +176,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_NANBEIGE,         "nanbeige"         },
     { LLM_ARCH_QWEN3TTS,         "qwen3tts"         },
     { LLM_ARCH_POCKETTTS,        "pockettts"        },
+    { LLM_ARCH_MOSHI,            "moshi"            },
     { LLM_ARCH_ZONOS3,           "zonos3"           },
     { LLM_ARCH_KOKORO,           "kokoro"           },
     { LLM_ARCH_TINY_VOCA,        "tiny-voca"        },
@@ -187,6 +188,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_LONGCAT_FLASH,    "longcat-flash"    },
     { LLM_ARCH_LONGCAT_NGRAM,    "longcat-ngram"    },
     { LLM_ARCH_INKLING2_LOOP,    "inkling2_loop"    },
+    { LLM_ARCH_DOMYN_EDGE,       "domynedge"        },
     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
 };
 
@@ -1631,6 +1633,8 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_MPT:
         // MLA without the absorption optimization: uses the unsplit attn_kv_b instead of attn_k_b/attn_v_b
         case LLM_ARCH_MINICPM3:
+        // b12633 (#32491): 1-2B audio backbone driven by mtmd, its head pads the logits with a concat, not validated under -sm tensor
+        case LLM_ARCH_MOSHI:
         case LLM_ARCH_OLMO2:
         case LLM_ARCH_OLMOE:
         case LLM_ARCH_DOTS3NOTE:

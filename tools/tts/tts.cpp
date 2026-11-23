@@ -90,6 +90,7 @@ int main(int argc, char ** argv) {
     mtmd_params.device    = params.mmproj_device;
     mtmd_params.devices   = params.mmproj_devices.data();
     mtmd_params.n_devices = params.mmproj_devices.size();
+    mtmd_params.n_threads = params.cpuparams.n_threads;
     mtmd::context_ptr mctx(mtmd_init_from_file(params.mmproj.path.c_str(), model, mtmd_params));
     if (!mctx) {
         LOG_ERR("failed to load mmproj %s\n", params.mmproj.path.c_str());

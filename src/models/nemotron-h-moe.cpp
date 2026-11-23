@@ -118,10 +118,7 @@ llama_model_nemotron_h_moe::graph_mtp::graph_mtp(const llm_graph_params & params
                 hparams.expert_weights_scale,
                 LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID,
                 il_ffn, // build_moe_ffn bounds its aggregation with the top-k of this layer
-                router_logits, nullptr,
-                layer_ffn.ffn_up_exps_s,
-                nullptr, // no gate
-                layer_ffn.ffn_down_exps_s);
+                router_logits);
         cb(moe_out, "mtp_ffn_moe_out", il);
 
         if (layer_ffn.ffn_latent_up) {

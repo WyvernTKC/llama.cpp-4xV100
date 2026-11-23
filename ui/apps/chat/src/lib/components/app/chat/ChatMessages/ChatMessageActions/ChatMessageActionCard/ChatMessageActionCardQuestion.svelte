@@ -29,6 +29,6 @@
 			</Button>
 		{/each}
 
-		<span class="text-xs text-muted-foreground">or type your own answer below</span>
+		<span class="text-caption text-muted-foreground">or type your own answer below</span>
 	{/snippet}
 </ChatMessageActionCard>

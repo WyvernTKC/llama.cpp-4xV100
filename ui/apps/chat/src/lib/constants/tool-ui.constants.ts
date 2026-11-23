@@ -7,33 +7,31 @@
 // (see ChatMessageToolCallBlockGetDatetime and
 // ChatMessageToolCallBlockSearchResults for prior art).
 
-import {
-	AlarmClock,
-	Bell,
-	BookmarkPlus,
-	BookmarkX,
-	BookOpen,
-	Bot,
-	Braces,
-	Brain,
-	Clock,
-	Eye,
-	FilePen,
-	FilePlus,
-	FileSearch,
-	FileText,
-	Gauge,
-	Hourglass,
-	Info,
-	ListChecks,
-	MessageCircleQuestionMark,
-	MessageSquarePlus,
-	MessagesSquare,
-	PenLine,
-	SearchCode,
-	Shrink,
-	Terminal
-} from '@lucide/svelte';
+import AlarmClock from '@lucide/svelte/icons/alarm-clock';
+import Bell from '@lucide/svelte/icons/bell';
+import BookOpen from '@lucide/svelte/icons/book-open';
+import BookmarkPlus from '@lucide/svelte/icons/bookmark-plus';
+import BookmarkX from '@lucide/svelte/icons/bookmark-x';
+import Bot from '@lucide/svelte/icons/bot';
+import Braces from '@lucide/svelte/icons/braces';
+import Brain from '@lucide/svelte/icons/brain';
+import Clock from '@lucide/svelte/icons/clock';
+import Eye from '@lucide/svelte/icons/eye';
+import FilePen from '@lucide/svelte/icons/file-pen';
+import FilePlus from '@lucide/svelte/icons/file-plus';
+import FileSearch from '@lucide/svelte/icons/file-search';
+import FileText from '@lucide/svelte/icons/file-text';
+import Gauge from '@lucide/svelte/icons/gauge';
+import Hourglass from '@lucide/svelte/icons/hourglass';
+import Info from '@lucide/svelte/icons/info';
+import ListChecks from '@lucide/svelte/icons/list-checks';
+import MessageCircleQuestionMark from '@lucide/svelte/icons/message-circle-question-mark';
+import MessageSquarePlus from '@lucide/svelte/icons/message-square-plus';
+import MessagesSquare from '@lucide/svelte/icons/messages-square';
+import PenLine from '@lucide/svelte/icons/pen-line';
+import SearchCode from '@lucide/svelte/icons/search-code';
+import Shrink from '@lucide/svelte/icons/shrink';
+import Terminal from '@lucide/svelte/icons/terminal';
 import { BuiltInTool, ToolSource } from '#lib/enums/index.ts';
 import type { ToolUiEntry } from '#lib/types/index.ts';
 

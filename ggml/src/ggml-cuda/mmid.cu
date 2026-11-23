@@ -34,6 +34,9 @@ static_assert(sizeof(mm_ids_helper_store) == 4, "unexpected size for mm_ids_help
 // compact row of its own. A warp can then match more often than it has tokens, or a vec4 lane twice in its 4 ids: the
 // warp stops storing past its room and the block makes an exact second pass instead, a lane per id, that counts the
 // matches of each warp and then writes them straight to global memory in (token, slot) order.
+//
+// The room of a warp is its token count, capped by the shared memory a block can opt in to (96 KiB on a V100: 24k
+// tokens a block): a batch beyond it is exact too, through the second pass of the experts whose matches outgrow it.
 #define MM_IDS_HELPER_MAX_WARPS 8
 
 // the number of lanes below this one for which pred holds, and in total
@@ -111,7 +114,8 @@ template <int n_expert_used_template, bool vec4>
 __launch_bounds__(MM_IDS_HELPER_MAX_WARPS*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
-        const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, const bool write_inverse) {
+        const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, const bool write_inverse,
+        const int room) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
     const int expert = blockIdx.x;
@@ -121,13 +125,14 @@ static __global__ void mm_ids_helper(
     const int tokens_per_warp = (n_tokens + nwarps - 1) / nwarps;
     const int it_begin        = min(warp*tokens_per_warp, n_tokens);
     const int it_end          = min(it_begin + tokens_per_warp, n_tokens);
-    const int n_store         = it_end - it_begin; // room of the warp in shared memory
+    const int n_store         = min(it_end - it_begin, room); // room of the warp in shared memory
 
-    // at most one match per token, so the matches of a warp fit from its first token on; the counts of the warps
-    //   follow (dynamic too, as the launch gives the dynamic part all the shared memory a block can opt in to)
+    // at most one match per token, so the matches of a warp fit in a room of its token count (unless the launch capped
+    //   it); the counts of the warps follow (dynamic too, as the launch gives the dynamic part all the shared memory a
+    //   block can opt in to)
     extern __shared__ char data_mm_ids_helper[];
-    mm_ids_helper_store * store         = (mm_ids_helper_store *) data_mm_ids_helper + it_begin;
-    int                 * warp_count    = (int *) ((mm_ids_helper_store *) data_mm_ids_helper + n_tokens);
+    mm_ids_helper_store * store         = (mm_ids_helper_store *) data_mm_ids_helper + warp*room;
+    int                 * warp_count    = (int *) ((mm_ids_helper_store *) data_mm_ids_helper + nwarps*room);
     int                 * warp_nex_prev = warp_count + MM_IDS_HELPER_MAX_WARPS;
 
     int  nex_prev   = 0;     // Number of columns for experts with a lower index.
@@ -275,20 +280,25 @@ static void launch_mm_ids_helper(
     const int n_iter = (n_tokens*n_expert_used_var + 4*warp_size - 1) / (4*warp_size);
     const int nwarps = std::max(1, std::min(MM_IDS_HELPER_MAX_WARPS, n_iter/8));
 
+    // the room of a warp: its tokens, as many as the shared memory left after the counts of the warps holds
+    const size_t nbytes_counts   = 2*MM_IDS_HELPER_MAX_WARPS*sizeof(int);
+    const int    tokens_per_warp = (n_tokens + nwarps - 1) / nwarps;
+    const int    room            = (int) std::min<size_t>(tokens_per_warp, (smpbo - nbytes_counts) / (nwarps*sizeof(mm_ids_helper_store)));
+
     const dim3 num_blocks(n_experts, 1, 1);
     const dim3 block_size(warp_size, nwarps, 1);
-    const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store) + 2*MM_IDS_HELPER_MAX_WARPS*sizeof(int);
+    const size_t nbytes_shared = size_t(nwarps)*room*sizeof(mm_ids_helper_store) + nbytes_counts;
     GGML_ASSERT(nbytes_shared <= smpbo);
     if (vec4) {
         if constexpr (vec4_ok) {
             CUDA_SET_SHARED_MEMORY_LIMIT((mm_ids_helper<n_expert_used_template, true>), smpbo);
             mm_ids_helper<n_expert_used_template, true><<<num_blocks, block_size, nbytes_shared, stream>>>
-                (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
+                (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse, room);
         }
     } else {
         CUDA_SET_SHARED_MEMORY_LIMIT((mm_ids_helper<n_expert_used_template, false>), smpbo);
         mm_ids_helper<n_expert_used_template, false><<<num_blocks, block_size, nbytes_shared, stream>>>
-            (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
+            (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse, room);
     }
 }
 

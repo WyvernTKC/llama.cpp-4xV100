@@ -43,16 +43,16 @@
 	>
 		<ListChecks class="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
 
-		<span class="text-sm font-medium text-foreground/80">Task list</span>
+		<span class="text-body-sm font-medium text-foreground/80">Task list</span>
 
 		{#if progress && progress.total > 0}
-			<span class="text-xs">{progress.done}/{progress.total} done</span>
+			<span class="text-caption">{progress.done}/{progress.total} done</span>
 
 			{#if progress.current}
-				<span class="min-w-0 truncate text-xs">· {progress.current.content}</span>
+				<span class="min-w-0 truncate text-caption">· {progress.current.content}</span>
 			{/if}
 		{:else if tasks}
-			<span class="text-xs">cleared</span>
+			<span class="text-caption">cleared</span>
 		{/if}
 
 		{#if showSpinner}

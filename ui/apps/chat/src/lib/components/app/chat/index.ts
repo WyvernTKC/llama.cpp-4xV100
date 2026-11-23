@@ -80,6 +80,14 @@ export { default as ChatAttachmentsListItemMcpResource } from './ChatAttachments
 export { default as ChatAttachmentsListItemThumbnailFile } from './ChatAttachments/ChatAttachmentsList/ChatAttachmentsListItem/ChatAttachmentsListItemThumbnailFile.svelte';
 
 /**
+ * An audio attachment drawn as a clip: a playable waveform (peaks computed from
+ * the audio when it was stored without them) and, for a voice message, its
+ * transcript under it on hover, focus or a tap, with the transcribing and failed
+ * states. `sm` in the chat form, removable; `md` in a sent message.
+ */
+export { default as ChatAttachmentsListItemVoice } from './ChatAttachments/ChatAttachmentsList/ChatAttachmentsListItem/ChatAttachmentsListItemVoice.svelte';
+
+/**
  * Thumbnail for image attachments with lazy loading and error fallback.
  * Displays image preview with configurable dimensions. Falls back to placeholder
  * on load error.
@@ -181,6 +189,13 @@ export { default as ChatFormActionRecord } from './ChatForm/ChatFormActions/Chat
  * (Web Speech API). The reply to a dictated message is read aloud.
  */
 export { default as ChatFormActionDictate } from './ChatForm/ChatFormActions/ChatFormActionDictate.svelte';
+
+/**
+ * The actions row while the chat form records: cancel, the live waveform and the
+ * elapsed time, and stop, with a voice message's streaming text under the waveform
+ * and a waiting state while dictated text is transcribed after recording.
+ */
+export { default as ChatFormActionsRecording } from './ChatForm/ChatFormActions/ChatFormActionsRecording.svelte';
 
 /**
  * Container for chat form action buttons. Arranges file attachment, audio record,

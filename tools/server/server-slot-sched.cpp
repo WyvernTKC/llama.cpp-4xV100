@@ -309,6 +309,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
         wait_saves();
         states.erase(it_best);
+
+        SRV_TRC("slot %d: prompt cache restore took %.2f ms\n", id_slot, (ggml_time_us() - t_start) / 1000.0);
     }
 
     return true;

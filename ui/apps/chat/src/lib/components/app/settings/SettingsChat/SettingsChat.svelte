@@ -8,6 +8,7 @@
 		SettingsChatMemories,
 		SettingsChatMobileHeader,
 		SettingsChatToolsTab,
+		SettingsChatVoiceTab,
 		SettingsFooter,
 		SettingsResetButton
 	} from '#lib/components/app/settings/index.ts';
@@ -36,8 +37,12 @@
 
 	let activeSlug = $derived(initialSection ?? 'general');
 
+	// Settings > Voice configures upstream's voice input, which this fork's chat form does not use:
+	// it keeps its own dictation (General) and the microphone that attaches a recording
+	const sections = SETTINGS_CHAT_SECTIONS.filter((s) => s.slug !== SETTINGS_SECTION_SLUGS.VOICE);
+
 	function handleSectionChange(section: SettingsSectionTitle) {
-		const found = SETTINGS_CHAT_SECTIONS.find((s) => s.title === section);
+		const found = sections.find((s) => s.title === section);
 
 		if (found) {
 			activeSlug = found.slug;
@@ -47,8 +52,7 @@
 	}
 
 	let currentSection = $derived(
-		SETTINGS_CHAT_SECTIONS.find((section) => section.slug === activeSlug) ||
-			SETTINGS_CHAT_SECTIONS[0]
+		sections.find((section) => section.slug === activeSlug) || sections[0]
 	);
 
 	let localConfig: SettingsConfigType = $state({ ...settingsStore.config });
@@ -168,7 +172,7 @@
 		<SettingsChatDesktopSidebar
 			isActive={(section: SettingsSection) => section.slug === activeSlug}
 			onSectionChange={handleSectionChange}
-			sections={SETTINGS_CHAT_SECTIONS}
+			{sections}
 		/>
 
 		<SettingsChatMobileHeader
@@ -176,7 +180,7 @@
 			class={mobileHeaderClass}
 			isActive={(section: SettingsSection) => section.slug === activeSlug}
 			onSectionChange={handleSectionChange}
-			sections={SETTINGS_CHAT_SECTIONS}
+			{sections}
 		/>
 
 		<div class="mx-auto max-w-2xl px-4 flex-1 md:mt-4">
@@ -186,6 +190,12 @@
 						<SettingsChatToolsTab />
 					{:else if currentSection.slug === SETTINGS_SECTION_SLUGS.IMPORT_EXPORT}
 						<SettingsChatImportExportTab />
+					{:else if currentSection.slug === SETTINGS_SECTION_SLUGS.VOICE && currentSection.fields}
+						<SettingsChatVoiceTab
+							fields={currentSection.fields}
+							{localConfig}
+							onConfigChange={handleConfigChange}
+						/>
 					{:else if currentSection.fields}
 						<div class="space-y-6">
 							<SettingsChatFields
@@ -214,7 +224,9 @@
 				</div>
 
 				<div class="mt-8 border-t border-border/30 pt-6 pb-6">
-					<p class="text-xs text-muted-foreground">Settings are saved in browser's localStorage</p>
+					<p class="text-caption text-muted-foreground">
+						Settings are saved in browser's localStorage
+					</p>
 				</div>
 			</div>
 

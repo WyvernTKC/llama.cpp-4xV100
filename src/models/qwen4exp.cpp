@@ -1042,7 +1042,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     //   n_devices-fold. The per-cell keys cost compress_ratio times the block matmul on one device, so only
     //   a large batch takes it.
     const int64_t fused_min = qwen4exp_qsa_fused_min_tokens();
-    const bool    fused     = cparams.fused_lid && fused_min > 0 && n_tps >= fused_min;
+    const bool    fused     = fused_min > 0 && n_tps >= fused_min;
 
     // nothing above depends on the layer, so the layers sharing a ratio share one input set
     llm_graph_input_qsa * inp = nullptr;
@@ -1215,7 +1215,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ggml_lightning_indexer_set_prec(score, GGML_PREC_F32);
         }
         cb(score, "indexer_score_tokens", il);
-        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
 
         ggml_tensor * top_k = ggml_top_k(ctx0, score, width);
 
@@ -1693,10 +1692,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             LLM_FFN_SILU, true,
             hparams.expert_weights_scale,
             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            logits, model.layers[il].ffn_gate_up_exps,
-            model.layers[il].ffn_up_exps_s,
-            model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
+            logits, model.layers[il].ffn_gate_up_exps);
     cb(moe_out, "ffn_moe_out", il);
 
     // shared experts, as in the Qwen3Next reference

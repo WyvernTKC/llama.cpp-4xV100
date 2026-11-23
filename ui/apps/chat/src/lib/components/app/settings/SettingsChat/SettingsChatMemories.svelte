@@ -41,23 +41,23 @@
 </script>
 
 <div class="grid gap-1">
-	<h4 class="mt-0 mb-2 text-sm font-medium">Saved memories</h4>
+	<h4 class="mt-0 mb-2 text-body-sm font-medium">Saved memories</h4>
 
-	<p class="mb-4 text-sm text-muted-foreground">
+	<p class="mb-4 text-body-sm text-muted-foreground">
 		What the model saved with save_memory, newest first. New chats list them in their system prompt;
 		a chat that already started keeps the list it started with.
 	</p>
 
 	{#if loaded && memories.length === 0}
-		<p class="text-sm text-muted-foreground italic">No memories yet.</p>
+		<p class="text-body-sm text-muted-foreground italic">No memories yet.</p>
 	{:else}
 		<ul class="divide-y divide-border/50 rounded-lg border border-border/50">
 			{#each memories as memory (memory.id)}
-				<li class="flex items-start gap-2 p-3 text-sm">
+				<li class="flex items-start gap-2 p-3 text-body-sm">
 					<div class="min-w-0 flex-1">
 						<p class="break-words">{memory.content}</p>
 
-						<p class="mt-1 text-xs text-muted-foreground">
+						<p class="mt-1 text-caption text-muted-foreground">
 							{memory.id} · {new Date(memory.updatedAt).toLocaleDateString()}
 						</p>
 					</div>

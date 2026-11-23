@@ -15,7 +15,7 @@
 	let { class: className = '', tasks }: Props = $props();
 </script>
 
-<ul class="space-y-0.5 text-sm {className}">
+<ul class="space-y-0.5 text-body-sm {className}">
 	{#each tasks as task, i (i)}
 		<li class="flex items-start gap-2">
 			{#if task.status === AgentTaskStatus.COMPLETED}

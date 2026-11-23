@@ -803,6 +803,7 @@ class MODEL_ARCH(IntEnum):
     NANBEIGE         = auto()
     QWEN3TTS         = auto()
     POCKETTTS        = auto()
+    MOSHI            = auto()
     ZONOS3           = auto()
     KOKORO           = auto()
     TINY_VOCA        = auto()
@@ -813,6 +814,7 @@ class MODEL_ARCH(IntEnum):
     LONGCAT_FLASH    = auto()
     LONGCAT_NGRAM    = auto()
     INKLING2_LOOP    = auto()
+    DOMYN_EDGE       = auto()
 
 
 class VISION_PROJECTOR_TYPE(IntEnum):
@@ -1830,6 +1832,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.NANBEIGE:         "nanbeige",
     MODEL_ARCH.QWEN3TTS:         "qwen3tts",
     MODEL_ARCH.POCKETTTS:        "pockettts",
+    MODEL_ARCH.MOSHI:            "moshi",
     MODEL_ARCH.ZONOS3:           "zonos3",
     MODEL_ARCH.KOKORO:           "kokoro",
     MODEL_ARCH.TINY_VOCA:        "tiny-voca",
@@ -1840,6 +1843,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.LONGCAT_FLASH:    "longcat-flash",
     MODEL_ARCH.LONGCAT_NGRAM:    "longcat-ngram",
     MODEL_ARCH.INKLING2_LOOP:    "inkling2_loop",
+    MODEL_ARCH.DOMYN_EDGE:       "domynedge",
 }
 
 VISION_PROJECTOR_TYPE_NAMES: dict[VISION_PROJECTOR_TYPE, str] = {
@@ -7012,6 +7016,20 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.FFN_UP,
     ],
+    MODEL_ARCH.MOSHI: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+    ],
     MODEL_ARCH.TINY_VOCA: [
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.OUTPUT_NORM,
@@ -7273,6 +7291,22 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.LOOP_FFN_CTRL_DOWN,
         MODEL_TENSOR.LOOP_FFN_CTRL_GAIN,
         MODEL_TENSOR.LOOP_FFN_CTRL_FORGET,
+    ],
+    MODEL_ARCH.DOMYN_EDGE: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_POST_NORM,
+        MODEL_TENSOR.FFN_PRE_NORM,
+        MODEL_TENSOR.FFN_POST_NORM,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.OUTPUT_NORM,
     ],
 }
 
@@ -7604,6 +7638,8 @@ class VisionProjectorType:
     QWEN3TTS_GEN = "qwen3tts_gen" # audio generation: code_predictor
     POCKETTTS_SPKENC = "pockettts_spkenc" # audio: mimi encoder as voice-prompt encoder
     POCKETTTS_GEN = "pockettts_gen" # audio generation: flow-matching decoder + mimi decoder
+    MOSHI = "moshi" # audio: streaming mimi encoder, input audio codes -> backbone rows
+    MOSHI_GEN = "moshi_gen" # audio generation: depformer + mimi decoder
     CHATTERBOX_SPKENC = "chatterbox_spkenc" # audio: CAMPPlus speaker encoder
     CHATTERBOX = "chatterbox" # audio generation: s3gen flow matching + HiFT vocoder
     SOPRANO = "soprano" # audio generation: Vocos decoder

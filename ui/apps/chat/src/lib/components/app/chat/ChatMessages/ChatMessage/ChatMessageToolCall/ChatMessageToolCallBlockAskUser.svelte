@@ -51,7 +51,7 @@
 	<div class="flex items-start gap-2">
 		<MessageCircleQuestionMark class="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
 
-		<span class="text-sm text-foreground/80">
+		<span class="text-body-sm text-foreground/80">
 			<span class="font-medium">Asked you:</span>
 			{question || '...'}
 		</span>
@@ -62,12 +62,12 @@
 	</div>
 
 	{#if answer !== null}
-		<div class="ml-5 text-sm">
+		<div class="ml-5 text-body-sm">
 			<span class="font-medium text-foreground/80">You answered:</span>
 
 			<span class="text-foreground/90">{answer}</span>
 		</div>
 	{:else if section.toolResult}
-		<div class="ml-5 text-xs italic">{section.toolResult}</div>
+		<div class="ml-5 text-caption italic">{section.toolResult}</div>
 	{/if}
 </div>

@@ -2504,6 +2504,9 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
             break;
         case GGML_OP_SET_ROWS:
             {
+                if (op->src[0]->type == GGML_TYPE_BF16) {
+                    return false;
+                }
                 switch (op->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
@@ -2555,6 +2558,9 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 }
                 if (((const int32_t *) op->op_params)[15] != 0) {
                     return false; // FIXME: support ggml_rope_set_offset
+                }
+                if (op->src[0]->type != GGML_TYPE_F32 && op->src[0]->type != GGML_TYPE_F16) {
+                    return false;
                 }
                 if (op->src[0]->ne[0] > 896) {
                     return false;

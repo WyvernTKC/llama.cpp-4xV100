@@ -3,7 +3,6 @@
 	import { SkipForward, Square } from '@lucide/svelte';
 	import {
 		ChatFormActionDictate,
-		ChatFormActionReasoning,
 		ChatFormActionRecord,
 		ChatFormActionsAdd,
 		ChatFormActionSubmit,
@@ -158,12 +157,12 @@
 		{/if}
 
 		{#if showModelSelector}
-			<ChatFormActionReasoning />
-
+			<!-- the reasoning effort sits in the model picker, under the models -->
 			<ModelsSelector
 				bind:this={selectorModelRef}
 				{disabled}
 				forceForegroundText
+				showReasoning
 				useGlobalSelection
 			/>
 		{/if}

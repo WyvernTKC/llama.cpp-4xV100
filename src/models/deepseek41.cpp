@@ -190,6 +190,8 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
         layer.indexer_k_norm   = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM,   "weight", i), {n_embd_indexer}, TENSOR_NOT_REQUIRED);
 
         layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert}, 0);
+        // the reference computes the router in F32: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/1bae0e1088993b9b82de08f59de5be5a34e42170/inference/model.py#L813
+        prec_policy.set_acc(layer.ffn_gate_inp, GGML_PREC_F32);
         layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   i), {n_expert}, 0);
         // vision variant only: routing bias for image tokens
         layer.ffn_exp_probs_b_vl = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B_VL, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
@@ -779,14 +781,13 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
 
     ggml_tensor * score = nullptr;
 
-    // The fused op takes the mask as F16. V4 hands it the "lid" mask, which llama-graph types from
-    //   fused_lid itself, but V4.1 scores against the compressed positions the attention already
+    // The fused op takes the mask as F16. V4 hands it the "lid" mask, which llama-graph always types
+    //   F16, but V4.1 scores against the compressed positions the attention already
     //   masks, so it shares that stream's mask and gets F16 only when flash attention is on. Fall
     //   back rather than cast: the widened mask below is the very tensor the fused path avoids.
-    if (cparams.fused_lid && mask->type == GGML_TYPE_F16) {
+    if (mask->type == GGML_TYPE_F16) {
         score = ggml_lightning_indexer(ctx0, idx_q, idx_k, idx_w, mask);
         cb(score, "idx_score", il);
-        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
     } else {
         idx_q = ggml_permute(ctx0, idx_q, 0, 2, 1, 3);
         idx_k = ggml_permute(ctx0, idx_k, 0, 2, 1, 3);

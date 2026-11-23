@@ -745,14 +745,19 @@ struct llama_meta_device_get_split_state_userdata {
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
 struct llama_prec_policy {
-    // the key is the weight tensor `res->src[0]`, stores the recommended accumulation type of the op (unused for now)
-    // TODO: migrate ad-hoc ggml_prec_set_acc() calls to this container + update apply() to use it
+    // the key is the weight tensor `res->src[0]`, stores the recommended accumulation type of the op
     std::unordered_map<const ggml_tensor *, ggml_prec> prec_acc;
 
     // the key is the weight tensor `res->src[0]`, stores the recommended activation precision type
     std::unordered_map<const ggml_tensor *, ggml_prec> prec_src1;
 
     bool apply(ggml_tensor * res) const;
+
+    void set_acc(const ggml_tensor * w, ggml_prec prec) {
+        if (w) {
+            prec_acc[w] = prec;
+        }
+    }
 
     void load(llama_model_loader & ml, const llama_model & model);
 };
@@ -825,6 +830,11 @@ struct llama_model {
     llama_prec_policy prec_policy;
 
     llama_hadamard hdmd;
+
+    // weight -> "<name>.scale" tensor (e.g. NVFP4 scale2), applied by build_lora_mm and build_lora_mm_id
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> w_scales;
+
+    ggml_tensor * get_w_scale(const ggml_tensor * w) const;
 
     // see llama_model_set_attn_rot
     bool attn_rot = true;
@@ -1072,6 +1082,12 @@ struct llama_model {
     ggml_tensor * get_rope_factors(const llama_cparams & cparams, int il) const;
 
     llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
+
+    // graph size budget: max graph nodes per model tensor
+    virtual uint32_t graph_nodes_per_tensor() const { return 8; }
+
+    // apply Hadamard transform to the lightning indexer keys
+    virtual bool lid_k_hdmd() const { return false; }
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 

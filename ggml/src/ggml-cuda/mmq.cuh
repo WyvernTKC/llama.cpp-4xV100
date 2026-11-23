@@ -1166,7 +1166,7 @@ static __global__ void mul_mat_q(
             int col_high   = ncols_dst;
             int col_diff   = ncols_dst;
             int offset_y       = wt*stride_sample_y   + zt*stride_channel_y;
-            int offset_dst     = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst;
+            int64_t offset_dst = (int64_t) wt*stride_sample_dst + (int64_t) zt*stride_channel_dst + (int64_t) jt*J*stride_col_dst;
             int offset_y_scale;
             if constexpr (type == GGML_TYPE_NVFP4) {
                 offset_y_scale = wt*nchannels_y.z*ncols_y + zt*ncols_y;
@@ -1274,7 +1274,7 @@ static __global__ void mul_mat_q(
         int col_high   = ncols_dst;
         int col_diff   = ncols_dst;
         int offset_y       = wt*stride_sample_y   + zt*stride_channel_y;
-        int offset_dst     = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst;
+        int64_t offset_dst = (int64_t) wt*stride_sample_dst + (int64_t) zt*stride_channel_dst + (int64_t) jt*J*stride_col_dst;
         int offset_y_scale;
         if constexpr (type == GGML_TYPE_NVFP4) {
             offset_y_scale = wt*nchannels_y.z*ncols_y + zt*ncols_y;
@@ -1386,7 +1386,7 @@ static __global__ void mul_mat_q(
     int col_high   = ncols_dst;
     int col_diff   = ncols_dst;
     int offset_y       = wt*stride_sample_y   + zt*stride_channel_y;
-    int offset_dst     = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst;
+    int64_t offset_dst = (int64_t) wt*stride_sample_dst + (int64_t) zt*stride_channel_dst + (int64_t) jt*J*stride_col_dst;
     int offset_y_scale;
     if constexpr (type == GGML_TYPE_NVFP4) {
         offset_y_scale = wt*nchannels_y.z*ncols_y + zt*ncols_y;
@@ -1548,7 +1548,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
     }
 
     if (!ids_dst) {
-        const int offset_dst = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst + it*I;
+        const int64_t offset_dst = (int64_t) wt*stride_sample_dst + (int64_t) zt*stride_channel_dst + (int64_t) jt*J*stride_col_dst + it*I;
         dst += offset_dst;
 
         const int i_max = nrows_x   - it*I - 1;

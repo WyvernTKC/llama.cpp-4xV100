@@ -27,7 +27,7 @@
 
 {#if openTasks || wakeup}
 	<div
-		class="pointer-events-auto mx-auto mb-2 flex max-w-[48rem] flex-col gap-1.5 rounded-md border border-border bg-card/95 px-3 py-1.5 text-sm shadow-sm backdrop-blur"
+		class="pointer-events-auto mx-auto mb-2 flex max-w-[48rem] flex-col gap-1.5 rounded-md border border-border bg-card/95 px-3 py-1.5 text-body-sm shadow-(--elevation-control) backdrop-blur"
 	>
 		{#if openTasks && progress}
 			<button
@@ -37,12 +37,12 @@
 			>
 				<ListChecks class="h-3.5 w-3.5 shrink-0" />
 
-				<span class="text-xs font-medium text-foreground/80">
+				<span class="text-caption font-medium text-foreground/80">
 					Tasks {progress.done}/{progress.total}
 				</span>
 
 				{#if progress.current && !expanded}
-					<span class="min-w-0 truncate text-xs">· {progress.current.content}</span>
+					<span class="min-w-0 truncate text-caption">· {progress.current.content}</span>
 				{/if}
 
 				{#if expanded}
@@ -58,7 +58,7 @@
 		{/if}
 
 		{#if wakeup}
-			<div class="flex items-center gap-2 text-xs text-muted-foreground">
+			<div class="flex items-center gap-2 text-caption text-muted-foreground">
 				<AlarmClock class="h-3.5 w-3.5 shrink-0" />
 
 				<span class="min-w-0 truncate">

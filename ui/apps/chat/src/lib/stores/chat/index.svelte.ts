@@ -1677,7 +1677,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		const allMessages = await conversationsStore.getConversationMessages(convId);
 		const branchPath = [...filterByLeafNodeId(allMessages, leafId, false)];
 		const request = await agenticStore.requestFor(
-			await ChatService.normalizeMessagesForApi(sliceAtLastCompaction(branchPath)),
+			await ChatService.normalizeMessagesForApi(sliceAtLastCompaction(branchPath), model),
 			this.toolPolicyFor(convId)
 		);
 
@@ -1859,7 +1859,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			// message shaping, cut before the preserved steps: the server
 			// reuses the prefix it cached and only the instruction is new.
 			const request = await agenticStore.requestFor(
-				await ChatService.normalizeMessagesForApi(source.slice(0, cut)),
+				await ChatService.normalizeMessagesForApi(source.slice(0, cut), effectiveModel),
 				this.toolPolicyFor(convId)
 			);
 			const configValue = settingsStore.config;
