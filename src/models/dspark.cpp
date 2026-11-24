@@ -253,11 +253,22 @@ static ggml_tensor * inkling2_head_step(llm_graph_context & g, const llama_model
     auto * latent = dspark_recurrent_step(g.ctx0, model, state, prev_embd, features);
     auto * correction = ggml_add(g.ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
     const auto [output, scale] = llama_model_dflash::get_lm_head(g, model);
-    auto * base = g.build_lora_mm(output, hidden, scale);
-    auto * bias = g.build_lora_mm(output, correction, scale);
-    ggml_prec_set_acc(base, GGML_PREC_F32);
-    ggml_prec_set_acc(bias, GGML_PREC_F32);
-    auto * logits = ggml_add(g.ctx0, base, bias);
+    // W (h + c) = W h + W c: one read of the head per step instead of two (LLAMA_DSPARK_HEAD_FOLD=0 keeps two products)
+    static const bool fold = [] {
+        const char * env = getenv("LLAMA_DSPARK_HEAD_FOLD");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    ggml_tensor * logits;
+    if (fold) {
+        logits = g.build_lora_mm(output, ggml_add(g.ctx0, hidden, correction), scale);
+        ggml_prec_set_acc(logits, GGML_PREC_F32);
+    } else {
+        auto * base = g.build_lora_mm(output, hidden, scale);
+        auto * bias = g.build_lora_mm(output, correction, scale);
+        ggml_prec_set_acc(base, GGML_PREC_F32);
+        ggml_prec_set_acc(bias, GGML_PREC_F32);
+        logits = ggml_add(g.ctx0, base, bias);
+    }
     // logits split over the vocab cannot be cut by a view: a multi-device backend gathers them first (as inkling2's output)
     logits = ggml_cont(g.ctx0, logits);
     logits->flags |= GGML_TENSOR_FLAG_MIRRORED;

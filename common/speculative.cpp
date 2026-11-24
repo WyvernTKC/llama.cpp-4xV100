@@ -1362,26 +1362,37 @@ protected:
         context_pos.assign(context_slots, -1);
     }
 
-    // called after the injection of rows row0 .. row0 + n_chunk - 1 of batch_in, while h_nextn still holds their context features
-    void store_context_features(const common_batch & batch_in, llama_seq_id seq_id, int32_t row0, int32_t n_chunk) {
+    // called after the injection of n_chunk rows at positions pos[0 .. n_chunk - 1], while h_nextn still holds their context features
+    void store_context_features(llama_seq_id seq_id, const llama_pos * pos, int32_t n_chunk) {
         if (!context_rows) {
             return;
         }
         const float * projected = llama_get_embeddings_nextn(params.ctx_dft);
         if (projected) {
             const size_t seq_offset = (size_t) seq_id * context_rows;
-            const llama_pos pos_min = std::max(0, batch_in.tokens[row0 + n_chunk - 1].pos[0] - block_size);
+            const llama_pos pos_min = std::max(0, pos[n_chunk - 1] - block_size);
             for (int32_t i = 0; i < n_chunk; ++i) {
-                const llama_pos pos = batch_in.tokens[row0 + i].pos[0];
-                if (pos < pos_min) {
+                if (pos[i] < pos_min) {
                     continue;
                 }
-                const size_t slot = seq_offset + (size_t) pos % context_rows;
+                const size_t slot = seq_offset + (size_t) pos[i] % context_rows;
                 std::memcpy(context_embd.data() + slot * (size_t) n_embd_dec,
                         projected + (size_t) i * n_embd_dec, (size_t) n_embd_dec * sizeof(float));
-                context_pos[slot] = pos;
+                context_pos[slot] = pos[i];
             }
         }
+    }
+
+    // the same for rows row0 .. row0 + n_chunk - 1 of batch_in
+    void store_context_features(const common_batch & batch_in, llama_seq_id seq_id, int32_t row0, int32_t n_chunk) {
+        if (!context_rows) {
+            return;
+        }
+        std::vector<llama_pos> pos(n_chunk);
+        for (int32_t i = 0; i < n_chunk; ++i) {
+            pos[i] = batch_in.tokens[row0 + i].pos[0];
+        }
+        store_context_features(seq_id, pos.data(), n_chunk);
     }
 
 public:
@@ -1772,6 +1783,173 @@ struct common_speculative_impl_inkling2_dspark final : public common_speculative
     bool  adapt_on  = false;
     float adapt_min = 0.33f;
 
+    // Plain decode steps (and verify rounds) hold their target rows, and the next draft injects them in one batch: a step
+    // that drafts nothing then runs no draft decode at all (3% of a plain step on 4x V100 -sm tensor). With the target
+    // states on the devices the rows stay there, in the states ring (llama_spec_states_ring), else they are copied on the
+    // host. Rows are kept in increasing position order, a row at position p drops every held row at p or later (the
+    // target rewrote them), and a flush drops the rows at or after the anchor (rejected drafts). LLAMA_DSPARK_HOLD=0
+    // injects every batch at once.
+    struct held_rows {
+        std::vector<llama_pos> pos;
+        std::vector<int32_t>   row;  // target states on the devices: the states row (see llama_spec_states_ring)
+        std::vector<float>     feat; // target states on the host: target_layer_ids_n extract layers of n_embd_tgt
+    };
+    std::vector<held_rows> held;
+    bool hold_on = false;
+    // flushed before the device ring (256 rows) could wrap onto held rows
+    static constexpr size_t hold_max = 128;
+
+    void hold_truncate(llama_seq_id seq_id, llama_pos pos_end) {
+        auto & h = held[seq_id];
+        size_t n = h.pos.size();
+        while (n > 0 && h.pos[n - 1] >= pos_end) {
+            --n;
+        }
+        h.pos.resize(n);
+        h.row.resize(states_dev ? n : 0);
+        h.feat.resize(states_dev ? 0 : n * (size_t) n_embd_enc);
+    }
+
+    // inject the held rows of seq_id below pos_end and forget the rest
+    bool hold_flush(llama_seq_id seq_id, llama_pos pos_end) {
+        if ((size_t) seq_id >= held.size()) {
+            return true;
+        }
+        hold_truncate(seq_id, pos_end);
+        auto & h = held[seq_id];
+        const int32_t n_rows = (int32_t) h.pos.size();
+        if (n_rows == 0) {
+            return true;
+        }
+        auto * ctx_dft = params.ctx_dft;
+        const int32_t n_ubatch = std::min((int32_t) 256, (int32_t) llama_n_ubatch(ctx_dft));
+        llama_batch_ext * bx = batch_inject.get();
+        std::vector<const float *> parts(target_layer_ids_n);
+        bool ok = true;
+        for (int32_t offset = 0; ok && offset < n_rows; offset += n_ubatch) {
+            const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
+            llama_batch_ext_clear(bx);
+            for (int32_t i = 0; i < n_chunk; ++i) {
+                int32_t idx;
+                if (states_dev) {
+                    idx = llama_batch_ext_add_state_row(bx, seq_id, h.row[offset + i]);
+                } else {
+                    const float * row = h.feat.data() + (size_t) (offset + i) * n_embd_enc;
+                    for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                        parts[k] = row + (size_t) k * n_embd_tgt;
+                    }
+                    idx = llama_batch_ext_add_embd_parts(bx, seq_id, parts.data(), target_layer_ids_n, (size_t) n_embd_tgt);
+                }
+                const llama_pos p = h.pos[offset + i];
+                const llama_pos pos[4] = { p, p, p, 0 };
+                if (idx < 0 || !llama_batch_ext_set_pos(bx, idx, pos)) {
+                    LOG_ERR("%s: failed to add held row %d to the inject batch\n", __func__, (int) (offset + i));
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok && llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, bx) != 0) {
+                LOG_ERR("%s: llama_process(ctx_dft) failed on %d held rows\n", __func__, (int) n_chunk);
+                ok = false;
+            }
+            if (ok) {
+                store_context_features(seq_id, h.pos.data() + offset, n_chunk);
+            }
+        }
+        h.pos.clear();
+        h.row.clear();
+        h.feat.clear();
+        return ok;
+    }
+
+    bool process(const common_batch & batch_in) override {
+        if (!hold_on || batch_in.size() <= 0) {
+            return common_speculative_impl_draft_dflash::process(batch_in);
+        }
+        const int32_t n_tokens = batch_in.size();
+        std::vector<int32_t> i_beg(n_seq, -1);
+        std::vector<int32_t> i_end(n_seq, -1);
+        for (int32_t k = 0; k < n_tokens; ++k) {
+            const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
+            if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+                continue;
+            }
+            i_end[seq_id] = k;
+            if (i_beg[seq_id] < 0) {
+                i_beg[seq_id] = k;
+            }
+        }
+        // decode-sized token batches are held; anything else (a prompt, an image) goes in at once after the held rows
+        bool hold = batch_in.has_token() && !batch_in.has_embd();
+        for (llama_seq_id seq_id = 0; hold && seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            hold = i_beg[seq_id] < 0 || i_end[seq_id] - i_beg[seq_id] + 1 <= block_size + 1;
+        }
+        bool ok = true;
+        if (states_dev) {
+            // the rows are named where the target wrote them (a small batch: the ring), so every batch goes through here
+            const bool has_embeddings = batch_in.has_embd();
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_beg[seq_id] < 0) {
+                    continue;
+                }
+                hold_truncate(seq_id, batch_in.tokens[i_beg[seq_id]].pos[0]);
+                const int32_t n_rows = i_end[seq_id] - i_beg[seq_id] + 1;
+                // an M-RoPE image pins all its rows to one position: skipped, as in process() of the base
+                const bool pos_pinned = batch_in.tokens[i_beg[seq_id]].pos[0] == batch_in.tokens[i_end[seq_id]].pos[0];
+                if (has_embeddings && n_rows > 1 && pos_pinned) {
+                    continue;
+                }
+                auto & h = held[seq_id];
+                for (int32_t row = i_beg[seq_id]; row <= i_end[seq_id]; ++row) {
+                    const int32_t state_row = llama_spec_state_row(params.ctx_tgt, row);
+                    if (state_row < 0) {
+                        LOG_ERR("%s: no target states row for batch entry %d\n", __func__, (int) row);
+                        return false;
+                    }
+                    h.pos.push_back(batch_in.tokens[row].pos[0]);
+                    h.row.push_back(state_row);
+                }
+                if (!hold || h.pos.size() >= hold_max) {
+                    ok = hold_flush(seq_id, std::numeric_limits<llama_pos>::max()) && ok;
+                }
+            }
+            return ok;
+        }
+        if (!hold) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_beg[seq_id] >= 0) {
+                    ok = hold_flush(seq_id, batch_in.tokens[i_beg[seq_id]].pos[0]) && ok;
+                }
+            }
+            return common_speculative_impl_draft_dflash::process(batch_in) && ok;
+        }
+        std::vector<const float *> layers(target_layer_ids_n);
+        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+            layers[k] = llama_get_embeddings_layer_inp(params.ctx_tgt, (uint32_t) target_layer_ids[k]);
+            if (!layers[k]) {
+                GGML_ABORT("DSpark: target layer %d input not extracted.", target_layer_ids[k]);
+            }
+        }
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (i_beg[seq_id] < 0) {
+                continue;
+            }
+            hold_truncate(seq_id, batch_in.tokens[i_beg[seq_id]].pos[0]);
+            auto & h = held[seq_id];
+            for (int32_t row = i_beg[seq_id]; row <= i_end[seq_id]; ++row) {
+                h.pos.push_back(batch_in.tokens[row].pos[0]);
+                for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                    const float * src = layers[k] + (size_t) row * n_embd_tgt;
+                    h.feat.insert(h.feat.end(), src, src + n_embd_tgt);
+                }
+            }
+            if (h.pos.size() >= hold_max) {
+                ok = hold_flush(seq_id, std::numeric_limits<llama_pos>::max()) && ok;
+            }
+        }
+        return ok;
+    }
+
     int32_t adapt_count(llama_seq_id seq_id, int32_t count) {
         if (!adapt_on || (size_t) seq_id >= adapt.size()) {
             return count;
@@ -1825,9 +2003,21 @@ struct common_speculative_impl_inkling2_dspark final : public common_speculative
             /* .backend_sampling = */ false, // the block samples on the backend itself (sampled ids), see draft()
             /* .nextn_masked     = */ false,
         });
+        const char * env_hold = std::getenv("LLAMA_DSPARK_HOLD");
+        hold_on = env_hold == nullptr || std::atoi(env_hold) != 0;
+        if (hold_on && states_dev) {
+            // batches up to a verify round (anchor + drafts) keep their states rows in the ring until a draft injects them
+            hold_on = llama_spec_states_ring(params.ctx_tgt, block_size + 1);
+        }
+        held.resize(n_seq);
+        LOG_INF("%s: - held target rows: %s\n", __func__, hold_on ? "yes" : "no");
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        if (hold_on) {
+            // the held rows are the prompt's last batch and rows of a reused prefix: all below the next position
+            hold_flush(seq_id, std::numeric_limits<llama_pos>::max());
+        }
         common_speculative_impl_draft_dflash::begin(seq_id, prompt);
         if ((size_t) seq_id < seeds.size()) {
             seeds[seq_id] = -1;
@@ -1852,18 +2042,18 @@ struct common_speculative_impl_inkling2_dspark final : public common_speculative
         std::vector<block_data> blocks;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
-            if (!dp.drafting || dp.pos0 < 1) {
-                continue;
-            }
-            if ((uint64_t) dp.pos0 + block_size > llama_n_ctx_seq(ctx)) {
-                continue;
-            }
-            const size_t slot = (size_t) seq_id*context_rows + (dp.pos0 - 1) % context_rows;
-            if (context_pos[slot] != dp.pos0 - 1) {
+            if (!dp.drafting || dp.pos0 < 1 || (uint64_t) dp.pos0 + block_size > llama_n_ctx_seq(ctx)) {
                 continue;
             }
             const int32_t count = adapt_count(seq_id, dp.n_max >= 0 ? std::min(params.n_max, dp.n_max) : params.n_max);
             if (count < params.n_min || count == 0) {
+                continue;
+            }
+            if (hold_on && !hold_flush(seq_id, dp.pos0)) {
+                continue;
+            }
+            const size_t slot = (size_t) seq_id*context_rows + (dp.pos0 - 1) % context_rows;
+            if (context_pos[slot] != dp.pos0 - 1) {
                 continue;
             }
             if ((size_t) seq_id < adapt.size()) {

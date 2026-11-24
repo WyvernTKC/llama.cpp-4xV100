@@ -49,6 +49,9 @@ using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_b
 struct llama_spec_states {
     llama_spec_states_tensors t;
 
+    // rows after the batch rows that small batches of the target can write to (llama_spec_states_ring)
+    llama_spec_ring ring;
+
     ggml_context_ptr        ctx;
     ggml_backend_buffer_ptr buf;
 
@@ -147,6 +150,11 @@ struct llama_context {
 
     // see llama_set_spec_states_device
     bool set_spec_states_device(llama_context & dft);
+
+    // see llama_spec_states_ring and llama_spec_state_row
+    bool    set_spec_states_ring(int32_t n_tokens_max);
+    int32_t spec_state_row(int32_t i) const;
+
     void set_causal_attn(bool value);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);

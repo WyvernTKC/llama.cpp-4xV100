@@ -23,6 +23,7 @@ struct llama_layer;
 struct llama_model;
 struct llama_prec_policy;
 struct llama_hadamard;
+struct llama_spec_ring;
 
 class llama_moe_cache;
 
@@ -201,6 +202,8 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     ggml_tensor * rows = nullptr; // I64 [n_batch]
+
+    llama_spec_ring * ring = nullptr;
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {
@@ -902,12 +905,26 @@ struct llama_graph_reshape_group {
     std::vector<std::pair<ggml_tensor *, int>> tensors; // tensor, dim
 };
 
-// The target states a speculative draft context reads on the devices (llama_set_spec_states_device). A row is a batch index.
+// Rows after the batch rows of the target states, used as a ring (llama_spec_states_ring): a batch of at most n_tokens_max
+//   entries writes its rows there, so a reader can still name them after later batches
+struct llama_spec_ring {
+    int64_t base         = 0; // the first ring row
+    int64_t size         = 0; // ring rows
+    int64_t n_tokens_max = 0; // batches of at most this many entries go to the ring, 0 = none
+    int64_t next         = 0; // the next ring slot
+
+    std::vector<int32_t> rows; // the row each entry of the last batch was written to, by batch index
+};
+
+// The target states a speculative draft context reads on the devices (llama_set_spec_states_device). A row is a batch
+//   index, or a ring row (see llama_spec_states_ring).
 struct llama_spec_states_tensors {
     ggml_tensor * feat = nullptr; // F32 [n_col*n_embd, n_rows]: the inputs of the extracted layers, a column block each
     ggml_tensor * h    = nullptr; // F32 [n_embd_out, n_rows]: the unmasked nextn embeddings
 
     std::vector<int32_t> col; // [n_layer + 1]: the column block of a layer in feat, -1 = not extracted
+
+    llama_spec_ring * ring = nullptr;
 };
 
 struct llm_graph_params {

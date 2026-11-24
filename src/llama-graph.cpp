@@ -562,8 +562,19 @@ void llm_graph_input_spec_rows::set_input(const llama_ubatch * ubatch) {
 
     std::vector<int64_t> data(n_tokens);
     const bool has_idxs = ubatch->data && ubatch->data->batch_idxs.size() == (size_t) n_tokens;
+    const bool to_ring  = ring && ring->size > 0 && n_tokens <= ring->n_tokens_max;
     for (int64_t i = 0; i < n_tokens; ++i) {
-        data[i] = has_idxs ? ubatch->data->batch_idxs[i] : i;
+        const int64_t idx = has_idxs ? ubatch->data->batch_idxs[i] : i;
+        data[i] = to_ring ? ring->base + (ring->next + i) % ring->size : idx;
+        if (ring) {
+            if ((int64_t) ring->rows.size() <= idx) {
+                ring->rows.resize(idx + 1, -1);
+            }
+            ring->rows[idx] = (int32_t) data[i];
+        }
+    }
+    if (to_ring) {
+        ring->next = (ring->next + n_tokens) % ring->size;
     }
     ggml_backend_tensor_set(rows, data.data(), 0, n_tokens*sizeof(int64_t));
 }
@@ -5598,6 +5609,7 @@ static void llm_graph_spec_write(const llm_graph_context & g, ggml_tensor * dst,
 
         inp->rows = ggml_new_tensor_1d(g.ctx0, GGML_TYPE_I64, g.n_tokens);
         ggml_set_input(inp->rows);
+        inp->ring = g.spec_write->ring;
 
         g.res->spec_rows = inp->rows;
         g.res->add_input(std::move(inp));

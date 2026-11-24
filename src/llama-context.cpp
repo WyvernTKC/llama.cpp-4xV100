@@ -1604,6 +1604,21 @@ ggml_backend_t llama_context::spec_device_backend() const {
     return nullptr;
 }
 
+bool llama_context::set_spec_states_ring(int32_t n_tokens_max) {
+    if (!spec_states || !spec_owner || spec_states->ring.size <= n_tokens_max) {
+        return false;
+    }
+    spec_states->ring.n_tokens_max = std::max(0, n_tokens_max);
+    return true;
+}
+
+int32_t llama_context::spec_state_row(int32_t i) const {
+    if (!spec_states || !spec_owner || i < 0 || (size_t) i >= spec_states->ring.rows.size()) {
+        return -1;
+    }
+    return spec_states->ring.rows[i];
+}
+
 bool llama_context::spec_layer_on_device(uint32_t il) const {
     return spec_states && spec_owner && il < spec_states->t.col.size() && spec_states->t.col[il] >= 0;
 }
@@ -1651,8 +1666,12 @@ bool llama_context::set_spec_states_device(llama_context & dft) {
         return false;
     }
 
-    // a row per batch entry, kept until the next batch
-    const int64_t n_rows = cparams.n_batch;
+    // a row per batch entry, kept until the next batch, then a ring for small batches (llama_spec_states_ring)
+    const int64_t n_ring = 256;
+    const int64_t n_rows = cparams.n_batch + n_ring;
+    states->ring.base = cparams.n_batch;
+    states->ring.size = n_ring;
+    states->t.ring    = &states->ring;
 
     ggml_init_params params = {
         /*.mem_size   =*/ 2*ggml_tensor_overhead(),
@@ -5717,6 +5736,14 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 bool llama_set_spec_states_device(llama_context * ctx_tgt, llama_context * ctx_dft) {
     return ctx_tgt->set_spec_states_device(*ctx_dft);
+}
+
+bool llama_spec_states_ring(llama_context * ctx_tgt, int32_t n_tokens_max) {
+    return ctx_tgt->set_spec_states_ring(n_tokens_max);
+}
+
+int32_t llama_spec_state_row(llama_context * ctx_tgt, int32_t i) {
+    return ctx_tgt->spec_state_row(i);
 }
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {

@@ -157,6 +157,15 @@ LLAMA_API int32_t llama_batch_ext_add_state_row(struct llama_batch_ext * batch, 
 //   flags are set. False (the host copies stay) when the devices cannot: not one device per context, no events.
 //   LLAMA_SPEC_STATES_DEVICE=0 keeps the host copies.
 LLAMA_API bool llama_set_spec_states_device(struct llama_context * ctx_tgt, struct llama_context * ctx_dft);
+
+// With the target states on the devices: batches of ctx_tgt with at most n_tokens_max entries (0: none) write their rows
+//   to a ring after the batch rows instead of at their batch indexes, so a reader can name them several batches later
+//   (llama_spec_state_row). The ring holds 256 rows: name them before they are overwritten. False without device states.
+LLAMA_API bool llama_spec_states_ring(struct llama_context * ctx_tgt, int32_t n_tokens_max);
+
+// The target states row entry i of the last batch of ctx_tgt was written to, -1 if none
+LLAMA_API int32_t llama_spec_state_row(struct llama_context * ctx_tgt, int32_t i);
+
 // Questions packed after a shared state in one sequence, contexts without memory only
 // 0 (default) is the state, k > 0 the k-th question; full attention layers hide other questions from a question
 LLAMA_API bool llama_batch_ext_set_decision_group(struct llama_batch_ext * batch, int32_t idx, int32_t group);
