@@ -428,6 +428,9 @@ struct common_speculative_impl {
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
 
+    // (optional) put the rows held back for seq_id into the draft context, see common_speculative_flush
+    virtual void flush(llama_seq_id /*seq_id*/, llama_pos /*pos_end*/) {}
+
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
@@ -1817,11 +1820,22 @@ struct common_speculative_impl_inkling2_dspark final : public common_speculative
         }
         hold_truncate(seq_id, pos_end);
         auto & h = held[seq_id];
+        auto * ctx_dft = params.ctx_dft;
+        // rows the draft context already has are stale: its state was replaced (a prompt cache load) while rows were held
+        const llama_pos pos_dft = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+        const size_t n_old = std::upper_bound(h.pos.begin(), h.pos.end(), pos_dft) - h.pos.begin();
+        if (n_old > 0) {
+            h.pos.erase(h.pos.begin(), h.pos.begin() + n_old);
+            if (states_dev) {
+                h.row.erase(h.row.begin(), h.row.begin() + n_old);
+            } else {
+                h.feat.erase(h.feat.begin(), h.feat.begin() + n_old * (size_t) n_embd_enc);
+            }
+        }
         const int32_t n_rows = (int32_t) h.pos.size();
         if (n_rows == 0) {
             return true;
         }
-        auto * ctx_dft = params.ctx_dft;
         const int32_t n_ubatch = std::min((int32_t) 256, (int32_t) llama_n_ubatch(ctx_dft));
         llama_batch_ext * bx = batch_inject.get();
         std::vector<const float *> parts(target_layer_ids_n);
@@ -2028,6 +2042,11 @@ struct common_speculative_impl_inkling2_dspark final : public common_speculative
         if ((size_t) seq_id < sampler_cfg.size()) {
             sampler_cfg[seq_id].temp = NAN;
         }
+    }
+
+    // a saved draft state without the held rows would restore behind the target
+    void flush(llama_seq_id seq_id, llama_pos pos_end) override {
+        hold_flush(seq_id, pos_end);
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
@@ -4244,6 +4263,16 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
         if (impl_other.get() != impl) {
             impl_other->accept(seq_id, n_accepted, true);
         }
+    }
+}
+
+void common_speculative_flush(common_speculative * spec, llama_seq_id seq_id, llama_pos pos_end) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->flush(seq_id, pos_end);
     }
 }
 

@@ -392,6 +392,8 @@ struct server_slot {
             return nullptr;
         }
 
+        common_speculative_flush(spec, id, prompt.tokens.pos_next());
+
         llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_NONE;
 
         size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, flags);
@@ -3088,6 +3090,8 @@ private:
             return;
         }
 
+        common_speculative_flush(spec.get(), slot.id, slot.prompt.tokens.pos_next());
+
         auto n_in_tier = [&](bool dev) {
             return (size_t) std::count_if(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
                     [&](const common_prompt_checkpoint & c) { return is_dev(c) == dev; });
@@ -3380,6 +3384,7 @@ private:
         std::vector<uint8_t> data_dft;
         std::vector<uint8_t> data_spec;
         if (ctx_dft != nullptr) {
+            common_speculative_flush(spec.get(), slot.id, slot.prompt.tokens.pos_next());
             data_dft.resize(llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE));
             llama_state_seq_get_data_ext(ctx_dft, data_dft.data(), data_dft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
