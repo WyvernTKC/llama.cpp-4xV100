@@ -5988,6 +5988,17 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
     return true;
 }
 
+// A source a fused node's output can never lie over: memory the graph does not allocate (a weight, a cache). A source of
+//   op NONE in a compute buffer is not one: it is the scheduler's copy of an input from another backend, which ggml-alloc
+//   frees after its last reader when the scheduler keeps one copy (llama's graph slots under -sm layer, the host -> meta
+//   inputs under -sm tensor). If that reader is a node of the chain before its output, the output may take its place.
+//   GGML_CUDA_NO_FUSION_INPUT_CHECK=1 skips every source of op NONE, as before.
+static bool ggml_cuda_fusion_src_is_fixed(const ggml_tensor * src) {
+    static const bool skip_inputs = getenv("GGML_CUDA_NO_FUSION_INPUT_CHECK") != nullptr;
+    return src->op == GGML_OP_NONE && (skip_inputs || src->buffer == nullptr ||
+        ggml_backend_buffer_get_usage(src->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+}
+
 // returns whether the write (out) nodes overwrite the read nodes in operation; src_may_alias is an input the fused op
 //   has finished reading before it writes
 static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
@@ -6029,7 +6040,7 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
             for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
                 const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
 
-                if (!src || src->op == GGML_OP_NONE || src == logits_may_alias || src == src_may_alias) {
+                if (!src || ggml_cuda_fusion_src_is_fixed(src) || src == logits_may_alias || src == src_may_alias) {
                     continue;
                 }
 
@@ -6834,7 +6845,7 @@ static int ggml_cuda_try_fuse_attn_rot(ggml_backend_cuda_context * cuda_ctx, ggm
         };
         for (int j = i; j < k; ++j) {
             for (const ggml_tensor * src : cgraph->nodes[j]->src) {
-                if (src == nullptr || src->op == GGML_OP_NONE || src->data == x->data) {
+                if (src == nullptr || ggml_cuda_fusion_src_is_fixed(src) || src->data == x->data) {
                     continue;
                 }
                 bool intermediate = false;
@@ -7321,10 +7332,10 @@ static int ggml_cuda_try_fuse_cont_small_k(ggml_backend_cuda_context * cuda_ctx,
     for (int d = 0; d < GGML_MAX_DIMS; ++d) {
         x.nb[d] = view->nb[d];
     }
-    // ggml-alloc may have put mm over the view: the CONT was its last reader. The range check below skips a source of op
-    //   NONE, which is what the view is when the states come from another device (-sm layer): the scheduler's copy of the
-    //   view, which a scheduler without pipeline copies (llama's graph slots) frees after the CONT. The kernel would then
-    //   overwrite rows of x that other blocks have not read yet. Same for y.
+    // ggml-alloc may have put mm over the view: the CONT was its last reader. The kernel would then overwrite rows of x that
+    //   other blocks have not read yet. When the states come from another device (-sm layer) the view is the scheduler's
+    //   copy of it, of op NONE (see ggml_cuda_fusion_src_is_fixed): checked here too, whatever the range check skips. Same
+    //   for y.
     if (ggml_cuda_tensors_overlap(mm, view) || ggml_cuda_tensors_overlap(mm, mm->src[1]) ||
             !ggml_cuda_should_use_mul_mat_small_k(&x, mm->src[1], mm) || !ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
         return 0;
