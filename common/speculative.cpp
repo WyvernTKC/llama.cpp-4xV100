@@ -2503,6 +2503,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // call to pair with, so it's stashed here until that next call fires.
     std::vector<std::vector<float>> pending_h;   // [n_seq][n_embd]
     std::vector<llama_pos>          pending_pos; // [n_seq] target position of pending_h, -1: unknown
+    std::vector<float>              zero_h;      // [n_embd] the row before the first position of a sequence
 
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
@@ -2593,6 +2594,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
         pending_pos.assign(n_seq, -1);
+        zero_h.assign(n_embd, 0.0f);
 
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
@@ -2702,7 +2704,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     : batch.add_embd(t.embd, t.pos.data(), seq_id, false);
 
                 if (k == i_batch_beg[seq_id]) {
-                    batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
+                    // the row of the previous position, else zeros as for a fresh context: a new prompt must not pair
+                    //   its first token with the last row of the previous request
+                    const bool prev = pending_pos[seq_id] >= 0 && pending_pos[seq_id] + 1 == t.pos[0];
+                    batch.set_embd_state(idx, { prev ? pending_h[seq_id].data() : zero_h.data(), 1, (size_t) n_embd });
                 } else if (states_dev) {
                     batch.set_state_row(idx, k - 1);
                 } else {
