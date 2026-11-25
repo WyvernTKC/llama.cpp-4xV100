@@ -1079,3 +1079,4 @@ bool llm_arch_supports_sm_tensor_expert_offload(const llm_arch & arch);
 bool llm_arch_ssm_scan_family(const llm_arch & arch);
 bool llm_arch_supports_rs_rollback(const llm_arch & arch);
 bool llm_arch_supports_mixed_batch(const llm_arch & arch);
+bool llm_arch_mmid_down_bf16(const llm_arch & arch);

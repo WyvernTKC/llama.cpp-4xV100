@@ -236,6 +236,7 @@ export type {
 	BackgroundReply,
 	PendingQuestion,
 	SteeringMessage,
+	PendingPermissionRequest,
 	AgenticSection,
 	ToolResultLine,
 	ContinueIntent
@@ -249,6 +250,8 @@ export type {
 	EditFileEdit,
 	EditFileMeta,
 	EditFileTitleMeta,
+	ToolCallDescription,
+	ToolCallPhrasing,
 	ToolEntry,
 	ToolGroup,
 	ToolUiEntry,

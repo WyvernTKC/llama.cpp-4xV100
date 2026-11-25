@@ -163,35 +163,42 @@ std::unique_ptr<llm_graph_context> llama_model_bailingmoe3::build_arch_graph(con
 ggml_tensor * llama_model_bailingmoe3::graph::build_causal_conv1d(
         llm_graph_input_rs * inp_rs, ggml_tensor * conv_states_all, ggml_tensor * conv_state_all,
         int64_t qkv, ggml_tensor * x, ggml_tensor * proj_w, ggml_tensor * conv_w,
-        int64_t d_conv, int64_t head_dim, int64_t n_head, int64_t n_seq_tokens, int64_t n_seqs) {
+        int64_t d_conv, int64_t head_dim, int64_t n_head, int64_t n_seq_tokens, int64_t n_seqs, int il) {
     const int64_t d_inner = head_dim * n_head;
     const int64_t conv_state_size = (d_conv - 1) * d_inner;
     const int64_t total_state_size = 3 * conv_state_size;
 
-    ggml_tensor * conv_state = ggml_view_3d(ctx0, conv_state_all, d_conv - 1, d_inner, n_seqs,
-            (d_conv - 1) * ggml_element_size(conv_state_all),
-            total_state_size * ggml_element_size(conv_state_all),
-            qkv * conv_state_size * ggml_element_size(conv_state_all));
-
     ggml_tensor * x_proj = ggml_mul_mat(ctx0, proj_w, x);
     x_proj = ggml_reshape_3d(ctx0, x_proj, d_inner, n_seq_tokens, n_seqs);
-    ggml_tensor * conv_x = ggml_concat(ctx0, conv_state, ggml_transpose(ctx0, x_proj), 0);
 
-    const int64_t cache_head = inp_rs->mctx->get_head();
-    const int64_t mem_size   = inp_rs->mctx->get_size();
+    ggml_tensor * conv_x = nullptr;
+    if (cparams.rs_replay) {
+        // the row holds the q, k and v conv histories one after the other
+        conv_x = build_conv_state_replay(inp_rs, conv_states_all, x_proj, d_conv - 1, d_inner, il, conv_state_all, qkv);
+    } else {
+        ggml_tensor * conv_state = ggml_view_3d(ctx0, conv_state_all, d_conv - 1, d_inner, n_seqs,
+                (d_conv - 1) * ggml_element_size(conv_state_all),
+                total_state_size * ggml_element_size(conv_state_all),
+                qkv * conv_state_size * ggml_element_size(conv_state_all));
 
-    const int64_t K = (int64_t) cparams.n_rs_seq + 1;
-    const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+        conv_x = ggml_concat(ctx0, conv_state, ggml_transpose(ctx0, x_proj), 0);
 
-    // per-slot 3D views: the -sm tensor split of the 3-segment conv row is validated for this shape
-    for (int64_t slot = 0; slot < n_written; ++slot) {
-        ggml_tensor * conv_snap = ggml_view_3d(ctx0, conv_x, d_conv - 1, d_inner, n_seqs,
-                conv_x->nb[1], conv_x->nb[2], (conv_x->ne[0] - (d_conv - 1) - slot) * conv_x->nb[0]);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_snap,
-                ggml_view_3d(ctx0, conv_states_all, d_conv - 1, d_inner, n_seqs,
-                    (d_conv - 1) * ggml_element_size(conv_states_all),
-                    total_state_size * ggml_element_size(conv_states_all),
-                    ((slot * mem_size + cache_head) * total_state_size + qkv * conv_state_size) * ggml_element_size(conv_states_all))));
+        const int64_t cache_head = inp_rs->mctx->get_head();
+        const int64_t mem_size   = inp_rs->mctx->get_size();
+
+        const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+        const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+
+        // per-slot 3D views: the -sm tensor split of the 3-segment conv row is validated for this shape
+        for (int64_t slot = 0; slot < n_written; ++slot) {
+            ggml_tensor * conv_snap = ggml_view_3d(ctx0, conv_x, d_conv - 1, d_inner, n_seqs,
+                    conv_x->nb[1], conv_x->nb[2], (conv_x->ne[0] - (d_conv - 1) - slot) * conv_x->nb[0]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_snap,
+                    ggml_view_3d(ctx0, conv_states_all, d_conv - 1, d_inner, n_seqs,
+                        (d_conv - 1) * ggml_element_size(conv_states_all),
+                        total_state_size * ggml_element_size(conv_states_all),
+                        ((slot * mem_size + cache_head) * total_state_size + qkv * conv_state_size) * ggml_element_size(conv_states_all))));
+        }
     }
 
     ggml_tensor * conv_weight = ggml_reshape_2d(ctx0, conv_w, d_conv, d_inner);
@@ -241,17 +248,17 @@ llama_model_bailingmoe3::graph::graph(const llm_graph_params & params) :
         if (hparams.is_recr(il)) {
             const auto * mctx_cur = inp_rs->mctx;
             ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
-            ggml_tensor * conv_state_all = build_rs(inp_rs, conv_states_all, hparams.n_embd_r(), n_seqs);
+            ggml_tensor * conv_state_all = build_rs(inp_rs, conv_states_all, conv_states_all->ne[0], n_seqs);
 
             ggml_tensor * q = build_causal_conv1d(
                     inp_rs, conv_states_all, conv_state_all, 0, cur, layer.wq, layer.ssm_q_conv,
-                    d_conv, head_dim, n_head, n_seq_tokens, n_seqs);
+                    d_conv, head_dim, n_head, n_seq_tokens, n_seqs, il);
             ggml_tensor * k = build_causal_conv1d(
                     inp_rs, conv_states_all, conv_state_all, 1, cur, layer.wk, layer.ssm_k_conv,
-                    d_conv, head_dim, n_head, n_seq_tokens, n_seqs);
+                    d_conv, head_dim, n_head, n_seq_tokens, n_seqs, il);
             ggml_tensor * v = build_causal_conv1d(
                     inp_rs, conv_states_all, conv_state_all, 2, cur, layer.wv, layer.ssm_v_conv,
-                    d_conv, head_dim, n_head, n_seq_tokens, n_seqs);
+                    d_conv, head_dim, n_head, n_seq_tokens, n_seqs, il);
 
             ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ssm_f_a, cur);
             gate = ggml_add(ctx0, gate, layer.ssm_dt_b);

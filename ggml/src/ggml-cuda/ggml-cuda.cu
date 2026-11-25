@@ -4599,6 +4599,48 @@ static int ggml_cuda_try_gdn_cache_fusion(
 
     fused_state_cpy.data        = (float *) dst->data; // rollback group 0 (newest)
     fused_state_cpy.slot_stride = K > 1 ? (int64_t) (dst->nb[2] / sizeof(float)) : 0;
+
+    // rs_replay: the next 4 real nodes may store the k, v, g, beta inputs into the pending rows (the kernel stores k per
+    //   sequence of v, so not with q and k broadcast over the sequences)
+    if (gdn->src[6] != nullptr && gdn->src[3]->ne[0] == 1 && gdn->src[1]->ne[3] == src_v->ne[3]) {
+        int    j = node_idx + skip + 1;
+        int    skip_in = skip;
+        float * in_dst[4];
+        int64_t in_nb2[4];
+        int64_t in_nb3[4];
+        int i = 0;
+        for (; i < 4 && j < cgraph->n_nodes; ++j) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            if (ggml_cuda_is_view_or_noop(n)) {
+                continue;
+            }
+            const ggml_tensor * in = gdn->src[1 + i];
+            const ggml_tensor * d  = n->src[1];
+            // the cpy reads the whole input, directly or through a view of the same data
+            const ggml_tensor * s0 = n->src[0];
+            const bool whole_in = s0 == in || (s0 != nullptr && s0->data == in->data && ggml_are_same_shape(s0, in) &&
+                                               ggml_are_same_stride(s0, in));
+            if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT) || !whole_in ||
+                d->type != GGML_TYPE_F32 || d->data == nullptr || !ggml_are_same_shape(d, in) ||
+                d->nb[0] != sizeof(float) || d->nb[1] != d->ne[0]*sizeof(float) || d->nb[2] != d->ne[0]*d->ne[1]*sizeof(float)) {
+                break;
+            }
+            in_dst[i] = (float *) d->data;
+            in_nb2[i] = d->nb[2] / sizeof(float);
+            in_nb3[i] = d->nb[3] / sizeof(float);
+            skip_in   = j - node_idx;
+            ++i;
+        }
+        if (i == 4) {
+            for (int c = 0; c < 4; ++c) {
+                fused_state_cpy.in_dst[c] = in_dst[c];
+                fused_state_cpy.in_nb2[c] = in_nb2[c];
+                fused_state_cpy.in_nb3[c] = in_nb3[c];
+            }
+            skip = skip_in;
+        }
+    }
+
     return skip;
 }
 
@@ -4697,16 +4739,16 @@ static int32_t ggml_cuda_graph_use_count_skip_empty_views(const ggml_cgraph * cg
     return n;
 }
 
-// the input of an l2 norm built as rms_norm + scale (build_gdn_l2_norm), if only t's reader uses the norm
+// the input of an l2 norm built as rms_norm + scale (build_gdn_l2_norm), if only the n_readers readers of t use the norm
 static const ggml_tensor * ggml_cuda_gdn_l2_norm_input(
-        const ggml_cgraph * cgraph, const ggml_tensor * t, float & eps, float & post_scale, float & post_bias) {
+        const ggml_cgraph * cgraph, const ggml_tensor * t, float & eps, float & post_scale, float & post_bias, const int n_readers = 1) {
     if (t->op != GGML_OP_SCALE || t->src[0]->op != GGML_OP_RMS_NORM) {
         return nullptr;
     }
     const ggml_tensor * norm = t->src[0];
     const ggml_tensor * x    = norm->src[0];
     if (t->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || !ggml_is_contiguous_rows(x) ||
-            ggml_cuda_graph_use_count(cgraph, t) != 1 || ggml_cuda_graph_use_count(cgraph, norm) != 1 ||
+            ggml_cuda_graph_use_count(cgraph, t) != n_readers || ggml_cuda_graph_use_count(cgraph, norm) != 1 ||
             ((t->flags | norm->flags) & GGML_TENSOR_FLAG_OUTPUT)) {
         return nullptr;
     }
@@ -4719,6 +4761,8 @@ static const ggml_tensor * ggml_cuda_gdn_l2_norm_input(
 // A gated delta net at a few tokens whose q and k are their l2 norms: the kernel applies the norms and the two norm
 //   launches are skipped. Only with the snapshot cpy fusion, which runs the op in ggml_cuda_try_fuse. At prefill the
 //   norms stay apart, as in the kernel they would lengthen its serial loop over the tokens.
+//   With replay the cpy that stores k into the pending rows reads the k norm too, directly or through a view that only it
+//   reads; that is allowed when the kernel runs the cpy (the fused input stores), as it then stores the k it normalized.
 static bool ggml_cuda_gdn_l2_fusion(const ggml_cgraph * cgraph, const int gdn_idx, ggml_cuda_gated_delta_net_l2 & l2) {
     const ggml_tensor * gdn = cgraph->nodes[gdn_idx];
     if (gdn->op != GGML_OP_GATED_DELTA_NET) {
@@ -4729,15 +4773,27 @@ static bool ggml_cuda_gdn_l2_fusion(const ggml_cgraph * cgraph, const int gdn_id
     if (warp_size != 32 || (S_v != 16 && S_v != 32 && S_v != 64 && S_v != 128) || gdn->src[2]->ne[2] > 8) {
         return false;
     }
-    float eps_k, post_scale_k, post_bias_k;
-    const ggml_tensor * q = ggml_cuda_gdn_l2_norm_input(cgraph, gdn->src[0], l2.eps, l2.post_scale, l2.post_bias);
-    const ggml_tensor * k = ggml_cuda_gdn_l2_norm_input(cgraph, gdn->src[1], eps_k, post_scale_k, post_bias_k);
-    if (!q || !k || q->ne[0] != S_v || !ggml_are_same_shape(q, gdn->src[0]) || !ggml_are_same_shape(k, gdn->src[1]) ||
-            !ggml_are_same_stride(q, k) || eps_k != l2.eps || post_scale_k != l2.post_scale || post_bias_k != l2.post_bias) {
+    ggml_cuda_gated_delta_net_fused_cache cache;
+    const int skip = ggml_cuda_try_gdn_cache_fusion(cgraph, gdn_idx, cache);
+    if (skip == 0) {
         return false;
     }
-    ggml_cuda_gated_delta_net_fused_cache cache;
-    if (ggml_cuda_try_gdn_cache_fusion(cgraph, gdn_idx, cache) == 0) {
+    int k_readers = 1;
+    for (int j = gdn_idx + 1; cache.in_dst[0] != nullptr && j <= gdn_idx + skip; j++) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op != GGML_OP_CPY) {
+            continue;
+        }
+        const ggml_tensor * s0 = n->src[0];
+        if (s0 == gdn->src[1] || (s0->op == GGML_OP_VIEW && s0->src[0] == gdn->src[1] && ggml_cuda_graph_use_count(cgraph, s0) == 1)) {
+            k_readers++;
+        }
+    }
+    float eps_k, post_scale_k, post_bias_k;
+    const ggml_tensor * q = ggml_cuda_gdn_l2_norm_input(cgraph, gdn->src[0], l2.eps, l2.post_scale, l2.post_bias);
+    const ggml_tensor * k = ggml_cuda_gdn_l2_norm_input(cgraph, gdn->src[1], eps_k, post_scale_k, post_bias_k, k_readers);
+    if (!q || !k || q->ne[0] != S_v || !ggml_are_same_shape(q, gdn->src[0]) || !ggml_are_same_shape(k, gdn->src[1]) ||
+            !ggml_are_same_stride(q, k) || eps_k != l2.eps || post_scale_k != l2.post_scale || post_bias_k != l2.post_bias) {
         return false;
     }
     // ggml-alloc frees the norm inputs after the norms, their last readers, so a node from there up to the gated delta
@@ -4826,11 +4882,12 @@ static int ggml_cuda_gdn_gather_fusion(
     }
 
     // the cpy of the start state to its rollback slot, if any, is the first real node after the snapshot cpy. It reads s
-    //   whole, directly or through a view of no offset, and has no rows when the net wrote every slot
+    //   whole, directly or through a view of no offset, and has no rows when the net wrote every slot. Replay has no
+    //   rollback slots (a rollback drops pending tokens instead), so there any other reader of s stops the fold
     gather = {};
     int extra     = 0;
     int s_readers = 1; // the net
-    for (int j = gdn_idx + skip_cache + 1; j < cgraph->n_nodes; ++j) {
+    for (int j = gdn_idx + skip_cache + 1; gdn->src[6] == nullptr && j < cgraph->n_nodes; ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
         const ggml_tensor * n_src = n->src[0];
         const bool pre_cpy = n->op == GGML_OP_CPY && !(n->flags & GGML_TENSOR_FLAG_OUTPUT) && (n_src == s ||

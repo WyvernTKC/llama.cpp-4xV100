@@ -63,6 +63,7 @@ import type {
 	AgenticMessage,
 	AgenticToolCallList,
 	AgenticToolPolicy,
+	PendingPermissionRequest,
 	SteeringMessage
 } from '#lib/types/agentic.js';
 import type {
@@ -151,6 +152,7 @@ function createDefaultSession(): AgenticSession {
 		lastError: null,
 		liveLlm: null,
 		pendingPermissionRequest: null,
+		startedAt: null,
 		streamingToolCall: null,
 		totalToolCalls: 0
 	};
@@ -204,6 +206,8 @@ function toAgenticMessages(messages: ApiChatMessageData[]): AgenticMessage[] {
 class AgenticStore {
 	// what the chat tools asked for during the running flow, per conversation
 	private chatToolRequests = new Map<string, AgenticChatToolRequests>();
+	/** When each running flow started, keyed by its timings object; see buildFinalTimings */
+	private flowStarts = new WeakMap<ChatMessageAgenticTimings, number>();
 	// permission, continue and steering gates the loop waits on between turns
 	private gates = new AgenticGates();
 	// compaction epoch the context reminder went out in, per conversation
@@ -326,9 +330,7 @@ class AgenticStore {
 		return this.gates.getPendingContinueRequest(conversationId);
 	}
 
-	getPendingPermissionRequest(
-		conversationId: string
-	): { toolName: string; serverLabel: string } | null {
+	getPendingPermissionRequest(conversationId: string): PendingPermissionRequest | null {
 		return this.gates.getPendingPermissionRequest(conversationId);
 	}
 
@@ -354,6 +356,11 @@ class AgenticStore {
 		}
 
 		return session;
+	}
+
+	/** When the running flow started (ms since epoch), or null when idle. */
+	getStartedAt(conversationId: string): number | null {
+		return this.sessions.get(conversationId)?.startedAt ?? null;
 	}
 
 	getStreamingToolCall(conversationId: string): { name: string; arguments: string } | null {
@@ -467,6 +474,7 @@ class AgenticStore {
 			isRunning: true,
 			lastError: null,
 			liveLlm: null,
+			startedAt: Date.now(),
 			totalToolCalls: 0
 		});
 
@@ -498,7 +506,8 @@ class AgenticStore {
 			this.updateSession(conversationId, {
 				flowRootMessageId: null,
 				isRunning: false,
-				liveLlm: null
+				liveLlm: null,
+				startedAt: null
 			});
 
 			if (hasMcpServers) {
@@ -529,8 +538,13 @@ class AgenticStore {
 	): ChatMessageTimings | undefined {
 		if (agenticTimings.toolCallsCount === 0) return capturedTimings;
 
+		const startedAt = this.flowStarts.get(agenticTimings);
+
 		return {
-			agentic: agenticTimings,
+			agentic:
+				startedAt === undefined
+					? agenticTimings
+					: { ...agenticTimings, totalMs: Date.now() - startedAt },
 			cache_n: capturedTimings?.cache_n,
 			predicted_ms: capturedTimings?.predicted_ms,
 			predicted_n: capturedTimings?.predicted_n,
@@ -625,6 +639,11 @@ class AgenticStore {
 			toolsMs: 0,
 			turns: 0
 		};
+
+		// the run's start travels with its timings, so every exit of the loop
+		// stamps the total task time without being handed it
+		this.flowStarts.set(agenticTimings, this.sessions.get(conversationId)?.startedAt ?? Date.now());
+
 		const maxTurns = agenticConfig.maxTurns;
 		const effectiveModel = options.model || modelsStore.models[0]?.model || '';
 
@@ -937,6 +956,7 @@ class AgenticStore {
 					conversationId,
 					toolName,
 					serverLabel,
+					toolCall.id,
 					signal
 				);
 

@@ -12,7 +12,12 @@ import { ToolPermissionDecision } from '#lib/enums/index.ts';
 // direct imports between stores, not via the barrel, to avoid circular deps
 import { permissionsStore } from '#lib/stores/permissions.svelte.ts';
 import { toolsStore } from '#lib/stores/tools.svelte.ts';
-import type { DatabaseMessageExtra, PendingQuestion, SteeringMessage } from '#lib/types/index.ts';
+import type {
+	DatabaseMessageExtra,
+	PendingPermissionRequest,
+	PendingQuestion,
+	SteeringMessage
+} from '#lib/types/index.ts';
 import { SvelteMap } from 'svelte/reactivity';
 
 export class AgenticGates {
@@ -22,10 +27,7 @@ export class AgenticGates {
 	private pendingContinueRequests = new SvelteMap<string, boolean>();
 
 	/** Dedicated reactive state for pending permission requests (ensures immediate UI updates) */
-	private pendingPermissions = new SvelteMap<
-		string,
-		{ toolName: string; serverLabel: string } | null
-	>();
+	private pendingPermissions = new SvelteMap<string, PendingPermissionRequest | null>();
 	/** Reactive: the ask_user question a conversation waits on */
 	private pendingQuestions = new SvelteMap<string, PendingQuestion>();
 
@@ -74,9 +76,7 @@ export class AgenticGates {
 		return this.pendingContinueRequests.get(conversationId) ?? false;
 	}
 
-	getPendingPermissionRequest(
-		conversationId: string
-	): { toolName: string; serverLabel: string } | null {
+	getPendingPermissionRequest(conversationId: string): PendingPermissionRequest | null {
 		return this.pendingPermissions.get(conversationId) ?? null;
 	}
 
@@ -173,6 +173,7 @@ export class AgenticGates {
 		conversationId: string,
 		toolName: string,
 		serverLabel: string,
+		toolCallId: string,
 		signal?: AbortSignal
 	): Promise<ToolPermissionDecision> {
 		const permissionKey = toolsStore.getPermissionKey(toolName);
@@ -181,7 +182,7 @@ export class AgenticGates {
 			return ToolPermissionDecision.ONCE;
 		}
 
-		this.pendingPermissions.set(conversationId, { serverLabel, toolName });
+		this.pendingPermissions.set(conversationId, { serverLabel, toolCallId, toolName });
 
 		return new Promise<ToolPermissionDecision>((resolve) => {
 			if (signal?.aborted) {

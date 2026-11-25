@@ -255,7 +255,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         const int64_t t_start = ggml_time_us();
 
         {
-            auto & data = it_best->data.main;
+            const auto & data = it_best->data.main;
 
             const size_t size = data.size();
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
@@ -264,16 +264,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
                 return false;
             }
-
-            // the larger of the two stays for the next save
-            if (data.cap > spare.cap) {
-                std::swap(data, spare);
-            }
-            data.clear();
         }
 
         {
-            auto & data = it_best->data.drft;
+            const auto & data = it_best->data.drft;
 
             if (!data.empty()) {
                 GGML_ASSERT(ctx_dft);
@@ -285,13 +279,19 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
                     return false;
                 }
-
-                if (data.cap > spare_drft.cap) {
-                    std::swap(data, spare_drft);
-                }
-                data.clear();
             }
         }
+
+        // both states are restored and the entry goes away below (a failed restore returns above and leaves it whole):
+        // the larger of its buffer and the spare stays for the next save
+        auto keep = [](common_state_bytes & data, common_state_bytes & spare) {
+            if (data.cap > spare.cap) {
+                std::swap(data, spare);
+            }
+            data.clear();
+        };
+        keep(it_best->data.main, spare);
+        keep(it_best->data.drft, spare_drft);
 
         SRV_TRC(" - restored prompt state: %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
         SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_RESTORE__\n");

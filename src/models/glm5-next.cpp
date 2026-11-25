@@ -190,9 +190,10 @@ std::unique_ptr<llm_graph_context> llama_model_glm5_next::build_arch_graph(const
     return std::make_unique<graph>(params);
 }
 
-// Causal conv1d over one of the Q/K/V projections
+// Causal conv1d over one of the Q/K/V projections. conv_x is the conv input of the replay (build_conv_state_replay), or
+//   nullptr to read the window from conv_state_all and store it here
 static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
-                                 ggml_tensor * conv_states_all, ggml_tensor * conv_state_all,
+                                 ggml_tensor * conv_states_all, ggml_tensor * conv_state_all, ggml_tensor * conv_x,
                                  int64_t qkv, ggml_tensor * x_proj, ggml_tensor * conv_w,
                                  int64_t d_conv, int64_t head_dim, int64_t n_head,
                                  int64_t n_seq_tokens, int64_t n_seqs, int64_t n_tokens, int64_t kv_head,
@@ -201,26 +202,28 @@ static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
     const int64_t conv_state_size = (d_conv - 1) * d_inner;
     const int64_t n_embd_r_total  = 3 * conv_state_size;
 
-    ggml_tensor * conv_state_x = ggml_view_3d(ctx0, conv_state_all, d_conv - 1, d_inner, n_seqs,
-        (d_conv - 1)   * ggml_element_size(conv_state_all),
-        n_embd_r_total * ggml_element_size(conv_state_all),
-        qkv * conv_state_size * ggml_element_size(conv_state_all));
+    if (conv_x == nullptr) {
+        ggml_tensor * conv_state_x = ggml_view_3d(ctx0, conv_state_all, d_conv - 1, d_inner, n_seqs,
+            (d_conv - 1)   * ggml_element_size(conv_state_all),
+            n_embd_r_total * ggml_element_size(conv_state_all),
+            qkv * conv_state_size * ggml_element_size(conv_state_all));
 
-    ggml_tensor * x_3d   = ggml_reshape_3d(ctx0, x_proj, d_inner, n_seq_tokens, n_seqs);
-    ggml_tensor * conv_x = ggml_concat(ctx0, conv_state_x, ggml_transpose(ctx0, x_3d), 0);
+        ggml_tensor * x_3d = ggml_reshape_3d(ctx0, x_proj, d_inner, n_seq_tokens, n_seqs);
+        conv_x = ggml_concat(ctx0, conv_state_x, ggml_transpose(ctx0, x_3d), 0);
 
-    // group s holds the conv window s tokens back.
-    // [TAG_RECURRENT_ROLLBACK_SPLITS]: the last K_rs tokens must share one ubatch.
-    for (int64_t s = 0; s < K_rs; ++s) {
-        const int64_t s_idx = std::max<int64_t>(0, n_seq_tokens - s);
-        ggml_tensor * conv_x_s = ggml_view_3d(ctx0, conv_x, d_conv - 1, d_inner, n_seqs,
-            conv_x->nb[1], conv_x->nb[2], s_idx * conv_x->nb[0]);
-        ggml_build_forward_expand(gf,
-            ggml_cpy(ctx0, conv_x_s,
-                ggml_view_3d(ctx0, conv_states_all, d_conv - 1, d_inner, n_seqs,
-                    (d_conv - 1)   * ggml_element_size(conv_states_all),
-                    n_embd_r_total * ggml_element_size(conv_states_all),
-                    ((s * mem_size + kv_head) * n_embd_r_total + qkv * conv_state_size) * ggml_element_size(conv_states_all))));
+        // group s holds the conv window s tokens back.
+        // [TAG_RECURRENT_ROLLBACK_SPLITS]: the last K_rs tokens must share one ubatch.
+        for (int64_t s = 0; s < K_rs; ++s) {
+            const int64_t s_idx = std::max<int64_t>(0, n_seq_tokens - s);
+            ggml_tensor * conv_x_s = ggml_view_3d(ctx0, conv_x, d_conv - 1, d_inner, n_seqs,
+                conv_x->nb[1], conv_x->nb[2], s_idx * conv_x->nb[0]);
+            ggml_build_forward_expand(gf,
+                ggml_cpy(ctx0, conv_x_s,
+                    ggml_view_3d(ctx0, conv_states_all, d_conv - 1, d_inner, n_seqs,
+                        (d_conv - 1)   * ggml_element_size(conv_states_all),
+                        n_embd_r_total * ggml_element_size(conv_states_all),
+                        ((s * mem_size + kv_head) * n_embd_r_total + qkv * conv_state_size) * ggml_element_size(conv_states_all))));
+        }
     }
 
     ggml_tensor * conv_weight = ggml_reshape_2d(ctx0, conv_w, d_conv, d_inner);
@@ -930,7 +933,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     const auto   kv_head  = mctx_cur->get_head();
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
-    ggml_tensor * conv_state_all  = build_rs(inp_rs, conv_states_all, hparams.n_embd_r(), n_seqs);
+    ggml_tensor * conv_state_all  = build_rs(inp_rs, conv_states_all, conv_states_all->ne[0], n_seqs);
 
     const int64_t mem_size = mctx_cur->get_size();
     const int64_t K_rs     = (int64_t) cparams.n_rs_seq + 1;
@@ -956,7 +959,13 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     ggml_tensor * const qkv_proj[3] = { q_proj, k_proj, v_proj };
     ggml_tensor * const qkv_conv[3] = { layer.ssm_q_conv, layer.ssm_k_conv, layer.ssm_v_conv };
     for (int64_t i = 0; i < 3; ++i) {
-        qkv_cur[i] = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, i, qkv_proj[i], qkv_conv[i], d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
+        // replay: the row holds the q, k and v conv histories one after the other
+        ggml_tensor * conv_x = nullptr;
+        if (cparams.rs_replay) {
+            conv_x = build_conv_state_replay(inp_rs, conv_states_all, ggml_reshape_3d(ctx0, qkv_proj[i], d_inner, n_seq_tokens, n_seqs),
+                d_conv - 1, d_inner, il, conv_state_all, i);
+        }
+        qkv_cur[i] = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, conv_x, i, qkv_proj[i], qkv_conv[i], d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
         if (fused_order) {
             ggml_build_forward_expand(gf, qkv_cur[i]);
         }

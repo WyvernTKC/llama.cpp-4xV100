@@ -9179,7 +9179,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
     const ggml_tensor * kv_rows = dst->src[5];
-    const ggml_tensor * chunk_list = dst->src[7];
+    // src[6] and src[7] hold the table and the indices of an indexed bias, else the KV ranges (unused here) and
+    //   the chunk list
+    const bool indexed_bias = ggml_flash_attn_ext_has_indexed_bias(dst);
+    const ggml_tensor * chunk_list   = indexed_bias ? nullptr : dst->src[7];
+    const ggml_tensor * bias_table   = indexed_bias ? dst->src[6] : nullptr;
+    const ggml_tensor * bias_indices = indexed_bias ? dst->src[7] : nullptr;
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -9220,6 +9225,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
     const int64_t rv2 = neq2/nev2;
     const int64_t rv3 = neq3/nev3;
+
+    const int64_t n_bins = bias_table ? bias_table->ne[0] : 0;
 
     // parallelize by q rows using ggml_vec_dot_f32
 
@@ -9305,12 +9312,21 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const int32_t * cl_b = cl ? cl + 1 : nullptr;
         const int32_t * cl_e = cl ? cl + 1 + cl[0] : nullptr;
 
+        // bias rows of this query and head, queries of all streams are flattened
+        const float   * bias = bias_table   ? (const float   *) ((const char *) bias_table->data   + (iq3*neq1 + iq1)*bias_table->nb[2] + iq2*bias_table->nb[1]) : nullptr;
+        const int32_t * bins = bias_indices ? (const int32_t *) ((const char *) bias_indices->data + (iq3*neq1 + iq1)*bias_indices->nb[1]) : nullptr;
+
         // online softmax / attention
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            float mv = mp ? GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            if (bias) {
+                GGML_ASSERT(bins[ic] >= 0 && bins[ic] < n_bins);
+                mv += bias[bins[ic]];
+            }
+            mv *= slope;
             if (rtab && mv != -INFINITY) {
                 const int32_t kp = rkv[ic];
                 const int64_t d  = (int64_t) rq - kp;
@@ -9497,6 +9513,12 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     const ggml_tensor * kv_rows = dst->src[5];
     const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : nek1;
 
+    // the indexed bias, without it src[6] and src[7] are the KV ranges and the chunk list
+    const bool indexed_bias = ggml_flash_attn_ext_has_indexed_bias(dst);
+    const ggml_tensor * bias_table   = indexed_bias ? dst->src[6] : nullptr;
+    const ggml_tensor * bias_indices = indexed_bias ? dst->src[7] : nullptr;
+    const int64_t n_bins = bias_table ? bias_table->ne[0] : 0;
+
     int ir = ir0;
     while (ir < ir1) {
         // q indices for the start of this tile
@@ -9575,8 +9597,15 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                 bool can_skip = true;
                 for (int tq = 0; tq < tile_rows; tq++) {
                     const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
+                    const float   * bias = bias_table   ? (const float   *) ((const char *) bias_table->data   + (iq3*neq1 + iq1 + tq)*bias_table->nb[2] + iq2*bias_table->nb[1]) : nullptr;
+                    const int32_t * bins = bias_indices ? (const int32_t *) ((const char *) bias_indices->data + (iq3*neq1 + iq1 + tq)*bias_indices->nb[1]) : nullptr;
                     for (int tk = 0; tk < kv_tile; tk++) {
-                        mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
+                        float m = GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
+                        if (bias) {
+                            GGML_ASSERT(bins[ic + tk] >= 0 && bins[ic + tk] < n_bins);
+                            m += bias[bins[ic + tk]];
+                        }
+                        mask32[tq * KV_TILE_SZ + tk] = slope * m;
                         if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
                             can_skip = false;
                         }
@@ -9894,7 +9923,9 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref && !dst->src[7] && !dst->src[8] &&
+        // chunk lists and the relative-position bias take the one-chunk path (src[7] of an indexed bias is its indices)
+        const bool has_chunk_list = dst->src[7] && !ggml_flash_attn_ext_has_indexed_bias(dst);
+        bool use_tiled = !use_ref && !has_chunk_list && !dst->src[8] &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&
@@ -11518,11 +11549,19 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // per-seq stride in floats (seq s starts at state + s * seq_stride)
     const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
 
-    const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
+    // replay: pending tokens to run before the new ones (see ggml_gated_delta_net_ext)
+    const ggml_tensor * src_pk    = dst->src[6];
+    const ggml_tensor * src_pv    = dst->src[7];
+    const ggml_tensor * src_pgb   = dst->src[8];
+    const ggml_tensor * src_n_rep = dst->src[9];
+    const int64_t n_pend = src_pk ? ggml_get_op_params_i32(dst, 1) : 0;
+    const bool    keep   = src_pk && ggml_get_op_params_i32(dst, 2) != 0;
+
+    const int64_t per_thread = S_v + (K > 1 || keep ? S_v * S_v : 0);
     const int ith = params->ith;
 
     float * delta       = (float *)params->wdata + ith * per_thread + CACHE_LINE_SIZE_F32;
-    float * state_work  = K > 1 ? (delta + S_v) : nullptr;
+    float * state_work  = K > 1 || keep ? (delta + S_v) : nullptr;
 
     // output layout: [attn_scores | new_states]
     // attn_scores: S_v * H * n_tokens * n_seqs    floats
@@ -11556,7 +11595,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
         // For K=1, write directly to the single output slot to avoid an extra memcpy at the end.
         // For K>1, work in scratch and copy out per-token when the slot is in range.
-        float * s_out = (K > 1)
+        float * s_out = (K > 1 || keep)
             ? state_work
             : state_out_base + (iv3 * H + iv1) * S_v * S_v;
 
@@ -11564,6 +11603,48 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
         const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
         memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+
+        if (src_pk) {
+            const int64_t n_r = ((const int32_t *) src_n_rep->data)[iv3];
+            GGML_ASSERT(n_r >= 0 && n_r <= n_pend);
+
+            const char * pk  = (const char *) src_pk->data  + iv3*src_pk->nb[3]  + ik1*src_pk->nb[1];
+            const char * pv  = (const char *) src_pv->data  + iv3*src_pv->nb[3]  + iv1*src_pv->nb[1];
+            const char * pgb = (const char *) src_pgb->data + iv3*src_pgb->nb[3] + iv1*src_pgb->nb[1];
+
+            for (int64_t t = 0; t < n_r; t++) {
+                const float * k_d    = (const float *) (pk  + t*src_pk->nb[2]);
+                const float * v_d    = (const float *) (pv  + t*src_pv->nb[2]);
+                const float * g_d    = (const float *) (pgb + t*src_pgb->nb[2]);
+                const float beta_val = *(const float *) (pgb + (n_pend + t)*src_pgb->nb[2]);
+
+                if (kda) {
+                    for (int64_t i = 0; i < S_v; ++i) {
+                        delta[i] = expf(g_d[i]);
+                    }
+                    for (int64_t j = 0; j < S_v; ++j) {
+                        ggml_vec_mul_f32(S_v, &s_out[j * S_v], &s_out[j * S_v], delta);
+                    }
+                } else {
+                    ggml_vec_scale_f32(S_v * S_v, s_out, expf(g_d[0]));
+                }
+
+                for (int64_t j = 0; j < S_v; ++j) {
+                    float sum = 0.0f;
+                    ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, k_d, 0, 1);
+                    delta[j] = (v_d[j] - sum) * beta_val;
+                }
+
+                for (int64_t j = 0; j < S_v; ++j) {
+                    ggml_vec_mad_f32(S_v, &s_out[j * S_v], k_d, delta[j]);
+                }
+            }
+
+            // the committed state, the new tokens go on in the scratch
+            if (keep) {
+                memcpy(state_out_base + (iv3 * H + iv1) * S_v * S_v, s_out, S_v * S_v * sizeof(float));
+            }
+        }
 
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
