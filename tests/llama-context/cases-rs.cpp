@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -487,6 +489,111 @@ struct case_shared_seq_reserve : ctx_test {
     }
 };
 
+// a speculative decoding trace, as the server runs it: a prompt with its last 4 tokens in their own batch, then verify
+// batches of 1..n_rs_seq+1 tokens whose rejected tokens are rolled back. Run twice in one context, the second time on a
+// cleared sequence: nothing the first run left in the recurrent rows (rollback snapshots, replay pending inputs and
+// conv columns) may reach the second one, so the logits must match bit for bit
+struct case_spec_repeat : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return "spec"; }
+
+    const char * description() const override {
+        return "a verify-and-rollback trace gives the same logits when run again on a cleared sequence";
+    }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        ctx_opts opts;
+        opts.n_seq_max = 1;
+        opts.n_rs_seq  = 5;
+
+        auto ctx = mr.ctx(opts);
+        if (!ctx) {
+            return case_result::fail();
+        }
+
+        const uint32_t n_rs_seq = llama_n_rs_seq(ctx.get());
+        if (n_rs_seq < 2) {
+            return case_result::skip("n_rs_seq is too small");
+        }
+
+        constexpr llama_pos n_prompt = 37;
+        constexpr int       n_steps  = 24;
+
+        const auto trace = [&](std::vector<float> & out) -> bool {
+            out.clear();
+            if (!seq_rm(ctx.get(), 0)) {
+                return false;
+            }
+
+            // the prompt, its last 4 tokens in their own batch
+            if (!decode_gen(ctx.get(), n_vocab, 0, 0, n_prompt - 4) || !decode_gen(ctx.get(), n_vocab, 0, n_prompt - 4, n_prompt)) {
+                TLOG_ERR("%s: prompt decode failed\n", __func__);
+                return false;
+            }
+
+            llama_pos pos = n_prompt;
+            for (int step = 0; step < n_steps; ++step) {
+                // 1 token (no draft) every 5th step, else 2..n_rs_seq+1
+                const int n = step % 5 == 4 ? 1 : 2 + (step*3) % (int) n_rs_seq;
+
+                common_batch batch(ctx.get());
+                for (int i = 0; i < n; ++i) {
+                    // a step-dependent token, so that a replayed token differs from the one decoded at that pos before
+                    batch.add(gen_token(n_vocab, 0, pos + i + 3*step), pos + i, 0, true);
+                }
+                if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+                    TLOG_ERR("%s: decode failed at step %d\n", __func__, step);
+                    return false;
+                }
+                for (int i = 0; i < n; ++i) {
+                    const float * logits = llama_get_logits_ith(ctx.get(), i);
+                    if (logits == nullptr) {
+                        TLOG_ERR("%s: missing logits at step %d, row %d\n", __func__, step, i);
+                        return false;
+                    }
+                    out.insert(out.end(), logits, logits + n_vocab);
+                }
+
+                // keep the first 1..n tokens, roll back the rest
+                const int keep = 1 + (step*7) % n;
+                if (keep < n && !llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, pos + keep, -1)) {
+                    TLOG_ERR("%s: rollback of %d tokens refused at step %d\n", __func__, n - keep, step);
+                    return false;
+                }
+                pos += keep;
+            }
+
+            return true;
+        };
+
+        std::vector<float> first;
+        std::vector<float> second;
+        CTX_REQUIRE(trace(first),  "the first trace failed");
+        CTX_REQUIRE(trace(second), "the second trace failed");
+        CTX_REQUIRE(first.size() == second.size(), "the traces have different lengths");
+
+        const logits_diff diff = compare_logits(first.data(), second.data(), first.size());
+        CTX_REQUIRE(diff.nmse() <= 0.0 && diff.diff_max == 0.0f,
+                "the second trace differs (max diff " + std::to_string(diff.diff_max) + ", nmse " + std::to_string(diff.nmse()) +
+                ", first difference at logit " + std::to_string(diff.i_first) + " of " + std::to_string(first.size()) + ")");
+
+        if (const char * path = getenv("LLAMA_TEST_SPEC_DUMP")) {
+            const std::string file = std::string(path) + "." + mr.name + ".bin";
+            if (FILE * f = fopen(file.c_str(), "wb")) {
+                fwrite(first.data(), sizeof(float), first.size(), f);
+                fclose(f);
+            }
+        }
+
+        TLOG_INF("%s: two verify-and-rollback traces matched (%zu logits)\n", __func__, first.size());
+
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
@@ -494,6 +601,7 @@ std::vector<ctx_test_ptr> make_rs_cases() {
     cases.push_back(std::make_unique<case_rollback_bound>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
+    cases.push_back(std::make_unique<case_spec_repeat>());
 
     return cases;
 }
