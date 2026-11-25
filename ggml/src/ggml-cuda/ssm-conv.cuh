@@ -79,3 +79,22 @@ void ggml_cuda_op_ssm_conv_state_long(ggml_backend_cuda_context & ctx, const ggm
                                       const ggml_tensor * x, const ggml_tensor * ssm_conv, ggml_tensor * silu,
                                       const ggml_cuda_ssm_conv_state_long_slots & slots,
                                       bool residual = false, float res_scale = 1.0f, const ggml_tensor * res_r = nullptr);
+
+// The replay form of the chain (llm_build_delta_net_base::build_conv_state_replay, one sequence): the window is the
+//   d_conv - 1 columns of the channels-first conv history of the cell that win_cols names (after the kept pending
+//   tokens), x holds the new tokens channels-first, and the last n_dst columns of [window | x] go back to the history
+//   row of the cell, dst_hist[col*hist_stride + c]. silu(ssm_conv(cont(transpose(concat)))) in one launch (two with
+//   more than one block of tokens), the history read from the cache row itself; silu may sit on x with its layout.
+struct ggml_cuda_ssm_conv_replay_args {
+    const float   * states;      // the history of this convolution in row ids[0], column k at k*col_stride
+    const int32_t * ids;
+    int64_t         row_stride;
+    int64_t         col_stride;
+    const int32_t * win_cols;    // [d_conv - 1]
+    float         * dst_hist;
+    int64_t         hist_stride;
+    int             n_dst;
+};
+
+void ggml_cuda_op_ssm_conv_replay(ggml_backend_cuda_context & ctx, const ggml_cuda_ssm_conv_replay_args & a,
+                                  const ggml_tensor * x, const ggml_tensor * ssm_conv, ggml_tensor * silu);

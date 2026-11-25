@@ -7629,6 +7629,87 @@ struct test_ssm_conv_state : public test_case {
     }
 };
 
+// build_conv_state_replay of one sequence (rs_replay) and the convolution after it: the window is the channels-first
+//   history of the cell from column n_rep on (after the kept pending tokens), the new tokens are appended, and the last
+//   n_dst columns go back to the history row of kv_head. CUDA runs it in one launch at the CONCAT.
+struct test_ssm_conv_replay : public test_case {
+    const int64_t nr;      // channels
+    const int64_t n_t;     // tokens
+    const int64_t n_dst;   // 3 (commit the window) or 3 + n_t (keep the new tokens pending)
+    const int32_t n_rep;   // kept pending tokens replayed before the window
+    const int32_t src_row; // the cache row the history comes from
+    const int64_t kv_head; // the cell the history columns go to
+
+    static constexpr int64_t n_hist  = 3 + 6; // the window and n_rs_seq + 1 = 6 pending columns
+    static constexpr int64_t n_cells = 3;
+
+    ggml_tensor * silu      = nullptr;
+    ggml_tensor * cache_out = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_REPLAY";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(nr, n_t, n_dst, n_rep, src_row, kv_head);
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { silu, cache_out }; }
+
+    test_ssm_conv_replay(int64_t nr = 2560, int64_t n_t = 1, int64_t n_dst = 3, int32_t n_rep = 0, int32_t src_row = 1,
+                         int64_t kv_head = 1)
+        : nr(nr), n_t(n_t), n_dst(n_dst), n_rep(n_rep), src_row(src_row), kv_head(kv_head) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cache    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nr*n_hist, n_cells);
+        ggml_tensor * ids      = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_tensor * win_cols = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 3, 1);
+        ggml_tensor * x        = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nr, n_t, 1);
+        ggml_tensor * w        = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, nr);
+        ggml_set_name(cache,    "cache");
+        ggml_set_name(ids,      "ids");
+        ggml_set_name(win_cols, "win_cols");
+        ggml_set_name(x,        "x");
+        ggml_set_name(w,        "w");
+
+        ggml_tensor * row  = ggml_get_rows(ctx, cache, ids);
+        ggml_tensor * hist = ggml_reshape_3d(ctx, row, nr, n_hist, 1);
+        ggml_tensor * cols = ggml_concat(ctx, ggml_get_rows(ctx, hist, win_cols), x, 1);
+
+        ggml_tensor * tail     = ggml_view_3d(ctx, cols, nr, n_dst, 1, cols->nb[1], cols->nb[2], (3 + n_t - n_dst)*cols->nb[1]);
+        ggml_tensor * hist_all = ggml_reshape_3d(ctx, cache, nr, n_hist, n_cells);
+        ggml_tensor * hist_dst = ggml_view_3d(ctx, hist_all, nr, n_dst, 1, hist_all->nb[1], hist_all->nb[2], kv_head*hist_all->nb[2]);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, tail, hist_dst));
+
+        silu = ggml_silu(ctx, ggml_ssm_conv(ctx, ggml_cont(ctx, ggml_transpose(ctx, cols)), w));
+        ggml_set_name(silu, "silu");
+        ggml_build_forward_expand(gf, silu);
+
+        // the cache after the history columns went back
+        cache_out = ggml_scale(ctx, cache, 1.0f);
+        ggml_set_name(cache_out, "cache_out");
+        return cache_out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (strcmp(t->name, "ids") == 0) {
+                ggml_backend_tensor_set(t, &src_row, 0, sizeof(src_row));
+            } else if (strcmp(t->name, "win_cols") == 0) {
+                const int32_t c[3] = { n_rep, n_rep + 1, n_rep + 2 };
+                ggml_backend_tensor_set(t, c, 0, sizeof(c));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -17159,6 +17240,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_conv_state(256,  100, 6, 0, 2));
     test_cases.emplace_back(new test_ssm_conv_state(2560, 2048, 1, 1, 1));
     test_cases.emplace_back(new test_ssm_conv_state(2560, 2048, 4, 1, 1));
+    // nr, n_t, n_dst, n_rep, src_row, kv_head
+    test_cases.emplace_back(new test_ssm_conv_replay(2560,    1, 3, 0, 1, 1));
+    test_cases.emplace_back(new test_ssm_conv_replay(2560,    1, 3, 4, 1, 1));
+    test_cases.emplace_back(new test_ssm_conv_replay(2560,    4, 7, 0, 1, 1));
+    test_cases.emplace_back(new test_ssm_conv_replay(2560,    6, 9, 2, 1, 1));
+    test_cases.emplace_back(new test_ssm_conv_replay(2560,    3, 6, 6, 1, 1));
+    test_cases.emplace_back(new test_ssm_conv_replay(1000,    5, 8, 3, 0, 2));
+    test_cases.emplace_back(new test_ssm_conv_replay(2560,    8, 3, 1, 1, 1));
+    test_cases.emplace_back(new test_ssm_conv_replay(2560,    9, 3, 2, 1, 1));
+    test_cases.emplace_back(new test_ssm_conv_replay(2560,   33, 3, 0, 1, 1));
+    test_cases.emplace_back(new test_ssm_conv_replay(512,   100, 3, 5, 0, 2));
+    test_cases.emplace_back(new test_ssm_conv_replay(2560, 2048, 3, 0, 1, 1));
+    test_cases.emplace_back(new test_ssm_conv_replay(2560, 2048, 3, 6, 1, 1));
     // bailingmoe3: the states of q, k and v in one row
     test_cases.emplace_back(new test_ssm_conv_state(4096, 1, 1, 1, 1, 3));
     test_cases.emplace_back(new test_ssm_conv_state(4096, 1, 1, 1, 0, 3));

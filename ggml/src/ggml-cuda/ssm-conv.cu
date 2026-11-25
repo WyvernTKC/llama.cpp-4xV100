@@ -633,6 +633,135 @@ void ggml_cuda_op_ssm_conv_state_long(ggml_backend_cuda_context & ctx, const ggm
         (float *) silu->data, (int64_t) (silu->nb[1]/ts), (const float *) halo.ptr, slots_long, nr, n_t, res_scale, r_d, r_s);
 }
 
+// The replay chain, more than one block of tokens: the first d_conv - 1 columns of the concat of every block (the
+//   window for the first, the last tokens of the block before for the others, which with silu on x may already be
+//   overwritten when the block reads them) and then the n_dst history columns, before the convolution. A thread
+//   reads the window of its channel before it writes the history columns of that channel.
+template <int d_conv, int split_n_t>
+static __global__ void ssm_conv_replay_halo_f32(const ggml_cuda_ssm_conv_replay_args a, const float * x, const int64_t x_stride_t,
+                                                float * halo, const int nr, const int n_t, const int n_blocks_t) {
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= nr) {
+        return;
+    }
+    const float * hist = a.states + (int64_t) a.ids[0]*a.row_stride + c;
+    const auto col = [&](const int p) {
+        return p < d_conv - 1 ? hist[(int64_t) a.win_cols[p]*a.col_stride] : x[(int64_t) (p - (d_conv - 1))*x_stride_t + c];
+    };
+
+    for (int b = blockIdx.y; b < n_blocks_t; b += gridDim.y) {
+#pragma unroll
+        for (int k = 0; k < d_conv - 1; ++k) {
+            halo[((int64_t) b*(d_conv - 1) + k)*nr + c] = col(b*split_n_t + k);
+        }
+    }
+
+    if (blockIdx.y == 0) {
+        const int p0 = d_conv - 1 + n_t - a.n_dst;
+        for (int j = 0; j < a.n_dst; ++j) {
+            const float v = col(p0 + j);
+            a.dst_hist[(int64_t) j*a.hist_stride + c] = v;
+        }
+    }
+}
+
+// one channel of split_n_t tokens a thread, convolved as ssm_conv_f32 / ssm_conv_long_token_f32 and the SILU: all of its
+//   columns are read before it writes. With one block of tokens (n_t <= split_n_t, halo nullptr) it reads the window
+//   and also stores the history columns (tail), else ssm_conv_replay_halo_f32 did and left the first columns in halo.
+template <int d_conv, int split_n_t>
+static __global__ void ssm_conv_replay_f32(const ggml_cuda_ssm_conv_replay_args a, const float * x, const int64_t x_stride_t,
+                                           const float * w, const int64_t w_stride, float * dst, const int64_t dst_stride_t,
+                                           const float * halo, const int nr, const int n_t, const bool tail) {
+    ggml_cuda_pdl_lc();
+    const int c  = blockIdx.x*blockDim.x + threadIdx.x;
+    const int t0 = blockIdx.y*split_n_t;
+
+    ggml_cuda_pdl_sync();
+    if (c >= nr) {
+        return;
+    }
+
+    const float * hist = a.states + (int64_t) a.ids[0]*a.row_stride + c;
+
+    // column j of the window is column t0 + j of the concat
+    constexpr int n_cols = d_conv - 1 + split_n_t;
+    float win[n_cols];
+#pragma unroll
+    for (int j = 0; j < n_cols; ++j) {
+        const int p = t0 + j;
+        if (halo != nullptr && j < d_conv - 1) {
+            win[j] = halo[((int64_t) blockIdx.y*(d_conv - 1) + j)*nr + c];
+        } else {
+            win[j] = p < d_conv - 1 ? hist[(int64_t) a.win_cols[p]*a.col_stride] :
+                     p - (d_conv - 1) < n_t ? x[(int64_t) (p - (d_conv - 1))*x_stride_t + c] : 0.0f;
+        }
+    }
+
+    if (tail) {
+        // one block: columns d_conv - 1 + n_t - n_dst .. d_conv - 2 + n_t of the concat, all in win
+        const int p0 = d_conv - 1 + n_t - a.n_dst;
+#pragma unroll
+        for (int j = 0; j < n_cols; ++j) {
+            if (j >= p0 && j < d_conv - 1 + n_t) {
+                a.dst_hist[(int64_t) (j - p0)*a.hist_stride + c] = win[j];
+            }
+        }
+    }
+
+    float wv[d_conv];
+#pragma unroll
+    for (int j = 0; j < d_conv; ++j) {
+        wv[j] = w[c*w_stride + j];
+    }
+
+#pragma unroll
+    for (int i = 0; i < split_n_t; ++i) {
+        if (t0 + i >= n_t) {
+            break;
+        }
+        dst[(int64_t) (t0 + i)*dst_stride_t + c] = ggml_cuda_ssm_conv_silu<d_conv>(win + i, wv, 0.0f);
+    }
+}
+
+void ggml_cuda_op_ssm_conv_replay(ggml_backend_cuda_context & ctx, const ggml_cuda_ssm_conv_replay_args & a,
+                                  const ggml_tensor * x, const ggml_tensor * ssm_conv, ggml_tensor * silu) {
+    const ggml_tensor * w = ssm_conv->src[1];
+
+    // the SILU may be of a reshape of the convolution: contiguous, channel c of token t at t*nr + c
+    const int nr  = (int) w->ne[1];
+    const int n_t = (int) ssm_conv->ne[1];
+    GGML_ASSERT(w->ne[0] == 4 && ssm_conv->ne[2] == 1 && x->nb[0] == sizeof(float) && ggml_is_contiguous(silu) &&
+                ggml_nelements(silu) == (int64_t) nr*n_t);
+    GGML_ASSERT(a.n_dst >= 1 && a.n_dst <= 3 + n_t);
+
+    constexpr int threads = 128;
+    const size_t  ts      = sizeof(float);
+    const int64_t x_st    = (int64_t) (x->nb[1]/ts);
+    const int64_t dst_st  = nr;
+
+    if (n_t <= GGML_CUDA_SSM_CONV_STATE_MAX_TOKENS) {
+        constexpr int split_n_t = GGML_CUDA_SSM_CONV_STATE_MAX_TOKENS;
+        const ggml_cuda_kernel_launch_params launch_params(dim3((nr + threads - 1) / threads, 1, 1), threads, 0, ctx.stream());
+        ggml_cuda_kernel_launch(ssm_conv_replay_f32<4, split_n_t>, launch_params, a, (const float *) x->data, x_st,
+            (const float *) w->data, (int64_t) (w->nb[1]/ts), (float *) silu->data, dst_st, (const float *) nullptr, nr, n_t, true);
+        return;
+    }
+
+    constexpr int split_n_t  = 32;
+    const int     n_blocks_t = (n_t + split_n_t - 1) / split_n_t;
+
+    // the first columns of every block go first: the window, before the history columns overwrite it, and with silu on
+    //   x the tokens before each block
+    ggml_cuda_pool_alloc<float> halo(ctx.pool(), (size_t) n_blocks_t*3*nr);
+    const dim3 blocks_halo((nr + threads - 1) / threads, std::min(n_blocks_t, 16), 1);
+    ssm_conv_replay_halo_f32<4, split_n_t><<<blocks_halo, threads, 0, ctx.stream()>>>(
+        a, (const float *) x->data, x_st, halo.get(), nr, n_t, n_blocks_t);
+
+    const ggml_cuda_kernel_launch_params launch_params(dim3((nr + threads - 1) / threads, n_blocks_t, 1), threads, 0, ctx.stream());
+    ggml_cuda_kernel_launch(ssm_conv_replay_f32<4, split_n_t>, launch_params, a, (const float *) x->data, x_st,
+        (const float *) w->data, (int64_t) (w->nb[1]/ts), (float *) silu->data, dst_st, (const float *) halo.get(), nr, n_t, false);
+}
+
 void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst) {
     const struct ggml_tensor * src0 = dst->src[0];  // conv_x
     const struct ggml_tensor * src1 = dst->src[1];  // conv1d.weight
