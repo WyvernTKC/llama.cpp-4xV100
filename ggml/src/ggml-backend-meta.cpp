@@ -4373,6 +4373,39 @@ static std::vector<ggml_backend_meta_copy_part> ggml_backend_meta_copy_parts(
             }
         }
         GGML_ASSERT(offset_data*row_count == size);
+
+        // One row (a state save or restore of one cell): the parts of a device follow each other in its tensor and lie
+        //   a fixed stride apart in the host layout, so a run of them is one 2-D copy. A recurrent row cut into many
+        //   segments (the replay conv history, 45 per device on Qwen 3.5) was one copy per segment.
+        if (row_count == 1) {
+            std::vector<ggml_backend_meta_copy_part> merged;
+            for (size_t j = 0; j < n_bufs; j++) {
+                size_t run = SIZE_MAX; // index in merged of the open run of device j
+                for (const auto & p : parts) {
+                    if (p.j != j || p.nbytes == 0) {
+                        continue;
+                    }
+                    if (run != SIZE_MAX && merged[run].nbytes == p.nbytes) {
+                        auto & r = merged[run];
+                        const size_t last_simple = r.simple_off + (r.n_rows - 1)*r.stride_simple;
+                        const size_t last_data   = r.data_off   + (r.n_rows - 1)*r.stride_data;
+                        if (p.simple_off >= last_simple + p.nbytes && p.data_off >= last_data + p.nbytes) {
+                            const size_t ds = p.simple_off - last_simple;
+                            const size_t dd = p.data_off   - last_data;
+                            if (r.n_rows == 1 || (ds == r.stride_simple && dd == r.stride_data)) {
+                                r.stride_simple = ds;
+                                r.stride_data   = dd;
+                                r.n_rows++;
+                                continue;
+                            }
+                        }
+                    }
+                    merged.push_back(p);
+                    run = merged.size() - 1;
+                }
+            }
+            return merged;
+        }
         return parts;
     }
 
@@ -5367,52 +5400,15 @@ static void ggml_backend_meta_set_tensor_async_impl(ggml_backend_t backend, ggml
 
     // Segmented or repeated splits. A fused weight - gemma4's ffn_gate_up_exps is one segment repeated
     // twice - lays each repetition's per-device slices side by side inside one row, so a device owns
-    // several disjoint ranges of a row instead of one. Walk segment/repetition/device exactly as
-    // ggml_backend_meta_buffer_set_tensor does and issue one strided copy per piece.
+    // several disjoint ranges of a row instead of one: the same strided pieces as the buffer's set_tensor
+    // (ggml_backend_meta_copy_parts, which merges the pieces of a one-row restore into one copy per device).
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
-        GGML_ASSERT(split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 || split_state.axis == GGML_BACKEND_SPLIT_AXIS_1);
-        GGML_ASSERT(split_state.nr[0] != 0);
-        GGML_ASSERT(tensor->ne[3] == 1);
-
-        const bool axis0 = split_state.axis == GGML_BACKEND_SPLIT_AXIS_0;
-        if (axis0) {
-            GGML_ASSERT(tensor->ne[2] == 1);
-        }
-
-        const size_t row_stride = axis0 ? tensor->nb[1] : tensor->nb[2];
-        GGML_ASSERT(offset % row_stride == 0);
-        GGML_ASSERT(size   % row_stride == 0);
-        const int64_t row_start = offset / row_stride;
-        const int64_t row_count = size   / row_stride;
-        GGML_ASSERT(row_start + row_count <= (axis0 ? tensor->ne[1] : tensor->ne[2]));
-
-        const int64_t blck_size = ggml_blck_size(tensor->type);
-        size_t offset_data = 0;
-        std::vector<size_t> simple_offsets(n_backends, 0);
-        for (size_t s = 0; s < split_state.n_segments; s++) {
-            for (size_t r = 0; r < split_state.nr[s]; r++) {
-                for (size_t j = 0; j < n_backends; j++) {
-                    ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                    size_t nbytes;
-                    if (axis0) {
-                        GGML_ASSERT(split_state.ne[s*n_backends + j] % blck_size == 0);
-                        nbytes = split_state.ne[s*n_backends + j]/blck_size * tensor->nb[0];
-                    } else {
-                        nbytes = split_state.ne[s*n_backends + j] * tensor->nb[1];
-                    }
-                    const size_t simple_stride = axis0 ? simple_tensor->nb[1] : simple_tensor->nb[2];
-                    if (nbytes > 0) {
-                        ggml_backend_tensor_set_2d_async(backend_j(j), simple_tensor,
-                            (const char *) data + offset_data,
-                            simple_offsets[j] + row_start*simple_stride, nbytes,
-                            row_count, simple_stride, row_stride);
-                    }
-                    offset_data       += nbytes;
-                    simple_offsets[j] += nbytes;
-                }
+        for (const auto & p : ggml_backend_meta_copy_parts(tensor, split_state, n_backends, offset, size)) {
+            if (p.nbytes > 0 && p.n_rows > 0) {
+                ggml_backend_tensor_set_2d_async(backend_j(p.j), ggml_backend_meta_buffer_simple_tensor(tensor, p.j),
+                    (const char *) data + p.data_off, p.simple_off, p.nbytes, p.n_rows, p.stride_simple, p.stride_data);
             }
         }
-        GGML_ASSERT(offset_data*row_count == size);
         return;
     }
 
